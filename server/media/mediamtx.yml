@@ -1,0 +1,12 @@
+logLevel: info
+rtsp: true
+rtspAddress: 127.0.0.1:8554
+rtspTransports: [tcp]
+hls: false
+webrtc: true
+webrtcAddress: :8889
+webrtcAllowOrigins: ['*']
+webrtcAdditionalHosts: [192.168.100.108]
+paths:
+  adas-ch2:
+    source: publisher

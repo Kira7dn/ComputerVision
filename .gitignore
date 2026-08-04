@@ -1,0 +1,21 @@
+# Python virtual environment
+.venv/
+# Environment variables
+.env
+# Node modules
+node_modules/
+# Dist/build outputs
+dist/
+# Logs
+*.log
+# OS files
+.DS_Store
+Thumbs.db
+# Python caches
+__pycache__/
+*.pyc
+# Vite/Node cache
+.vite/
+sdk/
+.secret/
+server/uploads/
