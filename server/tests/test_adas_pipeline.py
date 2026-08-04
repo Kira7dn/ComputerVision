@@ -1,11 +1,5 @@
-import sys
 import unittest
-from pathlib import Path
-
-MEDIA_DIR = Path(__file__).resolve().parent.parent / 'media'
-sys.path.insert(0, str(MEDIA_DIR))
-
-from adas_pipeline import LatestFrameSlot, RollingLatency
+from camera_server.adas.pipeline import LatestFrameSlot, RollingLatency
 
 
 class LatestFrameSlotTest(unittest.TestCase):

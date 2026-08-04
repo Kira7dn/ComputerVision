@@ -5,6 +5,7 @@ Based on the working DahuaRpcClient login flow from dahua_hdd_downloader.py.
 """
 
 import sys
+import os
 import io
 sys.stdout = io.TextIOWrapper(sys.stdout.detach(), encoding='utf-8')
 sys.stderr = io.TextIOWrapper(sys.stderr.detach(), encoding='utf-8')
@@ -205,7 +206,9 @@ def test_get_rtsp_url(client: DahuaRpcClient):
 def main():
     host = "192.168.100.229"
     username = "admin"
-    password = "letron123"
+    password = os.environ.get("DAHUA_PASSWORD")
+    if not password:
+        raise RuntimeError("DAHUA_PASSWORD is required")
 
     print(f"=== Dahua Live Stream Real Test ===")
     print(f"Target: {host}")

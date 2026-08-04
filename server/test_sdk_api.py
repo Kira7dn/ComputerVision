@@ -47,7 +47,9 @@ def main():
     ip = "192.168.100.229"
     port = 37777
     username = "admin"
-    password = "letron123"
+    password = os.environ.get("DAHUA_PASSWORD")
+    if not password:
+        raise RuntimeError("DAHUA_PASSWORD is required")
     channel = 0  # 0-based, channel 1 = 0
 
     stu_in = NET_IN_LOGIN_WITH_HIGHLEVEL_SECURITY()

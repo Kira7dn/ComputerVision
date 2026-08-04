@@ -2,6 +2,8 @@
 .venv/
 # Environment variables
 .env
+.env.*
+!.env.example
 # Node modules
 node_modules/
 # Dist/build outputs
@@ -19,3 +21,19 @@ __pycache__/
 sdk/
 .secret/
 server/uploads/
+server/runtime/
+runtime/
+*.key
+*.crt
+*.sqlite3
+*.sqlite3-*
+*.engine
+*.engine.json
+*.pt
+*.onnx
+server/media/probe-*/
+server/media/dahua_netsdk_backup/bin/
+server/media/dahua_netsdk_backup/obj/
+camera_adas.egg-info/
+.pip-cache/
+.tmp/

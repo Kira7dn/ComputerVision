@@ -1,0 +1,1 @@
+"""ADAS inference ownership."""
