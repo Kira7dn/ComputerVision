@@ -1,0 +1,64 @@
+services:
+  mediamtx:
+    image: bluenviron/mediamtx:1.19.3
+    container_name: camera-mediamtx
+    restart: unless-stopped
+    ports:
+      - "18554:18554/tcp"
+    volumes:
+      - E:/Docker/Frigate/mediamtx-mock.yml:/mediamtx.yml:ro
+
+  frigate:
+    image: ghcr.io/blakeblackshear/frigate:stable-tensorrt
+    container_name: frigate
+    restart: unless-stopped
+    privileged: true
+    shm_size: "256mb"
+    depends_on:
+      - mediamtx
+    gpus: all
+    ports:
+      - "8971:8971"
+      - "8554:8554"
+      - "8555:8555/tcp"
+      - "8555:8555/udp"
+    volumes:
+      - E:/Docker/Frigate/config:/config
+      - E:/Docker/Frigate/media:/media/frigate
+      - D:/BusinessAnalyze/Camera/models/roboflow-logistics-yolov8/best-frigate.onnx:/models/logistics-yolov8.onnx:ro
+      - D:/BusinessAnalyze/Camera/models/roboflow-logistics-yolov8/labelmap.txt:/models/logistics-yolov8.txt:ro
+      - /etc/localtime:/etc/localtime:ro
+
+  frigate-notifier:
+    build: ./notifier
+    container_name: frigate-notifier
+    restart: unless-stopped
+    depends_on:
+      - frigate
+    env_file:
+      - path: ../.env.local
+        required: false
+    environment:
+      FRIGATE_URL: http://frigate:5000
+      NOTIFIER_POLL_SECONDS: "3"
+      NOTIFIER_RETRY_COUNT: "3"
+      MIN_TRACK_DISPLACEMENT: "0.12"
+      MIN_TRACK_DURATION_SECONDS: "2"
+      ZALO_MEDIA_BASE_URL: ${NGROK_URL:-}
+      VEHICLE_WHITELIST_FILE: /runtime/vehicle_whitelist.json
+      NOTIFIER_STATE_FILE: /runtime/notifier_state.json
+    volumes:
+      - E:/Docker/Frigate/runtime:/runtime
+
+  media-gateway:
+    build: ./notifier
+    container_name: camera-media-gateway
+    command: ["python", "/app/media_gateway.py"]
+    restart: unless-stopped
+    depends_on:
+      - frigate
+    environment:
+      FRIGATE_URL: http://frigate:5000
+      MEDIA_GATEWAY_PORT: "8090"
+    ports:
+      - "8090:8090"

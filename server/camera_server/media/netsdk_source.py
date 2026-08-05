@@ -186,6 +186,8 @@ class NetSdkHlsManager:
 
         try:
             if self.adas_enabled and channel in self.adas_channels:
+                # Avoid an NVENC session burst when the dashboard starts all channels.
+                time.sleep(max(0, channel - 1) * 1.5)
                 from camera_server.adas.pipeline_impl import AdasPipeline
                 session['adas'] = AdasPipeline(channel, self.event_log, channel_dir)
                 session['adas'].start()

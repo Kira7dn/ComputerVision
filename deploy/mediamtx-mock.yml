@@ -1,0 +1,11 @@
+logLevel: info
+rtsp: true
+rtspAddress: :18554
+rtspTransports: [tcp]
+hls: false
+webrtc: false
+paths:
+  chokepoint-face:
+    source: publisher
+  gate-in:
+    source: publisher

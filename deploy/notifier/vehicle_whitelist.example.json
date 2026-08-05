@@ -1,0 +1,16 @@
+[
+  {
+    "plate": "KA02MM9091",
+    "owner_name": "Demo owner 1",
+    "vehicle_type": "car",
+    "enabled": true,
+    "note": "Phase 4 demo"
+  },
+  {
+    "plate": "KA02MN1826",
+    "owner_name": "Demo owner 2",
+    "vehicle_type": "car",
+    "enabled": true,
+    "note": "Phase 4 demo"
+  }
+]

@@ -37,3 +37,7 @@ server/media/dahua_netsdk_backup/obj/
 camera_adas.egg-info/
 .pip-cache/
 .tmp/
+
+# Local mock media and cloned upstream repositories
+mock_videos/
+frigate/

@@ -90,7 +90,7 @@ class Runtime:
 
     def _spawn_media_mtx(self) -> None:
         executable = os.environ.get("MEDIAMTX_BIN", "mediamtx")
-        config = self.root.parent / "deploy" / "mediamtx.yml"
+        config = self.root / "ops" / "mediamtx.yml"
         try:
             process = subprocess.Popen([executable, str(config)], cwd=str(self.root))
         except FileNotFoundError:

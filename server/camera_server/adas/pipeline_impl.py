@@ -16,8 +16,8 @@ from pathlib import Path
 from .scheduler import InferenceJob, get_shared_scheduler
 
 
-FRAME_WIDTH = 640
-FRAME_HEIGHT = 384
+FRAME_WIDTH = 320
+FRAME_HEIGHT = 192
 FRAME_BYTES = FRAME_WIDTH * FRAME_HEIGHT * 3
 TARGET_CLASSES = {0, 2, 3, 5, 7}  # COCO: person, car, motorcycle, bus, truck
 
@@ -128,6 +128,7 @@ class AdasPipeline:
         self.dahua_to_detection_latency = RollingLatency()
         self.dahua_to_publish_latency = RollingLatency()
         self.warning_enabled = os.environ.get('ADAS_WARNING_ENABLED', 'true').lower() == 'true'
+        self.publish_fps = max(5, int(os.environ.get('ADAS_PUBLISH_FPS', '10')))
         self.warning_roi = self._parse_roi(os.environ.get('ADAS_WARNING_ROI', '0.15,0.35,0.85,0.98'))
         self.warning_debounce_frames = max(1, int(os.environ.get('ADAS_WARNING_DEBOUNCE_FRAMES', '3')))
         self.warning_cooldown_ms = max(0, int(os.environ.get('ADAS_WARNING_COOLDOWN_MS', '1000')))
@@ -289,11 +290,17 @@ class AdasPipeline:
 
     def _start_publisher(self):
         log_file = (self.output_dir / 'adas-publisher.log').open('wb', buffering=0)
+        encoder = os.environ.get('ADAS_PUBLISH_CODEC', 'libx264')
+        encoder_args = ['-c:v', encoder]
+        if encoder == 'libx264':
+            encoder_args += ['-preset', 'ultrafast', '-tune', 'zerolatency']
+        else:
+            encoder_args += ['-preset', 'p1', '-tune', 'ull']
         process = subprocess.Popen([
             'ffmpeg', '-hide_banner', '-loglevel', 'warning',
             '-f', 'rawvideo', '-pix_fmt', 'bgr24',
-            '-s', f'{FRAME_WIDTH}x{FRAME_HEIGHT}', '-r', '25', '-i', 'pipe:0',
-            '-an', '-c:v', 'h264_nvenc', '-preset', 'p1', '-tune', 'ull',
+            '-s', f'{FRAME_WIDTH}x{FRAME_HEIGHT}', '-r', str(self.publish_fps), '-i', 'pipe:0',
+            '-an', *encoder_args,
             '-pix_fmt', 'yuv420p', '-profile:v', 'main',
             '-bf', '0', '-g', '12', '-forced-idr', '1',
             '-f', 'rtsp', '-rtsp_transport', 'tcp', self.mediamtx_rtsp,

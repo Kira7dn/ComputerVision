@@ -1,0 +1,128 @@
+mqtt:
+  enabled: false
+
+logger:
+  default: info
+  logs:
+    frigate.data_processing.real_time.face: debug
+    frigate.embeddings.maintainer: debug
+    frigate.camera.state: debug
+    frigate.object_detection.base: debug
+
+detectors:
+  onnx:
+    type: onnx
+
+face_recognition:
+  enabled: true
+  model_size: large
+  detection_threshold: 0.5
+  min_area: 100
+  unknown_score: 0.8
+  recognition_threshold: 0.9
+  min_faces: 1
+  save_attempts: 200
+  blur_confidence_filter: false
+
+lpr:
+  enabled: true
+  min_area: 100
+  recognition_threshold: 0.6
+  enhancement: 3
+  debug_save_plates: true
+
+model:
+  width: 640
+  height: 640
+  input_tensor: nchw
+  input_pixel_format: rgb
+  input_dtype: float
+  model_type: yolo-generic
+  path: /models/logistics-yolov8.onnx
+  labelmap_path: /models/logistics-yolov8.txt
+
+record:
+  enabled: true
+  detections:
+    retain:
+      days: 2
+  alerts:
+    retain:
+      days: 2
+
+snapshots:
+  enabled: true
+  bounding_box: true
+  retain:
+    default: 2
+
+cameras:
+  gate_in_camera:
+    enabled: true
+    friendly_name: Gate In Camera
+    motion:
+      # Keep motion enabled because Frigate requires it when object
+      # detection is enabled. Use the most sensitive bounded settings for
+      # the deterministic mock replay.
+      threshold: 1
+      contour_area: 1
+    objects:
+      track:
+        - car
+        - license_plate
+        - person
+      filters:
+        car:
+          min_score: 0.3
+          threshold: 0.4
+        license_plate:
+          min_score: 0.3
+          threshold: 0.5
+        person:
+          min_score: 0.5
+          threshold: 0.7
+    zones:
+      gate_in_zone:
+        coordinates: 0,0,1,0,1,1,0,1
+        objects:
+          - car
+          - person
+    ffmpeg:
+      inputs:
+        - path: rtsp://host.docker.internal:18554/gate-in
+          input_args: preset-rtsp-generic
+          roles:
+            - detect
+            - record
+    detect:
+      enabled: true
+      width: 1280
+      height: 720
+      fps: 10
+
+  face_camera:
+    enabled: true
+    friendly_name: Camera 2 - Face Recognition
+    face_recognition:
+      enabled: true
+      min_area: 100
+    objects:
+      track:
+        - person
+    zones:
+      face_zone:
+        coordinates: 0,0,1,0,1,1,0,1
+        objects:
+          - person
+    ffmpeg:
+      inputs:
+        - path: rtsp://host.docker.internal:18554/chokepoint-face
+          input_args: preset-rtsp-generic
+          roles:
+            - detect
+            - record
+    detect:
+      enabled: true
+      width: 1280
+      height: 720
+      fps: 5
