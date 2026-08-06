@@ -21,4 +21,4 @@ python tools/train_native_lpr.py `
 
 The script validates all three splits, trains, evaluates on `test`, and exports
 `native-lpr-finetuned.onnx` with static `640x640`, batch 1, no NMS insertion and
-no score multiplier. It never changes `deploy/config.yml` or the active model.
+no score multiplier. It never changes the generated runtime config or active model.

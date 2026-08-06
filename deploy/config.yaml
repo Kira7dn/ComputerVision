@@ -1,0 +1,121 @@
+runtime:
+  image: camera-frigate:0.18.0-33c00a27e-runtime3-reviewfix1-tensorrt
+  build_base_image: camera-frigate:0.18.0-33c00a27e-runtime3-tensorrt
+  cpu_limit: 4
+  model_path: models/yolov9-t-320.onnx
+  config_dir: runtime/config
+  media_dir: E:/Docker/Frigate/media
+  data_dir: runtime/data
+  rtsp_transport: tcp
+  replay:
+    loop: true
+    sources:
+      face_camera: mock_videos/face-recognition/segments/01_P1E_S1_C1.mp4
+  integrations:
+    enabled: false
+
+mqtt:
+  enabled: false
+
+go2rtc:
+  streams:
+    face_camera:
+      - rtsp://mediamtx:18554/face_camera
+
+logger:
+  default: info
+
+auth:
+  reset_admin_password: false
+
+detectors:
+  onnx:
+    type: onnx
+    device: CPU
+    intra_op_num_threads: 2
+    inter_op_num_threads: 1
+    allow_spinning: false
+    execution_mode: sequential
+
+face_recognition:
+  enabled: true
+  model_size: large
+  device: GPU
+  detection_threshold: 0.5
+  min_area: 100
+  unknown_score: 0.8
+  recognition_threshold: 0.9
+  min_faces: 2
+  save_attempts: 0
+  blur_confidence_filter: false
+
+lpr:
+  enabled: false
+
+model:
+  width: 320
+  height: 320
+  input_tensor: nchw
+  input_pixel_format: rgb
+  input_dtype: float
+  model_type: yolo-generic
+  path: /models/yolov9-t-320.onnx
+  labelmap_path: /labelmap/coco-80.txt
+
+record:
+  enabled: true
+  detections:
+    retain:
+      days: 2
+  alerts:
+    retain:
+      days: 2
+
+snapshots:
+  enabled: true
+  bounding_box: true
+  retain:
+    default: 2
+
+cameras:
+  face_camera:
+    enabled: true
+    friendly_name: Face Recognition Camera
+    face_recognition:
+      enabled: true
+      min_area: 750
+    review:
+      alerts:
+        enabled: false
+      detections:
+        enabled: true
+        labels: [person]
+    objects:
+      track: [person]
+    ffmpeg:
+      inputs:
+        - path: rtsp://127.0.0.1:8554/face_camera
+          input_args: preset-rtsp-restream
+          roles: [detect, record]
+    live:
+      streams:
+        Main: face_camera
+    detect:
+      enabled: true
+      width: 1280
+      height: 720
+      fps: 5
+      max_disappeared: 5
+    motion:
+      threshold: 53
+      contour_area: 10
+      improve_contrast: true
+
+version: 0.18-0
+
+semantic_search:
+  enabled: false
+
+classification:
+  bird:
+    enabled: false

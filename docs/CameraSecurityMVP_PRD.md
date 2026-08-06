@@ -495,7 +495,7 @@ Các kết luận trên là định hướng từ tài liệu, chưa thay thế 
 
 **Kết quả Phase 1 ngày 2026-08-05:** Docker Server `29.6.2`, Docker Compose `v5.3.1`, Frigate `0.17.2-3d4dd3a`, image `stable-tensorrt`, GPU `NVIDIA GeForce RTX 3050 Laptop GPU`. Frigate healthy với ba mock stream; `/config` và `/media/frigate` là bind mount từ `E:\Docker\Frigate`. Runtime API ghi nhận khoảng 15 FPS input, custom fall ONNX khoảng 170 ms/inference, GPU được container nhận diện và `nvidia-smi` hoạt động.
 
-**Lệnh vận hành:** `powershell -ExecutionPolicy Bypass -File .\deploy\start.ps1` và `powershell -ExecutionPolicy Bypass -File .\deploy\stop.ps1`. Compose nằm tại `deploy/docker-compose.yml`.
+**Lệnh vận hành:** dùng duy nhất `powershell -ExecutionPolicy Bypass -File .\deploy\run.ps1 <command>`. Chạy command `help` để xem `start/status/logs/doctor/stop` và các tác vụ bảo trì. Compose reference nằm tại `deploy/reference/docker-compose.yml`.
 
 ### Quản lý source và runtime
 

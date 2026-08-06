@@ -41,3 +41,4 @@ camera_adas.egg-info/
 # Local mock media and cloned upstream repositories
 mock_videos/
 frigate/
+.playwright-cli/

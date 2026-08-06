@@ -1,0 +1,65 @@
+- main [ref=f5e3]:
+  - generic [ref=f5e4]:
+    - complementary [ref=f5e5]:
+      - generic [ref=f5e7]:
+        - link [ref=f5e8] [cursor=pointer]:
+          - /url: /
+        - button [ref=f5e12] [cursor=pointer]:
+          - link [ref=f5e13]:
+            - /url: /
+        - button [ref=f5e17] [cursor=pointer]:
+          - link [ref=f5e18]:
+            - /url: /review
+        - button [ref=f5e23] [cursor=pointer]:
+          - link [ref=f5e24]:
+            - /url: /explore
+        - button [ref=f5e28] [cursor=pointer]:
+          - link [ref=f5e29]:
+            - /url: /export
+        - button [ref=f5e33] [cursor=pointer]:
+          - link [ref=f5e34]:
+            - /url: /faces
+        - button [ref=f5e42] [cursor=pointer]:
+          - link [ref=f5e43]:
+            - /url: /classification
+      - generic [ref=f5e49]:
+        - button [ref=f5e50] [cursor=pointer]
+        - generic [ref=f5e55] [cursor=pointer]
+    - generic [ref=f5e58]:
+      - generic [ref=f5e59]:
+        - link "CPU 18%" [ref=f5e60] [cursor=pointer]:
+          - /url: /system#general
+        - link "NVIDIA GeForce RTX 3050 Laptop GPU 6%" [ref=f5e65] [cursor=pointer]:
+          - /url: /system#general
+      - generic [ref=f5e70]: System is healthy
+    - generic [ref=f5e75]:
+      - region "Notifications alt+T"
+      - generic [ref=f5e76]:
+        - group [ref=f5e77]:
+          - radio "Alerts" [checked] [ref=f5e78] [cursor=pointer]:
+            - generic [ref=f5e79]: Alerts ∙ 0
+          - radio "Detections" [ref=f5e84] [cursor=pointer]:
+            - generic [ref=f5e85]: Detections ∙ 6
+          - radio "Motion" [ref=f5e90] [cursor=pointer]
+        - generic [ref=f5e96]:
+          - button "Cameras Filter" [ref=f5e97] [cursor=pointer]:
+            - generic [ref=f5e100]: All Cameras
+          - generic [ref=f5e101] [cursor=pointer]:
+            - switch "Show Reviewed" [ref=f5e102]
+            - generic [ref=f5e103]: Show Reviewed
+          - button "Select a date to filter by" [ref=f5e104] [cursor=pointer]:
+            - generic [ref=f5e107]: Last 24 Hours
+          - button "Filter" [ref=f5e108] [cursor=pointer]
+      - generic [ref=f5e112]:
+        - generic [ref=f5e113]: There are no alerts to review
+        - generic [ref=f5e120]:
+          - generic [ref=f5e125]:
+            - generic [ref=f5e126]: 11:15 PM
+            - generic [ref=f5e187]: 11:00 PM
+            - generic [ref=f5e248]: 10:45 PM
+            - generic [ref=f5e309]: 10:30 PM
+            - generic [ref=f5e370]: 10:15 PM
+            - generic [ref=f5e431]: 10:00 PM
+            - generic [ref=f5e492]: 9:45 PM
+          - scrollbar [ref=f5e527]:
+            - generic [ref=f5e530] [cursor=pointer]

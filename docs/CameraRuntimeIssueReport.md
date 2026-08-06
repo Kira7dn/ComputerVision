@@ -109,7 +109,7 @@ Ngoài ra, process FFmpeg của Frigate vẫn được quan sát đang scale det
 
 Trước đây tồn tại hai bản config:
 
-- `deploy/config.yml` trong workspace.
+- Cấu hình runtime và Frigate duy nhất trong `deploy/config.yaml`.
 - `E:\Docker\Frigate\config\config.yml` trên runtime volume.
 
 `start.ps1` từng copy bản workspace sang ổ E, gây nguy cơ lệch config và khó biết bản nào là chuẩn.
@@ -117,7 +117,7 @@ Trước đây tồn tại hai bản config:
 Đã chuyển sang một SOT duy nhất:
 
 ```text
-D:\BusinessAnalyze\Camera\deploy\config.yml
+D:\BusinessAnalyze\Camera\deploy\config.yaml
 ```
 
 `docker-compose.yml` mount trực tiếp file này:
@@ -126,13 +126,14 @@ D:\BusinessAnalyze\Camera\deploy\config.yml
 ./config.yml:/config/config.yml:ro
 ```
 
-`start.ps1` không còn copy config sang ổ E. File config cũ trên ổ E đã được xóa. Docker inspect đã xác minh source mount hiện tại là `deploy/config.yml` với `RW=False`.
+Runtime không copy config sang ổ E. `run.ps1` sinh `.tmp/runtime/config.yml` bằng atomic replace và mount read-only vào container.
 
 Entrypoint vận hành chuẩn là:
 
 ```powershell
-.\deploy\stop.ps1
-.\deploy\start.ps1
+.\deploy\run.ps1 help
+.\deploy\run.ps1 start
+.\deploy\run.ps1 stop
 ```
 
 Không dùng restart thủ công để thay thế flow này khi cần đồng bộ mock publisher và Compose.
@@ -145,7 +146,7 @@ Không dùng restart thủ công để thay thế flow này khi cần đồng b�
 - Đưa LPR về baseline `enabled + debug_save_plates`.
 - Bật logger `frigate.data_processing.common.license_plate: debug`.
 - Chuyển config về một SOT duy nhất.
-- Tách độ phân giải mock gate và face trong `start.ps1`.
+- Tách độ phân giải replay gate và face trong cấu hình runtime được sinh bởi `deploy/run.ps1`.
 - Nâng thử gate mock lên `1920x1080` để tăng pixel cho plate.
 
 ## Những việc chưa được nghiệm thu

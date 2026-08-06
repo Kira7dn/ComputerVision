@@ -4,8 +4,8 @@ rtspAddress: :18554
 rtspTransports: [tcp]
 hls: false
 webrtc: false
+api: true
+apiAddress: :9997
 paths:
-  chokepoint-face:
-    source: publisher
-  gate-in:
+  all_others:
     source: publisher

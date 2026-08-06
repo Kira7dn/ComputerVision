@@ -280,12 +280,12 @@ Technical validation đạt khi:
 
 ## 15. Phase 4 runtime contract và kiểm thử
 
-Notifier dùng `deploy/notifier/frigate_notifier.py`. API media của event là:
+Notifier dùng `deploy/reference/integrations/notifier/frigate_notifier.py`. API media của event là:
 
 - `GET /api/events/<event_id>/snapshot.jpg`
 - `GET /api/events/<event_id>/clip.mp4`
 
-Whitelist đặt tại `E:\Docker\Frigate\runtime\vehicle_whitelist.json`, state notification tại `E:\Docker\Frigate\runtime\notifier_state.json`; cả hai được mount vào container và không nằm trong Git. File mẫu là `deploy/notifier/vehicle_whitelist.example.json`. Contract có `event_id`, camera, direction, car, plate/status/confidence, thời gian, snapshot/clip URL và `plate_result`.
+Whitelist đặt tại `E:\Docker\Frigate\runtime\vehicle_whitelist.json`, state notification tại `E:\Docker\Frigate\runtime\notifier_state.json`; cả hai được mount vào container và không nằm trong Git. File mẫu là `deploy/reference/integrations/notifier/vehicle_whitelist.example.json`. Contract có `event_id`, camera, direction, car, plate/status/confidence, thời gian, snapshot/clip URL và `plate_result`.
 
 Đã xác nhận ở mức contract/unit smoke: suy ra `in`/`out`, nhận đúng `recognized_license_plate`, phân loại `allowed`/`not_allowed`/`unreadable`, URL media theo event ID, credential rỗng không làm notifier crash và state có thể lưu bền qua restart. Runtime ngày 05/08/2026 đã xác nhận hai camera cổng có event `car` qua Frigate API, có clip và một số event có snapshot. OCR của `KA02MM9091`/`KA02MN1826` và notification thật vẫn chưa được đánh dấu đạt trong lần kiểm tra này.
 

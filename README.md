@@ -94,3 +94,26 @@ Lưu ý kiểm định: `healthy` chỉ nghĩa là XVR đang trả stream NetSDK
 playback. SDK Python trong bộ này không có API seed video vào channel XVR; video giả phải đưa
 vào MediaMTX/pipeline. `capture_to_browser_ms` chưa được đo vì TS callback không cung cấp PTS
 camera usable.
+
+## Frigate Camera runtime v2
+
+Entrypoint duy nhất nằm tại `deploy/run.ps1`. Hướng dẫn đầy đủ nằm trong
+`deploy/README.md`; toàn bộ cấu hình runtime và Frigate nằm trong `deploy/config.yaml`.
+Production nhận RTSP H.264 trực tiếp qua go2rtc. Replay file bật MediaMTX cùng FFmpeg
+trong Docker. Root `.env.local` chỉ chứa secret và được Docker Compose nạp trực tiếp.
+
+```powershell
+# Xem toàn bộ chức năng, không cần nhớ tên nhiều script
+./deploy/run.ps1 help
+
+./deploy/run.ps1 doctor
+./deploy/run.ps1 start
+./deploy/run.ps1 status
+./deploy/run.ps1 logs
+./deploy/run.ps1 stop
+```
+
+Khai báo nhiều source trực tiếp trong `go2rtc.streams`, `cameras` và
+`runtime.replay.sources`. Mỗi source phải là H.264 và giải mã được ít nhất một frame.
+Runtime mount trực tiếp `deploy/config.yaml` thành `/config/config.yml`; không sinh thêm
+một bản Frigate config hoặc runtime env trung gian.

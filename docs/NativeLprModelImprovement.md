@@ -3,7 +3,7 @@
 ## Model active và candidate
 
 Model active vẫn là `models/roboflow-logistics-yolov8/best-frigate.onnx` qua
-`deploy/docker-compose.yml`. Không có model active nào bị ghi đè.
+`deploy/reference/docker-compose.yml`. Không có model active nào bị ghi đè.
 
 | Model | SHA-256 | Ghi chú |
 |---|---|---|
