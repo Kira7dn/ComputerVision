@@ -1,19 +1,21 @@
 $ErrorActionPreference = 'Stop'
 $workspace = Split-Path -Parent $PSScriptRoot
 $compose = Join-Path $PSScriptRoot 'docker-compose.yml'
-$sourceConfig = Join-Path $PSScriptRoot 'config.yml'
-$runtimeConfig = 'E:\Docker\Frigate\config\config.yml'
 $logDir = Join-Path $workspace '.tmp\runtime'
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 
 if (-not (docker info 2>$null)) { throw 'Docker Engine is not available.' }
 
+# Validate the effective Compose configuration before changing the running stack.
+docker compose -f $compose config --quiet
+
 $old = Get-CimInstance Win32_Process -Filter "Name='ffmpeg.exe'" |
   Where-Object { $_.CommandLine -like '*18554*' -or $_.CommandLine -like '*mock_videos*' }
 foreach ($p in $old) { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }
 
-Copy-Item -LiteralPath $sourceConfig -Destination $runtimeConfig -Force
-docker compose -f $compose up -d --no-build mediamtx frigate
+# Always recreate these services so bind-mounted config.yml and source overlays
+# are loaded even when an old container is already running.
+docker compose -f $compose up -d --no-build --force-recreate mediamtx frigate
 Start-Sleep -Seconds 3
 
 $car = Join-Path $workspace 'mock_videos\car-number-plate-video\cam-in\Traffic Control CCTV.mp4'

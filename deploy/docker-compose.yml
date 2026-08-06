@@ -24,9 +24,18 @@ services:
       - "8555:8555/udp"
     volumes:
       - E:/Docker/Frigate/config:/config
+      - ./config.yml:/config/config.yml
+      # Overlay the changed Python modules and compatibility files. The
+      # prebuilt image retains its native TensorRT runtime dependencies.
+      - D:/BusinessAnalyze/Camera/frigate/frigate/version.py:/opt/frigate/frigate/version.py:ro
+      - D:/BusinessAnalyze/Camera/frigate/frigate/const.py:/opt/frigate/frigate/const.py:ro
+      - D:/BusinessAnalyze/Camera/frigate/frigate/util/image.py:/opt/frigate/frigate/util/image.py:ro
+      - D:/BusinessAnalyze/Camera/frigate/frigate/comms/event_metadata_updater.py:/opt/frigate/frigate/comms/event_metadata_updater.py:ro
+      - D:/BusinessAnalyze/Camera/frigate/frigate/data_processing/real_time/face.py:/opt/frigate/frigate/data_processing/real_time/face.py:ro
+      - D:/BusinessAnalyze/Camera/frigate/frigate/track/object_processing.py:/opt/frigate/frigate/track/object_processing.py:ro
+      - D:/BusinessAnalyze/Camera/frigate/frigate/track/tracked_object.py:/opt/frigate/frigate/track/tracked_object.py:ro
       - E:/Docker/Frigate/media:/media/frigate
-      - D:/BusinessAnalyze/Camera/models/roboflow-logistics-yolov8/best-frigate.onnx:/models/logistics-yolov8.onnx:ro
-      - D:/BusinessAnalyze/Camera/models/roboflow-logistics-yolov8/labelmap.txt:/models/logistics-yolov8.txt:ro
+      - D:/BusinessAnalyze/Camera/models/yolov9/yolov9-t-converted.onnx:/models/yolov9-t.onnx:ro
       - /etc/localtime:/etc/localtime:ro
 
   frigate-notifier:

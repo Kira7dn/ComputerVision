@@ -1,13 +1,21 @@
 mqtt:
   enabled: false
 
+go2rtc:
+  streams:
+    gate_in_camera:
+      - rtsp://host.docker.internal:18554/gate-in
+    face_camera:
+      - rtsp://host.docker.internal:18554/chokepoint-face
+
 logger:
   default: info
   logs:
     frigate.data_processing.real_time.face: debug
     frigate.embeddings.maintainer: debug
-    frigate.camera.state: debug
-    frigate.object_detection.base: debug
+
+auth:
+  reset_admin_password: false
 
 detectors:
   onnx:
@@ -16,20 +24,19 @@ detectors:
 face_recognition:
   enabled: true
   model_size: large
+  device: GPU
   detection_threshold: 0.5
   min_area: 100
   unknown_score: 0.8
   recognition_threshold: 0.9
-  min_faces: 1
+  min_faces: 2
   save_attempts: 200
   blur_confidence_filter: false
 
 lpr:
-  enabled: true
-  min_area: 100
-  recognition_threshold: 0.6
-  enhancement: 3
-  debug_save_plates: true
+  # Disable LPR while validating the face-recognition pipeline so the
+  # enrichment worker and detector resources are reserved for faces.
+  enabled: false
 
 model:
   width: 640
@@ -38,8 +45,8 @@ model:
   input_pixel_format: rgb
   input_dtype: float
   model_type: yolo-generic
-  path: /models/logistics-yolov8.onnx
-  labelmap_path: /models/logistics-yolov8.txt
+  path: /models/yolov9-t.onnx
+  labelmap_path: /labelmap/coco-80.txt
 
 record:
   enabled: true
@@ -58,71 +65,95 @@ snapshots:
 
 cameras:
   gate_in_camera:
-    enabled: true
+    # Camera 1 is not part of the face-recognition flow. Keep it configured
+    # for later re-enablement without starting its LPR/vehicle pipeline.
+    enabled: false
     friendly_name: Gate In Camera
+    lpr:
+      enabled: false
     motion:
       # Keep motion enabled because Frigate requires it when object
       # detection is enabled. Use the most sensitive bounded settings for
       # the deterministic mock replay.
-      threshold: 1
-      contour_area: 1
+      threshold: 30
+      contour_area: 10
+      mask: 
+        0.299,0.148,0.011,0.302,0.007,0.677,0.324,0.335,0.836,0.394,0.846,0.142
+      improve_contrast: false
     objects:
       track:
         - car
-        - license_plate
-        - person
-      filters:
-        car:
-          min_score: 0.3
-          threshold: 0.4
-        license_plate:
-          min_score: 0.3
-          threshold: 0.5
-        person:
-          min_score: 0.5
-          threshold: 0.7
+      mask: 0.006,0.024,0.981,0.05,0.977,0.43,0.017,0.466
     zones:
       gate_in_zone:
-        coordinates: 0,0,1,0,1,1,0,1
+        coordinates: 0.25,0.60,0.75,0.60,0.75,0.99,0.25,0.99
         objects:
           - car
-          - person
     ffmpeg:
       inputs:
-        - path: rtsp://host.docker.internal:18554/gate-in
-          input_args: preset-rtsp-generic
+        - path: rtsp://mediamtx:18554/gate-in
+          input_args: preset-rtsp-restream
           roles:
             - detect
             - record
+    live:
+      streams:
+        Main: gate_in_camera
     detect:
       enabled: true
       width: 1280
       height: 720
       fps: 10
 
+    review:
+      alerts:
+        required_zones: gate_in_zone
+      detections:
+        required_zones: gate_in_zone
   face_camera:
     enabled: true
     friendly_name: Camera 2 - Face Recognition
     face_recognition:
       enabled: true
-      min_area: 100
+      # Recommended default for reliable recognition on the detect stream.
+      min_area: 750
+    review:
+      alerts:
+        enabled: false
+      detections:
+        enabled: true
+        labels:
+          - person
     objects:
       track:
         - person
-    zones:
-      face_zone:
-        coordinates: 0,0,1,0,1,1,0,1
-        objects:
-          - person
+    zones: {}
     ffmpeg:
       inputs:
-        - path: rtsp://host.docker.internal:18554/chokepoint-face
-          input_args: preset-rtsp-generic
+        - path: rtsp://mediamtx:18554/chokepoint-face
+          input_args: preset-rtsp-restream
           roles:
             - detect
             - record
+    live:
+      streams:
+        Main: face_camera
     detect:
       enabled: true
       width: 1280
       height: 720
       fps: 5
+      # End a person track quickly after missed detections so a later person
+      # cannot inherit the previous face history/object id.
+      max_disappeared: 5
+    motion:
+      threshold: 53
+      contour_area: 10
+      improve_contrast: true
+version: 0.17-0
+semantic_search:
+  enabled: false
+  model_size: small
+classification:
+  bird:
+    enabled: false
