@@ -115,9 +115,7 @@ function Get-Runtime($Config) {
     BuildBaseImage = [string](Get-Value $runtime 'build_base_image' 'camera-frigate:0.18.0-33c00a27e-runtime3-tensorrt')
     CpuLimit = $cpu
     ModelPath = Resolve-WorkspacePath ([string](Get-Value $runtime 'model_path' 'models/yolov9-t-320.onnx'))
-    ConfigDir = Resolve-WorkspacePath ([string](Get-Value $runtime 'config_dir' 'runtime/config'))
-    MediaDir = Resolve-WorkspacePath ([string](Get-Value $runtime 'media_dir' 'runtime/media'))
-    DataDir = Resolve-WorkspacePath ([string](Get-Value $runtime 'data_dir' 'runtime/data'))
+    MediaDir = Resolve-WorkspacePath ([string](Get-Value $runtime 'media_dir' 'E:/Docker/Frigate/media'))
     Transport = $transport
     ReplayLoop = [bool](Get-Value $runtime.replay 'loop' $true)
     ReplaySources = Get-Value $runtime.replay 'sources' ([pscustomobject]@{})
@@ -259,14 +257,13 @@ function Test-Sources([object[]]$Sources, [string]$Transport) {
 }
 
 function Set-ComposeEnvironment($Runtime) {
-  foreach ($path in @($Runtime.ConfigDir,$Runtime.MediaDir,$Runtime.DataDir)) { New-Item -ItemType Directory -Force -Path $path | Out-Null }
+  New-Item -ItemType Directory -Force -Path $Runtime.MediaDir | Out-Null
   $env:FRIGATE_IMAGE = $Runtime.Image
   $env:FRIGATE_CPU_LIMIT = [string]$Runtime.CpuLimit
   $env:CAMERA_CONFIG_FILE = $configFile.Replace('\','/')
   $env:CAMERA_MODEL_PATH = $Runtime.ModelPath.Replace('\','/')
-  $env:FRIGATE_CONFIG_DIR = $Runtime.ConfigDir.Replace('\','/')
   $env:FRIGATE_MEDIA_DIR = $Runtime.MediaDir.Replace('\','/')
-  $env:CAMERA_RUNTIME_DATA_DIR = $Runtime.DataDir.Replace('\','/')
+  $env:NGROK_URL = Get-EnvFileValue 'NGROK_URL'
   foreach ($mapping in @(
     @('FRIGATE_TELEGRAM_BOT_TOKEN', 'TELEGRAM_BOT_TOKEN'),
     @('FRIGATE_TELEGRAM_CHAT_ID', 'TELEGRAM_CHAT_ID'),
@@ -281,6 +278,60 @@ function Set-ComposeEnvironment($Runtime) {
       }
     }
   }
+}
+
+function Test-NgrokConfiguration($Config) {
+  $token = Get-EnvFileValue 'NGROK_AUTHTOKEN'
+  $url = (Get-EnvFileValue 'NGROK_URL').TrimEnd('/')
+  if ([string]::IsNullOrWhiteSpace($token)) { throw 'NGROK_AUTHTOKEN is required in .env.local.' }
+  if ($url -notmatch '^https://[A-Za-z0-9.-]+(?::\d+)?$') { throw 'NGROK_URL must be a reserved HTTPS origin in .env.local.' }
+  $configured = [string](Get-Value $Config.notifications 'public_base_url' '')
+  if ($configured -and $configured -ne '{NGROK_URL}' -and $configured.TrimEnd('/') -ne $url) {
+    throw 'notifications.public_base_url must match NGROK_URL.'
+  }
+  return $url
+}
+
+function Get-NgrokTunnelUrl {
+  $oldPreference = $ErrorActionPreference
+  try {
+    $ErrorActionPreference = 'Continue'
+    $output = & docker exec frigate curl --fail --silent --max-time 2 http://camera-ngrok:4040/api/tunnels 2>$null
+  } finally {
+    $ErrorActionPreference = $oldPreference
+  }
+  if ($LASTEXITCODE -ne 0 -or -not $output) { return '' }
+  try {
+    $document = ($output -join "`n") | ConvertFrom-Json
+    return [string](@($document.tunnels | Where-Object { $_.proto -eq 'https' } | Select-Object -First 1).public_url)
+  } catch { return '' }
+}
+
+function Wait-NgrokReady([string]$ExpectedUrl) {
+  $deadline = [DateTime]::UtcNow.AddSeconds(120)
+  do {
+    $actual = (Get-NgrokTunnelUrl).TrimEnd('/')
+    if ($actual -eq $ExpectedUrl) {
+      $expires = [DateTimeOffset]::UtcNow.AddMinutes(1).ToUnixTimeSeconds()
+      $probe = "$ExpectedUrl/api/notifications/media/readiness/artifact.jpg?expires=$expires&signature=invalid"
+      $oldPreference = $ErrorActionPreference
+      try {
+        $ErrorActionPreference = 'Continue'
+        $status = & docker exec frigate curl --silent --output /dev/null --write-out '%{http_code}' --max-time 5 $probe 2>$null
+      } finally {
+        $ErrorActionPreference = $oldPreference
+      }
+      if ($LASTEXITCODE -eq 0 -and [string]$status -eq '403') {
+        Write-Host "ngrok ready at $ExpectedUrl; signed media route rejects invalid signatures."
+        return $true
+      }
+    }
+    $ngrokState = & docker inspect camera-ngrok --format '{{.State.Status}}' 2>$null
+    if ($ngrokState -in @('restarting','exited','dead')) { break }
+    Start-Sleep -Seconds 2
+  } while ([DateTime]::UtcNow -lt $deadline)
+  Write-Warning 'ngrok tunnel is degraded; Telegram media remains available but public media actions, Zalo, and WebPush are disabled.'
+  return $false
 }
 
 function New-ReplayOverride([object[]]$Sources, $Runtime) {
@@ -309,7 +360,9 @@ function New-ReplayOverride([object[]]$Sources, $Runtime) {
     $lines.Add('    depends_on: [mediamtx]')
     $lines.Add('    entrypoint: ["/usr/lib/ffmpeg/7.0/bin/ffmpeg"]')
     $lines.Add("    volumes: [$volume]")
-    $command = @('-hide_banner','-loglevel','warning','-re','-stream_loop',$loop,'-fflags','+genpts','-i','/runtime/source','-vf','setpts=N/(15*TB),scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,fps=15','-an','-c:v','libx264','-preset','ultrafast','-tune','zerolatency','-pix_fmt','yuv420p','-r','15','-g','30','-fps_mode','cfr','-f','rtsp','-rtsp_transport','tcp',("rtsp://mediamtx:18554/$($source.Name)")) | ConvertTo-Json -Compress
+    # Replay transports prepared H.264 media without decoding or re-encoding it.
+    $commandArgs = @('-hide_banner','-loglevel','warning','-re','-stream_loop',$loop,'-fflags','+genpts','-i','/runtime/source','-map','0:v:0','-an','-c:v','copy','-f','rtsp','-rtsp_transport','tcp',("rtsp://mediamtx:18554/$($source.Name)"))
+    $command = $commandArgs | ConvertTo-Json -Compress
     $lines.Add("    command: $command")
   }
   Write-AtomicUtf8 $composeOverride (($lines -join "`n") + "`n")
@@ -367,45 +420,13 @@ function Test-RuntimeDependencies($Runtime) {
   if (-not (Test-Path -LiteralPath $Runtime.ModelPath -PathType Leaf)) { throw "Missing model: $($Runtime.ModelPath)" }
 }
 
-function Initialize-FrigateConfigVolume($Runtime) {
+function Ensure-FrigateConfigVolume {
   $volumeName = 'camera-frigate-config'
   $existingVolumes = @(& docker volume ls --filter "name=^${volumeName}$" --format '{{.Name}}')
-  $isNew = $existingVolumes -notcontains $volumeName
-  if ($isNew) {
+  if ($existingVolumes -notcontains $volumeName) {
     & docker volume create $volumeName *> $null
     if ($LASTEXITCODE -ne 0) { throw "Unable to create Docker volume: $volumeName" }
-    if (Test-Path -LiteralPath $Runtime.ConfigDir -PathType Container) {
-      $backupRoot = Join-Path $Runtime.DataDir 'config-backups'
-      $backup = Join-Path $backupRoot ([DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss'))
-      New-Item -ItemType Directory -Force -Path $backupRoot | Out-Null
-      Copy-Item -LiteralPath $Runtime.ConfigDir -Destination $backup -Recurse
-      Write-Host "Backed up legacy config to $backup"
-    }
   }
-
-  New-Item -ItemType Directory -Force -Path $Runtime.ConfigDir | Out-Null
-  $sourceHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $configFile).Hash.ToLowerInvariant()
-  $seedScript = @'
-set -eu
-if [ ! -f /config/.camera-imported ]; then
-  cp -a /legacy/. /config/ 2>/dev/null || true
-  touch /config/.camera-imported
-fi
-current="$(cat /config/.camera-source-hash 2>/dev/null || true)"
-if [ "$current" != "$CAMERA_SOURCE_HASH" ]; then
-  cp /source/config.yml /config/config.yml
-  printf '%s' "$CAMERA_SOURCE_HASH" > /config/.camera-source-hash
-fi
-'@
-  $seedEncoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($seedScript))
-  & docker run --rm --entrypoint sh `
-    -e "CAMERA_SOURCE_HASH=$sourceHash" `
-    -e "CAMERA_SEED_SCRIPT=$seedEncoded" `
-    -v "${volumeName}:/config" `
-    -v "$($Runtime.ConfigDir):/legacy:ro" `
-    -v "${configFile}:/source/config.yml:ro" `
-    $Runtime.Image -c 'echo "$CAMERA_SEED_SCRIPT" | base64 -d | sh'
-  if ($LASTEXITCODE -ne 0) { throw 'Unable to initialize writable Frigate config volume.' }
 }
 
 function Build-RuntimeImage($Runtime) {
@@ -464,6 +485,7 @@ function Test-FrigateConfig($Runtime, [object[]]$Sources) {
       -e FRIGATE_TELEGRAM_CHAT_ID `
       -e FRIGATE_ZALO_BOT_TOKEN `
       -e FRIGATE_ZALO_CHAT_ID `
+      -e NGROK_URL `
       -v "${configFile}:/config/config.yml:ro" `
       -v "$($Runtime.ModelPath):/models/yolov9-t-320.onnx:ro" `
       $Runtime.Image -c $validator 2>&1
@@ -572,9 +594,14 @@ try {
   switch ($Command) {
     'doctor' {
       Test-RuntimeDependencies $runtime
+      $ngrokUrl = Test-NgrokConfiguration $config
       $probes = @(Test-Sources $sources $runtime.Transport)
       Test-FrigateConfig $runtime $sources
       Invoke-Compose $prefix @('config','--quiet')
+      if ((& docker ps --format '{{.Names}}') -contains 'camera-ngrok') {
+        $actual = (Get-NgrokTunnelUrl).TrimEnd('/')
+        if ($actual -ne $ngrokUrl) { Write-Warning 'Running ngrok tunnel is degraded or does not match NGROK_URL.' }
+      }
       $state = [ordered]@{ checked_at=[DateTime]::UtcNow.ToString('o'); cameras=@() }
       foreach ($source in $sources) {
         $probe = $probes | Where-Object Name -eq $source.Name | Select-Object -First 1
@@ -585,16 +612,18 @@ try {
     }
     'start' {
       Test-RuntimeDependencies $runtime
+      $ngrokUrl = Test-NgrokConfiguration $config
       $probes = @(Test-Sources $sources $runtime.Transport)
       Test-FrigateConfig $runtime $sources
-      Initialize-FrigateConfigVolume $runtime
+      Ensure-FrigateConfigVolume
       Invoke-Compose $prefix @('config','--quiet')
       Invoke-Compose $prefix @('up','-d','--no-build','--remove-orphans','--force-recreate')
       Wait-RuntimeReady $sources
+      $ngrokReady = Wait-NgrokReady $ngrokUrl
       $state = [ordered]@{ started_at=[DateTime]::UtcNow.ToString('o'); cameras=@() }
       foreach ($source in $sources) { $state.cameras += [ordered]@{ name=$source.Name; mode=$source.Mode; source=$source.Redacted } }
       Write-AtomicUtf8 $stateFile (($state | ConvertTo-Json -Depth 5) + "`n")
-      Write-Host "Runtime ready with $($sources.Count) camera(s)."
+      Write-Host "Runtime ready with $($sources.Count) camera(s); public tunnel: $(if ($ngrokReady) { 'ready' } else { 'degraded' })."
       Show-Status
     }
     'status' { Show-Status }

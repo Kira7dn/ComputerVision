@@ -22,7 +22,6 @@ sdk/
 .secret/
 server/uploads/
 server/runtime/
-runtime/
 *.key
 *.crt
 *.sqlite3
@@ -43,3 +42,5 @@ mock_videos/
 frigate/
 .playwright-cli/
 output/
+runtime/
+dahua_sdk/

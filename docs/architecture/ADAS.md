@@ -1,4 +1,4 @@
-# Kiến trúc ADAS Level 0 độ trễ thấp với Dahua và YOLOv8
+# Kiến trúc ADAS Level 0
 
 ## 1. Mục tiêu và phạm vi
 

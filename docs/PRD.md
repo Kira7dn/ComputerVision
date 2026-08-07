@@ -1,12 +1,22 @@
-# PRD: MVP Camera AI An ninh tại Cổng bảo vệ
+# PRD Camera AI
+
+> Trạng thái triển khai ngày 07/08/2026: Event hiện do bảng `Event` và
+> `EventAggregator` trong Frigate làm SOT; LPR, face recognition và notification đã
+> chạy trong native pipeline, không dùng integration service bên ngoài làm SOT.
+> Listener notification car/face hiện được giữ cấu hình nhưng tắt. Các phần mô tả
+> integration service/phase bên dưới được giữ như lịch sử thiết kế MVP, không phải
+> topology runtime hiện tại.
+>
+> Kiến trúc đích cho sản phẩm B2B nằm tại
+> [Kiến trúc cải thiện nền tảng Camera AI](architecture/Platform.md).
 
 **Phiên bản:** 0.1  
 **Ngày:** 05/08/2026  
 **Trạng thái:** Draft
 
-**Runtime hiện tại:** đang giới hạn ở hai mock camera: `gate_in_camera` (CCTV biển số) và `face_camera` (choke point/face). `gate_out_camera` và `safety_camera` chưa chạy trong cấu hình hiện tại.
+**Runtime hiện tại:** đang giới hạn ở hai replay camera: `car_camera` (car/native LPR) và `face_camera` (person/face recognition). `gate_out_camera` và `safety_camera` chưa chạy trong cấu hình hiện tại.
 
-**Cập nhật runtime Phase 4:** 05/08/2026 — chỉ dùng mock `gate_in_camera` bằng concat stream đã normalize; `gate_out_camera` và `safety_camera` tạm dừng.
+**Cập nhật runtime Phase 4 (lịch sử):** 05/08/2026 — từng dùng mock `gate_in_camera` bằng concat stream đã normalize; `gate_out_camera` và `safety_camera` tạm dừng.
 
 ## 1. Tổng quan
 

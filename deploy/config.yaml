@@ -3,15 +3,13 @@ runtime:
   build_base_image: camera-frigate:0.18.0-33c00a27e-runtime3-tensorrt
   cpu_limit: 8
   model_path: models/yolov9-t-320.onnx
-  config_dir: runtime/config
   media_dir: E:/Docker/Frigate/media
-  data_dir: runtime/data
   rtsp_transport: tcp
   replay:
     loop: true
     sources:
       face_camera: mock_videos/face-recognition/segments/01_P1E_S1_C1.mp4
-      car_camera: mock_videos/car-number-plate-video/cam-in/pexels-casey-whalen-6571483 (2160p).mp4
+      car_camera: "mock_videos/car-number-plate-video/cam-in/pexels-casey-whalen-6571483 (720p15).mp4"
 mqtt:
   enabled: false
 
@@ -29,9 +27,17 @@ auth:
   reset_admin_password: false
 
 notifications:
+  schema_version: 2
   enabled: true
-  cooldown: 10
-  providers:
+  public_base_url: "{NGROK_URL}"
+  pipeline:
+    finalization_timeout: 5
+    shadow_mode: false
+  presentation:
+    locale: vi
+  media:
+    max_storage_mb: 2048
+  channels:
     webpush:
       enabled: true
     telegram:
@@ -39,25 +45,123 @@ notifications:
       recipients:
         - id: security_team
           name: Security Team
-          chat_id: "{FRIGATE_TELEGRAM_CHAT_ID}"
+          chat_id: '{FRIGATE_TELEGRAM_CHAT_ID}'
           enabled: true
-          cameras: [car_camera]
     zalo:
       enabled: true
       media_url_ttl: 300
       recipients:
         - id: operators
           name: Operators
-          chat_id: "{FRIGATE_ZALO_CHAT_ID}"
+          chat_id: '{FRIGATE_ZALO_CHAT_ID}'
           enabled: true
-          cameras: [car_camera]
+  rules:
+    # Tạm tắt listen event car_camera. Đổi enabled về true để bật lại notification.
+    - id: car_alert
+      name: Car alert
+      enabled: false
+      event: alert
+      filters:
+        cameras:
+          - car_camera
+        labels:
+          - car
+        zones: []
+        identities: []
+        trigger_names: []
+        conditions: []
+      destinations:
+        webpush: true
+        telegram:
+          - security_team
+        zalo:
+          - operators
+      cooldown: 0
+    - id: car_license_plate
+      name: Car license plate
+      enabled: false
+      event: license_plate
+      filters:
+        cameras:
+          - car_camera
+        labels: []
+        zones: []
+        identities: []
+        trigger_names: []
+        conditions: []
+      destinations:
+        webpush: false
+        telegram:
+          - security_team
+        zalo:
+          - operators
+      cooldown: 0
+    - id: car_semantic_trigger
+      name: Car semantic trigger
+      enabled: false
+      event: semantic_trigger
+      filters:
+        cameras:
+          - car_camera
+        labels: []
+        zones: []
+        identities: []
+        trigger_names: []
+        conditions: []
+      destinations:
+        webpush: true
+        telegram:
+          - security_team
+        zalo:
+          - operators
+      cooldown: 0
+    - id: car_monitoring
+      name: Car monitoring
+      enabled: false
+      event: camera_monitoring
+      filters:
+        cameras:
+          - car_camera
+        labels: []
+        zones: []
+        identities: []
+        trigger_names: []
+        conditions: []
+      destinations:
+        webpush: true
+        telegram:
+          - security_team
+        zalo:
+          - operators
+      cooldown: 0
+    # Tạm tắt notification khuôn mặt. Đổi enabled về true để bật lại; không gửi identity unknown.
+    - id: face_recognition
+      name: Face recognition
+      enabled: false
+      event: face_recognized
+      filters:
+        cameras:
+          - face_camera
+        labels:
+          - person
+        zones: []
+        identities:
+          - '*'
+        trigger_names: []
+        conditions: []
+      destinations:
+        webpush: true
+        telegram:
+          - security_team
+        zalo:
+          - operators
+      cooldown: 0
   delivery:
     max_attempts: 5
     initial_backoff: 5
     max_backoff: 300
     retention_days: 7
     max_pending: 5000
-
 detectors:
   onnx:
     type: onnx
@@ -86,7 +190,7 @@ face_recognition:
   blur_confidence_filter: false
 
 lpr:
-  enabled: false
+  enabled: true
 
 model:
   width: 320
@@ -149,6 +253,17 @@ cameras:
   car_camera:
     <<: *face_camera_defaults
     friendly_name: Car Camera
+    detect:
+      enabled: true
+      width: 1280
+      height: 720
+      fps: 5
+      min_initialized: 2
+      max_disappeared: 3
+    motion:
+      threshold: 53
+      contour_area: 10
+      improve_contrast: false
     face_recognition:
       enabled: false
     review:
@@ -159,10 +274,6 @@ cameras:
         labels: [car]
     objects:
       track: [car]
-    notifications:
-      enabled: true
-      cooldown: 30
-      providers: [webpush, telegram, zalo]
     ffmpeg:
       inputs:
         - path: rtsp://127.0.0.1:8554/car_camera
