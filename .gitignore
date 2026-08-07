@@ -42,3 +42,4 @@ camera_adas.egg-info/
 mock_videos/
 frigate/
 .playwright-cli/
+output/

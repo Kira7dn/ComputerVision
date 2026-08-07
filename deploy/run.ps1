@@ -13,7 +13,9 @@ $composeFile = Join-Path $referenceDir 'docker-compose.yml'
 $envFile = Join-Path $workspace '.env.local'
 $runtimeDir = Join-Path $workspace '.tmp\runtime'
 $composeOverride = Join-Path $runtimeDir 'compose.replay.yml'
+$mediaMtxReplayConfig = Join-Path $runtimeDir 'mediamtx.replay.yml'
 $stateFile = Join-Path $runtimeDir 'state.json'
+$imageManifestFile = Join-Path $runtimeDir 'image.json'
 $defaultImage = 'camera-frigate:0.18.0-33c00a27e-runtime3-reviewfix1-tensorrt'
 $buildTimeLimitSeconds = 300
 
@@ -45,6 +47,16 @@ function Protect-Text([string]$Text, [object[]]$Sources) {
 function Resolve-WorkspacePath([string]$Value) {
   if ([IO.Path]::IsPathRooted($Value)) { return [IO.Path]::GetFullPath($Value) }
   return [IO.Path]::GetFullPath((Join-Path $workspace $Value))
+}
+
+function Get-EnvFileValue([string]$Name) {
+  if (-not (Test-Path -LiteralPath $envFile -PathType Leaf)) { return '' }
+  $prefix = $Name + '='
+  $line = Get-Content -LiteralPath $envFile -Encoding utf8 |
+    Where-Object { $_.StartsWith($prefix, [StringComparison]::Ordinal) } |
+    Select-Object -Last 1
+  if ($null -eq $line) { return '' }
+  return $line.Substring($prefix.Length).Trim().Trim('"').Trim("'")
 }
 
 function Stop-NativeProcessTree([Diagnostics.Process]$Process) {
@@ -84,11 +96,22 @@ function Get-Runtime($Config) {
   if ($null -eq $Config.runtime) { throw 'config.yaml must define runtime.' }
   $runtime = $Config.runtime
   $cpu = [double](Get-Value $runtime 'cpu_limit' 4)
-  if ($cpu -le 0 -or $cpu -gt 4) { throw 'runtime.cpu_limit must be greater than 0 and no more than 4.' }
+  if ($cpu -le 0) { throw 'runtime.cpu_limit must be greater than 0.' }
   $transport = [string](Get-Value $runtime 'rtsp_transport' 'tcp')
   if ($transport -notin @('tcp', 'udp')) { throw 'runtime.rtsp_transport must be tcp or udp.' }
+  $configuredImage = [string](Get-Value $runtime 'image' $defaultImage)
+  $image = $configuredImage
+  if (Test-Path -LiteralPath $imageManifestFile) {
+    try {
+      $manifest = Get-Content -LiteralPath $imageManifestFile -Encoding utf8 -Raw | ConvertFrom-Json
+      if ($manifest.source_image -eq $configuredImage -and $manifest.image) {
+        $image = [string]$manifest.image
+      }
+    } catch { }
+  }
   return [pscustomobject]@{
-    Image = [string](Get-Value $runtime 'image' $defaultImage)
+    Image = $image
+    ConfiguredImage = $configuredImage
     BuildBaseImage = [string](Get-Value $runtime 'build_base_image' 'camera-frigate:0.18.0-33c00a27e-runtime3-tensorrt')
     CpuLimit = $cpu
     ModelPath = Resolve-WorkspacePath ([string](Get-Value $runtime 'model_path' 'models/yolov9-t-320.onnx'))
@@ -98,7 +121,6 @@ function Get-Runtime($Config) {
     Transport = $transport
     ReplayLoop = [bool](Get-Value $runtime.replay 'loop' $true)
     ReplaySources = Get-Value $runtime.replay 'sources' ([pscustomobject]@{})
-    IntegrationsEnabled = [bool](Get-Value $runtime.integrations 'enabled' $false)
   }
 }
 
@@ -141,28 +163,61 @@ function Resolve-CameraSources($Config, $Runtime) {
   return $sources
 }
 
-function Invoke-NativeCapture([string]$FilePath, [string[]]$Arguments, [int]$TimeoutSeconds, [object[]]$Sources) {
-  $stdout = [IO.Path]::GetTempFileName(); $stderr = [IO.Path]::GetTempFileName()
+function ConvertTo-NativeArgument([string]$Argument) {
+  if ($Argument.Length -gt 0 -and $Argument -notmatch '[\s"]') { return $Argument }
+  $escaped = [regex]::Replace($Argument, '(\\*)"', '$1$1\"')
+  $escaped = [regex]::Replace($escaped, '(\\+)$', '$1$1')
+  return '"' + $escaped + '"'
+}
+
+function Invoke-NativeCapture(
+  [string]$FilePath,
+  [string[]]$Arguments,
+  [int]$TimeoutSeconds,
+  [object[]]$Sources,
+  [string]$WorkingDirectory = ''
+) {
+  $process = $null
   try {
-    $process = Start-Process -FilePath $FilePath -ArgumentList $Arguments -NoNewWindow -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
-    $null = $process.Handle
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $FilePath
+    if (-not [string]::IsNullOrWhiteSpace($WorkingDirectory)) {
+      $startInfo.WorkingDirectory = $WorkingDirectory
+    }
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.Arguments = (($Arguments | ForEach-Object { ConvertTo-NativeArgument $_ }) -join ' ')
+
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    if (-not $process.Start()) { throw "Unable to start $FilePath." }
+    $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+    $stderrTask = $process.StandardError.ReadToEndAsync()
     if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
       Stop-NativeProcessTree $process
       throw "$FilePath timed out after $TimeoutSeconds seconds."
     }
-    $out = Get-Content -LiteralPath $stdout -Encoding utf8 -Raw -ErrorAction SilentlyContinue
-    $err = Get-Content -LiteralPath $stderr -Encoding utf8 -Raw -ErrorAction SilentlyContinue
+    $out = $stdoutTask.GetAwaiter().GetResult()
+    $err = $stderrTask.GetAwaiter().GetResult()
     return [pscustomobject]@{ ExitCode=$process.ExitCode; StdOut=(Protect-Text $out $Sources); StdErr=(Protect-Text $err $Sources) }
   } finally {
-    Remove-Item -LiteralPath $stdout,$stderr -Force -ErrorAction SilentlyContinue
+    if ($null -ne $process) { $process.Dispose() }
   }
 }
 
-function Invoke-BuildStep([string]$Name, [string]$FilePath, [string[]]$Arguments, [Diagnostics.Stopwatch]$Stopwatch) {
+function Invoke-BuildStep(
+  [string]$Name,
+  [string]$FilePath,
+  [string[]]$Arguments,
+  [Diagnostics.Stopwatch]$Stopwatch,
+  [string]$WorkingDirectory = ''
+) {
   $remaining = $buildTimeLimitSeconds - [int][Math]::Ceiling($Stopwatch.Elapsed.TotalSeconds)
   if ($remaining -le 0) { throw "Build stopped: the $buildTimeLimitSeconds-second safety limit was reached before $Name." }
   Write-Host "[$Name] time remaining: ${remaining}s"
-  $result = Invoke-NativeCapture $FilePath $Arguments $remaining @()
+  $result = Invoke-NativeCapture $FilePath $Arguments $remaining @() $WorkingDirectory
   if (-not [string]::IsNullOrWhiteSpace($result.StdOut)) { Write-Host $result.StdOut.TrimEnd() }
   if (-not [string]::IsNullOrWhiteSpace($result.StdErr)) { Write-Host $result.StdErr.TrimEnd() }
   if ($result.ExitCode -ne 0) { throw "$Name failed with exit code $($result.ExitCode)." }
@@ -180,7 +235,14 @@ function Assert-OverlayDockerfile([string]$Path) {
 function Test-Sources([object[]]$Sources, [string]$Transport) {
   foreach ($tool in @('ffprobe','ffmpeg')) { if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) { throw "$tool is required." } }
   $results = @()
+  $probeCache = @{}
   foreach ($source in $Sources) {
+    $cacheKey = "$($source.Mode)|$($source.Raw)"
+    if ($probeCache.ContainsKey($cacheKey)) {
+      $cached = $probeCache[$cacheKey]
+      $results += [pscustomobject]@{ Name=$source.Name; Codec=$cached.Codec; Width=$cached.Width; Height=$cached.Height }
+      continue
+    }
     $input = @(); if ($source.Mode -eq 'rtsp') { $input += @('-rtsp_transport',$Transport) }
     $probe = Invoke-NativeCapture 'ffprobe' (@('-v','error') + $input + @('-select_streams','v:0','-show_entries','stream=codec_name,width,height','-of','json',$source.Raw)) 15 $Sources
     if ($probe.ExitCode -ne 0) { throw "Source '$($source.Name)' probe failed: $($probe.StdErr.Trim())" }
@@ -189,7 +251,9 @@ function Test-Sources([object[]]$Sources, [string]$Transport) {
     if ([string]$video.codec_name -ne 'h264') { throw "Source '$($source.Name)' uses '$($video.codec_name)'; only H.264 is supported." }
     $decode = Invoke-NativeCapture 'ffmpeg' (@('-v','error') + $input + @('-i',$source.Raw,'-map','0:v:0','-frames:v','1','-f','null','NUL')) 20 $Sources
     if ($decode.ExitCode -ne 0) { throw "Source '$($source.Name)' opened but no frame could be decoded: $($decode.StdErr.Trim())" }
-    $results += [pscustomobject]@{ Name=$source.Name; Codec='h264'; Width=[int]$video.width; Height=[int]$video.height }
+    $result = [pscustomobject]@{ Name=$source.Name; Codec='h264'; Width=[int]$video.width; Height=[int]$video.height }
+    $probeCache[$cacheKey] = $result
+    $results += $result
   }
   return $results
 }
@@ -203,6 +267,20 @@ function Set-ComposeEnvironment($Runtime) {
   $env:FRIGATE_CONFIG_DIR = $Runtime.ConfigDir.Replace('\','/')
   $env:FRIGATE_MEDIA_DIR = $Runtime.MediaDir.Replace('\','/')
   $env:CAMERA_RUNTIME_DATA_DIR = $Runtime.DataDir.Replace('\','/')
+  foreach ($mapping in @(
+    @('FRIGATE_TELEGRAM_BOT_TOKEN', 'TELEGRAM_BOT_TOKEN'),
+    @('FRIGATE_TELEGRAM_CHAT_ID', 'TELEGRAM_CHAT_ID'),
+    @('FRIGATE_ZALO_BOT_TOKEN', 'ZALO_BOT_TOKEN'),
+    @('FRIGATE_ZALO_CHAT_ID', 'ZALO_CHAT_ID')
+  )) {
+    $current = [Environment]::GetEnvironmentVariable($mapping[0])
+    if ([string]::IsNullOrWhiteSpace($current)) {
+      $legacy = Get-EnvFileValue $mapping[1]
+      if (-not [string]::IsNullOrWhiteSpace($legacy)) {
+        [Environment]::SetEnvironmentVariable($mapping[0], $legacy)
+      }
+    }
+  }
 }
 
 function New-ReplayOverride([object[]]$Sources, $Runtime) {
@@ -210,7 +288,14 @@ function New-ReplayOverride([object[]]$Sources, $Runtime) {
   $lines.Add('services:')
   $replays = @($Sources | Where-Object Mode -eq 'replay')
   if ($replays.Count -eq 0) { $lines.Add('  {}') }
-  foreach ($source in $replays) {
+  if ($replays.Count -gt 0) {
+    $mediaMount = (($mediaMtxReplayConfig.Replace('\','/') + ':/mediamtx.yml:ro') | ConvertTo-Json -Compress)
+    $lines.Add('  mediamtx:')
+    $lines.Add("    volumes: [$mediaMount]")
+  }
+  $groups = @($replays | Group-Object Path)
+  foreach ($group in $groups) {
+    $source = @($group.Group)[0]
     $service = 'replay-' + $source.Name.ToLowerInvariant().Replace('_','-')
     $container = 'camera-replay-' + $source.Name.ToLowerInvariant().Replace('_','-')
     $volume = (($source.Path.Replace('\','/') + ':/runtime/source:ro') | ConvertTo-Json -Compress)
@@ -224,17 +309,44 @@ function New-ReplayOverride([object[]]$Sources, $Runtime) {
     $lines.Add('    depends_on: [mediamtx]')
     $lines.Add('    entrypoint: ["/usr/lib/ffmpeg/7.0/bin/ffmpeg"]')
     $lines.Add("    volumes: [$volume]")
-    $command = @('-hide_banner','-loglevel','warning','-re','-stream_loop',$loop,'-fflags','+genpts','-i','/runtime/source','-vf','scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,fps=15','-an','-c:v','libx264','-preset','ultrafast','-tune','zerolatency','-pix_fmt','yuv420p','-r','15','-g','30','-f','rtsp','-rtsp_transport','tcp',("rtsp://mediamtx:18554/$($source.Name)")) | ConvertTo-Json -Compress
+    $command = @('-hide_banner','-loglevel','warning','-re','-stream_loop',$loop,'-fflags','+genpts','-i','/runtime/source','-vf','setpts=N/(15*TB),scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,fps=15','-an','-c:v','libx264','-preset','ultrafast','-tune','zerolatency','-pix_fmt','yuv420p','-r','15','-g','30','-fps_mode','cfr','-f','rtsp','-rtsp_transport','tcp',("rtsp://mediamtx:18554/$($source.Name)")) | ConvertTo-Json -Compress
     $lines.Add("    command: $command")
   }
   Write-AtomicUtf8 $composeOverride (($lines -join "`n") + "`n")
+
+  $mediaLines = [Collections.Generic.List[string]]::new()
+  @(
+    'logLevel: info',
+    'rtsp: true',
+    'rtspAddress: :18554',
+    'rtspTransports: [tcp]',
+    'hls: false',
+    'webrtc: false',
+    'api: true',
+    'apiAddress: :9997',
+    'paths:'
+  ) | ForEach-Object { $mediaLines.Add($_) }
+  foreach ($group in $groups) {
+    $members = @($group.Group)
+    $publisher = $members[0].Name
+    $mediaLines.Add("  ${publisher}:")
+    $mediaLines.Add('    source: publisher')
+    foreach ($alias in @($members | Select-Object -Skip 1)) {
+      $mediaLines.Add("  $($alias.Name):")
+      $mediaLines.Add("    source: rtsp://127.0.0.1:18554/${publisher}")
+    }
+  }
+  if ($groups.Count -eq 0) {
+    $mediaLines.Add('  all_others:')
+    $mediaLines.Add('    source: publisher')
+  }
+  Write-AtomicUtf8 $mediaMtxReplayConfig (($mediaLines -join "`n") + "`n")
 }
 
-function Get-ComposePrefix([bool]$Replay, [bool]$Integrations) {
+function Get-ComposePrefix([bool]$Replay) {
   if (-not (Test-Path -LiteralPath $envFile -PathType Leaf)) { throw "Missing required secrets file: $envFile" }
   $args = @('compose','-f',$composeFile,'-f',$composeOverride,'--env-file',$envFile)
   if ($Replay) { $args += @('--profile','replay') }
-  if ($Integrations) { $args += @('--profile','integrations') }
   return $args
 }
 
@@ -246,8 +358,54 @@ function Invoke-Compose([string[]]$Prefix, [string[]]$Arguments) {
 function Test-RuntimeDependencies($Runtime) {
   if (-not (Get-Command docker -ErrorAction SilentlyContinue)) { throw 'Docker CLI is required.' }
   & docker info *> $null; if ($LASTEXITCODE -ne 0) { throw 'Docker Engine is unavailable.' }
+  $dockerCpuCount = [int]((& docker info --format '{{.NCPU}}').Trim())
+  if ($LASTEXITCODE -ne 0 -or $dockerCpuCount -le 0) { throw 'Unable to determine Docker CPU capacity.' }
+  if ([double]$Runtime.CpuLimit -gt $dockerCpuCount) {
+    throw "runtime.cpu_limit ($($Runtime.CpuLimit)) exceeds Docker CPU capacity ($dockerCpuCount)."
+  }
   & docker image inspect $Runtime.Image *> $null; if ($LASTEXITCODE -ne 0) { throw "Missing runtime image: $($Runtime.Image)" }
   if (-not (Test-Path -LiteralPath $Runtime.ModelPath -PathType Leaf)) { throw "Missing model: $($Runtime.ModelPath)" }
+}
+
+function Initialize-FrigateConfigVolume($Runtime) {
+  $volumeName = 'camera-frigate-config'
+  $existingVolumes = @(& docker volume ls --filter "name=^${volumeName}$" --format '{{.Name}}')
+  $isNew = $existingVolumes -notcontains $volumeName
+  if ($isNew) {
+    & docker volume create $volumeName *> $null
+    if ($LASTEXITCODE -ne 0) { throw "Unable to create Docker volume: $volumeName" }
+    if (Test-Path -LiteralPath $Runtime.ConfigDir -PathType Container) {
+      $backupRoot = Join-Path $Runtime.DataDir 'config-backups'
+      $backup = Join-Path $backupRoot ([DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss'))
+      New-Item -ItemType Directory -Force -Path $backupRoot | Out-Null
+      Copy-Item -LiteralPath $Runtime.ConfigDir -Destination $backup -Recurse
+      Write-Host "Backed up legacy config to $backup"
+    }
+  }
+
+  New-Item -ItemType Directory -Force -Path $Runtime.ConfigDir | Out-Null
+  $sourceHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $configFile).Hash.ToLowerInvariant()
+  $seedScript = @'
+set -eu
+if [ ! -f /config/.camera-imported ]; then
+  cp -a /legacy/. /config/ 2>/dev/null || true
+  touch /config/.camera-imported
+fi
+current="$(cat /config/.camera-source-hash 2>/dev/null || true)"
+if [ "$current" != "$CAMERA_SOURCE_HASH" ]; then
+  cp /source/config.yml /config/config.yml
+  printf '%s' "$CAMERA_SOURCE_HASH" > /config/.camera-source-hash
+fi
+'@
+  $seedEncoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($seedScript))
+  & docker run --rm --entrypoint sh `
+    -e "CAMERA_SOURCE_HASH=$sourceHash" `
+    -e "CAMERA_SEED_SCRIPT=$seedEncoded" `
+    -v "${volumeName}:/config" `
+    -v "$($Runtime.ConfigDir):/legacy:ro" `
+    -v "${configFile}:/source/config.yml:ro" `
+    $Runtime.Image -c 'echo "$CAMERA_SEED_SCRIPT" | base64 -d | sh'
+  if ($LASTEXITCODE -ne 0) { throw 'Unable to initialize writable Frigate config volume.' }
 }
 
 function Build-RuntimeImage($Runtime) {
@@ -267,17 +425,32 @@ function Build-RuntimeImage($Runtime) {
     if (-not (Test-Path -LiteralPath (Join-Path $webDir 'node_modules'))) {
       Invoke-BuildStep 'npm ci' 'cmd.exe' @('/d','/s','/c','npm ci') $stopwatch
     }
-    Invoke-BuildStep 'frontend' 'cmd.exe' @('/d','/s','/c','npm run build') $stopwatch
+    Invoke-BuildStep 'frontend' 'cmd.exe' @('/d','/s','/c','npm run build') $stopwatch $webDir
   } finally {
     Pop-Location
   }
 
   $sourceDir = Join-Path $workspace 'frigate'
   $dockerPath = (Get-Command docker).Source
-  $dockerArgs = @('buildx','build','--load','--pull=false','--file',$dockerfile,'--build-context',"webdist=$webDir\dist",'--build-arg',"BASE_IMAGE=$($Runtime.BuildBaseImage)",'--tag',$Runtime.Image,$sourceDir)
+  $dockerArgs = @('buildx','build','--load','--pull=false','--file',$dockerfile,'--build-context',"webdist=$webDir\dist",'--build-arg',"BASE_IMAGE=$($Runtime.BuildBaseImage)",'--tag',$Runtime.ConfiguredImage,$sourceDir)
   Invoke-BuildStep 'runtime overlay' $dockerPath $dockerArgs $stopwatch
+  $imageId = (& docker image inspect --format '{{.Id}}' $Runtime.ConfiguredImage).Trim()
+  if ($LASTEXITCODE -ne 0 -or -not $imageId.StartsWith('sha256:')) {
+    throw 'Unable to resolve the built image digest.'
+  }
+  $repository = $Runtime.ConfiguredImage.Split(':')[0]
+  $immutableImage = "${repository}:overlay-$($imageId.Substring(7,12))"
+  & docker tag $Runtime.ConfiguredImage $immutableImage
+  if ($LASTEXITCODE -ne 0) { throw 'Unable to create immutable runtime image tag.' }
+  $manifest = [ordered]@{
+    source_image = $Runtime.ConfiguredImage
+    image = $immutableImage
+    digest = $imageId
+    built_at = [DateTime]::UtcNow.ToString('o')
+  }
+  Write-AtomicUtf8 $imageManifestFile (($manifest | ConvertTo-Json) + "`n")
   $stopwatch.Stop()
-  Write-Host ("Built runtime image: {0} in {1:n1}s (overlay only; full dependency build disabled)." -f $Runtime.Image,$stopwatch.Elapsed.TotalSeconds)
+  Write-Host ("Built runtime image: {0} in {1:n1}s (overlay only; full dependency build disabled)." -f $immutableImage,$stopwatch.Elapsed.TotalSeconds)
 }
 
 function Test-FrigateConfig($Runtime, [object[]]$Sources) {
@@ -285,7 +458,15 @@ function Test-FrigateConfig($Runtime, [object[]]$Sources) {
   $oldPreference = $ErrorActionPreference
   try {
     $ErrorActionPreference = 'Continue'
-    $output = & docker run --rm --entrypoint python3 -e CONFIG_FILE=/config/config.yml -v "${configFile}:/config/config.yml:ro" -v "$($Runtime.ModelPath):/models/yolov9-t-320.onnx:ro" $Runtime.Image -c $validator 2>&1
+    $output = & docker run --rm --entrypoint python3 `
+      -e CONFIG_FILE=/config/config.yml `
+      -e FRIGATE_TELEGRAM_BOT_TOKEN `
+      -e FRIGATE_TELEGRAM_CHAT_ID `
+      -e FRIGATE_ZALO_BOT_TOKEN `
+      -e FRIGATE_ZALO_CHAT_ID `
+      -v "${configFile}:/config/config.yml:ro" `
+      -v "$($Runtime.ModelPath):/models/yolov9-t-320.onnx:ro" `
+      $Runtime.Image -c $validator 2>&1
     $exitCode = $LASTEXITCODE
   } finally {
     $ErrorActionPreference = $oldPreference
@@ -294,20 +475,48 @@ function Test-FrigateConfig($Runtime, [object[]]$Sources) {
 }
 
 function Wait-RuntimeReady([object[]]$Sources) {
-  $deadline = [DateTime]::UtcNow.AddSeconds(90)
+  $deadline = [DateTime]::UtcNow.AddSeconds(180)
+  $stableSince = $null
+  $restartSignature = $null
   do {
     try {
-      $stats = Invoke-RestMethod -Uri 'http://127.0.0.1:5001/api/stats' -TimeoutSec 2
+      $stats = Get-FrigateInternalStats
       $ready = $true
       foreach ($source in $Sources) {
         $camera = $stats.cameras.($source.Name)
-        if ($null -eq $camera -or [double]$camera.camera_fps -le 0 -or [double]$camera.process_fps -le 0) { $ready = $false; break }
+        if ($null -eq $camera -or [double]$camera.camera_fps -lt 4.5 -or [double]$camera.process_fps -lt 4.5) { $ready = $false; break }
       }
-      if ($ready -and $null -ne $stats.detectors.onnx.inference_speed) { return }
-    } catch { }
+      $faceReady = $null -ne $stats.embeddings.face_recognition
+      $detectorsReady = @($stats.detectors.PSObject.Properties.Value | Where-Object { [double]$_.inference_speed -lt 200 }).Count -eq @($stats.detectors.PSObject.Properties).Count
+      if ($ready -and $faceReady -and $detectorsReady) {
+        & docker exec frigate sh -c 'set -eu; test -w /config; test -w /media/frigate; touch /config/.ready-write; rm /config/.ready-write; touch /media/frigate/.ready-write; rm /media/frigate/.ready-write' *> $null
+        if ($LASTEXITCODE -eq 0) {
+          $runtimeContainers = @(& docker ps --format '{{.Names}}' | Where-Object { $_ -eq 'frigate' -or $_ -like 'camera-replay-*' })
+          $currentSignature = (@($runtimeContainers | Sort-Object | ForEach-Object {
+            $count = & docker inspect $_ --format '{{.RestartCount}}' 2>$null
+            "${_}:$count"
+          }) -join ',')
+          if ($null -eq $stableSince -or $restartSignature -ne $currentSignature) {
+            $stableSince = [DateTime]::UtcNow
+            $restartSignature = $currentSignature
+          } elseif (([DateTime]::UtcNow - $stableSince).TotalSeconds -ge 60) {
+            return
+          }
+          Start-Sleep -Milliseconds 750
+          continue
+        }
+      }
+      $stableSince = $null
+    } catch { $stableSince = $null }
     Start-Sleep -Milliseconds 750
   } while ([DateTime]::UtcNow -lt $deadline)
-  throw 'Runtime did not become ready for every configured camera within 90 seconds.'
+  throw 'Runtime did not remain ready without camera restarts for 60 seconds within the 180-second startup window.'
+}
+
+function Get-FrigateInternalStats {
+  $output = & docker exec frigate curl --fail --silent --show-error --max-time 2 http://127.0.0.1:5000/api/stats 2>$null
+  if ($LASTEXITCODE -ne 0 -or -not $output) { throw 'Frigate internal stats endpoint is unavailable.' }
+  return ($output -join "`n") | ConvertFrom-Json
 }
 
 function Get-State {
@@ -323,12 +532,14 @@ function Show-Status {
   foreach ($camera in $state.cameras) { Write-Host ("Camera {0}: {1} ({2})" -f $camera.name,$camera.source,$camera.mode) }
   if (-not $running) { return }
   try {
-    $stats = Invoke-RestMethod -Uri 'http://127.0.0.1:5001/api/stats' -TimeoutSec 3
+    $stats = Get-FrigateInternalStats
     foreach ($camera in $state.cameras) {
       $value = $stats.cameras.($camera.name)
       Write-Host ("{0}: camera_fps={1}, process_fps={2}, skipped_fps={3}" -f $camera.name,$value.camera_fps,$value.process_fps,$value.skipped_fps)
     }
-    Write-Host ("Inference: {0} ms" -f $stats.detectors.onnx.inference_speed)
+    foreach ($detector in $stats.detectors.PSObject.Properties) {
+      Write-Host ("Detector {0}: inference={1} ms" -f $detector.Name,$detector.Value.inference_speed)
+    }
   } catch { Write-Warning 'Stats endpoint is unavailable.' }
 }
 
@@ -356,7 +567,7 @@ try {
   $hasReplay = @($sources | Where-Object Mode -eq 'replay').Count -gt 0
   Set-ComposeEnvironment $runtime
   New-ReplayOverride $sources $runtime
-  $prefix = Get-ComposePrefix $hasReplay $runtime.IntegrationsEnabled
+  $prefix = Get-ComposePrefix $hasReplay
 
   switch ($Command) {
     'doctor' {
@@ -376,8 +587,9 @@ try {
       Test-RuntimeDependencies $runtime
       $probes = @(Test-Sources $sources $runtime.Transport)
       Test-FrigateConfig $runtime $sources
+      Initialize-FrigateConfigVolume $runtime
       Invoke-Compose $prefix @('config','--quiet')
-      Invoke-Compose $prefix @('up','-d','--no-build','--remove-orphans')
+      Invoke-Compose $prefix @('up','-d','--no-build','--remove-orphans','--force-recreate')
       Wait-RuntimeReady $sources
       $state = [ordered]@{ started_at=[DateTime]::UtcNow.ToString('o'); cameras=@() }
       foreach ($source in $sources) { $state.cameras += [ordered]@{ name=$source.Name; mode=$source.Mode; source=$source.Redacted } }

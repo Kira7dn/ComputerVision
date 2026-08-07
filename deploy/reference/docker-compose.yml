@@ -8,18 +8,33 @@ services:
     <<: *frigate-image
     container_name: frigate
     restart: unless-stopped
-    shm_size: "256mb"
+    shm_size: "1gb"
+    mem_limit: "7g"
     cpus: ${FRIGATE_CPU_LIMIT:-4}
     gpus: all
+    env_file:
+      - path: ../../.env.local
+        required: true
+    environment:
+      FRIGATE_TELEGRAM_BOT_TOKEN: ${FRIGATE_TELEGRAM_BOT_TOKEN:-${TELEGRAM_BOT_TOKEN:-}}
+      FRIGATE_TELEGRAM_CHAT_ID: ${FRIGATE_TELEGRAM_CHAT_ID:-${TELEGRAM_CHAT_ID:-}}
+      FRIGATE_ZALO_BOT_TOKEN: ${FRIGATE_ZALO_BOT_TOKEN:-${ZALO_BOT_TOKEN:-}}
+      FRIGATE_ZALO_CHAT_ID: ${FRIGATE_ZALO_CHAT_ID:-${ZALO_CHAT_ID:-}}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:5000/api/stats >/dev/null && test -w /config && test -w /media/frigate"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 60s
     ports:
       - "8971:8971"
-      - "5001:5000"
-      - "8554:8554"
+      # Local-only acceptance endpoint; bypasses the auth proxy without
+      # exposing Frigate's internal HTTP service to the network.
+      - "127.0.0.1:5001:5000"
       - "8555:8555/tcp"
       - "8555:8555/udp"
     volumes:
-      - ${FRIGATE_CONFIG_DIR:-E:/Docker/Frigate/config}:/config
-      - ${CAMERA_CONFIG_FILE:?run.ps1 must set CAMERA_CONFIG_FILE}:/config/config.yml:ro
+      - frigate-config:/config
       - ${FRIGATE_MEDIA_DIR:-E:/Docker/Frigate/media}:/media/frigate
       - ${CAMERA_MODEL_PATH:?run.ps1 must set CAMERA_MODEL_PATH}:/models/yolov9-t-320.onnx:ro
       - /etc/localtime:/etc/localtime:ro
@@ -34,48 +49,7 @@ services:
     volumes:
       - ./mediamtx.replay.yml:/mediamtx.yml:ro
 
-  frigate-notifier:
-    build: ./integrations/notifier
-    container_name: frigate-notifier
-    profiles: ["integrations"]
-    restart: unless-stopped
-    depends_on:
-      - frigate
-    env_file:
-      - path: ../../.env.local
-        required: true
-    environment:
-      FRIGATE_URL: http://frigate:5000
-      NOTIFIER_POLL_SECONDS: "3"
-      NOTIFIER_RETRY_COUNT: "3"
-      MIN_TRACK_DISPLACEMENT: "0.12"
-      MIN_TRACK_DURATION_SECONDS: "2"
-      ZALO_MEDIA_BASE_URL: ${NGROK_URL:-}
-      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
-      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
-      ZALO_ACCESS_TOKEN: ${ZALO_ACCESS_TOKEN:-}
-      ZALO_OA_ID: ${ZALO_OA_ID:-}
-      ZALO_BOT_TOKEN: ${ZALO_BOT_TOKEN:-}
-      ZALO_CHAT_ID: ${ZALO_CHAT_ID:-}
-      ZALO_WEBHOOK_URL: ${ZALO_WEBHOOK_URL:-}
-      VEHICLE_WHITELIST_FILE: /runtime/vehicle_whitelist.json
-      NOTIFIER_STATE_FILE: /runtime/notifier_state.json
-    volumes:
-      - ${CAMERA_RUNTIME_DATA_DIR:-E:/Docker/Frigate/runtime}:/runtime
-
-  media-gateway:
-    build: ./integrations/notifier
-    container_name: camera-media-gateway
-    profiles: ["integrations"]
-    command: ["python", "/app/media_gateway.py"]
-    restart: unless-stopped
-    depends_on:
-      - frigate
-    env_file:
-      - path: ../../.env.local
-        required: true
-    environment:
-      FRIGATE_URL: http://frigate:5000
-      MEDIA_GATEWAY_PORT: "8090"
-    ports:
-      - "8090:8090"
+volumes:
+  frigate-config:
+    name: camera-frigate-config
+    external: true

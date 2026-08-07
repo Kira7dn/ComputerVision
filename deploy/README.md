@@ -8,7 +8,7 @@ deploy/config.yaml   # toàn bộ cấu hình runtime và Frigate
 .env.local           # credential, được Docker Compose nạp trực tiếp
 ```
 
-Các file Compose và integration nội bộ nằm trong `deploy/reference/`; người vận hành
+Các file Compose nội bộ nằm trong `deploy/reference/`; người vận hành
 không cần sửa chúng.
 
 ## Yêu cầu
@@ -33,7 +33,7 @@ Chạy từ `D:\BusinessAnalyze\Camera`:
 .\deploy\run.ps1 build
 ```
 
-Không có tham số source, loop, integrations hoặc detector. Sửa các giá trị đó trong
+Không có tham số source, loop hoặc detector. Sửa các giá trị đó trong
 `deploy/config.yaml`.
 
 `build` đóng image tại `runtime.image` từ `runtime.build_base_image`, source Python,
@@ -111,16 +111,12 @@ Dòng `Face snapshot metrics` xác nhận bước ghi media/DB; `committed` ph�
 
 ## Secret
 
-`deploy/reference/docker-compose.yml` liên kết trực tiếp tới root `.env.local` cho
-notifier và media gateway. Ví dụ:
+Telegram và Zalo là provider native của Frigate. Token chỉ được đọc từ root
+`.env.local` qua các biến sau:
 
 ```dotenv
-TELEGRAM_BOT_TOKEN=
-TELEGRAM_CHAT_ID=
-ZALO_BOT_TOKEN=
-ZALO_CHAT_ID=
-ZALO_WEBHOOK_URL=
-NGROK_URL=
+FRIGATE_TELEGRAM_BOT_TOKEN=
+FRIGATE_ZALO_BOT_TOKEN=
 ```
 
 Không đặt secret vào `deploy/config.yaml`. Credential trong RTSP URL được che trong
@@ -148,5 +144,4 @@ deploy/
 └── reference/
     ├── docker-compose.yml
     ├── mediamtx.replay.yml
-    └── integrations/notifier/
 ```

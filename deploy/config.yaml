@@ -1,7 +1,7 @@
 runtime:
-  image: camera-frigate:0.18.0-33c00a27e-runtime3-reviewfix1-tensorrt
+  image: camera-frigate:0.18.0-33c00a27e-face-lifecycle-tensorrt
   build_base_image: camera-frigate:0.18.0-33c00a27e-runtime3-tensorrt
-  cpu_limit: 4
+  cpu_limit: 8
   model_path: models/yolov9-t-320.onnx
   config_dir: runtime/config
   media_dir: E:/Docker/Frigate/media
@@ -11,9 +11,7 @@ runtime:
     loop: true
     sources:
       face_camera: mock_videos/face-recognition/segments/01_P1E_S1_C1.mp4
-  integrations:
-    enabled: false
-
+      car_camera: mock_videos/car-number-plate-video/cam-in/pexels-casey-whalen-6571483 (2160p).mp4
 mqtt:
   enabled: false
 
@@ -21,6 +19,8 @@ go2rtc:
   streams:
     face_camera:
       - rtsp://mediamtx:18554/face_camera
+    car_camera:
+      - rtsp://mediamtx:18554/car_camera
 
 logger:
   default: info
@@ -28,15 +28,51 @@ logger:
 auth:
   reset_admin_password: false
 
+notifications:
+  enabled: true
+  cooldown: 10
+  providers:
+    webpush:
+      enabled: true
+    telegram:
+      enabled: true
+      recipients:
+        - id: security_team
+          name: Security Team
+          chat_id: "{FRIGATE_TELEGRAM_CHAT_ID}"
+          enabled: true
+          cameras: [car_camera]
+    zalo:
+      enabled: true
+      media_url_ttl: 300
+      recipients:
+        - id: operators
+          name: Operators
+          chat_id: "{FRIGATE_ZALO_CHAT_ID}"
+          enabled: true
+          cameras: [car_camera]
+  delivery:
+    max_attempts: 5
+    initial_backoff: 5
+    max_backoff: 300
+    retention_days: 7
+    max_pending: 5000
+
 detectors:
   onnx:
     type: onnx
-    device: CPU
+    device: GPU
     intra_op_num_threads: 2
     inter_op_num_threads: 1
     allow_spinning: false
     execution_mode: sequential
-
+  onnx_2:
+    type: onnx
+    device: GPU
+    intra_op_num_threads: 2
+    inter_op_num_threads: 1
+    allow_spinning: false
+    execution_mode: sequential
 face_recognition:
   enabled: true
   model_size: large
@@ -46,7 +82,7 @@ face_recognition:
   unknown_score: 0.8
   recognition_threshold: 0.9
   min_faces: 2
-  save_attempts: 0
+  save_attempts: 200
   blur_confidence_filter: false
 
 lpr:
@@ -78,7 +114,7 @@ snapshots:
     default: 2
 
 cameras:
-  face_camera:
+  face_camera: &face_camera_defaults
     enabled: true
     friendly_name: Face Recognition Camera
     face_recognition:
@@ -110,7 +146,31 @@ cameras:
       threshold: 53
       contour_area: 10
       improve_contrast: true
-
+  car_camera:
+    <<: *face_camera_defaults
+    friendly_name: Car Camera
+    face_recognition:
+      enabled: false
+    review:
+      alerts:
+        enabled: false
+      detections:
+        enabled: true
+        labels: [car]
+    objects:
+      track: [car]
+    notifications:
+      enabled: true
+      cooldown: 30
+      providers: [webpush, telegram, zalo]
+    ffmpeg:
+      inputs:
+        - path: rtsp://127.0.0.1:8554/car_camera
+          input_args: preset-rtsp-restream
+          roles: [detect, record]
+    live:
+      streams:
+        Main: car_camera
 version: 0.18-0
 
 semantic_search:
