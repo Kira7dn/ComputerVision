@@ -1,13 +1,18 @@
 [CmdletBinding()]
 param(
   [Parameter(Position = 0)]
-  [ValidateSet('help', 'start', 'status', 'logs', 'doctor', 'stop', 'build')]
-  [string]$Command = 'help'
+  [ValidateSet('help', 'start', 'acceptance-start', 'acceptance-restore', 'status', 'logs', 'doctor', 'stop', 'build')]
+  [string]$Command = 'help',
+  [string]$ConfigFile = ''
 )
 
 $ErrorActionPreference = 'Stop'
 $workspace = Split-Path -Parent $PSScriptRoot
-$configFile = Join-Path $PSScriptRoot 'config.yaml'
+$configFile = if ([string]::IsNullOrWhiteSpace($ConfigFile)) {
+  Join-Path $PSScriptRoot 'config.yaml'
+} else {
+  $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($ConfigFile)
+}
 $referenceDir = Join-Path $PSScriptRoot 'reference'
 $composeFile = Join-Path $referenceDir 'docker-compose.yml'
 $envFile = Join-Path $workspace '.env.local'
@@ -334,9 +339,13 @@ function Wait-NgrokReady([string]$ExpectedUrl) {
   return $false
 }
 
-function New-ReplayOverride([object[]]$Sources, $Runtime) {
+function New-ReplayOverride([object[]]$Sources, $Runtime, [bool]$NotificationsEnabled) {
   $lines = [Collections.Generic.List[string]]::new()
   $lines.Add('services:')
+  if (-not $NotificationsEnabled) {
+    $lines.Add('  ngrok:')
+    $lines.Add('    profiles: ["notifications"]')
+  }
   $replays = @($Sources | Where-Object Mode -eq 'replay')
   if ($replays.Count -eq 0) { $lines.Add('  {}') }
   if ($replays.Count -gt 0) {
@@ -360,8 +369,9 @@ function New-ReplayOverride([object[]]$Sources, $Runtime) {
     $lines.Add('    depends_on: [mediamtx]')
     $lines.Add('    entrypoint: ["/usr/lib/ffmpeg/7.0/bin/ffmpeg"]')
     $lines.Add("    volumes: [$volume]")
-    # Replay transports prepared H.264 media without decoding or re-encoding it.
-    $commandArgs = @('-hide_banner','-loglevel','warning','-re','-stream_loop',$loop,'-fflags','+genpts','-i','/runtime/source','-map','0:v:0','-an','-c:v','copy','-f','rtsp','-rtsp_transport','tcp',("rtsp://mediamtx:18554/$($source.Name)"))
+      # Frequent IDR frames let Frigate/go2rtc attach immediately after a
+      # publisher restart instead of waiting on a long source GOP.
+      $commandArgs = @('-hide_banner','-loglevel','warning','-re','-stream_loop',$loop,'-fflags','+genpts','-i','/runtime/source','-map','0:v:0','-an','-c:v','libx264','-preset','ultrafast','-tune','zerolatency','-g','15','-keyint_min','15','-sc_threshold','0','-x264-params','repeat-headers=1','-f','rtsp','-rtsp_transport','tcp',("rtsp://mediamtx:18554/$($source.Name)"))
     $command = $commandArgs | ConvertTo-Json -Compress
     $lines.Add("    command: $command")
   }
@@ -496,8 +506,16 @@ function Test-FrigateConfig($Runtime, [object[]]$Sources) {
   if ($exitCode -ne 0) { throw (Protect-Text ($output -join "`n") $Sources) }
 }
 
-function Wait-RuntimeReady([object[]]$Sources) {
-  $deadline = [DateTime]::UtcNow.AddSeconds(180)
+function Wait-RuntimeReady([object[]]$Sources, $Config) {
+  $deadline = [DateTime]::UtcNow.AddSeconds(90)
+  $stableSeconds = 10.0
+  if ($env:CAMERA_READY_STABLE_SECONDS) {
+    $candidate = 0.0
+    if ([double]::TryParse($env:CAMERA_READY_STABLE_SECONDS, [ref]$candidate) -and $candidate -ge 1.0 -and $candidate -le 10.0) {
+      $stableSeconds = $candidate
+    }
+  }
+  $faceRequired = $null -ne $Config.face_recognition -and [bool](Get-Value $Config.face_recognition 'enabled' $false)
   $stableSince = $null
   $restartSignature = $null
   do {
@@ -508,7 +526,7 @@ function Wait-RuntimeReady([object[]]$Sources) {
         $camera = $stats.cameras.($source.Name)
         if ($null -eq $camera -or [double]$camera.camera_fps -lt 4.5 -or [double]$camera.process_fps -lt 4.5) { $ready = $false; break }
       }
-      $faceReady = $null -ne $stats.embeddings.face_recognition
+      $faceReady = -not $faceRequired -or $null -ne $stats.embeddings.face_recognition
       $detectorsReady = @($stats.detectors.PSObject.Properties.Value | Where-Object { [double]$_.inference_speed -lt 200 }).Count -eq @($stats.detectors.PSObject.Properties).Count
       if ($ready -and $faceReady -and $detectorsReady) {
         & docker exec frigate sh -c 'set -eu; test -w /config; test -w /media/frigate; touch /config/.ready-write; rm /config/.ready-write; touch /media/frigate/.ready-write; rm /media/frigate/.ready-write' *> $null
@@ -521,7 +539,7 @@ function Wait-RuntimeReady([object[]]$Sources) {
           if ($null -eq $stableSince -or $restartSignature -ne $currentSignature) {
             $stableSince = [DateTime]::UtcNow
             $restartSignature = $currentSignature
-          } elseif (([DateTime]::UtcNow - $stableSince).TotalSeconds -ge 60) {
+          } elseif (([DateTime]::UtcNow - $stableSince).TotalSeconds -ge $stableSeconds) {
             return
           }
           Start-Sleep -Milliseconds 750
@@ -532,7 +550,7 @@ function Wait-RuntimeReady([object[]]$Sources) {
     } catch { $stableSince = $null }
     Start-Sleep -Milliseconds 750
   } while ([DateTime]::UtcNow -lt $deadline)
-  throw 'Runtime did not remain ready without camera restarts for 60 seconds within the 180-second startup window.'
+  throw "Runtime did not remain ready without camera restarts for $stableSeconds seconds within the 90-second startup window."
 }
 
 function Get-FrigateInternalStats {
@@ -576,7 +594,7 @@ Camera runtime
   .\deploy\run.ps1 stop
   .\deploy\run.ps1 build
 
-All runtime and Frigate settings are defined in .\deploy\config.yaml.
+Use -ConfigFile to select an isolated config; the default is .\deploy\config.yaml.
 '@ | Write-Host
 }
 
@@ -584,17 +602,18 @@ try {
   if ($Command -eq 'help') { Show-Help; exit 0 }
   $config = Get-CameraConfig
   $runtime = Get-Runtime $config
+  $notificationsEnabled = $null -ne $config.notifications -and [bool](Get-Value $config.notifications 'enabled' $false)
   if ($Command -eq 'build') { Build-RuntimeImage $runtime; exit 0 }
   $sources = @(Resolve-CameraSources $config $runtime)
   $hasReplay = @($sources | Where-Object Mode -eq 'replay').Count -gt 0
   Set-ComposeEnvironment $runtime
-  New-ReplayOverride $sources $runtime
+  New-ReplayOverride $sources $runtime $notificationsEnabled
   $prefix = Get-ComposePrefix $hasReplay
 
   switch ($Command) {
     'doctor' {
       Test-RuntimeDependencies $runtime
-      $ngrokUrl = Test-NgrokConfiguration $config
+      $ngrokUrl = if ($notificationsEnabled) { Test-NgrokConfiguration $config } else { '' }
       $probes = @(Test-Sources $sources $runtime.Transport)
       Test-FrigateConfig $runtime $sources
       Invoke-Compose $prefix @('config','--quiet')
@@ -612,19 +631,67 @@ try {
     }
     'start' {
       Test-RuntimeDependencies $runtime
-      $ngrokUrl = Test-NgrokConfiguration $config
+      $ngrokUrl = if ($notificationsEnabled) { Test-NgrokConfiguration $config } else { '' }
+      if (-not $notificationsEnabled -and ((& docker ps -a --format '{{.Names}}') -contains 'camera-ngrok')) {
+        & docker rm -f camera-ngrok *> $null
+      }
       $probes = @(Test-Sources $sources $runtime.Transport)
       Test-FrigateConfig $runtime $sources
       Ensure-FrigateConfigVolume
       Invoke-Compose $prefix @('config','--quiet')
       Invoke-Compose $prefix @('up','-d','--no-build','--remove-orphans','--force-recreate')
-      Wait-RuntimeReady $sources
-      $ngrokReady = Wait-NgrokReady $ngrokUrl
+      if ($env:CAMERA_SKIP_READY_WAIT -ne '1') {
+        Wait-RuntimeReady $sources $config
+      }
+      $ngrokReady = if ($notificationsEnabled) { Wait-NgrokReady $ngrokUrl } else { $false }
       $state = [ordered]@{ started_at=[DateTime]::UtcNow.ToString('o'); cameras=@() }
       foreach ($source in $sources) { $state.cameras += [ordered]@{ name=$source.Name; mode=$source.Mode; source=$source.Redacted } }
       Write-AtomicUtf8 $stateFile (($state | ConvertTo-Json -Depth 5) + "`n")
-      Write-Host "Runtime ready with $($sources.Count) camera(s); public tunnel: $(if ($ngrokReady) { 'ready' } else { 'degraded' })."
+      Write-Host "Runtime ready with $($sources.Count) camera(s); public tunnel: $(if (-not $notificationsEnabled) { 'disabled' } elseif ($ngrokReady) { 'ready' } else { 'degraded' })."
       Show-Status
+    }
+    'acceptance-start' {
+      # The passage acceptance validator already performs strict fixture/config checks and
+      # owns readiness/stability gates. Keep this switch bounded to compose
+      # recreation so startup and rollback remain inside its 119-second budget.
+      Ensure-FrigateConfigVolume
+      Invoke-Compose $prefix @('config','--quiet')
+      $acceptanceServices = [Collections.Generic.List[string]]::new()
+      $replaySources = @($sources | Where-Object Mode -eq 'replay')
+      if ($replaySources.Count -gt 0) {
+        Invoke-Compose $prefix @('up','-d','--no-build','mediamtx')
+        foreach ($source in $replaySources) {
+          $acceptanceServices.Add(('replay-' + $source.Name.ToLowerInvariant().Replace('_','-')))
+        }
+        # Bring the RTSP paths online before Frigate opens them. Starting all
+        # services in one Compose transaction races Frigate capture against
+        # MediaMTX publication and can leave both cameras at 0 FPS for the
+        # validator's entire startup budget.
+        Invoke-Compose $prefix (@('up','-d','--no-build','--force-recreate','--no-deps') + @($acceptanceServices))
+        Start-Sleep -Milliseconds 1200
+        foreach ($source in $replaySources) {
+          $container = 'camera-replay-' + $source.Name.ToLowerInvariant().Replace('_','-')
+          $running = (& docker inspect $container --format '{{.State.Running}}' 2>$null).Trim()
+          if ($running -ne 'true') { throw "Replay publisher '$($source.Name)' did not start." }
+        }
+      }
+      Invoke-Compose $prefix @('up','-d','--no-build','--force-recreate','--no-deps','frigate')
+      $state = [ordered]@{ started_at=[DateTime]::UtcNow.ToString('o'); cameras=@() }
+      foreach ($source in $sources) { $state.cameras += [ordered]@{ name=$source.Name; mode=$source.Mode; source=$source.Redacted } }
+      Write-AtomicUtf8 $stateFile (($state | ConvertTo-Json -Depth 5) + "`n")
+      Write-Host "Acceptance runtime containers recreated for $($sources.Count) camera(s)."
+    }
+    'acceptance-restore' {
+      # Replay publishers are independent of the mounted Frigate config. Keep
+      # them alive during rollback and replace only Frigate, which is the sole
+      # service that must remount deploy/config.yaml.
+      Ensure-FrigateConfigVolume
+      Invoke-Compose $prefix @('config','--quiet')
+      Invoke-Compose $prefix @('up','-d','--no-build','--force-recreate','--no-deps','frigate')
+      $state = [ordered]@{ started_at=[DateTime]::UtcNow.ToString('o'); cameras=@() }
+      foreach ($source in $sources) { $state.cameras += [ordered]@{ name=$source.Name; mode=$source.Mode; source=$source.Redacted } }
+      Write-AtomicUtf8 $stateFile (($state | ConvertTo-Json -Depth 5) + "`n")
+      Write-Host "Acceptance runtime config restored for $($sources.Count) camera(s)."
     }
     'status' { Show-Status }
     'logs' {

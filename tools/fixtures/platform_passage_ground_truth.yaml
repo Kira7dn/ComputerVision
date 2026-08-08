@@ -1,0 +1,125 @@
+schema_version: 2
+test_case_limit_seconds: 119
+frame:
+  width: 1280
+  height: 720
+  fps: 15
+
+face:
+  enrollment:
+    identity: Jack
+    source: mock_videos/face-recognition/segments/01_P1E_S1_C1.mp4
+    frame_s: 21.125
+  passages:
+    - id: face-p1-01
+      source: mock_videos/face-recognition/segments/01_P1E_S1_C1.mp4
+      start_s: 20.25
+      end_s: 21.65
+      face_visible_s: 20.25
+      expected_identity: Jack
+      valid_passage: true
+      bbox: [690, 110, 990, 720]
+    - id: face-p1-02
+      source: mock_videos/face-recognition/segments/04_P1E_S2_C1.mp4
+      start_s: 17.10
+      end_s: 18.50
+      face_visible_s: 17.10
+      expected_identity: Jack
+      valid_passage: true
+      bbox: [665, 120, 930, 720]
+    - id: face-unknown-03
+      source: mock_videos/face-recognition/segments/04_P1E_S2_C1.mp4
+      start_s: 20.00
+      end_s: 21.40
+      face_visible_s: 20.00
+      expected_identity: unknown
+      valid_passage: true
+      bbox: [735, 80, 1010, 720]
+    - id: face-unknown-01
+      source: mock_videos/face-recognition/segments/07_P2E_S2_C1.1.mp4
+      start_s: 20.25
+      end_s: 21.65
+      face_visible_s: 20.25
+      expected_identity: unknown
+      valid_passage: true
+      bbox: [745, 180, 1110, 720]
+    - id: face-unknown-02
+      source: mock_videos/face-recognition/segments/09_P2E_S2_C2.1.mp4
+      start_s: 20.25
+      end_s: 21.65
+      face_visible_s: 20.25
+      expected_identity: unknown
+      valid_passage: true
+      bbox: [470, 170, 825, 720]
+    - id: face-negative-01
+      source: mock_videos/face-recognition/segments/02_P1E_S1_C2.mp4
+      start_s: 20.65
+      end_s: 21.15
+      face_visible_s: 20.65
+      expected_identity: null
+      valid_passage: false
+      bbox: null
+  close_follow:
+    - [face-p1-02, face-unknown-03]
+
+lpr:
+  source: mock_videos/car-number-plate-video/cam-in/pexels-casey-whalen-6571483 (720p15).mp4
+  duration_s: 15.0
+  passages:
+    - id: lpr-01
+      start_s: 0.75
+      end_s: 1.95
+      bbox: [330, 275, 625, 555]
+      roi: [320, 260, 640, 570]
+      readable: true
+      expected_plate: 619879
+      valid_passage: true
+    - id: lpr-02
+      start_s: 2.55
+      end_s: 3.75
+      bbox: [290, 225, 600, 545]
+      roi: [280, 210, 615, 560]
+      readable: true
+      expected_plate: 657648
+      valid_passage: true
+    - id: lpr-negative-01
+      start_s: 4.75
+      end_s: 5.15
+      bbox: null
+      roi: null
+      readable: false
+      expected_plate: null
+      valid_passage: false
+    - id: lpr-negative-02
+      start_s: 6.75
+      end_s: 7.15
+      bbox: null
+      roi: null
+      readable: false
+      expected_plate: null
+      valid_passage: false
+    - id: lpr-05
+      start_s: 10.90
+      end_s: 12.10
+      bbox: [70, 45, 365, 300]
+      roi: [60, 35, 375, 310]
+      readable: false
+      expected_plate: null
+      valid_passage: true
+    - id: lpr-07
+      start_s: 10.90
+      end_s: 12.10
+      bbox: [925, 0, 1220, 205]
+      roi: [915, 0, 1230, 215]
+      readable: false
+      expected_plate: null
+      valid_passage: true
+    - id: lpr-06
+      start_s: 13.10
+      end_s: 14.30
+      bbox: [520, 0, 830, 180]
+      roi: [510, 0, 840, 190]
+      readable: true
+      expected_plate: BFE3975
+      accepted_plates: [BFE3975, BEE3975]
+      valid_passage: true

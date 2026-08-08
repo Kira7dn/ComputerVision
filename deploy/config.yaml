@@ -1,5 +1,5 @@
 runtime:
-  image: camera-frigate:0.18.0-33c00a27e-face-lifecycle-tensorrt
+  image: camera-frigate:current
   build_base_image: camera-frigate:0.18.0-33c00a27e-runtime3-tensorrt
   cpu_limit: 8
   model_path: models/yolov9-t-320.onnx
@@ -245,7 +245,8 @@ cameras:
       width: 1280
       height: 720
       fps: 5
-      max_disappeared: 5
+      min_initialized: 1
+      max_disappeared: 2
     motion:
       threshold: 53
       contour_area: 10
@@ -253,12 +254,15 @@ cameras:
   car_camera:
     <<: *face_camera_defaults
     friendly_name: Car Camera
+    lpr:
+      enabled: true
+      min_area: 500
     detect:
       enabled: true
       width: 1280
       height: 720
       fps: 5
-      min_initialized: 2
+      min_initialized: 1
       max_disappeared: 3
     motion:
       threshold: 53

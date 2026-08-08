@@ -50,6 +50,28 @@ def restart_counts() -> dict[str, int]:
     return counts
 
 
+def container_started_epoch(name: str) -> float:
+    value = docker("inspect", name, "--format", "{{.State.StartedAt}}")
+    return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+
+
+def match_passage(
+    event_start: float,
+    replay_started: float,
+    source_duration: float,
+    passages: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    phase = (event_start - replay_started) % source_duration
+    return next(
+        (
+            passage
+            for passage in passages
+            if float(passage["start_s"]) <= phase <= float(passage["end_s"])
+        ),
+        None,
+    )
+
+
 def parse_size(value: str) -> float:
     match = re.fullmatch(r"\s*([0-9.]+)\s*([KMGTP]?i?B)\s*", value)
     if not match:
@@ -406,6 +428,85 @@ async def collect(args: argparse.Namespace) -> dict[str, Any]:
     config, source_duration = await asyncio.to_thread(
         load_config_and_source_duration, args.config
     )
+    ground_truth = None
+    if args.manifest:
+        manifest = yaml.safe_load(Path(args.manifest).read_text(encoding="utf-8"))
+        passages = manifest["lpr"]["passages"]
+        replay_started = container_started_epoch("camera-replay-car-camera")
+
+        def passage_for(event: dict[str, Any]) -> dict[str, Any] | None:
+            return match_passage(
+                float(event["start_time"]),
+                replay_started,
+                source_duration,
+                passages,
+            )
+
+        passage_results = []
+        manifest_consistency = []
+        for passage in passages:
+            detected = [
+                event
+                for event in events
+                if float(event.get("start_time") or 0) >= started_epoch
+                and (matched := passage_for(event)) is not None
+                and matched["id"] == passage["id"]
+            ]
+            recognized = [
+                event
+                for event in accepted_events
+                if (matched := passage_for(event)) is not None
+                and matched["id"] == passage["id"]
+            ]
+            plates = [
+                normalized_plate(event["recognized_license_plate"])
+                for event in recognized
+            ]
+            counts = Counter(plates)
+            representative, count = counts.most_common(1)[0] if counts else (None, 0)
+            consistency_value = count / len(plates) if plates else 0.0
+            result = {
+                "id": passage["id"],
+                "detected": bool(detected),
+                "recognized_count": len(plates),
+                "representative": representative,
+                "consistency": consistency_value,
+                "variants": dict(counts),
+                "readable": bool(passage["readable"]),
+                "expected_plate": passage.get("expected_plate"),
+                "exact_match": (
+                    representative == normalized_plate(str(passage["expected_plate"]))
+                    if passage["readable"] and passage.get("expected_plate")
+                    else None
+                ),
+            }
+            passage_results.append(result)
+            if len(plates) >= 3:
+                manifest_consistency.append(
+                    {
+                        "passage_id": passage["id"],
+                        "ocr_passages": len(plates),
+                        "representative": representative,
+                        "consistency": consistency_value,
+                        "variants": dict(counts),
+                    }
+                )
+        consistency = manifest_consistency
+        readable_results = [item for item in passage_results if item["readable"]]
+        ground_truth = {
+            "passage_detection_recall": sum(
+                item["detected"] for item in passage_results
+            )
+            / len(passage_results),
+            "lpr_exact_match": (
+                sum(item["exact_match"] is True for item in readable_results)
+                / len(readable_results)
+                if readable_results
+                else None
+            ),
+            "readable_denominator": len(readable_results),
+            "passages": passage_results,
+        }
 
     min_camera_fps = {
         camera: min(
@@ -448,7 +549,7 @@ async def collect(args: argparse.Namespace) -> dict[str, Any]:
         "models_downloaded": required_models.issubset(
             {name for name, state in model_state.items() if state == "downloaded"}
         ),
-        "models_loaded_once": all(count == 1 for count in download_counts.values()),
+        "models_loaded_once": all(count <= 1 for count in download_counts.values()),
         "lpr_metrics_present": all(
             key in samples[-1]["embeddings"]
             for key in ("plate_recognition", "yolov9_plate_detection")
@@ -481,16 +582,18 @@ async def collect(args: argparse.Namespace) -> dict[str, Any]:
             "lpr": config["lpr"],
             "face_camera": {
                 "detect": config["cameras"]["face_camera"]["detect"],
-                "face_recognition": config["cameras"]["face_camera"][
-                    "face_recognition"
-                ],
-                "lpr": config["cameras"]["face_camera"]["lpr"],
+                "face_recognition": config["cameras"]["face_camera"].get(
+                    "face_recognition", {}
+                ),
+                "lpr": config["cameras"]["face_camera"].get("lpr", {}),
             },
             "car_camera": {
-                "type": config["cameras"]["car_camera"]["type"],
+                "type": config["cameras"]["car_camera"].get("type", "generic"),
                 "detect": config["cameras"]["car_camera"]["detect"],
-                "face_recognition": config["cameras"]["car_camera"]["face_recognition"],
-                "lpr": config["cameras"]["car_camera"]["lpr"],
+                "face_recognition": config["cameras"]["car_camera"].get(
+                    "face_recognition", {}
+                ),
+                "lpr": config["cameras"]["car_camera"].get("lpr", {}),
                 "objects": config["cameras"]["car_camera"]["objects"],
             },
         },
@@ -503,6 +606,7 @@ async def collect(args: argparse.Namespace) -> dict[str, Any]:
         "accepted_sqlite_events": sqlite_events,
         "api_sqlite_matches": api_sqlite_matches,
         "ocr_consistency": consistency,
+        "ground_truth": ground_truth,
         "stability": {
             "min_camera_fps": min_camera_fps,
             "min_process_fps": min_process_fps,
@@ -518,6 +622,7 @@ async def collect(args: argparse.Namespace) -> dict[str, Any]:
         "passed": all(checks.values()),
         "notes": [
             "pending queue depth is not exposed by this Frigate stats schema; detector and enrichment metrics were sampled instead",
+            "model_state proves every required model is ready; download counts must stay at zero for a warm cache or one for a cold cache, never repeat in one runtime",
             "OCR consistency is repeatability on deterministic replay passages, not absolute character accuracy without ground truth",
             "event WebSocket boxes are snapshot updates and can be stale relative to LPR timestamps; containment is verified from the running container source contract and live plate boxes are independently bounded to the 1280x720 frame",
         ],
@@ -526,15 +631,18 @@ async def collect(args: argparse.Namespace) -> dict[str, Any]:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--duration", type=float, default=300)
+    parser.add_argument("--duration", type=float, default=90)
     parser.add_argument("--interval", type=float, default=10)
     parser.add_argument("--api-url", default="http://127.0.0.1:5001")
     parser.add_argument("--ws-url", default="ws://127.0.0.1:5001/ws")
     parser.add_argument("--config", default="deploy/config.yaml")
+    parser.add_argument("--manifest")
     parser.add_argument(
         "--output", default=".tmp/runtime/lpr-acceptance-2cam-720p.json"
     )
     args = parser.parse_args()
+    if args.duration <= 0 or args.duration > 90:
+        parser.error("LPR measurement must be at most 90 seconds")
     report = asyncio.run(collect(args))
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)

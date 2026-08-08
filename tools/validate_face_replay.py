@@ -13,7 +13,6 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-
 FACE_METRIC_PATTERN = re.compile(r"face_pipeline_metrics (\{.*\})")
 SNAPSHOT_METRIC_PATTERN = re.compile(
     r"Face snapshot metrics .*failed=(\d+).*camera_mismatch=(\d+)"
@@ -104,14 +103,74 @@ def parse_runtime_logs(since_epoch: int) -> tuple[list[dict], dict[str, int]]:
     return face_metrics, snapshot
 
 
+def event_identity(event: dict) -> str:
+    value = event.get("sub_label")
+    if isinstance(value, list):
+        value = value[0] if value else None
+    return str(value) if value else "unknown"
+
+
+def face_event_result(event: dict) -> dict:
+    data = event.get("data") or {}
+    person_box = data.get("box")
+    face_box = data.get("face_box")
+    frame_time = data.get("face_snapshot_frame_time")
+    correlation = bool(
+        event_identity(event) == str(data.get("face_snapshot_sub_label") or "unknown")
+        and isinstance(person_box, list)
+        and len(person_box) == 4
+        and isinstance(face_box, list)
+        and len(face_box) == 4
+        and person_box[0] <= face_box[0]
+        and person_box[1] <= face_box[1]
+        and face_box[0] + face_box[2] <= person_box[0] + person_box[2]
+        and face_box[1] + face_box[3] <= person_box[1] + person_box[3]
+        and isinstance(frame_time, (int, float))
+        and float(frame_time) >= float(event["start_time"])
+    )
+    latency_ms = (
+        (float(frame_time) - float(event["start_time"])) * 1000
+        if isinstance(frame_time, (int, float))
+        else None
+    )
+    return {
+        "id": event["id"],
+        "identity": event_identity(event),
+        "start_time": event["start_time"],
+        "face_snapshot_frame_time": frame_time,
+        "capture_to_recognition_ms": latency_ms,
+        "candidate_correlation": correlation,
+    }
+
+
+def score_ground_truth(predictions: list[str], expected: str) -> tuple[float, float]:
+    positive_predictions = [
+        prediction for prediction in predictions if prediction != "unknown"
+    ]
+    if expected == "unknown":
+        return (
+            float(not positive_predictions),
+            float(bool(predictions) and not positive_predictions),
+        )
+    correct = sum(prediction == expected for prediction in positive_predictions)
+    precision = correct / len(positive_predictions) if positive_predictions else 0.0
+    return precision, float(correct > 0)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--seconds", type=int, default=300)
-    parser.add_argument("--warmup", type=int, default=60)
+    parser.add_argument("--seconds", type=int, default=90)
+    parser.add_argument("--warmup", type=int, default=15)
     parser.add_argument("--interval", type=int, default=5)
     parser.add_argument("--base-url", default="http://127.0.0.1:5001")
+    parser.add_argument("--camera", default="face_camera")
+    parser.add_argument("--expected-identity")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    if args.seconds <= 0 or args.warmup < 0:
+        parser.error("--seconds must be positive and --warmup cannot be negative")
+    if args.warmup + args.seconds > 90:
+        parser.error("face replay measurement must be at most 90 seconds")
 
     initial_stats = get_json(f"{args.base_url}/api/stats")
     cameras = sorted(initial_stats["cameras"])
@@ -150,6 +209,7 @@ def main() -> int:
                 name: detector["inference_speed"]
                 for name, detector in stats["detectors"].items()
             },
+            "embeddings": stats.get("embeddings", {}),
         }
         samples.append(sample)
         print(json.dumps(sample), flush=True)
@@ -201,6 +261,28 @@ def main() -> int:
             if name.startswith("camera-replay-")
         ]
     )
+    events = get_json(
+        f"{args.base_url}/api/events?camera={args.camera}&label=person&limit=200&include_thumbnails=0"
+    )
+    face_events = [
+        face_event_result(event)
+        for event in events
+        if float(event.get("start_time") or 0) >= wall_started
+    ]
+    predictions = [event["identity"] for event in face_events]
+    expected = args.expected_identity
+    if expected:
+        recognition_precision, recognition_recall = score_ground_truth(
+            predictions, expected
+        )
+    else:
+        recognition_precision = None
+        recognition_recall = None
+    recognition_latencies = sorted(
+        float(event["capture_to_recognition_ms"])
+        for event in face_events
+        if event["capture_to_recognition_ms"] is not None
+    )
     camera_summary = {}
     for camera in cameras:
         values = [sample["cameras"][camera] for sample in steady]
@@ -221,7 +303,7 @@ def main() -> int:
     face_limits = {
         "first_attempt_ms_max": 750,
         "confirmed_ms_max": 1500,
-        "embedding_ms_max": 200,
+        "embedding_ms_p95": 200,
     }
     summary = {
         "duration_seconds": round(time.monotonic() - started, 2),
@@ -242,8 +324,33 @@ def main() -> int:
         "snapshot_metrics": snapshot_metrics,
         "restart_delta": restart_delta,
         "publisher_count": publisher_count,
+        "calls_per_second": {
+            key: max(
+                (float(sample["embeddings"].get(key, 0)) for sample in steady),
+                default=0,
+            )
+            for key in ("face_recognition", "plate_recognition", "yolov9_plate_detection")
+        },
         "memory_bytes_max": max(memory_samples, default=0),
         "shm_percent_max": max(shm_samples, default=0),
+        "ground_truth": {
+            "camera": args.camera,
+            "expected_identity": expected,
+            "passage_detection_recall": float(bool(face_events)),
+            "recognition_precision": recognition_precision,
+            "recognition_recall": recognition_recall,
+            "capture_to_recognition_ms_p50": (
+                statistics.median(recognition_latencies)
+                if recognition_latencies
+                else None
+            ),
+            "capture_to_recognition_ms_p95": (
+                float(np.percentile(recognition_latencies, 95))
+                if recognition_latencies
+                else None
+            ),
+            "events": face_events,
+        },
         "samples": samples,
         "face_metrics": face_metrics,
     }
@@ -268,7 +375,7 @@ def main() -> int:
         and snapshot_metrics["failed"] == 0
         and snapshot_metrics["camera_mismatch"] == 0
         and all(delta == 0 for delta in restart_delta.values())
-        and publisher_count == 1
+        and publisher_count == len(cameras)
         and summary["memory_bytes_max"] <= 7 * 1024**3
         and summary["shm_percent_max"] < 70
     )

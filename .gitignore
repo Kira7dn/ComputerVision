@@ -44,3 +44,4 @@ frigate/
 output/
 runtime/
 dahua_sdk/
+models/
