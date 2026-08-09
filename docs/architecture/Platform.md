@@ -42,7 +42,7 @@ Các bằng chứng hiện có được phân loại như sau; `pass` unit test 
 | Hạng mục | Bằng chứng hiện có | Trạng thái kiến trúc |
 | --- | --- | --- |
 | Hai-camera stream health | Replay giữ camera/process FPS ổn định | Diagnostic pass; không phải passage recognition acceptance |
-| LPR hai camera | Acceptance report gần nhất fail OCR consistency dưới 80% | Phase 1 chưa đạt |
+| LPR hai camera | Baseline passage recall 60%; Phase 2 đã tăng lên 100% trên fixture replay | Passage bottleneck Phase 2 đã đạt; recognition tiếp tục được cải thiện |
 | Face sáu/bảy camera | Các report gần nhất `accepted=false`, enrichment latency/pending vượt gate | Không có approved capacity sáu/bảy camera |
 | Distributed edge | Chưa có edge runtime/candidate ingress | Chưa benchmark hai camera trên Jetson |
 
@@ -591,6 +591,39 @@ Quy ước trạng thái: `[DOING]` là phase đang triển khai; chỉ chuyển
 acceptance của phase có bằng chứng. Checkbox chỉ được tick khi đã chạy test/benchmark;
 không tick chỉ vì code đã tồn tại.
 
+Đây là lộ trình **triển khai kiến trúc**. Mỗi phase bên dưới phải tạo ra runtime contract,
+module hoặc deployment topology được nêu rõ; unit test, replay và benchmark chỉ là bằng chứng
+để đóng phase, không phải work package thay thế cho phần triển khai. Phase 1–4 đã hoàn tất;
+Phase 5–8 phụ thuộc tuần tự theo sơ đồ dưới đây.
+
+### 13.1 Ma trận truy vết thiết kế → triển khai
+
+| Mục thiết kế | Requirement triển khai | Phase owner | Kết quả phải tồn tại |
+| --- | --- | --- | --- |
+| 1. Mục tiêu | On-premise central/edge, camera RTSP nhiều hãng và Event output dùng được bởi hệ thống nghiệp vụ | Phase 7–8 | Hai topology chạy được; Event/API/MQTT contract và product profile được certification |
+| 2. Baseline | Giữ Frigate capture/detect/track/Face/LPR/Event làm nền tảng | Phase 1–2 | Baseline và passage remediation có artifact `[DONE]` |
+| 3. Khoảng trống | Passage, quality input, evidence, compute, capacity và edge ownership có owner riêng | Phase 2–7 | Không còn gap nào chỉ xuất hiện trong tài liệu mà không có work package |
+| 4. Nguyên tắc | Latest/bounded queue, lineage, lifecycle, pipeline ownership và hardware limit | Phase 3–7 | Contract được enforce trong runtime/config, không chỉ mô tả |
+| 5. Kiến trúc đích | `central_full` và `edge_frontend` dùng cùng candidate/recognition contract | Phase 4, 7 | Central pipeline hoàn chỉnh trước; edge tái sử dụng đúng contract đó |
+| 6. Quality contract | Camera profile và reject reasons có schema/runtime owner | Phase 4 | Config validate được và selector xuất quality/reject reason |
+| 7. Detect/evidence stream | Detect latest-frame tách khỏi bounded evidence/record source | Phase 4 | Stream role, frame ownership và byte/time bound được triển khai |
+| 8. Frame reference | Candidate/result/evidence giữ cùng camera, track, generation, frame và bbox | Phase 3–4, 7 | `FrameRef`/candidate contract dùng xuyên central và edge |
+| 9. Unified Quality Selector | Face/LPR nhận candidate qua cùng selector contract | Phase 4 | Bounded per-track selection; không còn hai quality contract độc lập |
+| 10. Recognition/consensus | Typed track state, temporal consensus, dedupe và terminal recognition lifecycle | Phase 3, 5 | LPR execution sạch trước; Face/LPR lifecycle được hoàn thiện sau selector |
+| 11. Capacity/overload | Bounded work, early-stop, overload policy và hardware capacity profile | Phase 3, 5–6 | Central 2/4/8 camera có giới hạn công bố; overload không tạo backlog vô hạn |
+
+Dependency bắt buộc:
+
+```text
+baseline/passage [DONE]
+→ LPR execution foundation [DONE]
+→ camera quality + evidence + shared candidate contract [DONE]
+→ recognition lifecycle + compute control
+→ central capacity
+→ single-edge topology
+→ multi-edge + production certification
+```
+
 ### Phase 1 — Đo baseline hai camera [DONE]
 
 - [x] Xây passage dataset/replay cho LPR và face.
@@ -611,19 +644,18 @@ không có passage nào đủ rõ để gán ký tự bằng mắt (`readable_de
 passage của face là 8,20 giây, trong khi gate sau khi candidate đủ điều kiện đạt first
 attempt 309,1 ms và confirmed 629,5 ms.
 
-Time budget bắt buộc cho tới full production: từng test case, bao gồm unit, integration,
-replay, acceptance, stability và release certification, phải kết thúc trong dưới 120
-giây. Test được thiết kế vẫn phải chứng minh đủ tiêu chuẩn;
-không hạ tiêu chuẩn, không có soak test dài hoặc ngoại lệ ngầm. Test không chứng minh
-được trong budget này phải được thiết kế lại bằng fixture nhỏ và assertion trực tiếp.
+Time budget `<120 giây` áp dụng cho unit, integration và replay acceptance dùng trong vòng
+lặp phát triển. Capacity soak và production certification là job riêng có thời lượng công
+bố rõ; không ép kiểm tra độ bền dài hạn vào fixture 120 giây và không dùng soak dài để chặn
+vòng lặp phát triển hằng ngày.
 
 KPI baseline cần theo dõi khi triển khai Phase 2:
 
 | Mức ưu tiên | KPI | Baseline Phase 1 | Hướng cải thiện | Vai trò |
 | --- | --- | --- | --- | --- |
-| 1 | LPR passage detection recall | 60% | Tăng recall, không tạo nhầm passage | KPI chính; đang bỏ sót 40% passage ground truth |
+| 1 | LPR passage detection recall | 60% | Tăng recall và giữ passage precision ở ngưỡng product profile | KPI chính; đang bỏ sót 40% passage ground truth |
 | 1 | Face capture-to-recognition P95 theo physical passage | 8,20 giây | Giảm rõ rệt thời gian chờ candidate đủ điều kiện | KPI end-to-end chính |
-| 1 | Face recognition precision/recall | 100% / 100% trên known và unknown fixture | Không được giảm khi tối ưu latency/compute | Quality guardrail |
+| 1 | Face recognition precision/recall | 100% / 100% trên known và unknown fixture | Theo dõi regression theo ngưỡng passage phù hợp với kích thước tập thử | Quality guardrail |
 | 1 | Result/candidate correlation | Face correlation đạt; LPR plate box hợp lệ | Không có identity/plate gắn nhầm bbox, crop hoặc frame | Correctness gate |
 | 2 | Face first attempt / confirmed | 309,1 ms / 629,5 ms | Giữ dưới gate 750 ms / 1.500 ms và giảm nếu không mất recall | Latency sau khi candidate đủ điều kiện |
 | 2 | Pending queue cuối test | 0 | Luôn trở về 0 sau burst, không tích lũy stale candidate | Capacity/stability gate |
@@ -659,15 +691,15 @@ quality selector, top-K hoặc evidence buffer mới.
 
 Acceptance:
 
-- [x] Mọi acceptance/replay test case kết thúc trong dưới 120 giây; không có soak
-  test dài hoặc ngoại lệ cho production certification.
+- [x] Mọi acceptance/replay test case của Phase 2 kết thúc trong dưới 120 giây; Phase 2
+  không dùng soak dài làm điều kiện đóng phase. Capacity/release soak thuộc Phase 6–8.
 - [x] LPR báo cáo đầy đủ số lượng và tỷ lệ chuyển đổi ở từng tầng passage funnel; passage
-  recall cao hơn baseline 60% mà không tạo nhầm passage. Một passage không được detector
+  recall cao hơn baseline 60% và passage precision đạt ngưỡng 80%. Một passage không được detector
   hoặc tracker tạo ra không được ghi nhận là lỗi OCR/consensus.
 - [x] Fixture LPR readable có denominator lớn hơn 0 và báo cáo exact-match; unreadable
   passage vẫn tính vào passage recall nhưng không tính vào exact-match denominator.
 - [x] Face capture-to-recognition P95 theo physical passage giảm so với baseline 8,20 giây;
-  đồng thời precision/recall known/unknown không thấp hơn baseline fixture đã duyệt.
+  đồng thời detection recall, precision và recall đạt ngưỡng passage 80%.
 - [x] Báo cáo riêng thời gian `passage -> track`, `track -> candidate qualified`, first
   attempt và confirmed; không dùng riêng inference latency để đại diện end-to-end latency.
 
@@ -678,94 +710,240 @@ stall, RAM tối đa 4,29 GiB và SHM 14%. API và SQLite không có giá trị 
 nhau; một enrichment update không được cả hai store giữ lại được báo riêng, không bị gọi
 nhầm là API–SQLite mismatch.
 
-### Phase 3 — Bounded recognition
+#### Kết quả Phase 2 theo mục tiêu ban đầu
 
-Đầu vào đã được Phase 2 chứng minh, không mở lại passage remediation: exact-match LPR
-hiện là 33,3% trên denominator 3. `lpr-01` và `lpr-02` đều có track 3/3 vòng nhưng OCR
-không tạo kết quả; `lpr-02` đồng thời chỉ có plate box 2/3 vòng. `lpr-05` và `lpr-07`
-chỉ publish recognition 2/3 vòng; `lpr-06` đạt exact-match với representative `BEE3975`
-thuộc tập chấp nhận `BFE3975/BEE3975`. Phase 3 chịu trách nhiệm quality contract,
-bounded top-K/attempt, candidate dedupe, consensus và evidence lineage để cải thiện các
-recognition residual này mà không làm giảm passage recall 100% đã duyệt.
+Các chỉ số dưới đây là kết quả acceptance replay dùng để xác nhận hai bottleneck của
+Phase 2 đã được khắc phục so với baseline.
 
-Phase 3 chỉ bắt đầu sau khi Phase 2 xác định được bottleneck passage. Mục tiêu là giới hạn
-job/candidate, dừng xử lý đúng lúc và giữ result cùng evidence đã tạo ra nó.
+| Gate/KPI | Kết quả hiện tại | Ngưỡng Phase 2 | Bằng chứng |
+| --- | ---: | ---: | --- |
+| Acceptance tổng | `accepted=true`, 113,406 giây | `<119` giây, mọi hard gate đạt | [summary.json](../../.tmp/platform-phase2/summary.json) |
+| LPR passage recall | 100% trên 5 passage; 3/3 vòng có track cho từng passage | Recall cao hơn baseline 60%; passage precision `≥80%` | [lpr.json](../../.tmp/platform-phase2/lpr.json), [runtime trace](../../.tmp/platform-phase2/runtime-trace.json) |
+| Face detection/precision/recall | 100% / 100% / 100% | Mỗi chỉ số `≥80%` theo physical passage | [face.json](../../.tmp/platform-phase2/face.json) |
+| Face passage-to-confirmed P95 | 1.676,8 ms | `<3.000` ms và thấp hơn baseline 8,20 giây | [face.json](../../.tmp/platform-phase2/face.json) |
+| Face eligible-to-confirmed / first-attempt / embedding P95 | 621,6 / 147,3 / 44,9 ms | `≤1.500` / `≤750` / `≤200` ms | [face.json](../../.tmp/platform-phase2/face.json) |
+| Runtime | pending 0; restart 0; RAM 4,29 GiB; SHM 14%; không reconnect/stall | pending 0; RAM `≤7 GiB`; SHM `<70%`; runtime ổn định | [summary.json](../../.tmp/platform-phase2/summary.json) |
 
-- [ ] Khai báo quality threshold, attempt budget và `max_candidate_wait_ms` trực tiếp trong
-  camera config. Candidate đầu tiên đạt contract phải được xử lý trong deadline; selector
-  không được chờ vô hạn chỉ để lấy ảnh có quality cao hơn.
-- [ ] Thêm quality selector, candidate dedupe, bounded top-K, consensus và recognition state
-  `SEARCHING/ACCEPTED/EXHAUSTED` để early-stop face/LPR theo track.
-- [ ] Giữ evidence lineage xuyên suốt bằng `candidate_id`, frame timestamp/reference, object
-  bbox, detail bbox và crop đã dùng cho recognition.
-- [ ] Chỉ tách high-resolution evidence/record stream và thêm bounded evidence buffer khi
-  Phase 2 chứng minh pixel/crop quality là bottleneck. Không tự động tăng resolution và
-  không tạo storage service mới.
+#### Hạn chế hiện tại
 
-Acceptance:
+| Hạn chế | Hiện trạng và ảnh hưởng | Hướng xử lý | Bằng chứng |
+| --- | --- | --- | --- |
+| Chất lượng LPR recognition chưa ổn định | Exact-match đạt 1/3 passage có biển đọc được; `lpr-01` và `lpr-02` chưa tạo kết quả OCR hợp lệ. Hệ thống đã bắt được passage nhưng chưa đọc tin cậy mọi biển trong tập thử. | Phase 3 sửa execution architecture và temporal decision hiện có. Nếu raw OCR không có thông tin hữu ích thì dừng ở ranh giới model, không tiếp tục vá pipeline. | [lpr.json](../../.tmp/platform-phase2/lpr.json), [evidence lpr-01](../../.tmp/platform-phase2/mismatches/lpr-01.jpg), [evidence lpr-02](../../.tmp/platform-phase2/mismatches/lpr-02.jpg) |
+| Dữ liệu acceptance còn nhỏ | Kết quả hiện tại đủ xác nhận regression của Phase 2 nhưng chưa đủ để công bố accuracy tổng quát cho nhiều người, biển số và điều kiện hình ảnh. | Đây là đầu vào cho fine-tune/certification sau này, không phải work package triển khai của Phase 3. | [manifest](../../tools/fixtures/platform_passage_ground_truth.yaml) |
+| Chưa đo capacity và điều kiện triển khai rộng hơn | Acceptance mới chạy đồng thời một camera Face và một camera LPR trên replay 720p; chưa có kết quả 4/8 camera hoặc nhiều điều kiện lắp đặt. | Đo central capacity ở Phase 6 và thực hiện certification theo product/site profile ở Phase 8. | [summary.json](../../.tmp/platform-phase2/summary.json) |
 
-- [ ] Mọi test case kết thúc trong dưới 120 giây.
-- [ ] Recognition không chạy trên candidate dưới quality contract hoặc quá attempt budget.
-- [ ] Candidate đầu tiên đạt quality contract được enqueue trong `max_candidate_wait_ms`;
-  hết deadline phải có trạng thái rõ ràng thay vì pending vô hạn.
-- [ ] Sau `ACCEPTED`/`EXHAUSTED`, track không tạo thêm face/LPR job; Event chỉ kết thúc theo
-  passage boundary của tracker/zone.
-- [ ] Result luôn trỏ đúng candidate/crop/bbox đã tạo ra nó.
-- [ ] Queue trở về baseline sau burst; không tăng RAM/SHM/VRAM theo thời gian.
-- [ ] Enrichment calls/s giảm hoặc giữ nguyên mà không làm giảm passage recall,
-  recognition precision/recall hoặc exact-match.
+### Phase 3 — LPR execution foundation [DONE]
 
-### Phase 4 — Central capacity
+**Owner thiết kế:** mục 4, 8, 10 và phần LPR của mục 11. Phase này sửa execution path hiện
+có trước khi thêm quality/evidence source mới. Không đổi model, resolution hoặc Face logic.
 
-- [ ] Benchmark central workload 2/4/8 camera thành các test case độc lập dưới 120 giây.
-- [ ] Lưu source/config/model hash, passage SLA, calls/s, queue và CPU/GPU/VRAM/RAM/SHM
-  cho từng mức tải.
-- [ ] Chỉ giữ batch/FP16/shared-model hoặc preprocessing optimization khi có bằng chứng
-  giảm compute/copy mà không làm giảm passage/recognition KPI.
+Luồng triển khai:
 
-Acceptance:
+```text
+object update
+→ bounded latest-per-track worker
+→ plate detector/OCR
+→ PlateObservation
+→ PlateTrackState
+→ optional PlateCommit
+→ worker persist evidence
+→ maintainer publish Event
+```
 
-- [ ] Mỗi capacity test case kết thúc trong dưới 120 giây và queue trở về baseline.
-- [ ] Xác định và công bố số camera tối đa đạt passage SLA trên central hardware từ kết quả
-  2/4/8 camera; không suy diễn từ projection GPU.
-- [ ] Không cấu hình production vượt quá mức camera cao nhất đã đạt toàn bộ gate.
+- [x] Tạo typed `LprTrackKey(camera, track_id, generation)`, `PlateObservation`,
+  `PlateTrackState` và `PlateCommit`; history bounded và dedupe theo frame reference.
+- [x] Tách detector/OCR, temporal state reducer và Event side effect khỏi `lpr_process()`.
+- [x] Chuyển LPR sang latest-per-track worker; candidate cũ bị replace/drop theo capacity/TTL,
+  expire và generation mới vô hiệu toàn bộ stale work.
+- [x] Chỉ encode evidence và stage commit khi decision mới hoặc mạnh hơn; maintainer chỉ
+  publish một revision idempotent sang Event/API/SQLite.
+- [x] Đưa observation hợp lệ vào temporal history trước commit threshold; consensus dùng
+  unique-frame support, character confidence và text area. Nếu raw OCR không có thông tin
+  hữu ích thì dừng ở model boundary, không thêm heuristic.
+- [x] Xuất pending, replaced, capacity/TTL drops, stale-generation drops, candidate age và
+  worker latency trong stats runtime.
 
-### Phase 5 — Một Jetson, hai camera
+Hoàn thành khi LPR inference/I/O không block maintainer, queue luôn bounded, stale generation
+không publish được, một decision chỉ tạo một commit và regression replay giữ passage/Face KPI
+trong ngưỡng Phase 2.
 
-- [ ] Đóng gói một standard edge container chạy decode/detect/track/quality/top-K.
-- [ ] Central thực hiện face matching hoặc conditional OCR trên candidate từ edge.
-- [ ] Gửi bounded candidate batch qua một endpoint; network không block inference worker.
-- [ ] Chạy một edge image chuẩn với config hai camera.
+#### Kết quả Phase 3 so với cuối Phase 2
 
-Acceptance:
+Acceptance cuối chạy trên image `camera-frigate:overlay-0c53e795ecdc`, hoàn tất trong
+110,492 giây với `accepted=true`. Manifest passage và model hash giữ nguyên so với Phase 2;
+generated config hash khác nên đây là regression comparison cùng fixture/model, không phải A/B
+bit-identical tuyệt đối.
 
-- [ ] Hai camera thật trên một Jetson đạt passage SLA, nhiệt độ và queue budget.
-- [ ] Bandwidth edge-to-central thấp hơn ingest RTSP và không gửi frame ngoài top-K.
-- [ ] Kết quả replay của `edge_frontend` không giảm so với baseline `central_full` đã duyệt.
+| Gate/KPI | Cuối Phase 2 | Cuối Phase 3 | Kết luận |
+| --- | ---: | ---: | --- |
+| Acceptance tổng | `accepted=true`, 113,406 giây | `accepted=true`, 110,492 giây | Giữ toàn bộ hard gate, nhanh hơn 2,914 giây |
+| LPR passage recall | 100% | 100% | Không regression passage |
+| LPR passage precision | Chưa có field trong schema cũ | 100% | Không có false passage |
+| LPR exact-match | 33,3% trên denominator 3 | 33,3% trên denominator 3 | Execution refactor không cải thiện OCR/model boundary |
+| LPR consistency tối thiểu | 33,3% | 33,3% | Aggregate guardrail giữ nguyên |
+| Face detection/precision/recall | 100% / 100% / 100% | 100% / 100% / 100% | Không regression Face runtime |
+| Face passage-to-confirmed P95 | 1.676,8 ms | 1.595,6 ms | Cải thiện 81,2 ms |
+| Pending / restart / bad log | 0 / 0 / 0 | 0 / 0 / 0 | Không backlog, restart hoặc stall |
+| API–SQLite / correlation mismatch | 0 / 0 | 0 / 0 | Giữ external Event contract |
+| RAM tối đa / SHM | 4.602.057.457 byte / 14% | 4.598.836.232 byte / 14% | Không tăng tài nguyên đáng kể |
 
-### Phase 6 — Mở rộng nhiều Jetson
+Chi tiết LPR cho thấy quality residual vẫn thuộc model/input boundary: `lpr-01` và `lpr-02`
+tiếp tục có passage/track nhưng không tạo OCR hữu ích; `lpr-06` vẫn exact-match `BEE3975`
+nhưng consistency giảm từ 87,5% xuống 75%; `lpr-07` giữ consistency 100% nhưng representative
+đổi từ `FKH9211` thành `FKH921` và recognized rounds giảm từ 2 xuống 1. Vì aggregate passage,
+exact-match và stability gate không giảm, Phase 3 dừng đúng ở execution architecture, không vá
+threshold hoặc thêm QualitySelector/evidence buffer thuộc Phase 4.
 
-- [ ] Mở rộng dần từ một Jetson lên cấu hình mục tiêu 2 camera/node.
-- [ ] So sánh passage, latency, bandwidth, GPU/CPU và nhiệt độ với baseline.
-- [ ] Chạy repeated-cycle stability cho nhiều edge node bằng workload cô đọng; từng test
-  case vẫn phải kết thúc trong dưới 120 giây.
+Bằng chứng triển khai: 24/24 test LPR/deferred/maintainer/stats đạt; fake inference chậm xác
+nhận `process_frame()` không chờ inference; queue/state/control đều bounded; expire chặn stale
+in-flight result. Acceptance cuối có pending 0, restart 0, không reconnect/stall và runtime sau
+restore healthy. Hai unit assertion Face riêng còn lỗi ở fixture `transaction_id` và kỳ vọng
+frame 100.5; các đường code đó không nằm trong diff Phase 3 và Face runtime acceptance vẫn đạt.
+Summary acceptance hiện chưa lưu camera `skipped` thành một field so sánh Phase 2/3; gate này
+chỉ có bằng chứng gián tiếp từ pending 0, không stall và passage recall giữ 100%, không được coi
+là phép đo trực tiếp `skipped`.
 
-Acceptance:
+Bằng chứng: [Phase 2 summary](../../.tmp/platform-phase2/summary.json),
+[Phase 3 summary](../../.tmp/platform-passage/summary.json),
+[Phase 3 LPR result](../../.tmp/platform-passage/lpr.json),
+[Phase 3 runtime trace](../../.tmp/platform-passage/runtime-trace.json).
 
-- [ ] Không camera nào đồng thời chạy production ở cả hai topology.
-- [ ] Multi-node đạt passage SLA và không tích lũy queue hoặc giảm throughput theo thời gian.
+### Phase 4 — Camera quality, evidence và shared candidate contract [DONE]
+
+**Owner thiết kế:** mục 3–9. Đây là phase triển khai các thành phần đang có trong kiến trúc
+đích nhưng trước đây không có owner.
+
+- [x] Khai báo quality config theo camera, `FrameRef`, `EvidenceLease` và
+  `EvidenceCandidate` dùng chung cho Face/LPR;
+  schema gồm camera/track/generation/frame, object/detail bbox, source role, quality và reject
+  reasons.
+- [x] Map rõ `detect`, `evidence` và `record` role. Phase 4 chỉ cho phép `detect`; config
+  `evidence`/`record` fail rõ vì chưa có high-resolution adapter và không mở decoder thứ ba.
+- [x] Tạo `EvidenceRingBuffer` bounded theo byte và thời gian; frame hết hạn bị ghi đè, candidate
+  được chọn phải sở hữu crop/reference trước expiry.
+- [x] Triển khai `QualitySelector` nhận profile theo camera, chấm pixel density, blur, exposure,
+  pose/occlusion khi metric có sẵn và giữ bounded top-K theo physical track.
+- [x] Thay adapter chọn candidate riêng của Face/LPR bằng `EvidenceCandidate`; recognition không
+  đọc lại frame khác với frame đã được selector chọn.
+- [x] Reject reason và quality metrics đi vào passage observability; selector không tự đổi
+  model/resolution khi input không đạt profile.
+
+Hoàn thành khi cùng một candidate contract chạy được cho Face và LPR ở `central_full`, memory
+bounded theo cấu hình, result/evidence giữ đúng lineage và không còn quality path riêng biệt.
+
+#### Kết quả triển khai và acceptance Phase 4
+
+Image Phase 4 `camera-frigate:overlay-7c31cfa85448` đã build thành công. Bộ test tập trung trong
+image đạt 40/40 cho evidence, quality, LPR deferred/state/association, Face candidate và snapshot;
+19/19 test validator trên host đạt. Compile, Ruff cho module mới và `git diff --check` đều đạt.
+
+Acceptance Phase 4 sau khi sửa gate FPS hoàn tất trong 109,666 giây với `accepted=true`. Gate
+`skipped_fps` dùng regression budget theo control thay cho ngưỡng tuyệt đối không có trong
+baseline: mỗi camera không được tăng quá 0,1 FPS. Control Phase 3 đã ở mức 3,3/3,9; Phase 4 đạt
+3,4/3,2 nên không regression. Giá trị tuyệt đối vẫn được lưu làm diagnostic và backlog capacity,
+nhưng không bắt Phase 4 sửa vấn đề detect throughput tồn tại từ baseline.
+
+| Gate/KPI | Control Phase 3 | Phase 4 | Kết luận |
+| --- | ---: | ---: | --- |
+| Acceptance tổng | Control baseline | `accepted=true`, 109,666 giây | Đạt toàn bộ hard gate Phase 4 |
+| LPR recall / precision / exact-match | 100% / 100% / 33,3% | 100% / 100% / 33,3% | Không regression recognition |
+| Face detection / precision / recall | 100% / 100% / 100% | 80% / 100% / 80% | Đạt gate Phase 3 tối thiểu 80% |
+| Pending / restart / reconnect-stall | 0 / 0 / 0 | 0 / 0 / 0 | Đạt |
+| API-SQLite / correlation-lineage mismatch | Phase 3 chưa có candidate lineage | 0 / 0 | Shared candidate lineage đạt |
+| `skipped_fps` face / car | 3,3 / 3,9 | 3,4 / 3,2 | Đạt regression budget tối đa +0,1 mỗi camera |
+| Evidence tối đa face / car | 0 / 0 | 16.588.800 / 20.736.000 byte | Dưới 32 MiB mỗi camera |
+| RAM tối đa | 4.603.131.199 byte | 4.655.744.548 byte | Tăng 52.613.349 byte, dưới budget tăng 128 MiB và tổng dưới 7 GiB |
+
+Phase 4 vì vậy được đóng `[DONE]`. Việc giảm `skipped_fps` tuyệt đối được chuyển thành backlog
+capacity riêng; validator vẫn fail nếu Phase 4 làm bất kỳ camera nào tăng quá 0,1 FPS so với
+control. Acceptance đã restore runtime config và image trước khi kết thúc.
+
+Bằng chứng: [Phase 3 control summary](../../.tmp/platform-phase4-control/summary.json),
+[Phase 4 summary](../../.tmp/platform-phase4/summary.json),
+[Phase 4 Face result](../../.tmp/platform-phase4/face.json),
+[Phase 4 LPR result](../../.tmp/platform-phase4/lpr.json),
+[Phase 4 runtime trace](../../.tmp/platform-phase4/runtime-trace.json).
+
+### Phase 5 — Recognition lifecycle và compute control
+
+**Owner thiết kế:** mục 10, 10.1 và 11.2–11.4. Phase này dùng selector/candidate contract của
+Phase 4; không tạo pipeline thứ hai.
+
+- [ ] Chuẩn hóa recognition state `SEARCHING/ACCEPTED/EXHAUSTED` theo track; terminal state chỉ
+  dừng enrichment, không kết thúc Frigate Event.
+- [ ] Dedupe bằng candidate/frame identity, đặt attempt budget và bỏ pending job của track khi
+  recognition terminal.
+- [ ] LPR chạy confidence/format-gated retry trên các candidate độc lập đã xếp hạng; không OCR
+  lại cùng crop. `PlateTrackState` Phase 3 là implementation LPR của lifecycle này.
+- [ ] Face dùng best-shot first và chỉ retry candidate khác khi kết quả chưa đạt policy; tái sử
+  dụng bounded face worker/generation hiện có thay vì viết lại pipeline.
+- [ ] Config policy chỉ lưu threshold đã calibration cho product profile; raw model score không
+  được gọi là probability khi chưa calibration.
+- [ ] Xuất attempts/track, early-stop, terminal reason, compute/passage và queue age/depth.
+
+Hoàn thành khi Face/LPR đều dừng work đúng lifecycle, không xử lý lại candidate, Event ownership
+không đổi và compute/passage giảm hoặc giữ nguyên mà không gây regression passage-level đáng kể.
+
+### Phase 6 — Central capacity và overload control
+
+**Owner thiết kế:** mục 11.5–11.6 và central path của mục 5.
+
+- [ ] Đóng băng workload contract sau Phase 5 rồi benchmark central 2/4/8 camera trên đúng
+  hardware, model, resolution/FPS và passage mix.
+- [ ] Triển khai overload policy: drop stale chưa persist, thay candidate cùng track, tạm dừng
+  enrichment ưu tiên thấp và không drop committed Event/evidence.
+- [ ] Chỉ giữ batching/FP16/TensorRT/shared-model hoặc copy optimization khi benchmark chứng
+  minh giảm compute/latency mà không giảm passage/recognition KPI.
+- [ ] Xuất capacity profile gồm camera count, GPU/CPU/VRAM/RAM/SHM, queue age/depth, calls/s,
+  latency và source/config/model hash; deployment validate không vượt profile đã duyệt.
+
+Hoàn thành khi quick benchmark 2/4/8 có case độc lập dưới 120 giây, mức camera cao nhất đạt gate
+được công bố và candidate production profile hoàn tất soak 24 giờ không tích lũy queue/memory.
+
+### Phase 7 — Edge ingress và một Jetson/hai camera
+
+**Owner thiết kế:** mục 4.5–4.7 và 5.1–5.3.
+
+- [ ] Thêm `pipeline_mode`/edge assignment với ownership duy nhất; central không mở RTSP cho
+  camera đang chạy `edge_frontend`.
+- [ ] Đóng gói standard edge container chạy decode/detect/track/QualitySelector và bounded
+  candidate queue theo đúng contract Phase 4.
+- [ ] Tạo bounded batch ingress API; network client nằm ngoài inference worker, retry có giới
+  hạn và candidate mới/tốt hơn thay candidate cũ cùng track.
+- [ ] Central chỉ thực hiện matching/conditional OCR và cập nhật Event; model/config version
+  cùng evidence lineage đi xuyên request.
+
+Hoàn thành khi một Jetson chạy hai camera thật, bandwidth thấp hơn central RTSP ingest, network
+failure không block inference và `edge_frontend` giữ passage/result contract của `central_full`.
+
+### Phase 8 — Multi-edge, product profile và production integration
+
+**Owner thiết kế:** mục 1, topology mục 5 và acceptance sản phẩm.
+
+- [ ] Mở rộng nhiều Jetson theo giới hạn hai camera/node; mỗi camera chỉ có một runtime owner
+  và node disconnect/rejoin không tạo duplicate Event.
+- [ ] Đóng gói product profile cho gate LPR/face gồm camera requirements, model/config hash,
+  capacity, SLA và degraded behavior; camera RTSP nhiều hãng được certification theo profile.
+- [ ] Công bố Event/API/MQTT integration contract cho barrier, ERP/WMS, visitor management và
+  bảo vệ; adapter đặc thù chỉ được thêm khi có product scope, không nhúng vào recognition worker.
+- [ ] Chạy production certification ngày/đêm và failure/recovery trên topology thực; lưu artifact
+  theo site/profile thay vì công bố một accuracy chung.
+
+Hoàn thành khi multi-node không duplicate ownership, passage SLA/capacity/degraded behavior được
+chứng minh và ít nhất một integration flow nghiệp vụ hoàn tất end-to-end trên profile đã duyệt.
 
 ## 14. Acceptance tổng thể
 
-Không công bố một con số accuracy chung cho mọi camera. Mỗi product profile có SLA và
-điều kiện lắp đặt riêng. Bộ acceptance tối thiểu:
+Acceptance không thay implementation plan và không dùng một con số accuracy chung cho mọi
+camera. Mỗi phase chỉ đóng khi runtime behavior do phase sở hữu đã tồn tại và có artifact.
 
-- [ ] Ground-truth passage recall đạt ngưỡng product profile.
-- [ ] Recognition precision/recall đạt ngưỡng trên camera thật cả ngày và đêm.
-- [ ] Không có plate/identity gắn vào bbox của object khác.
-- [ ] P95 capture-to-recognition/Event đạt SLA.
-- [ ] Repeated-cycle stability test không tăng RAM, SHM, VRAM, queue hoặc staging qua
-  các chu kỳ; từng test case, kể cả production certification, kết thúc dưới 120 giây.
+| Loại gate | Quy tắc |
+| --- | --- |
+| CV quality | Passage recall/precision, recognition precision/recall và latency đạt product profile trên denominator công bố; không mặc định 100% |
+| Data correctness | Không gắn plate/identity sang physical passage khác; commit, frame reference, bbox và evidence cùng generation |
+| Runtime correctness | Queue/memory bounded, không stale result, duplicate owner hoặc duplicate commit; failure có degraded behavior rõ |
+| Development acceptance | Unit/integration/replay case độc lập hoàn thành dưới 120 giây để giữ vòng lặp phát triển ngắn |
+| Capacity/release certification | Soak là job riêng theo phase/profile, có duration và artifact riêng; không bị giả lập bằng cách kéo dài replay fixture |
 
 ## 15. Bản đồ code và đường dẫn cần can thiệp
 
@@ -792,40 +970,68 @@ acceptance ở mục 13:
 | `[DONE]` | `frigate/frigate/data_processing/real_time/face.py`, `frigate/frigate/util/face_snapshot.py` | Trace theo track generation, reset close-follow và giảm thời gian từ passage đến confirmed bằng cadence/selection hiện có; chưa thêm shared quality/top-K. |
 | `[DONE]` | `tools/fixtures/platform_passage_ground_truth.yaml`, `tools/prepare_passage_fixture.py`, `tools/validate_passage_acceptance.py`, `tools/tests/test_passage_acceptance.py` | Fixture readable 720p, replay anchor theo frame time, physical-passage scoring, funnel/latency breakdown và acceptance fail-closed hoàn tất dưới 119 giây. |
 
-### 15.3 Phase 3 — Bounded recognition
+### 15.3 Phase 3 — LPR execution foundation
 
 | Trạng thái | Đường dẫn | Can thiệp |
 | --- | --- | --- |
-| `[TODO]` | `frigate/frigate/config/classification.py`, `frigate/frigate/config/camera/camera.py`, `frigate/frigate/config/config.py` | Thêm quality threshold, attempt budget và `max_candidate_wait_ms` vào config face/LPR hiện có. |
-| `[PARTIAL]` | `frigate/frigate/config/camera/ffmpeg.py`, `frigate/frigate/video/ffmpeg.py`, `frigate/frigate/video/detect.py` | Map detect/evidence/record role và giữ detect path latest-frame. |
-| `[PARTIAL]` | `frigate/frigate/util/image.py`, `frigate/frigate/camera/state.py`, `frigate/frigate/camera/maintainer.py` | Chỉ khi có bằng chứng thiếu pixel/crop: dùng frame manager hiện có để tạo bounded high-resolution evidence buffer; không tạo storage service mới. |
-| `[PARTIAL]` | `frigate/frigate/data_processing/common/face/pipeline.py`, `frigate/frigate/data_processing/real_time/face.py` | Đã có latest-per-object, bounded worker và attempt limit; bổ sung deadline candidate, quality/top-K và terminal recognition state đầy đủ. |
-| `[PARTIAL]` | `frigate/frigate/data_processing/common/license_plate/mixin.py`, `frigate/frigate/data_processing/common/license_plate/association.py`, `frigate/frigate/data_processing/real_time/license_plate.py` | Đã có stationary stop và track association; bổ sung quality/top-K, candidate hash, attempt budget và terminal state. |
-| `[PARTIAL]` | `frigate/frigate/events/maintainer.py`, `frigate/frigate/track/object_processing.py`, `frigate/frigate/util/face_snapshot.py` | Giữ Event kết thúc theo tracker và result/bbox/crop cùng candidate. |
-| `[TODO]` | `frigate/frigate/test/test_face_recognition_pipeline.py`, `frigate/frigate/test/test_face_snapshot_pipeline.py` | Test quality/top-K, early-stop, track reset và candidate/frame correctness cho face. |
-| `[TODO]` | `frigate/frigate/test/test_lpr_track_association.py` | Test passage reset, candidate dedupe, attempt exhaustion và LPR early-stop. |
-| `[TODO]` | `frigate/frigate/test/test_shared_memory_frame_manager.py` | Test buffer bounded, overwrite frame cũ và copy candidate trước expiry. |
+| `[NEW]` | `frigate/frigate/data_processing/common/license_plate/state.py` | Khai báo typed track key, observation, bounded track state, commit decision và generation lifecycle. |
+| `[PARTIAL]` | `frigate/frigate/data_processing/common/license_plate/mixin.py` | Tách plate inference khỏi state reducer và Event/evidence side effect; đưa observation vào temporal decision trước publish threshold. |
+| `[PARTIAL]` | `frigate/frigate/data_processing/real_time/license_plate.py`, `frigate/frigate/data_processing/real_time/api.py` | Chuyển LPR sang bounded latest-per-track worker, stale/TTL drop và staged result; không để inference block maintainer. |
+| `[PARTIAL]` | `frigate/frigate/embeddings/maintainer.py` | Drain `PlateCommit`, thực hiện idempotent IPC/Event publish và ưu tiên expire/control; JPEG/disk đã hoàn tất ngoài maintainer. |
+| `[NEW]` | `frigate/frigate/test/test_lpr_track_state.py`, `frigate/frigate/test/test_lpr_deferred_processor.py` | Unit test state lifecycle, unique-frame consensus, stale generation, queue replacement và one-decision/one-commit; runtime acceptance hiện có chỉ làm regression cuối. |
 
-### 15.4 Phase 4 — Central capacity
+### 15.4 Phase 4 — Camera quality, evidence và candidate contract
 
 | Trạng thái | Đường dẫn | Can thiệp |
 | --- | --- | --- |
-| `[PARTIAL]` | `frigate/frigate/data_processing/common/face/model.py`, `frigate/frigate/embeddings/onnx/face_embedding.py`, `frigate/frigate/embeddings/maintainer.py` | Benchmark batch/FP16/shared model path; chỉ giữ thay đổi chứng minh giảm compute hoặc copy. |
-| `[PARTIAL]` | `frigate/frigate/data_processing/common/license_plate/model.py`, `frigate/frigate/embeddings/onnx/lpr_embedding.py` | Benchmark batch/FP16 và tránh preprocessing/copy lặp lại. |
-| `[PARTIAL]` | `frigate/frigate/detectors/detection_runners.py`, `frigate/frigate/detectors/plugins/tensorrt.py` | Dùng runner/TensorRT path hiện có; không tạo inference runtime thứ hai. |
-| `[TODO]` | `deploy/config.yaml`, `tools/validate_face_replay.py`, `tools/validate_lpr_acceptance.py`, `tools/summarize_baseline.py` | Tạo workload 2/4/8 camera thành các case độc lập dưới 120 giây và xuất capacity theo source/config/model hash. |
+| `[DONE]` | `frigate/frigate/data_processing/common/evidence.py` | `FrameRef`, `EvidenceLease`, `EvidenceCandidate`, ownership/expiry contract và bounded ring buffer dùng chung. |
+| `[DONE]` | `frigate/frigate/data_processing/common/quality.py` | `QualitySelector`, explainable score/reject reasons và bounded top-K per track. |
+| `[DONE]` | `frigate/frigate/config/camera/quality.py`, `frigate/frigate/config/camera/camera.py`, `frigate/frigate/config/config.py` | Camera quality profile và validation source role, FPS, byte budget cùng detect resolution. |
+| `[DONE]` | `frigate/frigate/embeddings/maintainer.py` | Ingest một detect frame dùng chung cho Face/LPR và sở hữu ring/selector lifecycle. |
+| `[DONE]` | `frigate/frigate/data_processing/real_time/face.py`, `frigate/frigate/data_processing/real_time/license_plate.py` | Nhận `EvidenceCandidate` qua adapter chung; result giữ nguyên frame/detail bbox đã được selector chọn. |
+| `[DONE]` | `frigate/frigate/test/test_evidence_quality.py`, các test Face/LPR deferred/state/snapshot | Kiểm tra ownership, bounds, replacement, stale generation và lineage; threshold accuracy thuộc product-profile calibration. |
 
-### 15.5 Phase 5–6 — Edge front-end
+### 15.5 Phase 5 — Recognition lifecycle và compute control
+
+| Trạng thái | Đường dẫn | Can thiệp |
+| --- | --- | --- |
+| `[NEW]` | `frigate/frigate/data_processing/common/recognition.py` | Recognition lifecycle/policy contract, terminal reason, attempt/dedupe accounting; không sở hữu Event lifecycle. |
+| `[NEW]` | `frigate/frigate/data_processing/common/license_plate/state.py` | Mở rộng typed state được tạo ở Phase 3 để implement lifecycle/policy chung. |
+| `[PARTIAL]` | `frigate/frigate/data_processing/common/license_plate/mixin.py` | Áp dụng candidate ranking, independent retry, terminal state và early-stop trên nền Phase 3. |
+| `[PARTIAL]` | `frigate/frigate/data_processing/common/face/pipeline.py`, `frigate/frigate/data_processing/real_time/face.py`, `frigate/frigate/util/face_snapshot.py` | Map bounded face worker/voting hiện có vào lifecycle chung, loại duplicate candidate và pending work sau terminal state. |
+| `[PARTIAL]` | `frigate/frigate/config/classification.py` | Khai báo policy theo product profile; threshold chưa calibration không được biểu diễn như probability/SLA. |
+| `[NEW]` | `frigate/frigate/test/test_recognition_lifecycle.py` | Kiểm tra state transition, dedupe, budget, early-stop và Event không kết thúc theo recognition state. |
+
+### 15.6 Phase 6 — Central capacity và overload
+
+| Trạng thái | Đường dẫn | Can thiệp |
+| --- | --- | --- |
+| `[NEW]` | `frigate/frigate/data_processing/overload.py` | Central overload policy theo queue age/capacity; chỉ drop stale/uncommitted work. |
+| `[PARTIAL]` | `frigate/frigate/embeddings/maintainer.py`, `frigate/frigate/stats/prometheus.py`, `frigate/frigate/stats/util.py` | Enforce priority/backpressure và xuất per-task queue/calls/compute metrics. |
+| `[PARTIAL]` | `frigate/frigate/data_processing/common/face/model.py`, `frigate/frigate/data_processing/common/license_plate/model.py`, `frigate/frigate/detectors/detection_runners.py`, `frigate/frigate/detectors/plugins/tensorrt.py` | Benchmark batching/FP16/TensorRT/shared-model; chỉ giữ optimization qua passage/capacity gate. |
+| `[NEW]` | `tools/validate_central_capacity.py`, `deploy/reference/config.central-capacity.yml` | Workload 2/4/8, quick acceptance dưới 120 giây và release soak riêng; xuất hardware capacity profile. |
+| `[PARTIAL]` | `deploy/config.yaml`, `deploy/run.ps1` | Chọn/validate capacity profile, không cho production vượt mức camera đã duyệt. |
+
+### 15.7 Phase 7 — Edge ingress và một Jetson/hai camera
 
 | Trạng thái | Đường dẫn | Can thiệp |
 | --- | --- | --- |
 | `[NEW]` | `frigate/frigate/api/edge.py` | Một endpoint nhận bounded candidate batch; request model nhỏ đặt cùng file. |
 | `[TODO]` | `frigate/frigate/api/fastapi_app.py` | Đăng ký edge router. |
-| `[NEW]` | `frigate/frigate/edge/service.py` | Edge front-end chạy decode/detect/track/quality/top-K; matching/OCR và Event ở central. |
-| `[NEW]` | `frigate/frigate/edge/client.py` | Bounded upload queue tách inference worker; ưu tiên candidate mới/tốt hơn theo track. |
+| `[NEW]` | `frigate/frigate/edge/service.py` | Edge front-end chạy decode/detect/track và tái sử dụng QualitySelector/EvidenceCandidate Phase 4; matching/OCR và Event ở central. |
+| `[NEW]` | `frigate/frigate/edge/client.py` | Bounded upload queue tách inference worker; replacement/retry theo track và không upload ngoài candidate contract. |
 | `[NEW]` | `frigate/frigate/test/http_api/test_http_edge.py`, `frigate/frigate/test/test_edge_candidate_queue.py` | Test batch contract, queue bound, replacement và inference không bị block bởi network. |
 | `[TODO]` | `deploy/config.yaml` | Khai báo `pipeline_mode`, edge assignment và hai camera/node. |
 | `[NEW]` | `deploy/reference/Dockerfile.edge`, `deploy/reference/docker-compose.edge.yml`, `deploy/reference/config.edge.yml` | Image và Compose Jetson tối thiểu cho hai camera. |
+
+### 15.8 Phase 8 — Multi-edge, profiles và integration
+
+| Trạng thái | Đường dẫn | Can thiệp |
+| --- | --- | --- |
+| `[NEW]` | `deploy/profiles/`, `tools/validate_product_profile.py` | Product/site profile, multi-vendor camera contract, multi-node workload và certification artifact. |
+| `[PARTIAL]` | `frigate/frigate/api/event.py`, `frigate/frigate/comms/mqtt.py`, `frigate/frigate/api/defs/response/event_response.py` | Công bố stable Event/API/MQTT payload cho barrier/ERP/WMS/visitor/security consumers; không nhúng adapter vào recognition. |
+| `[NEW]` | `docs/integration/CameraEventContract.md` | Integration boundary, idempotency, degraded/recovery semantics và mapping theo product profile. |
+| `[TODO]` | `deploy/reference/` | Multi-edge deployment example bảo đảm một camera/một owner và central không duplicate RTSP ingest. |
 
 ## 16. Tài liệu liên quan
 

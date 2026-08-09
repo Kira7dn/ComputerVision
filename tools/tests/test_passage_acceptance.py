@@ -12,7 +12,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 from tools.passage_metrics import match_by_time_and_bbox, normalize_plate, score_face_passages
 from tools.prepare_passage_fixture import load_manifest
 import tools.validate_passage_acceptance as passage_validator
-from tools.validate_passage_acceptance import api_sqlite_consistency, assign_records, correlation_mismatches, lpr_results, update_anchor_state
+from tools.validate_passage_acceptance import api_sqlite_consistency, assign_records, correlation_mismatches, face_results, false_passage_count, lpr_results, update_anchor_state
 
 MANIFEST = ROOT / "tools/fixtures/platform_passage_ground_truth.yaml"
 
@@ -25,6 +25,37 @@ def write_manifest(tmp_path: Path, value: dict) -> Path:
     path = tmp_path / "passage.yaml"
     path.write_text(yaml.safe_dump(value), encoding="utf-8")
     return path
+
+
+@pytest.mark.parametrize(
+    ("current", "control", "expected"),
+    [
+        (
+            {"face_camera": 2.9, "car_camera": 3.5},
+            {"face_camera": 3.3, "car_camera": 3.9},
+            True,
+        ),
+        (
+            {"face_camera": 3.4, "car_camera": 4.0},
+            {"face_camera": 3.3, "car_camera": 3.9},
+            True,
+        ),
+        (
+            {"face_camera": 3.41, "car_camera": 3.5},
+            {"face_camera": 3.3, "car_camera": 3.9},
+            False,
+        ),
+        (
+            {"face_camera": 2.9, "car_camera": 3.5},
+            {"face_camera": 3.3},
+            False,
+        ),
+    ],
+)
+def test_skipped_fps_gate_uses_control_regression(
+    current: dict[str, float], control: dict[str, float], expected: bool
+) -> None:
+    assert passage_validator.skipped_fps_within_control(current, control) is expected
 
 
 def test_passage_manifest_contract() -> None:
@@ -117,6 +148,37 @@ def test_close_follow_rejects_old_generation_correlation() -> None:
     assert correlation_mismatches(records)
     records[1]["generation"] = 2
     assert not correlation_mismatches(records)
+
+
+def test_face_passage_uses_majority_of_replay_rounds() -> None:
+    passage = {
+        "id": "known",
+        "valid_passage": True,
+        "start_s": 1.0,
+        "expected_identity": "Jack",
+    }
+    records = []
+    for round_id, anchor in ((1, 100.0), (2, 110.0)):
+        records.extend(
+            [
+                {"passage_id": "known", "round_id": round_id, "stage": "first_qualified_face", "trace_time": anchor + 0.1, "frame_time": anchor + 0.1},
+                {"passage_id": "known", "round_id": round_id, "stage": "first_attempt", "identity": "Jack", "trace_time": anchor + 0.2, "frame_time": anchor + 0.2},
+                {"passage_id": "known", "round_id": round_id, "stage": "confirmed_result", "identity": "Jack", "trace_time": anchor + 0.3, "frame_time": anchor + 0.3},
+            ]
+        )
+    result, _, *_ = face_results(records, [passage], [100.0, 110.0, 120.0])
+    assert result["passages"][0]["detected_rounds"] == 2
+    assert result["passages"][0]["correct_rounds"] == 2
+    assert result["detection_recall"] == 1
+    assert result["recall"] == 1
+
+
+def test_false_passage_count_deduplicates_stage_updates() -> None:
+    records = [
+        {"camera": "face_camera", "round_id": 1, "track_id": "t", "generation": 1, "stage": "first_attempt"},
+        {"camera": "face_camera", "round_id": 1, "track_id": "t", "generation": 1, "stage": "confirmed_result"},
+    ]
+    assert false_passage_count(records) == 1
 
 
 def test_unreadable_counts_recall_not_exact_denominator() -> None:

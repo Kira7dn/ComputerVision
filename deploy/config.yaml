@@ -224,6 +224,26 @@ cameras:
     face_recognition:
       enabled: true
       min_area: 750
+    quality: &phase4_quality
+      enabled: true
+      source_role: detect
+      buffer:
+        window_seconds: 3
+        max_bytes: 33554432
+        sample_fps: 5
+      top_k: 3
+      face:
+        min_detail_width_px: 24
+        min_detail_height_px: 24
+        min_laplacian_variance: 20
+        max_dark_fraction: 0.75
+        max_bright_fraction: 0.75
+      lpr:
+        min_detail_width_px: 24
+        min_detail_height_px: 14
+        min_laplacian_variance: 20
+        max_dark_fraction: 0.75
+        max_bright_fraction: 0.75
     review:
       alerts:
         enabled: false
@@ -253,6 +273,7 @@ cameras:
       improve_contrast: true
   car_camera:
     <<: *face_camera_defaults
+    quality: *phase4_quality
     friendly_name: Car Camera
     lpr:
       enabled: true
