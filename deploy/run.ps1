@@ -656,6 +656,9 @@ try {
       # recreation so startup and rollback remain inside its 119-second budget.
       Ensure-FrigateConfigVolume
       Invoke-Compose $prefix @('config','--quiet')
+      # SQLite must finish WAL/checkpoint work before Compose replaces the
+      # container or an acceptance timeout can surface as a disk I/O failure.
+      Invoke-Compose $prefix @('stop','--timeout','10','frigate')
       $acceptanceServices = [Collections.Generic.List[string]]::new()
       $replaySources = @($sources | Where-Object Mode -eq 'replay')
       if ($replaySources.Count -gt 0) {
@@ -687,6 +690,7 @@ try {
       # service that must remount deploy/config.yaml.
       Ensure-FrigateConfigVolume
       Invoke-Compose $prefix @('config','--quiet')
+      Invoke-Compose $prefix @('stop','--timeout','10','frigate')
       Invoke-Compose $prefix @('up','-d','--no-build','--force-recreate','--no-deps','frigate')
       $state = [ordered]@{ started_at=[DateTime]::UtcNow.ToString('o'); cameras=@() }
       foreach ($source in $sources) { $state.cameras += [ordered]@{ name=$source.Name; mode=$source.Mode; source=$source.Redacted } }

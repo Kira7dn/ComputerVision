@@ -8,6 +8,11 @@ import os
 import shutil
 import time
 from pathlib import Path
+from typing import Protocol
+
+
+class ObjectStore(Protocol):
+    def put(self, source: Path, key: str, checksum: str) -> str: ...
 
 
 class LocalObjectStore:
@@ -31,7 +36,7 @@ class LocalObjectStore:
 class UploadWorker:
     extensions = {".dav", ".mp4", ".mov", ".avi", ".mkv", ".ts", ".265", ".h265"}
 
-    def __init__(self, queue, store: LocalObjectStore, prefix: str = "dahua-history"):
+    def __init__(self, queue, store: ObjectStore, prefix: str = "dahua-history"):
         self.queue = queue
         self.store = store
         self.prefix = prefix.strip("/")

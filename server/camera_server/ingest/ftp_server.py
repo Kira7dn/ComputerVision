@@ -5,6 +5,7 @@ import argparse
 import logging
 import os
 from pathlib import Path
+from typing import ClassVar
 
 from pyftpdlib.authorizers import DummyAuthorizer
 from pyftpdlib.handlers import FTPHandler
@@ -20,6 +21,8 @@ SETTINGS = load_settings(require_dahua=False)
 VIDEO_DIR = SETTINGS.video_dir
 QUEUE_DB = SETTINGS.queue_db
 class ReceiverHandler(FTPHandler):
+    upload_queue: ClassVar[UploadQueue]
+
     def on_file_received(self, file):
         path = Path(file)
         self.upload_queue.enqueue(path)

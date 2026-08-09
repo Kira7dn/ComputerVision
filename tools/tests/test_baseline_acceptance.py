@@ -1,12 +1,8 @@
-import sys
 from copy import deepcopy
 from pathlib import Path
 
 import pytest
 import yaml
-
-ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT))
 
 from tools.prepare_baseline_fixture import load_manifest
 from tools.validate_face_replay import (
@@ -15,6 +11,7 @@ from tools.validate_face_replay import (
 )
 from tools.validate_lpr_acceptance import match_passage
 
+ROOT = Path(__file__).resolve().parents[2]
 MANIFEST = ROOT / "tools/fixtures/platform_baseline_ground_truth.yaml"
 
 
@@ -46,8 +43,10 @@ def test_manifest_rejects_readable_without_plate(tmp_path: Path) -> None:
 
 def test_passage_matching_survives_replay_loop() -> None:
     passages = [{"id": "p1", "start_s": 1.0, "end_s": 2.0}]
-    assert match_passage(101.5, 100.0, 15.0, passages)["id"] == "p1"
-    assert match_passage(116.5, 100.0, 15.0, passages)["id"] == "p1"
+    first = match_passage(101.5, 100.0, 15.0, passages)
+    second = match_passage(116.5, 100.0, 15.0, passages)
+    assert first is not None and first["id"] == "p1"
+    assert second is not None and second["id"] == "p1"
 
 
 @pytest.mark.parametrize(

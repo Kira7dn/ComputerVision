@@ -10,7 +10,7 @@ import re
 import subprocess
 import time
 from collections import Counter, defaultdict
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from urllib.request import urlopen
@@ -267,7 +267,7 @@ async def collect(args: argparse.Namespace) -> dict[str, Any]:
                         raw = await asyncio.wait_for(
                             ws.recv(), timeout=max(0.1, remaining)
                         )
-                    except asyncio.TimeoutError:
+                    except TimeoutError:
                         break
                     message = json.loads(raw)
                     topic = message.get("topic")
@@ -318,7 +318,7 @@ async def collect(args: argparse.Namespace) -> dict[str, Any]:
         stats = get_json(f"{args.api_url}/api/stats")
         samples.append(
             {
-                "at": datetime.now(timezone.utc).isoformat(),
+                "at": datetime.now(UTC).isoformat(),
                 "cameras": {
                     name: {
                         key: stats["cameras"][name].get(key)
@@ -384,22 +384,29 @@ async def collect(args: argparse.Namespace) -> dict[str, Any]:
     api_sqlite_matches = []
     for api_event in accepted_events:
         sqlite_event = sqlite_by_id.get(api_event["id"])
-        matches = bool(sqlite_event) and all(
-            (
-                abs(float(api_event[key]) - float(sqlite_event[key])) < 1e-6
-                if key in {"start_time", "recognized_license_plate_score"}
-                else api_event[key] == sqlite_event[key]
-            )
-            for key in (
+        comparison_keys = (
                 "camera",
                 "start_time",
                 "recognized_license_plate",
                 "recognized_license_plate_score",
-            )
         )
+        matches = sqlite_event is not None
+        if sqlite_event is not None:
+            for key in comparison_keys:
+                api_value = api_event.get(key)
+                sqlite_value = sqlite_event.get(key)
+                if key in {"start_time", "recognized_license_plate_score"}:
+                    if api_value is None or sqlite_value is None:
+                        matches = api_value is sqlite_value
+                    else:
+                        matches = abs(float(api_value) - float(sqlite_value)) < 1e-6
+                else:
+                    matches = api_value == sqlite_value
+                if not matches:
+                    break
         api_sqlite_matches.append({"id": api_event["id"], "matches": matches})
 
-    consistency = []
+    consistency: list[dict[str, Any]] = []
     for signature, plates in sorted(passage_plates.items()):
         counts = Counter(plates)
         representative, count = counts.most_common(1)[0]
@@ -443,7 +450,7 @@ async def collect(args: argparse.Namespace) -> dict[str, Any]:
             )
 
         passage_results = []
-        manifest_consistency = []
+        manifest_consistency: list[dict[str, Any]] = []
         for passage in passages:
             detected = [
                 event
@@ -459,7 +466,7 @@ async def collect(args: argparse.Namespace) -> dict[str, Any]:
                 and matched["id"] == passage["id"]
             ]
             plates = [
-                normalized_plate(event["recognized_license_plate"])
+                normalized_plate(str(event.get("recognized_license_plate") or ""))
                 for event in recognized
             ]
             counts = Counter(plates)
@@ -563,7 +570,7 @@ async def collect(args: argparse.Namespace) -> dict[str, Any]:
     }
     return {
         "schema_version": 1,
-        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "generated_at": datetime.now(UTC).isoformat(),
         "monitor": {
             "started_epoch": started_epoch,
             "finished_epoch": finished_epoch,

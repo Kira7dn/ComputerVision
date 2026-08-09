@@ -244,6 +244,9 @@ cameras:
         min_laplacian_variance: 20
         max_dark_fraction: 0.75
         max_bright_fraction: 0.75
+        min_aspect_ratio: 1.2
+        max_aspect_ratio: 6.0
+        min_edge_clearance_px: 1
     review:
       alerts:
         enabled: false

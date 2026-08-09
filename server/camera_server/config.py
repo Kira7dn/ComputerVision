@@ -44,7 +44,10 @@ class Settings:
 
 def load_settings(*, require_dahua: bool = True) -> Settings:
     default_runtime = Path(os.environ.get("PROGRAMDATA", Path.cwd())) / "Letron" / "Camera"
-    runtime = Path(_env("CAMERA_RUNTIME_DIR", str(default_runtime))).expanduser().resolve()
+    runtime_value = _env("CAMERA_RUNTIME_DIR", str(default_runtime)) or str(
+        default_runtime
+    )
+    runtime = Path(runtime_value).expanduser().resolve()
     password = required_secret("DAHUA_PASSWORD") if require_dahua else (_env("DAHUA_PASSWORD") or "")
     return Settings(
         runtime_dir=runtime,

@@ -1,19 +1,28 @@
-import copy
-import sys
 from pathlib import Path
 
 import pytest
 import yaml
 
-ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(ROOT / "tools"))
-
-from tools.passage_metrics import match_by_time_and_bbox, normalize_plate, score_face_passages
-from tools.prepare_passage_fixture import load_manifest
 import tools.validate_passage_acceptance as passage_validator
-from tools.validate_passage_acceptance import api_sqlite_consistency, assign_records, correlation_mismatches, face_results, false_passage_count, lpr_results, update_anchor_state
+from tools.passage_metrics import (
+    match_by_time_and_bbox,
+    normalize_plate,
+    score_face_passages,
+)
+from tools.prepare_passage_fixture import load_manifest
+from tools.validate_passage_acceptance import (
+    api_sqlite_consistency,
+    assign_records,
+    correlation_mismatches,
+    face_results,
+    false_passage_count,
+    lpr_results,
+    recognition_lifecycle_summary,
+    update_anchor_state,
+    wait_recognition_idle,
+)
 
+ROOT = Path(__file__).resolve().parents[2]
 MANIFEST = ROOT / "tools/fixtures/platform_passage_ground_truth.yaml"
 
 
@@ -25,6 +34,21 @@ def write_manifest(tmp_path: Path, value: dict) -> Path:
     path = tmp_path / "passage.yaml"
     path.write_text(yaml.safe_dump(value), encoding="utf-8")
     return path
+
+
+def test_wait_recognition_idle_reads_lifecycle_and_evidence(monkeypatch) -> None:
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self):
+            return b'{"embeddings":{"recognition_lifecycle":{"in_flight":0},"evidence":{"pinned":0}}}'
+
+    monkeypatch.setattr(passage_validator, "urlopen", lambda *_args, **_kwargs: Response())
+    assert wait_recognition_idle(0.01)
 
 
 @pytest.mark.parametrize(
@@ -71,25 +95,29 @@ def test_passage_manifest_contract() -> None:
 
 
 def test_passage_rejects_duplicate_id(tmp_path: Path) -> None:
-    value = manifest_value(); value["lpr"]["passages"][0]["id"] = value["face"]["passages"][0]["id"]
+    value = manifest_value()
+    value["lpr"]["passages"][0]["id"] = value["face"]["passages"][0]["id"]
     with pytest.raises(ValueError, match="globally unique"):
         load_manifest(write_manifest(tmp_path, value), ROOT)
 
 
 def test_passage_rejects_bad_window(tmp_path: Path) -> None:
-    value = manifest_value(); value["face"]["passages"][0]["end_s"] = value["face"]["passages"][0]["start_s"]
+    value = manifest_value()
+    value["face"]["passages"][0]["end_s"] = value["face"]["passages"][0]["start_s"]
     with pytest.raises(ValueError, match="invalid face passage window"):
         load_manifest(write_manifest(tmp_path, value), ROOT)
 
 
 def test_passage_rejects_bbox_outside_frame(tmp_path: Path) -> None:
-    value = manifest_value(); value["face"]["passages"][0]["bbox"] = [0, 0, 1281, 100]
+    value = manifest_value()
+    value["face"]["passages"][0]["bbox"] = [0, 0, 1281, 100]
     with pytest.raises(ValueError, match="outside"):
         load_manifest(write_manifest(tmp_path, value), ROOT)
 
 
 def test_passage_rejects_readable_plate_without_label(tmp_path: Path) -> None:
-    value = manifest_value(); value["lpr"]["passages"][0]["expected_plate"] = None
+    value = manifest_value()
+    value["lpr"]["passages"][0]["expected_plate"] = None
     with pytest.raises(ValueError, match="requires uppercase alphanumeric"):
         load_manifest(write_manifest(tmp_path, value), ROOT)
 
@@ -125,6 +153,74 @@ def test_time_and_bbox_distinguish_simultaneous_vehicles() -> None:
     records = [{"camera": "car_camera", "frame_time": 100.5, "stage": "event_published", "object_box": [505, 5, 595, 95], "track_id": "t"}]
     assigned = assign_records(records, {"car_camera": [100]}, {"car_camera": 3}, {"car_camera": passages})
     assert assigned[0]["passage_id"] == "b"
+
+
+def test_assignment_preserves_runtime_passage_and_propagates_ground_truth() -> None:
+    passages = [
+        {"id": "lpr-01", "start_s": 0, "end_s": 2, "bbox": [0, 0, 100, 100]},
+    ]
+    records = [
+        {
+            "camera": "car_camera",
+            "frame_time": 100.5,
+            "stage": "detector_hit",
+            "object_box": [0, 0, 100, 100],
+            "track_id": "vehicle-1",
+            "passage_id": "runtime-event-id",
+        },
+        {
+            "camera": "car_camera",
+            "round_id": 1,
+            "stage": "recognition_terminal",
+            "track_id": "vehicle-1",
+            "passage_id": "runtime-event-id",
+        },
+    ]
+
+    assigned = assign_records(
+        records,
+        {"car_camera": [100]},
+        {"car_camera": 3},
+        {"car_camera": passages},
+    )
+
+    assert [record["passage_id"] for record in assigned] == ["lpr-01", "lpr-01"]
+    assert all(
+        record["recognition_passage_id"] == "runtime-event-id"
+        for record in assigned
+    )
+    assert not correlation_mismatches(assigned)
+
+
+def test_time_only_record_cannot_seed_ground_truth_track_mapping() -> None:
+    passages = [
+        {"id": "lpr-01", "start_s": 0, "end_s": 2, "bbox": [0, 0, 100, 100]},
+    ]
+    records = [
+        {
+            "camera": "car_camera",
+            "frame_time": 100.5,
+            "stage": "recognition_attempt",
+            "track_id": "other-vehicle",
+            "passage_id": "runtime-id",
+        },
+        {
+            "camera": "car_camera",
+            "round_id": 1,
+            "stage": "recognition_terminal",
+            "track_id": "other-vehicle",
+            "passage_id": "runtime-id",
+        },
+    ]
+
+    assigned = assign_records(
+        records,
+        {"car_camera": [100]},
+        {"car_camera": 3},
+        {"car_camera": passages},
+    )
+    assert assigned
+    assert all(not record.get("passage_id") for record in assigned)
 
 
 def test_unknown_and_known_false_negative_are_scored() -> None:
@@ -170,6 +266,7 @@ def test_face_passage_uses_majority_of_replay_rounds() -> None:
     assert result["passages"][0]["detected_rounds"] == 2
     assert result["passages"][0]["correct_rounds"] == 2
     assert result["detection_recall"] == 1
+    assert result["accuracy"] == 1
     assert result["recall"] == 1
 
 
@@ -198,6 +295,10 @@ def test_unreadable_counts_recall_not_exact_denominator() -> None:
     assert not false
     assert result["passage_recall"] == 1
     assert result["readable_denominator"] == 1
+    assert result["accuracy"] == 1
+    assert result["recognition_publish_count"] == 2
+    assert result["precision"] == 0.5
+    assert result["recall"] == 1
     assert result["exact_match"] == 1
 
 
@@ -215,7 +316,40 @@ def test_lpr_passage_recall_is_tracker_recall_not_ocr_recall() -> None:
     assert result["passage_recall"] == 1
     assert result["passages"][0]["detected_rounds"] == 3
     assert result["passages"][0]["recognized_rounds"] == 0
+    assert result["accuracy"] == 0
+    assert result["precision"] == 1
+    assert result["recall"] == 0
     assert result["exact_match"] == 0
+
+
+def test_wrong_publish_is_recognition_fp_and_readable_passage_fn() -> None:
+    passages = [
+        {
+            "id": "p",
+            "valid_passage": True,
+            "readable": True,
+            "expected_plate": "ABC123",
+            "accepted_plates": [],
+        }
+    ]
+    records = [
+        {"stage": "track_seen", "passage_id": "p", "round_id": round_id}
+        for round_id in range(1, 4)
+    ] + [
+        {
+            "stage": "event_published",
+            "passage_id": "p",
+            "round_id": round_id,
+            "plate": "WRONG9",
+        }
+        for round_id in range(1, 4)
+    ]
+    result, _ = lpr_results(records, passages)
+    assert result["passage_precision"] == 1
+    assert result["passage_recall"] == 1
+    assert result["accuracy"] == 0
+    assert result["precision"] == 0
+    assert result["recall"] == 0
 
 
 def test_lpr_exact_match_uses_passage_representative() -> None:
@@ -269,3 +403,40 @@ def test_funnel_reports_first_missing_stage() -> None:
         records += [{"stage": stage, "passage_id": "p", "round_id": round_id} for stage in ("detector_hit", "track_seen", "lpr_eligible")]
     result, _ = lpr_results(records, [passage])
     assert result["passages"][0]["mismatch_reason"] == "plate_detected_miss"
+
+
+def test_recognition_lifecycle_summary_detects_attempts_duplicates_and_early_stop() -> None:
+    records = []
+    for task in ("face", "lpr"):
+        for index in (1, 2):
+            records.append(
+                {
+                    "stage": "recognition_attempt",
+                    "task": task,
+                    "camera": f"{task}_camera",
+                    "track_id": "track",
+                    "generation": 1,
+                    "attempt_index": index,
+                    "candidate_id": f"{task}-{index}",
+                    "latency_ms": 10,
+                }
+            )
+        records.append(
+            {
+                "stage": "recognition_terminal",
+                "task": task,
+                "camera": f"{task}_camera",
+                "track_id": "track",
+                "generation": 1,
+                "status": "ACCEPTED",
+                "reason": "consensus_accepted",
+            }
+        )
+    summary = recognition_lifecycle_summary(records, {"in_flight": 0})
+    assert summary["max_attempts_per_track"] == 2
+    assert summary["early_stop_by_task"] == {"face": True, "lpr": True}
+    assert not summary["duplicate_inference"]
+
+    records[1]["candidate_id"] = records[0]["candidate_id"]
+    summary = recognition_lifecycle_summary(records, {})
+    assert summary["duplicate_inference"]

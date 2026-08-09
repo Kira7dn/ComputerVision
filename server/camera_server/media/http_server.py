@@ -9,12 +9,12 @@ import re
 import sys
 import threading
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from urllib.parse import parse_qs, quote, urlparse
+from urllib.parse import quote, urlparse
 
-from .netsdk_source import NetSdkHlsManager
 from camera_server.archive.queue import UploadQueue
 from camera_server.config import load_settings
+
+from .netsdk_source import NetSdkHlsManager
 
 HOST = '0.0.0.0'
 PORT = 8080
@@ -29,10 +29,12 @@ VIDEO_DIR.mkdir(parents=True, exist_ok=True)
 LIVE_DIR.mkdir(parents=True, exist_ok=True)
 CLOUD_QUEUE_DB.parent.mkdir(parents=True, exist_ok=True)
 
-if hasattr(sys.stdout, 'reconfigure'):
-    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
-if hasattr(sys.stderr, 'reconfigure'):
-    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+stdout_reconfigure = getattr(sys.stdout, 'reconfigure', None)
+if callable(stdout_reconfigure):
+    stdout_reconfigure(encoding='utf-8', errors='replace')
+stderr_reconfigure = getattr(sys.stderr, 'reconfigure', None)
+if callable(stderr_reconfigure):
+    stderr_reconfigure(encoding='utf-8', errors='replace')
 
 
 class EventLog:
@@ -98,7 +100,7 @@ class MediaHandler(http.server.BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header('Content-Type', 'application/json; charset=utf-8')
         self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Content-Length', len(body))
+        self.send_header('Content-Length', str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
@@ -114,7 +116,8 @@ class MediaHandler(http.server.BaseHTTPRequestHandler):
         if path in ('/', '/media'):
             self._bytes(MEDIA_HTML.encode('utf-8'), 'text/html; charset=utf-8')
         elif path == '/favicon.ico':
-            self.send_response(204); self.end_headers()
+            self.send_response(204)
+            self.end_headers()
         elif path == '/health':
             self._json({'status': 'ok', 'service': 'dahua-media-server', 'dahua_control': True, 'live_transport': 'netsdk-ts', 'live_streams': live_streams.snapshot()})
         elif path in ('/api/v1/state', '/api/state'):
@@ -129,7 +132,8 @@ class MediaHandler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         path = urlparse(self.path).path
         if path not in ('/api/v1/live/start', '/api/v1/live/stop', '/api/live/start', '/api/live/stop'):
-            self.send_error(404); return
+            self.send_error(404)
+            return
         try:
             length = int(self.headers.get('Content-Length', 0))
             if not 0 < length <= 16384:
@@ -154,7 +158,8 @@ class MediaHandler(http.server.BaseHTTPRequestHandler):
 
     def _file(self, target, content_type, no_cache=False):
         if not target.is_file():
-            self.send_error(404); return
+            self.send_error(404)
+            return
         self._bytes(target.read_bytes(), content_type, no_cache)
 
     def _bytes(self, data, content_type, no_cache=False):
@@ -163,8 +168,9 @@ class MediaHandler(http.server.BaseHTTPRequestHandler):
         self.send_header('Access-Control-Allow-Origin', '*')
         if no_cache:
             self.send_header('Cache-Control', 'no-store, no-cache, must-revalidate')
-        self.send_header('Content-Length', len(data))
-        self.end_headers(); self.wfile.write(data)
+        self.send_header('Content-Length', str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
 
 
 def main():

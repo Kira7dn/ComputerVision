@@ -1,19 +1,22 @@
 """Read Dahua time-OSD configuration without changing the camera."""
-from ctypes import sizeof
 import os
 import sys
+from ctypes import sizeof
 from pathlib import Path
-if hasattr(sys.stdout, 'reconfigure'):
-    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 
-SDK_DIR = Path(__file__).resolve().parent.parent / 'dahua_sdk'
+stdout_reconfigure = getattr(sys.stdout, 'reconfigure', None)
+if callable(stdout_reconfigure):
+    stdout_reconfigure(encoding='utf-8', errors='replace')
+
+SDK_DIR = Path(__file__).resolve().parents[3] / 'dahua_sdk'
 sys.path.insert(0, str(SDK_DIR))
 from NetSDK.NetSDK import NetClient
 from NetSDK.SDK_Callback import fDisConnect, fHaveReConnect
-from NetSDK.SDK_Enum import NET_EM_CFG_OPERATE_TYPE, EM_A_NET_EM_OSD_BLEND_TYPE
+from NetSDK.SDK_Enum import EM_A_NET_EM_OSD_BLEND_TYPE, NET_EM_CFG_OPERATE_TYPE
 from NetSDK.SDK_Struct import (
-    C_LLONG, NET_IN_LOGIN_WITH_HIGHLEVEL_SECURITY,
-    NET_OUT_LOGIN_WITH_HIGHLEVEL_SECURITY, NET_OSD_TIME_TITLE,
+    NET_IN_LOGIN_WITH_HIGHLEVEL_SECURITY,
+    NET_OSD_TIME_TITLE,
+    NET_OUT_LOGIN_WITH_HIGHLEVEL_SECURITY,
 )
 
 sdk = NetClient()

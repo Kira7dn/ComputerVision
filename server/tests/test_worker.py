@@ -1,23 +1,27 @@
-import sys
 import tempfile
 import time
 import unittest
 from pathlib import Path
 
 from camera_server.archive.queue import UploadQueue
-from camera_server.archive.worker import UploadWorker, LocalObjectStore, sha256_file
+from camera_server.archive.worker import (
+    LocalObjectStore,
+    ObjectStore,
+    UploadWorker,
+    sha256_file,
+)
 
 
 class FailOnceStore:
-    def __init__(self, delegate):
+    def __init__(self, delegate: ObjectStore) -> None:
         self.delegate = delegate
         self.calls = 0
 
-    def put(self, source, object_key, checksum):
+    def put(self, source: Path, key: str, checksum: str) -> str:
         self.calls += 1
         if self.calls == 1:
             raise ConnectionError('simulated WAN outage')
-        return self.delegate.put(source, object_key, checksum)
+        return self.delegate.put(source, key, checksum)
 
 
 class UploadWorkerIntegrationTest(unittest.TestCase):

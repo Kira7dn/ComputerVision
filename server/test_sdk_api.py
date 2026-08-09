@@ -1,27 +1,30 @@
-# coding=utf-8
 """Test Dahua official Python SDK API for live video"""
 
 import os
 import sys
-import io
 
 # Fix Windows console encoding
-sys.stdout = io.TextIOWrapper(sys.stdout.detach(), encoding='utf-8')
-sys.stderr = io.TextIOWrapper(sys.stderr.detach(), encoding='utf-8')
+stdout_reconfigure = getattr(sys.stdout, 'reconfigure', None)
+if callable(stdout_reconfigure):
+    stdout_reconfigure(encoding='utf-8', errors='replace')
+stderr_reconfigure = getattr(sys.stderr, 'reconfigure', None)
+if callable(stderr_reconfigure):
+    stderr_reconfigure(encoding='utf-8', errors='replace')
 
 # Add dahua_sdk to path before importing
 SDK_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), '..', 'dahua_sdk'))
 sys.path.insert(0, SDK_DIR)
 
-from ctypes import c_int, sizeof
+from ctypes import sizeof
+
 from NetSDK.NetSDK import NetClient
 from NetSDK.SDK_Callback import fDisConnect, fHaveReConnect
-from NetSDK.SDK_Enum import SDK_RealPlayType, EM_LOGIN_SPAC_CAP_TYPE
+from NetSDK.SDK_Enum import EM_LOGIN_SPAC_CAP_TYPE, SDK_RealPlayType
 from NetSDK.SDK_Struct import (
     C_LLONG,
+    LOG_SET_PRINT_INFO,
     NET_IN_LOGIN_WITH_HIGHLEVEL_SECURITY,
     NET_OUT_LOGIN_WITH_HIGHLEVEL_SECURITY,
-    LOG_SET_PRINT_INFO,
 )
 
 # Global variables
@@ -105,11 +108,11 @@ def main():
 
 
 def disconnect_callback(l_login_id, pch_dvr_ip, n_dvr_port, dw_user):
-    print(f"Disconnected from camera")
+    print("Disconnected from camera")
 
 
 def reconnect_callback(l_login_id, pch_dvr_ip, n_dvr_port, dw_user):
-    print(f"Reconnected to camera")
+    print("Reconnected to camera")
 
 
 if __name__ == "__main__":

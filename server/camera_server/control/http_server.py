@@ -9,7 +9,6 @@ import threading
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
 import requests
 from aiohttp import WSMsgType, web
@@ -27,8 +26,9 @@ XVR_BASE = f'http://{XVR_HOST}'
 XVR_AUTH = None
 TZ = timezone(timedelta(hours=7))
 
-if hasattr(sys.stdout, 'reconfigure'):
-    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+stdout_reconfigure = getattr(sys.stdout, 'reconfigure', None)
+if callable(stdout_reconfigure):
+    stdout_reconfigure(encoding='utf-8', errors='replace')
 
 
 class ControlPlane:
@@ -224,7 +224,8 @@ async def websocket_handler(request):
             action = payload.get('action')
             channel = int(payload.get('channel', 0))
             if action == 'state':
-                await send_state(); continue
+                await send_state()
+                continue
             if action == 'live_start':
                 await asyncio.to_thread(control_plane.start_live, channel, int(payload.get('subtype', 0)))
             elif action == 'live_stop':

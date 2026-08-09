@@ -4,17 +4,19 @@ from __future__ import annotations
 
 import queue
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 
 @dataclass
 class InferenceJob:
     channel: int
-    frame: object
+    frame: Any
     sequence: int
     received_at: float
-    callback: object
+    callback: Callable[[InferenceJob], None]
 
 
 class InferenceScheduler:
@@ -28,7 +30,7 @@ class InferenceScheduler:
         self.condition = threading.Condition(self.lock)
         self.model = None
         self.closed = False
-        self.thread = None
+        self.thread: threading.Thread | None = None
 
     def load(self):
         import cv2  # noqa: F401
@@ -85,7 +87,7 @@ class InferenceScheduler:
             self.thread.join(timeout=2)
 
 
-_shared = {}
+_shared: dict[str, InferenceScheduler] = {}
 _shared_lock = threading.Lock()
 
 

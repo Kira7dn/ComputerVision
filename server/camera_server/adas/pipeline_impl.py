@@ -2,19 +2,19 @@
 
 from __future__ import annotations
 
+import collections
 import os
 import queue
-import shutil
 import subprocess
 import threading
 import time
-from urllib.parse import urlsplit, urlunsplit
 import uuid
-import collections
 from datetime import datetime
 from pathlib import Path
-from .scheduler import InferenceJob, get_shared_scheduler
+from typing import Any, BinaryIO, cast
+from urllib.parse import urlsplit, urlunsplit
 
+from .scheduler import InferenceJob, get_shared_scheduler
 
 FRAME_WIDTH = 320
 FRAME_HEIGHT = 192
@@ -140,6 +140,7 @@ class AdasPipeline:
         self.scheduler = None
         self.decoder = None
         self.publisher = None
+        self.process_logs: list[BinaryIO] = []
         self.threads = []
 
     def start(self):
@@ -187,10 +188,9 @@ class AdasPipeline:
                     process.kill()
         for thread in self.threads:
             thread.join(timeout=2)
-        for process in (self.decoder, self.publisher):
-            log_file = getattr(process, '_adas_log_file', None) if process else None
-            if log_file:
-                log_file.close()
+        for log_file in self.process_logs:
+            log_file.close()
+        self.process_logs.clear()
 
     def snapshot(self):
         now = time.monotonic()
@@ -251,9 +251,9 @@ class AdasPipeline:
                 raise RuntimeError(f'TensorRT engine not found: {self.model_path}')
             # .pt model will be loaded by Ultralytics; no engine file needed
         try:
-            import cv2  # noqa: F410
-            from ultralytics import YOLO
-            import tensorrt  # noqa: F401
+            import cv2 as _cv2  # noqa: F401
+            import tensorrt as _tensorrt  # noqa: F401
+            from ultralytics import YOLO as _YOLO  # noqa: F401
         except ImportError as exc:
             raise RuntimeError(f'ADAS TensorRT dependency missing: {exc}') from exc
         self.status = 'warming_up'
@@ -268,8 +268,10 @@ class AdasPipeline:
             if x2 <= x1 or y2 <= y1:
                 raise ValueError
             return [round(item, 4) for item in parts]
-        except (TypeError, ValueError):
-            raise RuntimeError('ADAS_WARNING_ROI must be normalized x1,y1,x2,y2')
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                'ADAS_WARNING_ROI must be normalized x1,y1,x2,y2'
+            ) from exc
 
     def _start_decoder(self):
         log_file = (self.output_dir / 'adas-decoder.log').open('wb', buffering=0)
@@ -285,7 +287,7 @@ class AdasPipeline:
             '-pix_fmt', 'bgr24', '-f', 'rawvideo', 'pipe:1',
         ], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log_file,
            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
-        process._adas_log_file = log_file
+        self.process_logs.append(log_file)
         return process
 
     def _start_publisher(self):
@@ -306,10 +308,14 @@ class AdasPipeline:
             '-f', 'rtsp', '-rtsp_transport', 'tcp', self.mediamtx_rtsp,
         ], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=log_file,
            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
-        process._adas_log_file = log_file
+        self.process_logs.append(log_file)
         return process
 
     def _encoded_writer(self):
+        decoder = self.decoder
+        if decoder is None or decoder.stdin is None:
+            self._fail('NVDEC process has no writable stdin')
+            return
         try:
             while not self.stop_event.is_set():
                 try:
@@ -320,24 +326,28 @@ class AdasPipeline:
                     self.pending_source_timestamps.append((received_at, source_pts_ms))
                     if source_pts_ms is not None and self.source_clock_offset is None:
                         self.source_clock_offset = received_at - source_pts_ms / 1000.0
-                self.decoder.stdin.write(payload)
-                self.decoder.stdin.flush()
+                decoder.stdin.write(payload)
+                decoder.stdin.flush()
         except (BrokenPipeError, OSError) as exc:
             self._fail(f'NVDEC input failed: {exc}')
 
     def _publisher_writer(self):
+        publisher = self.publisher
+        if publisher is None or publisher.stdin is None:
+            self._fail('WebRTC publisher has no writable stdin')
+            return
         try:
             while not self.stop_event.is_set():
                 try:
                     frame, received_at, source_pts_ms, source_capture_at = self.publish_queue.get(timeout=0.5)
                 except queue.Empty:
                     continue
-                if self.publisher.poll() is not None:
+                if publisher.poll() is not None:
                     self._fail('WebRTC publisher exited before frame write')
                     return
                 try:
-                    self.publisher.stdin.write(frame.tobytes())
-                    self.publisher.stdin.flush()
+                    publisher.stdin.write(frame.tobytes())
+                    publisher.stdin.flush()
                 except (BrokenPipeError, OSError) as exc:
                     self._fail(f'WebRTC publisher input failed: {exc}')
                     return
@@ -349,9 +359,13 @@ class AdasPipeline:
 
     def _decoded_reader(self):
         import numpy as np
+        decoder = self.decoder
+        if decoder is None or decoder.stdout is None:
+            self._fail('NVDEC process has no readable stdout')
+            return
         try:
             while not self.stop_event.is_set():
-                raw = self.decoder.stdout.read(FRAME_BYTES)
+                raw = decoder.stdout.read(FRAME_BYTES)
                 if len(raw) != FRAME_BYTES:
                     if not self.stop_event.is_set():
                         self.decode_errors += 1
@@ -375,6 +389,10 @@ class AdasPipeline:
             self._fail(f'NVDEC output failed: {exc}')
 
     def _inference_submitter(self):
+        scheduler = self.scheduler
+        if scheduler is None:
+            self._fail('inference scheduler is unavailable')
+            return
         while not self.stop_event.is_set():
             item = self.latest_frame.get()
             if item is None:
@@ -383,7 +401,7 @@ class AdasPipeline:
             if (time.monotonic() - received_at) * 1000 > 150:
                 self.frames_dropped_stale += 1
                 continue
-            self.scheduler.submit_latest(InferenceJob(
+            scheduler.submit_latest(InferenceJob(
                 channel=self.channel, frame=(frame, source_pts_ms, source_capture_at),
                 sequence=sequence, received_at=received_at, callback=self._run_inference,
             ))
@@ -399,10 +417,13 @@ class AdasPipeline:
             if age_ms > 150:
                 self.frames_dropped_stale += 1
                 return
-            result = self.model.predict(
+            if self.model is None:
+                raise RuntimeError('ADAS model is unavailable')
+            results = cast(Any, self.model.predict(
                 frame, imgsz=(FRAME_HEIGHT, FRAME_WIDTH), batch=1, conf=0.25,
-                iou=0.45, classes=sorted(TARGET_CLASSES), verbose=False)[0]
-            warning_candidate = None
+                iou=0.45, classes=sorted(TARGET_CLASSES), verbose=False))
+            result = results[0]
+            warning_candidate: dict[str, Any] | None = None
             for box in result.boxes:
                 x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
                 confidence, class_id = float(box.conf[0]), int(box.cls[0])

@@ -9,15 +9,21 @@ import threading
 import time
 from ctypes import POINTER, c_byte, c_ubyte, cast, sizeof
 from pathlib import Path
+from typing import Any
 
 # ADAS loaded lazily — only when ADAS_ENABLED=true and a matching channel is opened
 
 
-SDK_DIR = Path(__file__).resolve().parents[3] / 'sdk'
+SDK_DIR = Path(__file__).resolve().parents[3] / 'dahua_sdk'
 sys.path.insert(0, str(SDK_DIR))
 
 from NetSDK.NetSDK import NetClient
-from NetSDK.SDK_Callback import CB_FUNCTYPE, fDataCallBackEx, fDisConnect, fHaveReConnect
+from NetSDK.SDK_Callback import (
+    CB_FUNCTYPE,
+    fDataCallBackEx,
+    fDisConnect,
+    fHaveReConnect,
+)
 from NetSDK.SDK_Enum import (
     EM_LOGIN_SPAC_CAP_TYPE,
     EM_REAL_DATA_TYPE,
@@ -31,9 +37,7 @@ from NetSDK.SDK_Struct import (
     NET_IN_REALPLAY_BY_DATA_TYPE,
     NET_OUT_LOGIN_WITH_HIGHLEVEL_SECURITY,
     NET_OUT_REALPLAY_BY_DATA_TYPE,
-    NET_DATA_CALL_BACK_INFO,
 )
-
 
 TS_CALLBACK_DATA_TYPE = 1002
 H264_CALLBACK_DATA_TYPE = 1004
@@ -126,7 +130,7 @@ class NetSdkHlsManager:
         )
         data_queue = queue.Queue(maxsize=64)
         stop_event = threading.Event()
-        session = {
+        session: dict[str, Any] = {
             'channel': channel,
             'subtype': subtype,
             'login_id': C_LLONG(),

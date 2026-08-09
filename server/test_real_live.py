@@ -4,16 +4,21 @@ Test Dahua live stream using real RPC API calls.
 Based on the working DahuaRpcClient login flow from dahua_hdd_downloader.py.
 """
 
-import sys
 import os
-import io
-sys.stdout = io.TextIOWrapper(sys.stdout.detach(), encoding='utf-8')
-sys.stderr = io.TextIOWrapper(sys.stderr.detach(), encoding='utf-8')
+import sys
+
+stdout_reconfigure = getattr(sys.stdout, 'reconfigure', None)
+if callable(stdout_reconfigure):
+    stdout_reconfigure(encoding='utf-8', errors='replace')
+stderr_reconfigure = getattr(sys.stderr, 'reconfigure', None)
+if callable(stderr_reconfigure):
+    stderr_reconfigure(encoding='utf-8', errors='replace')
 
 import hashlib
 import json
-import requests
 from datetime import datetime
+
+import requests
 
 
 def md5_upper(value: str) -> str:
@@ -210,7 +215,7 @@ def main():
     if not password:
         raise RuntimeError("DAHUA_PASSWORD is required")
 
-    print(f"=== Dahua Live Stream Real Test ===")
+    print("=== Dahua Live Stream Real Test ===")
     print(f"Target: {host}")
     print(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print()

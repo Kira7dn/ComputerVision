@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import argparse
 import collections
-import datetime as dt
 import hashlib
 import json
 import os
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -22,8 +22,11 @@ import cv2
 import numpy as np
 import yaml
 
-from passage_metrics import bbox_iou, normalize_plate, percentile
-from prepare_passage_fixture import load_manifest
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from tools.passage_metrics import bbox_iou, normalize_plate, percentile
+from tools.prepare_passage_fixture import load_manifest
 
 CAMERAS = {"face": "face_camera", "lpr": "car_camera"}
 TRACE_CONTAINER_PATH = "/config/passage-trace.jsonl"
@@ -87,6 +90,37 @@ def docker_output(*args: str, timeout: int = 10, check: bool = True) -> str:
         timeout=timeout,
     )
     return result.stdout.strip()
+
+
+def capture_container_diagnostics(output: Path, since: float | None) -> None:
+    """Persist acceptance-container evidence before restore replaces it."""
+    inspect = subprocess.run(
+        ["docker", "inspect", "frigate"],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=10,
+    )
+    (output / "container-inspect.json").write_text(
+        inspect.stdout or inspect.stderr, encoding="utf-8"
+    )
+    args = ["docker", "logs", "frigate"]
+    if since is not None:
+        args += ["--since", str(int(since))]
+    logs = subprocess.run(
+        args,
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=15,
+    )
+    (output / "container.log").write_text(
+        logs.stdout + logs.stderr, encoding="utf-8"
+    )
 
 
 def restart_counts() -> dict[str, int]:
@@ -318,6 +352,8 @@ class ResourceSampler:
         self.evidence_bytes: dict[str, list[int]] = {
             camera: [] for camera in CAMERAS.values()
         }
+        self.evidence_pinned: list[int] = []
+        self.recognition_lifecycle: list[dict[str, int]] = []
         self.thread = threading.Thread(target=self._run, daemon=True)
 
     def start(self) -> None:
@@ -364,9 +400,51 @@ class ResourceSampler:
                         .get(camera, {})
                     )
                     self.evidence_bytes[camera].append(int(evidence.get("bytes", 0)))
+                embeddings = stats.get("embeddings") or {}
+                self.evidence_pinned.append(
+                    int((embeddings.get("evidence") or {}).get("pinned", 0))
+                )
+                self.recognition_lifecycle.append(
+                    {
+                        str(key): int(value)
+                        for key, value in (
+                            embeddings.get("recognition_lifecycle") or {}
+                        ).items()
+                    }
+                    | {
+                        "quality_top_k_depth": int(
+                            (embeddings.get("quality_selector") or {}).get(
+                                "top_k_depth", 0
+                            )
+                        ),
+                        "lpr_queue_depth": int(
+                            embeddings.get("lpr_queue_depth", 0)
+                        ),
+                    }
+                )
             except Exception:
                 pass
             self.stop_event.wait(1.0)
+
+
+def wait_recognition_idle(timeout: float = 4.0) -> bool:
+    """Allow bounded deferred work to release attempts and evidence leases."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            with urlopen("http://127.0.0.1:5001/api/stats", timeout=1) as response:
+                stats = json.loads(response.read().decode("utf-8"))
+            embeddings = stats.get("embeddings") or {}
+            lifecycle = embeddings.get("recognition_lifecycle") or {}
+            evidence = embeddings.get("evidence") or {}
+            if int(lifecycle.get("in_flight", 0)) == 0 and int(
+                evidence.get("pinned", 0)
+            ) == 0:
+                return True
+        except Exception:
+            pass
+        time.sleep(0.2)
+    return False
 
 
 def observe_round_anchors(
@@ -380,7 +458,7 @@ def observe_round_anchors(
     # Wait for the next observed black -> content transition instead; this is
     # the source anchor and deliberately does not infer phase from StartedAt.
 
-    states = {
+    states: dict[str, dict[str, Any]] = {
         camera: {
             "mode": "black",
             "black_count": 0,
@@ -413,8 +491,10 @@ def observe_round_anchors(
                 break
         time.sleep(0.12)
 
-    anchors = {camera: state["anchors"][:ROUNDS] for camera, state in states.items()}
-    details = {
+    anchors: dict[str, list[float]] = {
+        camera: list(state["anchors"][:ROUNDS]) for camera, state in states.items()
+    }
+    details: dict[str, Any] = {
         camera: {
             "count": len(anchors[camera]),
             "black_max": round(thresholds[camera][0], 2),
@@ -448,6 +528,11 @@ def assign_records(
 ) -> list[dict[str, Any]]:
     track_map: dict[tuple[str, int, str], str] = {}
     for record in records:
+        if record.get("passage_id") and not record.get("recognition_passage_id"):
+            record["recognition_passage_id"] = record["passage_id"]
+        # ``passage_id`` is reserved for the ground-truth passage in this
+        # report. Runtime ownership remains available as recognition_passage_id.
+        record.pop("passage_id", None)
         camera = str(record.get("camera", ""))
         frame_time = record.get("frame_time")
         if camera not in anchors or frame_time is None:
@@ -483,7 +568,10 @@ def assign_records(
         elif len(candidates) == 1 and box is not None and candidates[0].get("bbox"):
             if bbox_iou(box, [float(v) for v in candidates[0]["bbox"]]) < 0.01:
                 candidates = []
-        if len(candidates) == 1:
+        # A time-only match can silently attribute a different simultaneous
+        # vehicle to the target passage. Only bbox-backed records may seed the
+        # track map; lineage-only records inherit that verified mapping below.
+        if len(candidates) == 1 and box is not None:
             record["passage_id"] = candidates[0]["id"]
             if record.get("track_id"):
                 track_map[(camera, round_id, str(record["track_id"]))] = str(
@@ -496,7 +584,7 @@ def assign_records(
             int(record.get("round_id", 0)),
             str(record.get("track_id", "")),
         )
-        if not record.get("passage_id") and key in track_map:
+        if key in track_map:
             record["passage_id"] = track_map[key]
     return [record for record in records if record.get("round_id")]
 
@@ -558,10 +646,10 @@ def face_results(
             qualified = first_record(current, "first_qualified_face")
             attempt = first_record(current, "first_attempt")
             confirmed = first_record(current, "confirmed_result")
-            predictions = [
+            attempt_predictions = [
                 str(r.get("identity") or "unknown")
                 for r in current
-                if r.get("stage") in {"first_attempt", "confirmed_result"}
+                if r.get("stage") == "first_attempt"
             ]
             known_confirmed = [
                 str(r.get("identity"))
@@ -575,13 +663,12 @@ def face_results(
                 (
                     expected == "unknown"
                     and not known_confirmed
-                    and "unknown" in predictions
                 )
                 or (expected != "unknown" and expected in known_confirmed)
             )
             detected_rounds += int(detected)
             correct_rounds += int(correct)
-            all_predictions.extend(predictions)
+            all_predictions.extend(known_confirmed)
             end = confirmed if expected != "unknown" else attempt
             if end and round_id <= len(anchors):
                 passage_start = (
@@ -609,7 +696,8 @@ def face_results(
                     "round_id": round_id,
                     "detected": detected,
                     "correct": correct,
-                    "predictions": predictions,
+                    "predictions": known_confirmed,
+                    "attempt_predictions": attempt_predictions,
                     "stages": {
                         stage: (first_record(current, stage) or {}).get("trace_time")
                         for stage in (
@@ -637,7 +725,7 @@ def face_results(
     false_records = [
         r
         for r in records
-        if r.get("stage") in {"first_attempt", "confirmed_result"}
+        if r.get("stage") == "confirmed_result"
         and (
             not r.get("passage_id")
             or not next(
@@ -653,13 +741,21 @@ def face_results(
     false_passages = false_passage_count(false_records)
     detected = sum(row["detected"] for row in rows)
     correct = sum(row["correct"] for row in rows)
+    exact_published = sum(
+        row["correct"] and row["expected"] != "unknown" for row in rows
+    )
+    recognition_publishes = (
+        sum(bool(row["predictions"]) for row in rows) + false_passages
+    )
     result = {
         "passages": rows,
+        "accuracy": correct / len(rows) if rows else 0.0,
         "detection_recall": detected / len(rows) if rows else 0.0,
-        "precision": correct / (detected + false_passages)
-        if detected + false_passages
-        else 0.0,
+        "precision": exact_published / recognition_publishes
+        if recognition_publishes
+        else 1.0,
         "recall": correct / len(rows) if rows else 0.0,
+        "recognition_publish_count": recognition_publishes,
         "false_passages": false_passages,
     }
     return (
@@ -780,18 +876,34 @@ def lpr_results(
     false_passages = false_passage_count(false_records)
     readable = [row for row in rows if row["readable"]]
     detected = sum(row["detected"] for row in rows)
+    exact_tp = sum(row["exact"] is True for row in readable)
+    accuracy = (
+        exact_tp / len(readable)
+        if readable
+        else None
+    )
+    passage_recall = detected / len(rows) if rows else 0.0
+    passage_precision = (
+        detected / (detected + false_passages)
+        if detected + false_passages
+        else 0.0
+    )
+    recognition_publishes = sum(bool(row["plates"]) for row in rows) + false_passages
+    recognition_precision = (
+        exact_tp / recognition_publishes if recognition_publishes else 1.0
+    )
+    recognition_recall = exact_tp / len(readable) if readable else 0.0
     result = {
         "passages": rows,
-        "passage_recall": sum(row["detected"] for row in rows) / len(rows)
-        if rows
-        else 0.0,
-        "passage_precision": detected / (detected + false_passages)
-        if detected + false_passages
-        else 0.0,
+        "accuracy": accuracy,
+        "precision": recognition_precision,
+        "recall": recognition_recall,
+        "passage_recall": passage_recall,
+        "passage_precision": passage_precision,
+        "recognition_publish_count": recognition_publishes,
+        "exact_true_positives": exact_tp,
         "readable_denominator": len(readable),
-        "exact_match": sum(row["exact"] is True for row in readable) / len(readable)
-        if readable
-        else None,
+        "exact_match": accuracy,
         "consistency_min": min(
             (row["consistency"] for row in rows if row["plates"]), default=None
         ),
@@ -819,7 +931,7 @@ def correlation_mismatches(records: list[dict[str, Any]]) -> list[dict[str, Any]
                 int(record.get("generation") or 0),
             )
             mapping[key].add(str(record["passage_id"]))
-    mismatches = [
+    mismatches: list[dict[str, Any]] = [
         {"key": list(key), "passages": sorted(values)}
         for key, values in mapping.items()
         if len(values) > 1
@@ -872,6 +984,98 @@ def correlation_mismatches(records: list[dict[str, Any]]) -> list[dict[str, Any]
             )
         seen_candidates.add(identity)
     return mismatches
+
+
+def recognition_lifecycle_summary(
+    records: list[dict[str, Any]], stats: dict[str, int]
+) -> dict[str, Any]:
+    attempts = [
+        record
+        for record in records
+        if record.get("stage") == "recognition_attempt"
+        and record.get("inference_started", True)
+    ]
+    groups: dict[tuple[str, str, str, int], list[dict[str, Any]]] = (
+        collections.defaultdict(list)
+    )
+    for record in attempts:
+        groups[
+            (
+                str(record.get("task")),
+                str(record.get("camera")),
+                str(
+                    record.get("recognition_passage_id")
+                    or record.get("passage_id")
+                    or record.get("track_id")
+                ),
+                int(record.get("generation") or 0),
+            )
+        ].append(record)
+    duplicate_inference = []
+    for key, values in groups.items():
+        seen: set[str] = set()
+        for value in values:
+            candidate_id = str(value.get("candidate_id") or "")
+            if candidate_id and candidate_id in seen:
+                duplicate_inference.append(
+                    {"key": list(key), "candidate_id": candidate_id}
+                )
+            seen.add(candidate_id)
+    terminals = [
+        record for record in records if record.get("stage") == "recognition_terminal"
+    ]
+    early_stop_by_task = {
+        task: any(
+            record.get("task") == task
+            and record.get("status") == "ACCEPTED"
+            and len(
+                groups.get(
+                    (
+                        task,
+                        str(record.get("camera")),
+                        str(
+                            record.get("recognition_passage_id")
+                            or record.get("passage_id")
+                            or record.get("track_id")
+                        ),
+                        int(record.get("generation") or 0),
+                    ),
+                    [],
+                )
+            )
+            < 3
+            for record in terminals
+        )
+        for task in ("face", "lpr")
+    }
+    return {
+        "attempts": len(attempts),
+        "passages": len(groups),
+        "max_attempts_per_track": max(map(len, groups.values()), default=0),
+        "attempts_per_track": {
+            "min": min(map(len, groups.values()), default=0),
+            "max": max(map(len, groups.values()), default=0),
+            "mean": round(len(attempts) / len(groups), 3) if groups else 0.0,
+        },
+        "compute_ms_by_task": {
+            task: round(
+                sum(
+                    float(record.get("latency_ms") or 0)
+                    for record in attempts
+                    if record.get("task") == task
+                ),
+                3,
+            )
+            for task in ("face", "lpr")
+        },
+        "duplicate_inference": duplicate_inference,
+        "terminals": terminals,
+        "terminal_reasons": dict(
+            collections.Counter(str(record.get("reason")) for record in terminals)
+        ),
+        "early_stop_by_task": early_stop_by_task,
+        "stats": stats,
+    }
 
 
 def parse_pending(logs: str) -> int | None:
@@ -1076,7 +1280,9 @@ def main() -> int:
     previous_ready_seconds = os.environ.get("CAMERA_READY_STABLE_SECONDS")
     previous_skip_ready = os.environ.get("CAMERA_SKIP_READY_WAIT")
     runtime_started = False
+    replays_paused = False
     sampler: ResourceSampler | None = None
+    isolated_start_wall: float | None = None
     exit_code = 1
     try:
         phase = time.monotonic()
@@ -1109,7 +1315,7 @@ def main() -> int:
         )
         if not cache_valid:
             subprocess.run(
-                ["python", "tools/prepare_passage_fixture.py", *prepare_args],
+                [sys.executable, "tools/prepare_passage_fixture.py", *prepare_args],
                 check=True,
                 timeout=30,
             )
@@ -1125,13 +1331,6 @@ def main() -> int:
         )
         fixture["config_sha256"] = sha256(isolated_config)
         write_json(output / "fixture.json", fixture)
-        artifact_dir = output / "media" / "clips" / "artifacts"
-        if artifact_dir.is_dir() and artifact_dir.resolve().is_relative_to(output):
-            shutil.rmtree(artifact_dir)
-        database_dir = output / "media" / "passage"
-        if database_dir.is_dir() and database_dir.resolve().is_relative_to(output):
-            shutil.rmtree(database_dir)
-        database_dir.mkdir(parents=True, exist_ok=True)
         summary["fixture"] = fixture
         summary["fixture_contract"] = contract
         summary["timing"]["fixture_seconds"] = round(time.monotonic() - phase, 3)
@@ -1144,12 +1343,24 @@ def main() -> int:
             exit_code = 0 if all(summary["gates"].values()) else 1
             return exit_code
 
+        # A prior run may still have this output's SQLite database bind-mounted.
+        # Stop Frigate before resetting run-owned artifacts so SQLite can finish
+        # WAL/checkpoint work and release its files cleanly.
+        runtime_started = True
+        docker_output("stop", "--time", "10", "frigate", timeout=15, check=False)
+        artifact_dir = output / "media" / "clips" / "artifacts"
+        if artifact_dir.is_dir() and artifact_dir.resolve().is_relative_to(output):
+            shutil.rmtree(artifact_dir)
+        database_dir = output / "media" / "passage"
+        if database_dir.is_dir() and database_dir.resolve().is_relative_to(output):
+            shutil.rmtree(database_dir)
+        database_dir.mkdir(parents=True, exist_ok=True)
+
         isolated_start_wall = time.time()
         phase = time.monotonic()
         os.environ["PASSAGE_TRACE_PATH"] = TRACE_CONTAINER_PATH
         os.environ["CAMERA_READY_STABLE_SECONDS"] = "1"
         os.environ["CAMERA_SKIP_READY_WAIT"] = "1"
-        runtime_started = True
         run_deploy("acceptance-start", Path(fixture["config"]), timeout=30)
         wait_acceptance_ready(args.image or str(value["runtime"]["image"]), timeout=40)
         summary["timing"]["isolated_start_seconds"] = round(time.monotonic() - phase, 3)
@@ -1166,6 +1377,14 @@ def main() -> int:
         replays = {"face": output / "face-replay.mp4", "lpr": output / "lpr-replay.mp4"}
         phase = time.monotonic()
         anchors, anchor_details = observe_round_anchors(replays, started + 95)
+        docker_output(
+            "pause",
+            "camera-replay-face-camera",
+            "camera-replay-car-camera",
+            timeout=5,
+        )
+        replays_paused = True
+        recognition_idle = wait_recognition_idle()
         summary["timing"]["replay_seconds"] = round(time.monotonic() - phase, 3)
         sampler.stop()
         resource_memory = list(sampler.memory_bytes)
@@ -1178,6 +1397,13 @@ def main() -> int:
             camera: max(values, default=0)
             for camera, values in sampler.evidence_bytes.items()
         }
+        evidence_pinned_final = (
+            sampler.evidence_pinned[-1] if sampler.evidence_pinned else None
+        )
+        evidence_pinned_min = min(sampler.evidence_pinned, default=None)
+        lifecycle_stats = (
+            sampler.recognition_lifecycle[-1] if sampler.recognition_lifecycle else {}
+        )
         sampler = None
         final_restarts = restart_counts()
 
@@ -1205,6 +1431,7 @@ def main() -> int:
             CAMERAS["lpr"]: lpr_passages,
         }
         records = assign_records(records, anchors, durations, passages_by_camera)
+        recognition = recognition_lifecycle_summary(records, lifecycle_stats)
         write_json(
             output / "runtime-trace.json", {"anchors": anchors, "records": records}
         )
@@ -1236,6 +1463,15 @@ def main() -> int:
             check=False,
         )
         pending = parse_pending(runtime_logs)
+        pending_source = "face_pipeline_log"
+        if (
+            int(lifecycle_stats.get("in_flight", 0)) == 0
+            and evidence_pinned_final == 0
+        ):
+            # The periodic face log can be older than the final sampler point.
+            # Lifecycle plus evidence ownership is the authoritative live state.
+            pending = 0
+            pending_source = "lifecycle_and_evidence"
         bad_log_lines = [
             line
             for line in runtime_logs.splitlines()
@@ -1274,6 +1510,8 @@ def main() -> int:
             "shm_max_percent": max(resource_shm, default=None),
             "skipped_fps_max": skipped_fps,
             "evidence_bytes_max": evidence_bytes,
+            "evidence_pinned_final": evidence_pinned_final,
+            "evidence_pinned_min": evidence_pinned_min,
         }
         if resources["ram_max_bytes"] is None:
             usage = docker_output(
@@ -1295,6 +1533,7 @@ def main() -> int:
             "anchors": anchor_details,
             "rounds_complete": all(len(value) == ROUNDS for value in anchors.values()),
             "pending": pending,
+            "pending_source": pending_source,
             "restart_delta": restart_delta,
             "bad_log_lines": bad_log_lines,
             "correlation_mismatches": correlation,
@@ -1307,6 +1546,8 @@ def main() -> int:
                 "face_actual": face_model_loads,
             },
             "resources": resources,
+            "recognition_lifecycle": recognition,
+            "recognition_idle_after_replay": recognition_idle,
         }
         control = None
         if args.control_summary is not None:
@@ -1361,12 +1602,15 @@ def main() -> int:
             "lpr_recall": lpr["passage_recall"] == 1.0,
             "lpr_readable_denominator": lpr["readable_denominator"] >= 3,
             "lpr_exact_match_reported": lpr["exact_match"] is not None,
-            "lpr_exact_match_floor": lpr["exact_match"] is not None
-            and lpr["exact_match"] >= 1 / 3,
-            "lpr_passage_precision": lpr["passage_precision"] >= MIN_PASSAGE_RATE,
+            "lpr_accuracy": lpr["accuracy"] is not None
+            and lpr["accuracy"] >= 2 / 3,
+            "lpr_recognition_precision": lpr["precision"] == 1.0,
+            "lpr_recognition_recall": lpr["recall"] >= 2 / 3,
+            "lpr_passage_precision": lpr["passage_precision"] == 1.0,
             "face_detection_recall": face["detection_recall"] >= MIN_PASSAGE_RATE,
-            "face_precision": face["precision"] >= MIN_PASSAGE_RATE,
-            "face_recall": face["recall"] >= MIN_PASSAGE_RATE,
+            "face_accuracy": face["accuracy"] >= 0.8,
+            "face_precision": face["precision"] == 1.0,
+            "face_recall": face["recall"] >= 0.8,
             "face_passage_latency": latency["face"]["passage_to_confirmed_ms_p95"]
             is not None
             and latency["face"]["passage_to_confirmed_ms_p95"] <= 3000,
@@ -1392,6 +1636,23 @@ def main() -> int:
             "evidence_bytes_per_camera": all(
                 value <= 32 * 1024**2 for value in evidence_bytes.values()
             ),
+            "recognition_attempt_budget": recognition["max_attempts_per_track"] <= 3,
+            "recognition_duplicate_inference": not recognition["duplicate_inference"],
+            "recognition_stale_results": lifecycle_stats.get("stale_results", 0) == 0,
+            "recognition_early_stop_face": recognition["early_stop_by_task"]["face"],
+            "recognition_early_stop_lpr": recognition["early_stop_by_task"]["lpr"],
+            "recognition_in_flight_zero": lifecycle_stats.get("in_flight", 0) == 0,
+            "recognition_active_lifecycle_zero": lifecycle_stats.get(
+                "active_lifecycles", lifecycle_stats.get("active_tracks", 0)
+            )
+            == 0,
+            "recognition_selector_depth_zero": lifecycle_stats.get(
+                "quality_top_k_depth", 0
+            )
+            == 0,
+            "recognition_lpr_queue_zero": lifecycle_stats.get("lpr_queue_depth", 0)
+            == 0,
+            "evidence_pinned_zero": evidence_pinned_final == 0,
         }
         if control is not None:
             control_resources = control.get("runtime", {}).get("resources", {})
@@ -1410,6 +1671,20 @@ def main() -> int:
         summary["error"] = f"{type(exc).__name__}: {exc}"
         summary.setdefault("gates", {})["error_free"] = False
     finally:
+        try:
+            capture_container_diagnostics(output, isolated_start_wall)
+        except Exception as exc:
+            summary.setdefault("diagnostic_errors", []).append(
+                f"{type(exc).__name__}: {exc}"
+            )
+        if replays_paused:
+            docker_output(
+                "unpause",
+                "camera-replay-face-camera",
+                "camera-replay-car-camera",
+                timeout=5,
+                check=False,
+            )
         if sampler is not None:
             sampler.stop()
         phase = time.monotonic()
