@@ -12,7 +12,7 @@ not create labels. After annotation, run with the PyTorch weights corresponding
 to the native YOLOv8n model:
 
 ```powershell
-python tools/train_native_lpr.py `
+python tools/model/train_native_lpr.py `
   --weights D:\path\to\native-yolov8n.pt `
   --data-root .tmp\lpr-dataset-v2 `
   --output .tmp\models\native-lpr-finetuned `

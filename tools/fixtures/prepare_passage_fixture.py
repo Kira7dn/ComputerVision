@@ -1,4 +1,4 @@
-"""Validate and build the bounded 1280x720/15fps passage replay fixture."""
+"""Validate and build bounded per-camera passage replay fixtures."""
 from __future__ import annotations
 
 import argparse
@@ -14,8 +14,22 @@ from typing import Any
 import cv2
 import yaml
 
-WIDTH, HEIGHT, FPS = 1280, 720, 15
 BLACK_LEAD_SECONDS = 1.5
+
+
+def frame_spec(manifest: dict[str, Any], kind: str) -> tuple[int, int, int]:
+    """Return the declared replay frame for one pipeline."""
+    value = manifest["frame"] if kind == "face" else manifest[kind].get(
+        "frame", manifest["frame"]
+    )
+    if not isinstance(value, dict):
+        raise ValueError(f"{kind} frame must be an object")
+    width = int(value.get("width", 0))
+    height = int(value.get("height", 0))
+    fps = int(value.get("fps", 0))
+    if width <= 0 or height <= 0 or fps <= 0 or width % 2 or height % 2:
+        raise ValueError(f"{kind} frame must use positive even dimensions and FPS")
+    return width, height, fps
 
 
 def file_hash(path: Path) -> str:
@@ -26,13 +40,13 @@ def file_hash(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _boxes(value: Any, name: str) -> None:
+def _boxes(value: Any, name: str, width: int, height: int) -> None:
     if not isinstance(value, list) or len(value) != 4 or any(float(v) < 0 for v in value):
         raise ValueError(f"{name} must be a four-number non-negative bbox")
     if float(value[0]) >= float(value[2]) or float(value[1]) >= float(value[3]):
         raise ValueError(f"{name} must have positive width and height")
-    if float(value[2]) > WIDTH or float(value[3]) > HEIGHT:
-        raise ValueError(f"{name} is outside the 1280x720 frame")
+    if float(value[2]) > width or float(value[3]) > height:
+        raise ValueError(f"{name} is outside the {width}x{height} frame")
 
 
 def load_manifest(path: Path, root: Path) -> dict[str, Any]:
@@ -41,8 +55,8 @@ def load_manifest(path: Path, root: Path) -> dict[str, Any]:
         raise ValueError("manifest schema_version must be 2")
     if not 0 < int(data.get("test_case_limit_seconds", 0)) < 120:
         raise ValueError("test_case_limit_seconds must be under 120")
-    if data.get("frame") != {"width": WIDTH, "height": HEIGHT, "fps": FPS}:
-        raise ValueError("Passage fixture must be 1280x720 at 15 FPS")
+    face_width, face_height, _ = frame_spec(data, "face")
+    lpr_width, lpr_height, _ = frame_spec(data, "lpr")
     seen: set[str] = set()
     face = data.get("face", {})
     passages = face.get("passages", [])
@@ -64,7 +78,12 @@ def load_manifest(path: Path, root: Path) -> dict[str, Any]:
         if passage.get("valid_passage", True) and passage.get("bbox") is None:
             raise ValueError(f"active face passage requires bbox: {pid}")
         if passage.get("bbox") is not None:
-            _boxes(passage.get("bbox"), f"face {pid}.bbox")
+            _boxes(
+                passage.get("bbox"),
+                f"face {pid}.bbox",
+                face_width,
+                face_height,
+            )
         if not (root / passage["source"]).is_file():
             raise FileNotFoundError(passage["source"])
     close_follow = face.get("close_follow", [])
@@ -97,9 +116,19 @@ def load_manifest(path: Path, root: Path) -> dict[str, Any]:
         if passage.get("valid_passage", True) and (passage.get("bbox") is None or passage.get("roi") is None):
             raise ValueError(f"active LPR passage requires bbox and roi: {pid}")
         if passage.get("bbox") is not None:
-            _boxes(passage.get("bbox"), f"LPR {pid}.bbox")
+            _boxes(
+                passage.get("bbox"),
+                f"LPR {pid}.bbox",
+                lpr_width,
+                lpr_height,
+            )
         if passage.get("roi") is not None:
-            _boxes(passage.get("roi"), f"LPR {pid}.roi")
+            _boxes(
+                passage.get("roi"),
+                f"LPR {pid}.roi",
+                lpr_width,
+                lpr_height,
+            )
     if not (root / lpr["source"]).is_file():
         raise FileNotFoundError(lpr["source"])
     simultaneous = False
@@ -174,25 +203,40 @@ def write_enrollment_crop(manifest: dict[str, Any], root: Path, output: Path) ->
         raise RuntimeError(f"cannot write enrollment crop: {output}")
 
 
+def group_composite_passages(
+    passages: list[dict[str, Any]], kind: str
+) -> list[list[dict[str, Any]]]:
+    if kind != "lpr":
+        return [[passage] for passage in passages]
+
+    grouped: list[list[dict[str, Any]]] = []
+    for passage in passages:
+        if grouped and float(passage["start_s"]) < max(
+            float(item["end_s"]) for item in grouped[-1]
+        ):
+            grouped[-1].append(passage)
+        else:
+            grouped.append([passage])
+    return grouped
+
+
 def make_composite(manifest: dict[str, Any], root: Path, output: Path, kind: str) -> tuple[Path, list[dict[str, Any]]]:
+    width, height, fps = frame_spec(manifest, kind)
     media = output / "media"
     media.mkdir(parents=True, exist_ok=True)
     parts: list[Path] = []
     windows: list[dict[str, Any]] = []
     timeline = BLACK_LEAD_SECONDS
     lead = media / f"{kind}-black-lead.mp4"
-    ffmpeg(["-f", "lavfi", "-i", f"color=c=black:s={WIDTH}x{HEIGHT}:r={FPS}", "-t", str(BLACK_LEAD_SECONDS), "-an", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", str(lead)])
+    ffmpeg(["-f", "lavfi", "-i", f"color=c=black:s={width}x{height}:r={fps}", "-t", str(BLACK_LEAD_SECONDS), "-an", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", str(lead)])
     parts.append(lead)
     passages = manifest[kind]["passages"]
-    grouped: list[list[dict[str, Any]]] = []
-    for passage in passages:
-        if kind == "lpr" and grouped and all(float(grouped[-1][0][key]) == float(passage[key]) for key in ("start_s", "end_s")):
-            grouped[-1].append(passage)
-        else:
-            grouped.append([passage])
+    grouped = group_composite_passages(passages, kind)
     close_pairs = {tuple(pair) for pair in manifest.get("face", {}).get("close_follow", [])}
     for index, group in enumerate(grouped):
         passage = group[0]
+        group_start = min(float(item["start_s"]) for item in group)
+        group_end = max(float(item["end_s"]) for item in group)
         if index:
             previous_id = grouped[index - 1][-1]["id"]
             if kind == "face":
@@ -200,14 +244,23 @@ def make_composite(manifest: dict[str, Any], root: Path, output: Path, kind: str
             else:
                 gap_seconds = 0.85
             gap = media / f"{kind}-gap-{index:02d}.mp4"
-            ffmpeg(["-f", "lavfi", "-i", f"color=c=black:s={WIDTH}x{HEIGHT}:r={FPS}", "-t", str(gap_seconds), "-an", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", str(gap)])
+            ffmpeg(["-f", "lavfi", "-i", f"color=c=black:s={width}x{height}:r={fps}", "-t", str(gap_seconds), "-an", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", str(gap)])
             parts.append(gap); timeline += gap_seconds
         part = media / f"{kind}-{index:02d}.mp4"
-        duration = float(passage["end_s"]) - float(passage["start_s"])
-        ffmpeg(["-ss", str(passage["start_s"]), "-i", str(root / passage["source"] if kind == "face" else root / manifest["lpr"]["source"]), "-t", str(duration), "-an", "-vf", f"scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=decrease,pad={WIDTH}:{HEIGHT}:(ow-iw)/2:(oh-ih)/2,fps={FPS}", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", str(part)])
+        duration = group_end - group_start
+        ffmpeg(["-ss", str(group_start), "-i", str(root / passage["source"] if kind == "face" else root / manifest["lpr"]["source"]), "-t", str(duration), "-an", "-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,fps={fps}", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", str(part)])
         parts.append(part)
         for grouped_passage in group:
-            window = {"id": grouped_passage["id"], "start_s": round(timeline, 3), "end_s": round(timeline + duration, 3), "valid_passage": grouped_passage.get("valid_passage", True)}
+            window = {
+                "id": grouped_passage["id"],
+                "start_s": round(
+                    timeline + float(grouped_passage["start_s"]) - group_start, 3
+                ),
+                "end_s": round(
+                    timeline + float(grouped_passage["end_s"]) - group_start, 3
+                ),
+                "valid_passage": grouped_passage.get("valid_passage", True),
+            }
             if kind == "face":
                 window["face_visible_s"] = round(timeline + float(grouped_passage["face_visible_s"]) - float(grouped_passage["start_s"]), 3)
             windows.append(window)
@@ -216,9 +269,9 @@ def make_composite(manifest: dict[str, Any], root: Path, output: Path, kind: str
     concat.write_text("\n".join(f"file '{p.as_posix()}'" for p in parts) + "\n", encoding="utf-8")
     result = output / f"{kind}-replay.mp4"
     ffmpeg([
-        "-f", "concat", "-safe", "0", "-i", str(concat), "-an", "-vf", f"fps={FPS}",
+        "-f", "concat", "-safe", "0", "-i", str(concat), "-an", "-vf", f"fps={fps}",
         "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
-        "-g", str(FPS), "-keyint_min", str(FPS), "-sc_threshold", "0",
+        "-g", str(fps), "-keyint_min", str(fps), "-sc_threshold", "0",
         "-x264-params", "repeat-headers=1", "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(result),
     ], timeout=60)
     if timeline > 15:
@@ -257,6 +310,10 @@ def main() -> int:
     config["notifications"]["enabled"] = False; config["record"]["enabled"] = False
     config["database"] = {"path": "/media/frigate/passage/frigate.db"}
     config["cameras"]["car_camera"]["detect"]["min_initialized"] = 1
+    # The fixture includes a measured 2.58 s source-PTS gap.  Keep the
+    # tracker alive for the configured five-second detection boundary so a
+    # temporary queue miss cannot retire the physical passage before Event.
+    config["cameras"]["car_camera"]["detect"]["max_disappeared"] = 25
     # Composite passages intentionally use hard scene cuts. Do not let the
     # production lightning heuristic suppress every motion region while the
     # short fixture passage is visible.
@@ -267,13 +324,17 @@ def main() -> int:
     model_path = root / str(config["runtime"]["model_path"])
     result = {
         "schema_version": 2,
-        "builder_version": 8,
+        "builder_version": 9,
         "manifest": str(args.manifest.resolve()),
         "manifest_sha256": file_hash(args.manifest),
         "base_config_sha256": file_hash(args.config),
         "model_sha256": file_hash(model_path),
         "enrollment_image": str(enrollment_image),
         "source_sha256": {"face": file_hash(face_replay), "lpr": file_hash(lpr_replay)},
+        "replay_frames": {
+            kind: dict(zip(("width", "height", "fps"), frame_spec(manifest, kind)))
+            for kind in ("face", "lpr")
+        },
         "replay_windows": {"face": face_windows, "lpr": lpr_windows},
         "config": str(config_path),
         "config_sha256": file_hash(config_path),

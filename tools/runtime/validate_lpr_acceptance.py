@@ -18,8 +18,6 @@ from urllib.request import urlopen
 import websockets
 import yaml
 
-FRAME_WIDTH = 1280
-FRAME_HEIGHT = 720
 RUNTIME_CONTAINERS = (
     "frigate",
     "camera-replay-face-camera",
@@ -112,14 +110,19 @@ def parse_payload(message: dict[str, Any]) -> Any:
     return payload
 
 
-def box_contains_plate(box: list[float], plate_box: list[int]) -> bool:
+def box_contains_plate(
+    box: list[float],
+    plate_box: list[int],
+    frame_width: int,
+    frame_height: int,
+) -> bool:
     x1, y1, x2, y2 = box
     if max(box) <= 2:
         car_box = (
-            x1 * FRAME_WIDTH,
-            y1 * FRAME_HEIGHT,
-            x2 * FRAME_WIDTH,
-            y2 * FRAME_HEIGHT,
+            x1 * frame_width,
+            y1 * frame_height,
+            x2 * frame_width,
+            y2 * frame_height,
         )
     else:
         car_box = (x1, y1, x2, y2)
@@ -250,6 +253,12 @@ async def collect(args: argparse.Namespace) -> dict[str, Any]:
     lpr_updates: list[dict[str, Any]] = []
     latest_boxes: dict[str, list[float]] = {}
     ws_errors: list[str] = []
+    config, source_duration = await asyncio.to_thread(
+        load_config_and_source_duration, args.config
+    )
+    car_detect = config["cameras"]["car_camera"]["detect"]
+    frame_width = int(car_detect["width"])
+    frame_height = int(car_detect["height"])
 
     async def receive_ws() -> None:
         try:
@@ -295,11 +304,16 @@ async def collect(args: argparse.Namespace) -> dict[str, Any]:
                         update["plate_box_valid"] = bool(
                             isinstance(plate_box, list)
                             and len(plate_box) == 4
-                            and 0 <= plate_box[0] < plate_box[2] <= FRAME_WIDTH
-                            and 0 <= plate_box[1] < plate_box[3] <= FRAME_HEIGHT
+                            and 0 <= plate_box[0] < plate_box[2] <= frame_width
+                            and 0 <= plate_box[1] < plate_box[3] <= frame_height
                         )
                         update["plate_box_within_observed_car_box"] = (
-                            box_contains_plate(car_box, plate_box)
+                            box_contains_plate(
+                                car_box,
+                                plate_box,
+                                frame_width,
+                                frame_height,
+                            )
                             if car_box is not None and update["plate_box_valid"]
                             else None
                         )
@@ -432,9 +446,6 @@ async def collect(args: argparse.Namespace) -> dict[str, Any]:
             - samples[0]["cameras"][camera]["stalls_last_hour"]
         )
 
-    config, source_duration = await asyncio.to_thread(
-        load_config_and_source_duration, args.config
-    )
     ground_truth = None
     if args.manifest:
         manifest = yaml.safe_load(Path(args.manifest).read_text(encoding="utf-8"))
@@ -628,7 +639,7 @@ async def collect(args: argparse.Namespace) -> dict[str, Any]:
             "pending queue depth is not exposed by this Frigate stats schema; detector and enrichment metrics were sampled instead",
             "model_state proves every required model is ready; download counts must stay at zero for a warm cache or one for a cold cache, never repeat in one runtime",
             "OCR consistency is repeatability on deterministic replay passages, not absolute character accuracy without ground truth",
-            "event WebSocket boxes are snapshot updates and can be stale relative to LPR timestamps; containment is verified from the running container source contract and live plate boxes are independently bounded to the 1280x720 frame",
+            "event WebSocket boxes are snapshot updates and can be stale relative to LPR timestamps; containment is verified from the running container source contract and live plate boxes are independently bounded to the configured car detect frame",
         ],
     }
 
@@ -642,7 +653,7 @@ def main() -> int:
     parser.add_argument("--config", default="deploy/config.yaml")
     parser.add_argument("--manifest")
     parser.add_argument(
-        "--output", default=".tmp/runtime/lpr-acceptance-2cam-720p.json"
+        "--output", default=".tmp/runtime/lpr-acceptance-2cam.json"
     )
     args = parser.parse_args()
     if args.duration <= 0 or args.duration > 90:

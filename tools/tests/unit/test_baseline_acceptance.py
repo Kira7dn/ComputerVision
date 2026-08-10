@@ -4,14 +4,14 @@ from pathlib import Path
 import pytest
 import yaml
 
-from tools.prepare_baseline_fixture import load_manifest
-from tools.validate_face_replay import (
+from tools.fixtures.prepare_baseline_fixture import load_manifest
+from tools.runtime.validate_face_replay import (
     face_event_result,
     score_ground_truth,
 )
-from tools.validate_lpr_acceptance import match_passage
+from tools.runtime.validate_lpr_acceptance import box_contains_plate, match_passage
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[3]
 MANIFEST = ROOT / "tools/fixtures/platform_baseline_ground_truth.yaml"
 
 
@@ -47,6 +47,15 @@ def test_passage_matching_survives_replay_loop() -> None:
     second = match_passage(116.5, 100.0, 15.0, passages)
     assert first is not None and first["id"] == "p1"
     assert second is not None and second["id"] == "p1"
+
+
+def test_plate_containment_uses_configured_detect_resolution() -> None:
+    assert box_contains_plate(
+        [0.5, 0.0, 1.0, 1.0],
+        [1400, 700, 1500, 760],
+        1820,
+        1024,
+    )
 
 
 @pytest.mark.parametrize(

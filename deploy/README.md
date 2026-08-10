@@ -3,7 +3,7 @@
 Runtime có một entrypoint, một file cấu hình và một file secret:
 
 ```text
-deploy/run.ps1       # start/status/logs/doctor/stop
+deploy/run.ps1       # production, development, acceptance và build commands
 deploy/config.yaml   # toàn bộ cấu hình runtime và Frigate
 .env.local           # credential, được Docker Compose nạp trực tiếp
 ```
@@ -37,6 +37,37 @@ Chạy từ `D:\BusinessAnalyze\Camera`:
 .\deploy\run.ps1 stop
 .\deploy\run.ps1 build
 ```
+
+## Development không build image
+
+Các lệnh development bind-mount trực tiếp package Python local vào container ở
+`/opt/frigate/frigate` theo chế độ read-only. Sửa source không cần build lại
+frontend hoặc Docker image; restart chỉ recreate service Frigate và giữ nguyên
+model/media/cache hiện có.
+
+```powershell
+# Khởi động runtime development lần đầu
+.\deploy\run.ps1 dev-start
+
+# Sau mỗi lần sửa Python
+.\deploy\run.ps1 dev-restart
+
+# Theo dõi log Frigate; Ctrl+C chỉ dừng việc theo dõi log
+.\deploy\run.ps1 dev-logs
+
+# Dừng toàn bộ runtime development
+.\deploy\run.ps1 dev-stop
+```
+
+Mặc định source là `frigate/frigate`. Có thể chỉ định checkout khác bằng
+`-SourceDir`, nhưng thư mục đó phải là package Frigate có file `__init__.py`:
+
+```powershell
+.\deploy\run.ps1 dev-start -SourceDir D:\path\to\frigate\frigate
+```
+
+Dev mode không tự reload process Python. Sau khi sửa code phải chạy
+`dev-restart`; lệnh này luôn dùng `--no-build`.
 
 Không có tham số source, loop hoặc detector. Sửa các giá trị đó trong
 `deploy/config.yaml`.
@@ -96,6 +127,11 @@ Có thể trộn RTSP và replay trong cùng một runtime. Mỗi source phải 
 được ít nhất một frame; `doctor` kiểm tra tất cả source nhưng không start container.
 Replay dùng stream-copy để không tốn CPU chuyển mã lúc chạy, vì vậy cần chuẩn hóa trước
 độ phân giải và FPS của file nguồn theo profile camera mong muốn.
+
+Profile hiện tại giữ `face_camera` ở 1280×720/5 FPS và chạy `car_camera` từ nguồn
+1820×1024 với detect 1820×1024/5 FPS. Fixture passage khai báo kích thước riêng cho
+từng camera; bbox/ROI phải dùng hệ tọa độ của đúng detect frame, không dùng chung tọa
+độ 720p cho LPR.
 
 ## Kiểm tra face recognition
 

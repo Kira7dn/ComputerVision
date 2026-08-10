@@ -1,16 +1,17 @@
+import json
 from pathlib import Path
 
 import pytest
 import yaml
 
-import tools.validate_passage_acceptance as passage_validator
-from tools.passage_metrics import (
+import tools.runtime.validate_platform_runtime as passage_validator
+from tools.lib.passage_metrics import (
     match_by_time_and_bbox,
     normalize_plate,
     score_face_passages,
 )
-from tools.prepare_passage_fixture import load_manifest
-from tools.validate_passage_acceptance import (
+from tools.fixtures.prepare_passage_fixture import group_composite_passages, load_manifest
+from tools.runtime.validate_platform_runtime import (
     api_sqlite_consistency,
     assign_records,
     correlation_mismatches,
@@ -19,11 +20,26 @@ from tools.validate_passage_acceptance import (
     lpr_results,
     recognition_lifecycle_summary,
     update_anchor_state,
+    validate_runtime_lpr_evidence,
+    wait_file_quiescent,
     wait_recognition_idle,
 )
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[3]
 MANIFEST = ROOT / "tools/fixtures/platform_passage_ground_truth.yaml"
+
+
+def test_wait_file_quiescent_requires_stable_manifest(tmp_path: Path) -> None:
+    manifest = tmp_path / "evidence.jsonl"
+    manifest.write_text("{}\n", encoding="utf-8")
+
+    assert wait_file_quiescent(manifest, timeout=0.2, stable_seconds=0.05) is True
+    assert (
+        wait_file_quiescent(
+            tmp_path / "missing.jsonl", timeout=0.05, stable_seconds=0.01
+        )
+        is False
+    )
 
 
 def manifest_value() -> dict:
@@ -34,6 +50,228 @@ def write_manifest(tmp_path: Path, value: dict) -> Path:
     path = tmp_path / "passage.yaml"
     path.write_text(yaml.safe_dump(value), encoding="utf-8")
     return path
+
+
+def write_evidence_manifest(tmp_path: Path, records: list[dict]) -> Path:
+    evidence_dir = tmp_path / "passage-evidence"
+    evidence_dir.mkdir()
+    for index, record in enumerate(records):
+        if not record.pop("with_artifact", False):
+            continue
+        relative = Path("lpr") / str(record["evidence_id"]) / f"{index}.jpg"
+        target = evidence_dir / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(f"image-{index}".encode())
+        record.update(
+            {
+                "artifact_path": relative.as_posix(),
+                "artifact_sha256": passage_validator.sha256(target),
+                "artifact_bytes": target.stat().st_size,
+            }
+        )
+    (evidence_dir / "evidence.jsonl").write_text(
+        "\n".join(json.dumps(record) for record in records) + "\n",
+        encoding="utf-8",
+    )
+    return evidence_dir
+
+
+def test_runtime_lpr_evidence_accepts_complete_pre_gate_invocation(tmp_path: Path) -> None:
+    base = {
+        "evidence_id": "attempt-1",
+        "camera": "car_camera",
+        "frame_time": 1.0,
+        "track_id": "car-1",
+    }
+    evidence_dir = write_evidence_manifest(
+        tmp_path,
+        [
+            {**base, "stage": "invocation"},
+            {**base, "stage": "runtime_frame", "with_artifact": True},
+            {
+                **base,
+                "stage": "runtime_frame_object_box",
+                "with_artifact": True,
+            },
+            {
+                **base,
+                "stage": "eligibility_decision",
+                "accepted": False,
+                "reason": "no_position_changes",
+            },
+        ],
+    )
+
+    records, summary = validate_runtime_lpr_evidence(
+        evidence_dir, {}, {}, {}
+    )
+
+    assert len(records) == 4
+    assert summary["valid"] is True
+    assert summary["invocations"] == 1
+    assert summary["artifact_count"] == 2
+    assert summary["errors"] == []
+
+
+def test_runtime_lpr_evidence_rejects_missing_plate_crop(tmp_path: Path) -> None:
+    base = {
+        "evidence_id": "attempt-2",
+        "camera": "car_camera",
+        "frame_time": 1.0,
+        "track_id": "car-2",
+    }
+    evidence_dir = write_evidence_manifest(
+        tmp_path,
+        [
+            {**base, "stage": "invocation"},
+            {**base, "stage": "runtime_frame", "with_artifact": True},
+            {
+                **base,
+                "stage": "runtime_frame_object_box",
+                "with_artifact": True,
+            },
+            {
+                **base,
+                "stage": "eligibility_decision",
+                "accepted": True,
+                "reason": "eligible",
+            },
+            {**base, "stage": "car_crop", "with_artifact": True},
+            {**base, "stage": "plate_detector_input", "with_artifact": True},
+            {
+                **base,
+                "stage": "plate_detector_result",
+                "accepted": True,
+                "reason": "plate_detected",
+            },
+            {**base, "stage": "ocr_plate_input", "with_artifact": True},
+            {
+                **base,
+                "stage": "ocr_result",
+                "accepted": False,
+                "reason": "text_detector_empty",
+                "text_box_count": 0,
+            },
+        ],
+    )
+
+    _, summary = validate_runtime_lpr_evidence(evidence_dir, {}, {}, {})
+
+    assert summary["valid"] is False
+    assert any("missing stage: plate_crop" in error for error in summary["errors"])
+
+
+def test_runtime_lpr_evidence_requires_every_physical_passage(tmp_path: Path) -> None:
+    base = {
+        "evidence_id": "attempt-3",
+        "camera": "car_camera",
+        "frame_time": 100.0,
+        "track_id": "car-3",
+        "object_box": [0, 0, 100, 100],
+    }
+    evidence_dir = write_evidence_manifest(
+        tmp_path,
+        [
+            {**base, "stage": "invocation"},
+            {**base, "stage": "runtime_frame", "with_artifact": True},
+            {
+                **base,
+                "stage": "runtime_frame_object_box",
+                "with_artifact": True,
+            },
+            {
+                **base,
+                "stage": "eligibility_decision",
+                "accepted": False,
+                "reason": "no_position_changes",
+            },
+        ],
+    )
+    passages = [
+        {
+            "id": "seen",
+            "start_s": 1.0,
+            "end_s": 2.0,
+            "bbox": [0, 0, 100, 100],
+        },
+        {
+            "id": "missing",
+            "start_s": 3.0,
+            "end_s": 4.0,
+            "bbox": [200, 0, 300, 100],
+        },
+    ]
+
+    _, summary = validate_runtime_lpr_evidence(
+        evidence_dir,
+        {"car_camera": [100.0]},
+        {"car_camera": 5.0},
+        {"car_camera": passages},
+    )
+
+    assert summary["valid"] is False
+    assert summary["missing_passages"] == ["missing"]
+
+
+def test_fixture_lpr_ground_truth_uses_audited_physical_labels() -> None:
+    passages = {
+        passage["id"]: passage for passage in manifest_value()["lpr"]["passages"]
+    }
+
+    assert {
+        passage_id: (
+            passages[passage_id]["readable"],
+            passages[passage_id]["expected_plate"],
+        )
+        for passage_id in (
+            "lpr-01",
+            "lpr-transit-01",
+            "lpr-02",
+            "lpr-trailer-pickup-01",
+            "lpr-red-suv-01",
+            "lpr-service-van-01",
+            "lpr-rental-van-01",
+            "lpr-05",
+            "lpr-07",
+            "lpr-chevy-pickup-01",
+            "lpr-06",
+        )
+    } == {
+        "lpr-01": (True, "619879"),
+        "lpr-transit-01": (True, "C98191P"),
+        "lpr-02": (True, "657648"),
+        "lpr-trailer-pickup-01": (True, "7BN2396"),
+        "lpr-red-suv-01": (True, "1073"),
+        "lpr-service-van-01": (True, "3789"),
+        "lpr-rental-van-01": (True, "C64457T"),
+        "lpr-05": (True, "3B53567"),
+        "lpr-07": (True, "FKH9211"),
+        "lpr-chevy-pickup-01": (True, "XX6755"),
+        "lpr-06": (True, "BEE3975"),
+    }
+    assert all(
+        not passages[passage_id].get("accepted_plates")
+        for passage_id in passages
+    )
+
+
+def test_overlapping_lpr_passages_share_composite_segments() -> None:
+    grouped = group_composite_passages(
+        manifest_value()["lpr"]["passages"], "lpr"
+    )
+
+    assert [[passage["id"] for passage in group] for group in grouped] == [
+        ["lpr-01", "lpr-transit-01", "lpr-02"],
+        ["lpr-trailer-pickup-01", "lpr-red-suv-01"],
+        [
+            "lpr-service-van-01",
+            "lpr-rental-van-01",
+            "lpr-05",
+            "lpr-07",
+            "lpr-chevy-pickup-01",
+        ],
+        ["lpr-06"],
+    ]
 
 
 def test_wait_recognition_idle_reads_lifecycle_and_evidence(monkeypatch) -> None:
@@ -89,9 +327,11 @@ def test_passage_manifest_contract() -> None:
     assert sum(p["expected_identity"] == "Jack" for p in face) >= 2
     assert sum(p["expected_identity"] == "unknown" for p in face) >= 2
     assert value["face"]["close_follow"]
-    assert len(lpr) == 5
-    assert sum(p["readable"] for p in lpr) == 3
+    assert len(lpr) == 11
+    assert sum(p["readable"] for p in lpr) == 11
     assert all(p["bbox"] and p["roi"] for p in lpr)
+    assert value["lpr"]["frame"] == {"width": 1820, "height": 1024, "fps": 5}
+    assert value["lpr"]["source"].endswith(" (1024p).mp4")
 
 
 def test_passage_rejects_duplicate_id(tmp_path: Path) -> None:
@@ -112,6 +352,13 @@ def test_passage_rejects_bbox_outside_frame(tmp_path: Path) -> None:
     value = manifest_value()
     value["face"]["passages"][0]["bbox"] = [0, 0, 1281, 100]
     with pytest.raises(ValueError, match="outside"):
+        load_manifest(write_manifest(tmp_path, value), ROOT)
+
+
+def test_passage_rejects_lpr_bbox_outside_its_frame(tmp_path: Path) -> None:
+    value = manifest_value()
+    value["lpr"]["passages"][0]["bbox"] = [0, 0, 1821, 100]
+    with pytest.raises(ValueError, match="outside the 1820x1024 frame"):
         load_manifest(write_manifest(tmp_path, value), ROOT)
 
 
@@ -223,6 +470,152 @@ def test_time_only_record_cannot_seed_ground_truth_track_mapping() -> None:
     assert all(not record.get("passage_id") for record in assigned)
 
 
+def test_conflicting_track_mapping_fails_closed_for_entire_track() -> None:
+    passages = [
+        {"id": "left", "start_s": 0, "end_s": 2, "bbox": [0, 0, 100, 100]},
+        {"id": "right", "start_s": 0, "end_s": 2, "bbox": [500, 0, 600, 100]},
+    ]
+    records = [
+        {
+            "camera": "car_camera",
+            "frame_time": 100.5,
+            "stage": "detector_hit",
+            "object_box": [0, 0, 100, 100],
+            "track_id": "reused-track",
+        },
+        {
+            "camera": "car_camera",
+            "frame_time": 100.6,
+            "stage": "detector_hit",
+            "object_box": [500, 0, 600, 100],
+            "track_id": "reused-track",
+        },
+        {
+            "camera": "car_camera",
+            "round_id": 1,
+            "stage": "recognition_terminal",
+            "track_id": "reused-track",
+        },
+    ]
+
+    assigned = assign_records(
+        records,
+        {"car_camera": [100]},
+        {"car_camera": 3},
+        {"car_camera": passages},
+    )
+
+    assert all(not record.get("passage_id") for record in assigned)
+
+
+def test_moving_track_is_locked_to_one_physical_passage() -> None:
+    passages = [
+        {
+            "id": "fkh",
+            "start_s": 1,
+            "end_s": 3,
+            "bbox": [925, 0, 1220, 205],
+        },
+        {
+            "id": "xx",
+            "start_s": 1,
+            "end_s": 3,
+            "bbox": [490, 0, 840, 250],
+        },
+    ]
+    records = [
+        {
+            "camera": "car_camera",
+            "frame_time": 101.1,
+            "stage": "event_published",
+            "object_box": [937, 0, 1170, 204],
+            "track_id": "moving-car",
+            "plate": "FKH9211",
+        },
+        {
+            "camera": "car_camera",
+            "frame_time": 101.7,
+            "stage": "event_published",
+            "object_box": [742, 168, 1103, 509],
+            "track_id": "moving-car",
+            "plate": "FKH9211",
+        },
+        {
+            "camera": "car_camera",
+            "round_id": 1,
+            "stage": "recognition_terminal",
+            "track_id": "moving-car",
+        },
+    ]
+
+    assigned = assign_records(
+        records,
+        {"car_camera": [100]},
+        {"car_camera": 4},
+        {"car_camera": passages},
+    )
+
+    assert {record.get("passage_id") for record in assigned} == {"fkh"}
+
+
+def test_recognition_evidence_overrides_stale_initial_track_box() -> None:
+    passages = [
+        {"id": "early", "start_s": 1, "end_s": 2, "bbox": [0, 0, 100, 100]},
+        {"id": "late", "start_s": 3, "end_s": 4, "bbox": [500, 0, 600, 100]},
+    ]
+    records = [
+        {
+            "camera": "car_camera",
+            "frame_time": 100.0,
+            "stage": "track_seen",
+            "object_box": [0, 0, 100, 100],
+            "track_id": "continued-track",
+        },
+        {
+            "camera": "car_camera",
+            "frame_time": 102.0,
+            "stage": "event_published",
+            "object_box": [500, 0, 600, 100],
+            "track_id": "continued-track",
+            "plate": "BEE3975",
+        },
+    ]
+
+    assigned = assign_records(
+        records,
+        {"car_camera": [100]},
+        {"car_camera": 5},
+        {"car_camera": passages},
+    )
+
+    assert {record.get("passage_id") for record in assigned} == {"late"}
+
+
+def test_untracked_record_with_ambiguous_bbox_fails_closed() -> None:
+    passages = [
+        {"id": "a", "start_s": 1, "end_s": 2, "bbox": [0, 0, 100, 100]},
+        {"id": "b", "start_s": 1, "end_s": 2, "bbox": [10, 0, 110, 100]},
+    ]
+    records = [
+        {
+            "camera": "car_camera",
+            "frame_time": 101.5,
+            "stage": "detector_hit",
+            "object_box": [5, 0, 105, 100],
+        }
+    ]
+
+    assigned = assign_records(
+        records,
+        {"car_camera": [100]},
+        {"car_camera": 3},
+        {"car_camera": passages},
+    )
+
+    assert len(assigned) == 1
+    assert not assigned[0].get("passage_id")
+
+
 def test_unknown_and_known_false_negative_are_scored() -> None:
     passages = [
         {"id": "known", "start_s": 0, "end_s": 2, "bbox": [0, 0, 100, 100], "expected_identity": "Jack"},
@@ -246,7 +639,7 @@ def test_close_follow_rejects_old_generation_correlation() -> None:
     assert not correlation_mismatches(records)
 
 
-def test_face_passage_uses_majority_of_replay_rounds() -> None:
+def test_face_passage_reports_single_replay_round() -> None:
     passage = {
         "id": "known",
         "valid_passage": True,
@@ -254,7 +647,7 @@ def test_face_passage_uses_majority_of_replay_rounds() -> None:
         "expected_identity": "Jack",
     }
     records = []
-    for round_id, anchor in ((1, 100.0), (2, 110.0)):
+    for round_id, anchor in ((1, 100.0),):
         records.extend(
             [
                 {"passage_id": "known", "round_id": round_id, "stage": "first_qualified_face", "trace_time": anchor + 0.1, "frame_time": anchor + 0.1},
@@ -262,9 +655,9 @@ def test_face_passage_uses_majority_of_replay_rounds() -> None:
                 {"passage_id": "known", "round_id": round_id, "stage": "confirmed_result", "identity": "Jack", "trace_time": anchor + 0.3, "frame_time": anchor + 0.3},
             ]
         )
-    result, _, *_ = face_results(records, [passage], [100.0, 110.0, 120.0])
-    assert result["passages"][0]["detected_rounds"] == 2
-    assert result["passages"][0]["correct_rounds"] == 2
+    result, _, *_ = face_results(records, [passage], [100.0])
+    assert result["passages"][0]["detected_rounds"] == 1
+    assert result["passages"][0]["correct_rounds"] == 1
     assert result["detection_recall"] == 1
     assert result["accuracy"] == 1
     assert result["recall"] == 1
@@ -308,13 +701,13 @@ def test_lpr_passage_recall_is_tracker_recall_not_ocr_recall() -> None:
     ]
     records = [
         {"stage": stage, "passage_id": "p", "round_id": round_id}
-        for round_id in range(1, 4)
+        for round_id in range(1, 2)
         for stage in ("detector_hit", "track_seen", "lpr_eligible", "plate_detected")
     ]
     result, false = lpr_results(records, passages)
     assert not false
     assert result["passage_recall"] == 1
-    assert result["passages"][0]["detected_rounds"] == 3
+    assert result["passages"][0]["detected_rounds"] == 1
     assert result["passages"][0]["recognized_rounds"] == 0
     assert result["accuracy"] == 0
     assert result["precision"] == 1

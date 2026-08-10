@@ -50,6 +50,8 @@ def main() -> int:
     args = parser.parse_args()
     root = Path.cwd()
     manifest = yaml.safe_load(args.manifest.read_text(encoding="utf-8"))
+    face_frame = manifest["frame"]
+    lpr_frame = manifest["lpr"].get("frame", face_frame)
     output = args.output.resolve()
     images: list[tuple[str, Path]] = []
     form: dict[str, Any] = {
@@ -57,7 +59,12 @@ def main() -> int:
         "instructions": {
             "identity": "Use P1 or unknown for face passages.",
             "plate": "Use uppercase letters/numbers only; use null when unreadable.",
-            "bbox": "Use [x1,y1,x2,y2] in the exported 1280x720 frame. Leave null if not visible.",
+            "bbox": (
+                "Use [x1,y1,x2,y2] in each exported frame. "
+                f"Face is {face_frame['width']}x{face_frame['height']}; "
+                f"LPR is {lpr_frame['width']}x{lpr_frame['height']}. "
+                "Leave null if not visible."
+            ),
             "do_not_change": "Do not change id, source, or source_time_s."
         },
         "face": [],

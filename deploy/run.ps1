@@ -1,9 +1,10 @@
 [CmdletBinding()]
 param(
   [Parameter(Position = 0)]
-  [ValidateSet('help', 'start', 'acceptance-start', 'acceptance-restore', 'status', 'logs', 'doctor', 'stop', 'build')]
+  [ValidateSet('help', 'start', 'dev-start', 'dev-restart', 'dev-logs', 'dev-stop', 'acceptance-start', 'acceptance-restore', 'status', 'logs', 'doctor', 'stop', 'build')]
   [string]$Command = 'help',
-  [string]$ConfigFile = ''
+  [string]$ConfigFile = '',
+  [string]$SourceDir = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -52,6 +53,18 @@ function Protect-Text([string]$Text, [object[]]$Sources) {
 function Resolve-WorkspacePath([string]$Value) {
   if ([IO.Path]::IsPathRooted($Value)) { return [IO.Path]::GetFullPath($Value) }
   return [IO.Path]::GetFullPath((Join-Path $workspace $Value))
+}
+
+function Resolve-DevSourcePath([string]$Value) {
+  $candidate = if ([string]::IsNullOrWhiteSpace($Value)) { 'frigate/frigate' } else { $Value }
+  $resolved = Resolve-WorkspacePath $candidate
+  if (-not (Test-Path -LiteralPath $resolved -PathType Container)) {
+    throw "Missing Frigate development source directory: $resolved"
+  }
+  if (-not (Test-Path -LiteralPath (Join-Path $resolved '__init__.py') -PathType Leaf)) {
+    throw "Development source must be the Frigate Python package directory containing __init__.py: $resolved"
+  }
+  return $resolved
 }
 
 function Get-EnvFileValue([string]$Name) {
@@ -342,6 +355,15 @@ function Wait-NgrokReady([string]$ExpectedUrl) {
 function New-ReplayOverride([object[]]$Sources, $Runtime, [bool]$NotificationsEnabled) {
   $lines = [Collections.Generic.List[string]]::new()
   $lines.Add('services:')
+  if (-not [string]::IsNullOrWhiteSpace($env:CAMERA_SOURCE_OVERLAY)) {
+    $sourceOverlay = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($env:CAMERA_SOURCE_OVERLAY)
+    if (-not (Test-Path -LiteralPath $sourceOverlay -PathType Container)) {
+      throw "Missing CAMERA_SOURCE_OVERLAY directory: $sourceOverlay"
+    }
+    $sourceMount = (($sourceOverlay.Replace('\','/') + ':/opt/frigate/frigate:ro') | ConvertTo-Json -Compress)
+    $lines.Add('  frigate:')
+    $lines.Add("    volumes: [$sourceMount]")
+  }
   if (-not $NotificationsEnabled) {
     $lines.Add('  ngrok:')
     $lines.Add('    profiles: ["notifications"]')
@@ -569,6 +591,9 @@ function Show-Status {
   if ($null -eq $state) { Write-Host 'No runtime state. Run deploy\run.ps1 doctor or start.'; return }
   $running = (& docker ps --format '{{.Names}}' 2>$null) -contains 'frigate'
   Write-Host "Frigate: $(if ($running) { 'running' } else { 'stopped' })"
+  if ($state.development) {
+    Write-Host "Development source: $($state.source_overlay) (read-only bind mount)"
+  }
   foreach ($camera in $state.cameras) { Write-Host ("Camera {0}: {1} ({2})" -f $camera.name,$camera.source,$camera.mode) }
   if (-not $running) { return }
   try {
@@ -588,6 +613,10 @@ function Show-Help {
 Camera runtime
 
   .\deploy\run.ps1 start
+  .\deploy\run.ps1 dev-start
+  .\deploy\run.ps1 dev-restart
+  .\deploy\run.ps1 dev-logs
+  .\deploy\run.ps1 dev-stop
   .\deploy\run.ps1 status
   .\deploy\run.ps1 logs
   .\deploy\run.ps1 doctor
@@ -595,11 +624,23 @@ Camera runtime
   .\deploy\run.ps1 build
 
 Use -ConfigFile to select an isolated config; the default is .\deploy\config.yaml.
+Development commands bind-mount -SourceDir read-only; the default is .\frigate\frigate.
 '@ | Write-Host
 }
 
 try {
   if ($Command -eq 'help') { Show-Help; exit 0 }
+  $devSourcePath = $null
+  if ($Command -in @('dev-start','dev-restart','dev-logs','dev-stop')) {
+    $devSourcePath = Resolve-DevSourcePath $SourceDir
+    $env:CAMERA_SOURCE_OVERLAY = $devSourcePath
+  }
+  $effectiveCommand = switch ($Command) {
+    'dev-start' { 'start' }
+    'dev-logs' { 'logs' }
+    'dev-stop' { 'stop' }
+    default { $Command }
+  }
   $config = Get-CameraConfig
   $runtime = Get-Runtime $config
   $notificationsEnabled = $null -ne $config.notifications -and [bool](Get-Value $config.notifications 'enabled' $false)
@@ -610,7 +651,7 @@ try {
   New-ReplayOverride $sources $runtime $notificationsEnabled
   $prefix = Get-ComposePrefix $hasReplay
 
-  switch ($Command) {
+  switch ($effectiveCommand) {
     'doctor' {
       Test-RuntimeDependencies $runtime
       $ngrokUrl = if ($notificationsEnabled) { Test-NgrokConfiguration $config } else { '' }
@@ -644,10 +685,34 @@ try {
         Wait-RuntimeReady $sources $config
       }
       $ngrokReady = if ($notificationsEnabled) { Wait-NgrokReady $ngrokUrl } else { $false }
-      $state = [ordered]@{ started_at=[DateTime]::UtcNow.ToString('o'); cameras=@() }
+      $state = [ordered]@{
+        started_at=[DateTime]::UtcNow.ToString('o')
+        development=($null -ne $devSourcePath)
+        source_overlay=$devSourcePath
+        cameras=@()
+      }
       foreach ($source in $sources) { $state.cameras += [ordered]@{ name=$source.Name; mode=$source.Mode; source=$source.Redacted } }
       Write-AtomicUtf8 $stateFile (($state | ConvertTo-Json -Depth 5) + "`n")
       Write-Host "Runtime ready with $($sources.Count) camera(s); public tunnel: $(if (-not $notificationsEnabled) { 'disabled' } elseif ($ngrokReady) { 'ready' } else { 'degraded' })."
+      Show-Status
+    }
+    'dev-restart' {
+      Test-RuntimeDependencies $runtime
+      Ensure-FrigateConfigVolume
+      Invoke-Compose $prefix @('config','--quiet')
+      Invoke-Compose $prefix @('up','-d','--no-build','--force-recreate','--no-deps','frigate')
+      if ($env:CAMERA_SKIP_READY_WAIT -ne '1') {
+        Wait-RuntimeReady $sources $config
+      }
+      $state = [ordered]@{
+        started_at=[DateTime]::UtcNow.ToString('o')
+        development=$true
+        source_overlay=$devSourcePath
+        cameras=@()
+      }
+      foreach ($source in $sources) { $state.cameras += [ordered]@{ name=$source.Name; mode=$source.Mode; source=$source.Redacted } }
+      Write-AtomicUtf8 $stateFile (($state | ConvertTo-Json -Depth 5) + "`n")
+      Write-Host "Development Frigate restarted from source: $devSourcePath"
       Show-Status
     }
     'acceptance-start' {
@@ -699,7 +764,8 @@ try {
     }
     'status' { Show-Status }
     'logs' {
-      & docker @prefix logs --tail 200 2>&1 | ForEach-Object { Protect-Text ([string]$_) $sources }
+      $logArgs = if ($Command -eq 'dev-logs') { @('logs','--follow','--tail','200','frigate') } else { @('logs','--tail','200') }
+      & docker @prefix @logArgs 2>&1 | ForEach-Object { Protect-Text ([string]$_) $sources }
       if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     }
     'stop' {
@@ -709,6 +775,7 @@ try {
       Write-Host 'Camera runtime stopped cleanly.'
     }
   }
+  exit 0
 } catch {
   $knownSources = if ($null -ne (Get-Variable sources -ErrorAction SilentlyContinue)) { $sources } else { @() }
   Write-Host (Protect-Text $_.Exception.Message $knownSources) -ForegroundColor Red

@@ -1,4 +1,4 @@
-"""Aggregate three Phase 5 quick runs and an optional soak result."""
+"""Aggregate exactly three Platform runtime evidence reports."""
 
 from __future__ import annotations
 
@@ -9,10 +9,10 @@ from typing import Any
 
 
 def aggregate(
-    summaries: list[dict[str, Any]], soak: dict[str, Any] | None = None
+    summaries: list[dict[str, Any]], *, enforce_gates: bool = False
 ) -> dict[str, Any]:
     if len(summaries) != 3:
-        raise ValueError("Phase 5 requires exactly three quick-run summaries")
+        raise ValueError("The runtime report requires exactly three summaries")
     runs = []
     for index, summary in enumerate(summaries, start=1):
         failed = [name for name, value in summary.get("gates", {}).items() if not value]
@@ -20,7 +20,22 @@ def aggregate(
         runs.append(
             {
                 "run": index,
-                "accepted": bool(summary.get("accepted")),
+                "accepted": (
+                    bool(summary.get("accepted")) if enforce_gates else None
+                ),
+                "acceptance": {
+                    "mode": "gated" if enforce_gates else "evidence_only",
+                    "status": (
+                        "accepted"
+                        if enforce_gates and summary.get("accepted")
+                        else "rejected"
+                        if enforce_gates
+                        else "not_scored"
+                    ),
+                    "criteria": sorted(summary.get("gates", {}))
+                    if enforce_gates
+                    else [],
+                },
                 "seconds": summary.get("timing", {}).get("total_seconds"),
                 "failed_gates": failed,
                 "lpr_recall": summary.get("lpr", {}).get("passage_recall"),
@@ -35,12 +50,29 @@ def aggregate(
                 "max_attempts_per_track": recognition.get("max_attempts_per_track"),
                 "duplicate_inference": len(recognition.get("duplicate_inference", [])),
                 "early_stop_by_task": recognition.get("early_stop_by_task", {}),
+                "measurement": summary.get("measurement", {}),
+                "source_hash": summary.get("source_hash", {}),
+                "passages": {
+                    "face": summary.get("face", {}).get("passages", []),
+                    "lpr": summary.get("lpr", {}).get("passages", []),
+                },
+                "runtime_evidence": summary.get("runtime", {})
+                .get("lpr_evidence", {})
+                .get("invocation_summaries", []),
+                "hardware": {
+                    "resources": summary.get("runtime", {}).get("resources", {}),
+                    "samples": summary.get("runtime", {}).get(
+                        "hardware_samples", {}
+                    ),
+                },
+                "diagnostic_gates": summary.get(
+                    "diagnostic_gates", summary.get("gates", {})
+                ),
+                "artifacts": summary.get("report", {}).get("artifacts", []),
             }
         )
     def numeric(field: str) -> list[Any]:
         return [row[field] for row in runs if row[field] is not None]
-
-    soak_ok = soak is not None and bool(soak.get("accepted"))
 
     def meets_lpr_target(row: dict[str, Any]) -> bool:
         value = row.get("lpr_exact_match")
@@ -69,35 +101,53 @@ def aggregate(
             ),
             "duplicate_inference": sum(numeric("duplicate_inference")),
         },
-        "three_consecutive_hard_gate": all(row["accepted"] for row in runs),
-        "lpr_improvement_target": all(meets_lpr_target(row) for row in runs),
-        "soak": soak,
-        "soak_hard_gate": soak_ok,
+        "mode": "gated" if enforce_gates else "evidence_only",
+        "criteria": [],
+        "report_complete": all(
+            len(row.get("passages", {}).get("lpr", [])) == 11
+            and bool(row.get("passages", {}).get("face"))
+            and row.get("seconds") is not None
+            and bool(row.get("source_hash"))
+            for row in runs
+        ),
+        "three_consecutive_hard_gate": (
+            all(row["accepted"] for row in runs) if enforce_gates else None
+        ),
+        "lpr_improvement_target": (
+            all(meets_lpr_target(row) for row in runs) if enforce_gates else None
+        ),
     }
-    result["accepted"] = result["three_consecutive_hard_gate"] and soak_ok
+    result["accepted"] = (
+        result["three_consecutive_hard_gate"] if enforce_gates else None
+    )
+    result["acceptance"] = {
+        "mode": result["mode"],
+        "status": (
+            "accepted"
+            if enforce_gates and result["accepted"]
+            else "rejected"
+            if enforce_gates
+            else "not_scored"
+        ),
+        "criteria": [],
+    }
     return result
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("summaries", nargs=3, type=Path)
-    parser.add_argument("--soak-summary", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     summaries = [
         json.loads(path.read_text(encoding="utf-8")) for path in args.summaries
     ]
-    soak = (
-        json.loads(args.soak_summary.read_text(encoding="utf-8"))
-        if args.soak_summary
-        else None
-    )
-    result = aggregate(summaries, soak)
+    result = aggregate(summaries)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(
         json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
-    return 0 if result["accepted"] else 1
+    return 0
 
 
 if __name__ == "__main__":

@@ -108,6 +108,8 @@ trong Docker. Root `.env.local` chỉ chứa secret và được Docker Compose 
 
 ./deploy/run.ps1 doctor
 ./deploy/run.ps1 start
+./deploy/run.ps1 dev-start
+./deploy/run.ps1 dev-restart
 ./deploy/run.ps1 status
 ./deploy/run.ps1 logs
 ./deploy/run.ps1 stop

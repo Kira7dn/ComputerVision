@@ -9,7 +9,7 @@ runtime:
     loop: true
     sources:
       face_camera: mock_videos/face-recognition/segments/01_P1E_S1_C1.mp4
-      car_camera: "mock_videos/car-number-plate-video/cam-in/pexels-casey-whalen-6571483 (720p15).mp4"
+      car_camera: "mock_videos/car-number-plate-video/cam-in/pexels-casey-whalen-6571483 (1024p).mp4"
 mqtt:
   enabled: false
 
@@ -185,12 +185,12 @@ face_recognition:
   min_area: 100
   unknown_score: 0.8
   recognition_threshold: 0.9
-  min_faces: 2
   save_attempts: 200
   blur_confidence_filter: false
 
 lpr:
   enabled: true
+  recognition_threshold: 0.9
 
 model:
   width: 320
@@ -283,11 +283,11 @@ cameras:
       min_area: 500
     detect:
       enabled: true
-      width: 1280
-      height: 720
+      width: 1820
+      height: 1024
       fps: 5
       min_initialized: 1
-      max_disappeared: 3
+      max_disappeared: 25
     motion:
       threshold: 53
       contour_area: 10
