@@ -9,7 +9,6 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 import threading
@@ -2253,7 +2252,6 @@ def materialize_trace_replays(
         ]
         result = subprocess.run(command, check=False, capture_output=True, text=True)
         if result.returncode != 0 or not target.is_file():
-            target.unlink(missing_ok=True)
             continue
         (target_dir / "source.json").write_text(
             json.dumps(
@@ -2454,7 +2452,6 @@ def main() -> int:
             )
 
         trace_path = output / "runtime-trace.jsonl"
-        trace_path.unlink(missing_ok=True)
         subprocess.run(
             ["docker", "cp", f"frigate:{TRACE_CONTAINER_PATH}", str(trace_path)],
             check=False,
@@ -2827,7 +2824,7 @@ def main() -> int:
                 "all_physical_passages_and_rounds",
                 "detector_track_event_lpr_face_funnel",
                 "raw_ocr_and_quality_lineage",
-                "runtime_cleanup_and_resource_diagnostics",
+                "runtime_output_and_resource_diagnostics",
                 "container_logs_and_artifact_hashes",
             ],
         }
@@ -2875,10 +2872,6 @@ def main() -> int:
             summary.setdefault("diagnostic_errors", []).append(
                 f"trace_replay_materialization:{type(exc).__name__}: {exc}"
             )
-        for replay in locals().get("replays", {}).values():
-            replay_parent = Path(replay).parent
-            if replay_parent.name.startswith("camera-platform-"):
-                shutil.rmtree(replay_parent, ignore_errors=True)
         report_path = write_failure_only_report(output, summary)
         summary["report"]["artifacts"].append(
             {
