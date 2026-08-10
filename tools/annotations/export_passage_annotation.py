@@ -55,7 +55,7 @@ def main() -> int:
     output = args.output.resolve()
     images: list[tuple[str, Path]] = []
     form: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "instructions": {
             "identity": "Use P1 or unknown for face passages.",
             "plate": "Use uppercase letters/numbers only; use null when unreadable.",
@@ -65,7 +65,7 @@ def main() -> int:
                 f"LPR is {lpr_frame['width']}x{lpr_frame['height']}. "
                 "Leave null if not visible."
             ),
-            "do_not_change": "Do not change id, source, or source_time_s."
+            "do_not_change": "Do not change id or source.",
         },
         "face": [],
         "lpr": [],
@@ -77,11 +77,14 @@ def main() -> int:
         images.append((f"FACE {passage['id']} @ {seconds:.2f}s", path))
         form["face"].append({"id": passage["id"], "source": passage["source"], "source_time_s": round(seconds, 3), "image": str(path), "frame": {"width": width, "height": height}, "identity": None, "bbox": None})
     for passage in manifest["lpr"]["passages"]:
-        seconds = (float(passage["start_s"]) + float(passage["end_s"])) / 2
-        path = output / "frames" / f"lpr-{passage['id']}.jpg"
-        width, height = frame_at(root / manifest["lpr"]["source"], seconds, path)
-        images.append((f"LPR {passage['id']} @ {seconds:.2f}s", path))
-        form["lpr"].append({"id": passage["id"], "source": manifest["lpr"]["source"], "source_time_s": round(seconds, 3), "image": str(path), "frame": {"width": width, "height": height}, "readable": None, "expected_plate": None, "bbox": None, "roi": None})
+        form["lpr"].append(
+            {
+                "id": passage["id"],
+                "source": manifest["lpr"]["source"],
+                "readable": passage.get("readable"),
+                "expected_plate": passage.get("expected_plate"),
+            }
+        )
     make_sheet(images, output / "contact-sheet.jpg")
     (output / "annotation_form.json").write_text(json.dumps(form, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(json.dumps({"output": str(output), "contact_sheet": str(output / 'contact-sheet.jpg'), "form": str(output / 'annotation_form.json'), "frame_count": len(images)}, ensure_ascii=False))

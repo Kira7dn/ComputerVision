@@ -14,9 +14,6 @@ from typing import Any
 import cv2
 import yaml
 
-BLACK_LEAD_SECONDS = 1.5
-
-
 def frame_spec(manifest: dict[str, Any], kind: str) -> tuple[int, int, int]:
     """Return the declared replay frame for one pipeline."""
     value = manifest["frame"] if kind == "face" else manifest[kind].get(
@@ -56,7 +53,7 @@ def load_manifest(path: Path, root: Path) -> dict[str, Any]:
     if not 0 < int(data.get("test_case_limit_seconds", 0)) < 120:
         raise ValueError("test_case_limit_seconds must be under 120")
     face_width, face_height, _ = frame_spec(data, "face")
-    lpr_width, lpr_height, _ = frame_spec(data, "lpr")
+    frame_spec(data, "lpr")
     seen: set[str] = set()
     face = data.get("face", {})
     passages = face.get("passages", [])
@@ -97,57 +94,28 @@ def load_manifest(path: Path, root: Path) -> dict[str, Any]:
     if len(active_lpr) < 5 or len(readable_lpr) < 3:
         raise ValueError("LPR requires at least five vehicle passages and three readable passages")
     lpr_seen: set[str] = set()
+    expected_plates: set[str] = set()
     for passage in lpr_passages:
         pid = str(passage.get("id", ""))
         if not pid or pid in seen or pid in lpr_seen:
             raise ValueError("all passage IDs must be globally unique")
         lpr_seen.add(pid)
-        start, end = float(passage.get("start_s", -1)), float(passage.get("end_s", -1))
-        if not 0 <= start < end <= float(lpr.get("duration_s", 0)):
-            raise ValueError(f"invalid LPR passage window: {pid}")
         plate = passage.get("expected_plate")
         if passage.get("valid_passage", True) and passage.get("readable") and (not plate or not str(plate).isalnum() or str(plate) != str(plate).upper()):
             raise ValueError(f"readable LPR passage requires uppercase alphanumeric plate: {pid}")
+        if plate:
+            normalized = str(plate)
+            if normalized in expected_plates:
+                raise ValueError(f"LPR expected plates must be unique: {normalized}")
+            expected_plates.add(normalized)
         for variant in passage.get("accepted_plates", []):
             if not str(variant).isalnum() or str(variant) != str(variant).upper():
                 raise ValueError(f"accepted plate variants must be uppercase alphanumeric: {pid}")
         if not passage.get("readable") and plate is not None:
             raise ValueError(f"unreadable LPR passage cannot have a label: {pid}")
-        if passage.get("valid_passage", True) and (passage.get("bbox") is None or passage.get("roi") is None):
-            raise ValueError(f"active LPR passage requires bbox and roi: {pid}")
-        if passage.get("bbox") is not None:
-            _boxes(
-                passage.get("bbox"),
-                f"LPR {pid}.bbox",
-                lpr_width,
-                lpr_height,
-            )
-        if passage.get("roi") is not None:
-            _boxes(
-                passage.get("roi"),
-                f"LPR {pid}.roi",
-                lpr_width,
-                lpr_height,
-            )
     if not (root / lpr["source"]).is_file():
         raise FileNotFoundError(lpr["source"])
-    simultaneous = False
-    for index, left in enumerate(active_lpr):
-        for right in active_lpr[index + 1 :]:
-            overlaps = max(float(left["start_s"]), float(right["start_s"])) < min(float(left["end_s"]), float(right["end_s"]))
-            if overlaps and bbox_iou(left["bbox"], right["bbox"]) < 0.05:
-                simultaneous = True
-    if not simultaneous:
-        raise ValueError("LPR requires two simultaneous vehicles distinguished by bbox")
     return data
-
-
-def bbox_iou(left: list[float], right: list[float]) -> float:
-    ax1, ay1, ax2, ay2 = (float(v) for v in left)
-    bx1, by1, bx2, by2 = (float(v) for v in right)
-    intersection = max(0.0, min(ax2, bx2) - max(ax1, bx1)) * max(0.0, min(ay2, by2) - max(ay1, by1))
-    union = (ax2 - ax1) * (ay2 - ay1) + (bx2 - bx1) * (by2 - by1) - intersection
-    return intersection / union if union else 0.0
 
 
 def ffmpeg(args: list[str], timeout: int = 30) -> None:
@@ -203,23 +171,6 @@ def write_enrollment_crop(manifest: dict[str, Any], root: Path, output: Path) ->
         raise RuntimeError(f"cannot write enrollment crop: {output}")
 
 
-def group_composite_passages(
-    passages: list[dict[str, Any]], kind: str
-) -> list[list[dict[str, Any]]]:
-    if kind != "lpr":
-        return [[passage] for passage in passages]
-
-    grouped: list[list[dict[str, Any]]] = []
-    for passage in passages:
-        if grouped and float(passage["start_s"]) < max(
-            float(item["end_s"]) for item in grouped[-1]
-        ):
-            grouped[-1].append(passage)
-        else:
-            grouped.append([passage])
-    return grouped
-
-
 def make_composite(
     manifest: dict[str, Any],
     root: Path,
@@ -239,26 +190,13 @@ def make_composite(
     media.mkdir(parents=True, exist_ok=True)
     parts: list[Path] = []
     windows: list[dict[str, Any]] = []
-    timeline = BLACK_LEAD_SECONDS
-    lead = media / f"{kind}-black-lead.mp4"
-    ffmpeg(["-f", "lavfi", "-i", f"color=c=black:s={width}x{height}:r={fps}", "-t", str(BLACK_LEAD_SECONDS), "-an", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", str(lead)])
-    parts.append(lead)
+    timeline = 0.0
     passages = manifest[kind]["passages"]
-    grouped = group_composite_passages(passages, kind)
-    close_pairs = {tuple(pair) for pair in manifest.get("face", {}).get("close_follow", [])}
+    grouped = [[passage] for passage in passages]
     for index, group in enumerate(grouped):
         passage = group[0]
         group_start = min(float(item["start_s"]) for item in group)
         group_end = max(float(item["end_s"]) for item in group)
-        if index:
-            previous_id = grouped[index - 1][-1]["id"]
-            if kind == "face":
-                gap_seconds = 0.6 if (previous_id, passage["id"]) in close_pairs else 0.7
-            else:
-                gap_seconds = 0.85
-            gap = media / f"{kind}-gap-{index:02d}.mp4"
-            ffmpeg(["-f", "lavfi", "-i", f"color=c=black:s={width}x{height}:r={fps}", "-t", str(gap_seconds), "-an", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", str(gap)])
-            parts.append(gap); timeline += gap_seconds
         part = media / f"{kind}-{index:02d}.mp4"
         duration = group_end - group_start
         ffmpeg(["-ss", str(group_start), "-i", str(root / passage["source"] if kind == "face" else root / manifest["lpr"]["source"]), "-t", str(duration), "-an", "-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,fps={fps}", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", str(part)])
@@ -292,6 +230,21 @@ def make_composite(
     return result, windows
 
 
+def lpr_source(
+    manifest: dict[str, Any], root: Path
+) -> tuple[Path, list[dict[str, Any]]]:
+    """Return the authoritative continuous MP4 without transcoding it."""
+    source = (root / manifest["lpr"]["source"]).resolve()
+    windows = [
+        {
+            "id": passage["id"],
+            "valid_passage": passage.get("valid_passage", True),
+        }
+        for passage in manifest["lpr"]["passages"]
+    ]
+    return source, windows
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=Path, default=Path("deploy/config.yaml"))
@@ -317,33 +270,44 @@ def main() -> int:
     enrollment_image.parent.mkdir(parents=True, exist_ok=True)
     write_enrollment_crop(manifest, root, enrollment_image)
     face_replay, face_windows = make_composite(manifest, root, output, "face", workspace)
-    # LPR is a single source timeline; retain its independent passage windows.
-    lpr_replay, lpr_windows = make_composite(manifest, root, output, "lpr", workspace)
+    # LPR already has one authoritative source timeline. Do not cut it into
+    # passages or insert synthetic frames between physical vehicles.
+    lpr_replay, lpr_windows = lpr_source(manifest, root)
     config = yaml.safe_load(args.config.read_text(encoding="utf-8"))
     config = copy.deepcopy(config)
     config["runtime"]["media_dir"] = str(runtime_media)
-    config["runtime"]["replay"]["sources"] = {"face_camera": str(face_replay), "car_camera": str(lpr_replay)}
+    direct_sources = {"face_camera": str(face_replay), "car_camera": str(lpr_replay)}
+    config["runtime"].pop("replay", None)
+    config["runtime"]["direct"] = {"sources": direct_sources}
+    config.pop("go2rtc", None)
+    for camera in ("face_camera", "car_camera"):
+        config["cameras"][camera]["ffmpeg"]["inputs"] = [
+            {
+                "path": f"/runtime-input/{camera}.mp4",
+                "input_args": ["-re", "-fflags", "+genpts"],
+                "roles": ["detect"],
+            },
+            {
+                "path": f"/runtime-input/{camera}.mp4",
+                "input_args": ["-re", "-fflags", "+genpts"],
+                "roles": ["record"],
+            },
+        ]
     # Runtime evidence must exercise the production media path.  Keep the
     # configured record/snapshot features intact and suppress only external
     # notification delivery.
     config["notifications"]["enabled"] = False
     config["database"] = {"path": "/media/frigate/passage/frigate.db"}
-    config["cameras"]["car_camera"]["detect"]["min_initialized"] = 1
-    # The fixture includes a measured 2.58 s source-PTS gap.  Keep the
-    # tracker alive for the configured five-second detection boundary so a
-    # temporary queue miss cannot retire the physical passage before Event.
-    config["cameras"]["car_camera"]["detect"]["max_disappeared"] = 25
-    # Composite passages intentionally use hard scene cuts. Do not let the
-    # production lightning heuristic suppress every motion region while the
-    # short fixture passage is visible.
-    config["cameras"]["car_camera"]["motion"]["lightning_threshold"] = 1.0
     config["cameras"]["face_camera"]["face_recognition"]["min_area"] = 750
+    # This fixture is a fast highway scene. End unmatched vehicle tracks after
+    # one second so a following car cannot inherit a stale five-second lineage.
+    config["cameras"]["car_camera"]["detect"]["max_disappeared"] = 5
     config_path = output / "config.yaml"
     config_path.write_text(yaml.safe_dump(config, sort_keys=False, allow_unicode=True), encoding="utf-8")
     model_path = root / str(config["runtime"]["model_path"])
     result = {
         "schema_version": 2,
-        "builder_version": 9,
+        "builder_version": 10,
         "manifest": str(args.manifest.resolve()),
         "manifest_sha256": file_hash(args.manifest),
         "base_config_sha256": file_hash(args.config),

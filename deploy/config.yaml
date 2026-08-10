@@ -268,8 +268,6 @@ cameras:
       width: 1280
       height: 720
       fps: 5
-      min_initialized: 1
-      max_disappeared: 2
     motion:
       threshold: 53
       contour_area: 10
@@ -286,8 +284,6 @@ cameras:
       width: 1820
       height: 1024
       fps: 5
-      min_initialized: 1
-      max_disappeared: 25
     motion:
       threshold: 53
       contour_area: 10

@@ -5,9 +5,11 @@ Tài liệu này là contract test dùng xuyên suốt Platform roadmap, tách k
 
 ## 1. Mục đích và phạm vi
 
-Chương trình test chạy replay thực tế qua Frigate cho cả hai pipeline:
+Chương trình test đọc trực tiếp MP4 gốc để dựng physical trace của `car_camera`, đồng thời chạy
+runtime thực tế để thu các stage enrichment và media cho cả hai pipeline:
 
-- `car_camera`: detection, tracking, canonical Event, plate detection, OCR và Event publish.
+- `car_camera`: direct MP4 detection/tracking tạo physical trace; runtime bổ sung canonical Event,
+  plate detection, OCR và Event publish.
 - `face_camera`: detection, tracking, face candidate, embedding, identity và Event publish.
 
 Đây là chương trình quan sát và lập báo cáo. Không có tiêu chí `pass/fail`, không có KPI
@@ -31,18 +33,21 @@ Mỗi invocation tự tạo một thư mục timestamp:
 
 Script thực hiện:
 
-1. Chuẩn bị fixture/replay và manifest ground truth.
-2. Khởi động hai publisher RTSP ở chế độ standby bằng frame đen; phiên RTSP không bị ngắt
-   khi chuyển sang video nguồn.
-3. Khởi động Frigate, chờ camera, detector, model và image readiness.
-4. Mở capture gate bằng `run_id`, sau đó trigger đồng thời mỗi publisher phát video nguồn
+1. Đọc trực tiếp MP4 LPR gốc, pre-calibrate motion state ngoài cửa sổ đo rồi chạy đúng
+   motion-region, detector và tracker Frigate từ source time `0`; không qua RTSP, MediaMTX,
+   transcode, black frame hoặc freeze.
+2. Ghi `direct-lpr-tracks.json`; raw tracker ID chỉ là lineage, physical trace được ngắt online
+   khi cùng raw ID có chuyển động đảo chiều phi vật lý. Fixture và OCR không tham gia tách trace.
+3. Chuẩn bị runtime media và danh sách plate audit dùng riêng cho bước đối chiếu cuối.
+4. Khởi động Frigate, chờ camera, detector, model và image readiness.
+5. Mở capture gate bằng `run_id`, sau đó trigger đồng thời mỗi publisher phát video nguồn
    đúng một lần rồi tự trở về standby.
-5. Ghi source PTS/anchor và thu passage trace, runtime LPR evidence, hardware/runtime samples
+6. Ghi source PTS/anchor và thu passage trace, runtime LPR evidence, hardware/runtime samples
    chỉ trong cửa sổ capture của run hiện tại.
-6. Chờ deferred recognition/evidence lifecycle và native recording segment được commit.
-7. Lấy `Event.start_time/end_time` và tải clip bằng recording API có sẵn của Frigate.
-8. Thu Docker inspect/log trước khi restore runtime.
-9. Xuất `report.md`, JSON report, raw trace, runtime evidence và clip theo trace.
+7. Chờ deferred recognition/evidence lifecycle và native recording segment được commit.
+8. Lấy `Event.start_time/end_time` và tải clip bằng recording API có sẵn của Frigate.
+9. Thu Docker inspect/log trước khi restore runtime.
+10. Xuất `report.md`, JSON report, direct trace, runtime evidence và clip theo trace.
 
 `tools/runtime/validate_platform_runtime.py` là implementation; entrypoint chuẩn duy nhất là
 `tools/tests/e2e/run_platform_runtime_test.py`.
@@ -81,18 +86,22 @@ Trace Face phải tách được:
 Kết quả phải giữ person bbox, face bbox, candidate/frame/evidence lineage, raw top-1/top-2
 outcome, margin, identity và terminal reason.
 
-## 4. Quy tắc đo và gán passage
+## 4. Quy tắc trace và đối chiếu kết quả
 
-- Dùng source PTS của video, không dùng wall-clock để suy thời gian nguồn.
-- Mỗi record được gán one-to-one vào một physical passage và một replay round.
-- Track chạm nhiều passage phải được báo là `track_switch`; không gán toàn bộ trajectory vào
-  passage có IoU lớn nhất.
-- Record thiếu PTS, bbox hoặc candidate lineage được ghi `unscorable`/`lineage_missing`.
+- Pipeline tự tạo trace từ detector/tracker và passage registry online; fixture không được tạo,
+  tách, hợp nhất hoặc đổi trace.
+- `direct-lpr-tracks.json` là bằng chứng authoritative cho số physical trace LPR. Runtime raw
+  tracker ID chỉ là lineage và có thể được nhiều physical trace kế tiếp sử dụng.
+- LPR chỉ đối chiếu final `event_published.plate` của mỗi trace với danh sách `expected_plate`
+  duy nhất sau khi pipeline hoàn tất. Không dùng fixture time/bbox/ROI để gán xe.
+- PTS, bbox và candidate lineage vẫn phải ghi đầy đủ để kiểm tra pixel/result/evidence cùng frame.
+- Face giữ passage association riêng vì kết quả `unknown` không có chuỗi identity để match.
 - Mỗi invocation chạy đúng một replay round; nếu cần so sánh nhiều lần thì mỗi lần có một
   thư mục timestamp riêng.
 - Mọi trace/evidence phải mang đúng `run_id` của invocation. Runtime không ghi warm-up
   trước capture gate và report không đọc record của run cũ.
-- Bảng báo cáo tối thiểu là passage × round cho cả car và face; ở một invocation `round_id=1`.
+- Bảng LPR lấy runtime trace làm hàng; bảng fixture comparison chỉ bổ sung expected plate nếu
+  final plate match duy nhất. Face tiếp tục dùng passage × round; một invocation có `round_id=1`.
 - `measurement_valid` chỉ mô tả tính đầy đủ/hợp lệ của dữ liệu đo, không phải acceptance.
 - Anchor/fixture video không được dùng để dựng lại clip. Media của trace chỉ được lấy từ
   canonical Event và recording API của runtime đang được đo.
@@ -102,12 +111,12 @@ outcome, margin, identity và terminal reason.
 ### Car/LPR
 
 - Detection hit count và track coverage.
-- Passage/round assignment.
+- Runtime trace count và final plate-only comparison.
 - LPR eligibility count/reason.
 - Plate detector count, score, bbox và latency.
 - OCR invocation count, text box count, raw text, character scores và latency.
 - Event publish count, plate, score, candidate/frame/evidence lineage.
-- Missing stage, wrong assignment, duplicate candidate và false passage.
+- Missing stage, duplicate candidate, plate mismatch và output không thuộc danh sách audit.
 
 ### Face
 
@@ -174,8 +183,9 @@ runtime tạm, không nằm trong cây report. Script đọc recording khi Friga
 thẳng vào trace tương ứng; report không sinh rồi xóa hoặc di chuyển các thư mục media trung gian.
 
 Detector observation không phải lifecycle trace, không có thư mục hoặc clip riêng. Passage
-không tạo được runtime trace được báo `trace_id = -`; script không tạo trace/video giả và
-không fallback sang cắt fixture.
+không tạo được runtime trace được báo `trace_id = -`; script không tạo trace/video giả,
+không fallback sang cắt fixture và cũng không cắt recording theo timestamp khi chưa resolve
+được đúng một canonical Event đã kết thúc.
 
 Report phải ghi SHA-256 và byte size của artifact quan trọng. Artifact thiếu hoặc hash sai được
 ghi là report `incomplete`; đây là kiểm tra tính đầy đủ của bằng chứng, không phải đánh giá chất
@@ -215,7 +225,8 @@ Kết quả chuẩn có dạng:
 
 ## 9. Test code/regression
 
-Các regression test kiểm tra scorer, assignment, physical passage, OCR/LPR result và lifecycle:
+Các regression test kiểm tra scorer, Face passage assignment, đối chiếu final plate LPR,
+OCR/LPR result và lifecycle:
 
 ```powershell
 python -m pytest tools/tests/unit -q
@@ -227,6 +238,7 @@ runtime replay và không được dùng để tuyên bố hệ thống nhận d
 ## 10. Bằng chứng hiện có
 
 Report evidence gần nhất nằm tại thư mục timestamp dưới `.tmp/platform-runtime/`. Mỗi thư mục
-là một invocation độc lập, chứa một round và 11 passage LPR cùng Face passage tương ứng. Các kết
-quả nhận dạng, runtime và hardware phải đọc từ artifact raw tương ứng, không suy diễn từ một cờ
-acceptance.
+là một invocation độc lập, chứa một lần replay nguồn LPR liên tục có 11 biển số audit và replay
+Face tương ứng. Số trace LPR là kết quả thực tế do detector/tracker tạo ra, không mặc định bằng
+11. Các kết quả nhận dạng, runtime và hardware phải đọc từ artifact raw tương ứng, không suy
+diễn từ fixture hoặc một cờ acceptance.

@@ -137,6 +137,7 @@ function Get-Runtime($Config) {
     Transport = $transport
     ReplayLoop = [bool](Get-Value $runtime.replay 'loop' $true)
     ReplaySources = Get-Value $runtime.replay 'sources' ([pscustomobject]@{})
+    DirectSources = Get-Value $runtime.direct 'sources' ([pscustomobject]@{})
   }
 }
 
@@ -154,7 +155,12 @@ function Resolve-CameraSources($Config, $Runtime) {
     throw 'config.yaml must define at least one camera.'
   }
   $streams = $Config.go2rtc.streams
-  $replayNames = @($Runtime.ReplaySources.PSObject.Properties.Name)
+  $replayNames = @($Runtime.ReplaySources.PSObject.Properties.Name | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+  $directNames = @($Runtime.DirectSources.PSObject.Properties.Name | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+  $overlap = @($replayNames | Where-Object { $directNames -contains $_ })
+  if ($overlap.Count -gt 0) {
+    throw "Camera sources cannot be both replay and direct: $($overlap -join ', ')"
+  }
   foreach ($name in $replayNames) {
     if ($Config.cameras.PSObject.Properties.Name -notcontains $name) {
       throw "runtime.replay.sources.$name has no matching cameras.$name entry."
@@ -164,14 +170,19 @@ function Resolve-CameraSources($Config, $Runtime) {
   foreach ($camera in $Config.cameras.PSObject.Properties) {
     $name = $camera.Name
     if ($name -notmatch '^[A-Za-z0-9_-]+$') { throw "Invalid camera name '$name'." }
-    $stream = Get-FirstStream $streams $name
-    if ($replayNames -contains $name) {
+    if ($directNames -contains $name) {
+      $path = Resolve-WorkspacePath ([string]$Runtime.DirectSources.$name)
+      if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Direct file for $name does not exist: $path" }
+      $sources += [pscustomobject]@{ Name=$name; Mode='direct'; Raw=$path; Path=$path; ContainerPath="/runtime-input/$name.mp4"; Redacted=$path }
+    } elseif ($replayNames -contains $name) {
+      $stream = Get-FirstStream $streams $name
       $path = Resolve-WorkspacePath ([string]$Runtime.ReplaySources.$name)
       if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Replay file for $name does not exist: $path" }
       $expected = "rtsp://mediamtx:18554/$name"
       if ($stream -ne $expected) { throw "go2rtc.streams.$name must be '$expected' for a replay source." }
       $sources += [pscustomobject]@{ Name=$name; Mode='replay'; Raw=$path; Path=$path; Redacted=$path }
     } else {
+      $stream = Get-FirstStream $streams $name
       if ($stream -notmatch '^(?i)rtsps?://') { throw "go2rtc.streams.$name must be RTSP or be declared under runtime.replay.sources." }
       $sources += [pscustomobject]@{ Name=$name; Mode='rtsp'; Raw=$stream; Path=$null; Redacted=(Protect-Source $stream) }
     }
@@ -371,6 +382,9 @@ function New-ReplayOverride([object[]]$Sources, $Runtime, [bool]$NotificationsEn
     }
     $frigateVolumes.Add($reportMedia.Replace('\','/') + ':/runtime-evidence')
   }
+  foreach ($source in @($Sources | Where-Object Mode -eq 'direct')) {
+    $frigateVolumes.Add($source.Path.Replace('\','/') + ":$($source.ContainerPath):ro")
+  }
   if ($frigateVolumes.Count -gt 0) {
     $mounts = @($frigateVolumes | ForEach-Object { $_ | ConvertTo-Json -Compress }) -join ', '
     $lines.Add('  frigate:')
@@ -381,7 +395,7 @@ function New-ReplayOverride([object[]]$Sources, $Runtime, [bool]$NotificationsEn
     $lines.Add('    profiles: ["notifications"]')
   }
   $replays = @($Sources | Where-Object Mode -eq 'replay')
-  if ($replays.Count -eq 0) { $lines.Add('  {}') }
+  if ($replays.Count -eq 0 -and $frigateVolumes.Count -eq 0 -and $NotificationsEnabled) { $lines.Add('  {}') }
   if ($replays.Count -gt 0) {
     $mediaMount = (($mediaMtxReplayConfig.Replace('\','/') + ':/mediamtx.yml:ro') | ConvertTo-Json -Compress)
     $lines.Add('  mediamtx:')
@@ -394,7 +408,6 @@ function New-ReplayOverride([object[]]$Sources, $Runtime, [bool]$NotificationsEn
     $container = 'camera-replay-' + $source.Name.ToLowerInvariant().Replace('_','-')
     $volume = (($source.Path.Replace('\','/') + ':/runtime/source:ro') | ConvertTo-Json -Compress)
     $loop = if ($Runtime.ReplayLoop) { '-1' } else { '0' }
-    $controlled = $env:CAMERA_REPLAY_CONTROLLED -eq '1'
     $lines.Add("  ${service}:")
     $lines.Add('    image: ${FRIGATE_IMAGE}')
     $lines.Add("    container_name: $container")
@@ -402,15 +415,6 @@ function New-ReplayOverride([object[]]$Sources, $Runtime, [bool]$NotificationsEn
     $lines.Add('    restart: unless-stopped')
     $lines.Add('    healthcheck: { disable: true }')
     $lines.Add('    depends_on: [mediamtx]')
-    if ($controlled) {
-      $scriptPath = (Join-Path $PSScriptRoot 'replay-controlled.sh').Replace('\','/')
-      $scriptMount = (($scriptPath + ':/runtime/replay-controlled.sh:ro') | ConvertTo-Json -Compress)
-      $lines.Add('    entrypoint: ["/bin/sh", "/runtime/replay-controlled.sh"]')
-      $lines.Add("    volumes: [$volume, $scriptMount]")
-      $command = @($source.Name) | ConvertTo-Json -Compress
-      $lines.Add("    command: $command")
-      continue
-    }
     $lines.Add('    entrypoint: ["/usr/lib/ffmpeg/7.0/bin/ffmpeg"]')
     $lines.Add("    volumes: [$volume]")
       # Frequent IDR frames let Frigate/go2rtc attach immediately after a

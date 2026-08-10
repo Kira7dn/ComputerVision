@@ -42,7 +42,7 @@ mock_videos/
 frigate/
 .playwright-cli/
 output/
-runtime/
+/runtime/
 dahua_sdk/
 models/
 artifacts/

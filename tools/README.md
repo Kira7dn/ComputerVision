@@ -7,7 +7,7 @@ Root `tools/` chỉ giữ package marker. Mọi tool được phân loại theo 
 | `runtime/` | Validator runtime và các validator chuyên biệt/legacy |
 | `tests/unit/` | Unit tests không cần Docker |
 | `tests/integration/` | Quy ước và điểm vào integration test |
-| `tests/e2e/` | Runtime replay test thực tế |
+| `tests/e2e/` | Direct-MP4 LPR tracking và runtime enrichment test thực tế |
 | `reporting/` | Tổng hợp và xuất report |
 | `fixtures/` | Manifest và fixture builder |
 | `annotations/` | Export/import annotation thủ công |

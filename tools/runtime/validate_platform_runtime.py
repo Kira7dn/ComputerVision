@@ -11,7 +11,6 @@ import os
 import re
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 from pathlib import Path
@@ -33,9 +32,10 @@ from tools.lib.passage_metrics import bbox_iou, normalize_plate, percentile
 CAMERAS = {"face": "face_camera", "lpr": "car_camera"}
 TRACE_CONTAINER_PATH = "/runtime-evidence/runtime-trace.jsonl"
 EVIDENCE_CONTAINER_DIR = "/runtime-evidence"
-CAPTURE_CUTOFF_CONTAINER_PATH = "/tmp/passage-capture-cutoff"
-CAPTURE_START_CONTAINER_PATH = "/tmp/passage-capture-start"
-LEAD_SECONDS = 1.5
+CAPTURE_CUTOFF_CONTAINER_PATH = "/runtime-evidence/capture-cutoff"
+CAPTURE_START_CONTAINER_PATH = "/runtime-evidence/capture-start"
+SOURCE_START_CONTAINER_DIR = "/runtime-evidence/source-start"
+LEAD_SECONDS = 0.0
 ROUNDS = 1
 MIN_PASSAGE_RATE = 0.8
 MAX_SKIPPED_FPS_REGRESSION = 0.1
@@ -101,7 +101,7 @@ def validate_runtime_lpr_evidence(
     durations: dict[str, float],
     passages_by_camera: dict[str, list[dict[str, Any]]],
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Load, attribute, and integrity-check acceptance-only LPR evidence."""
+    """Load and integrity-check runtime LPR evidence by producer trace."""
     manifest = evidence_dir / "lpr" / "evidence.jsonl"
     if not manifest.is_file():
         manifest = evidence_dir / "evidence.jsonl"
@@ -123,10 +123,6 @@ def validate_runtime_lpr_evidence(
     # This validator covers LPR evidence; Face evidence is recorded in the
     # same manifest but has its own lifecycle contract.
     records = [record for record in records if record.get("pipeline", "lpr") == "lpr"]
-    # Attribution mutates matching records in place. Keep unmatched evidence as
-    # well so missing anchors can never make runtime artifacts disappear from
-    # the integrity report.
-    assign_records(records, anchors, durations, passages_by_camera)
     errors: list[str] = []
     artifact_count = 0
     artifact_bytes = 0
@@ -247,28 +243,12 @@ def validate_runtime_lpr_evidence(
             }
         )
 
-    expected_passage_ids = {
-        str(passage["id"])
-        for passage in passages_by_camera.get(CAMERAS["lpr"], [])
-        if passage.get("valid_passage", True)
-    }
-    observed_passage_ids = {
-        str(item["passage_id"])
-        for item in invocation_summaries
-        if item.get("camera") == CAMERAS["lpr"] and item.get("passage_id")
-    }
-    missing_passage_ids = sorted(expected_passage_ids - observed_passage_ids)
-    errors.extend(f"missing passage evidence: {value}" for value in missing_passage_ids)
-
     summary = {
         "valid": bool(grouped) and not errors,
         "reason": None if grouped and not errors else "incomplete_runtime_evidence",
         "invocations": len(grouped),
         "artifact_count": artifact_count,
         "artifact_bytes": artifact_bytes,
-        "expected_passages": len(expected_passage_ids),
-        "observed_passages": len(observed_passage_ids & expected_passage_ids),
-        "missing_passages": missing_passage_ids,
         "errors": errors,
         "invocation_summaries": invocation_summaries,
     }
@@ -287,7 +267,24 @@ def run_deploy(command: str, config: Path | None = None, timeout: int = 45) -> N
     ]
     if config is not None:
         args += ["-ConfigFile", str(config)]
-    subprocess.run(args, check=True, timeout=timeout)
+    completed = subprocess.run(
+        args,
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout,
+    )
+    if completed.returncode != 0:
+        detail = "\n".join(
+            part.strip()
+            for part in (completed.stdout, completed.stderr)
+            if part.strip()
+        )
+        raise RuntimeError(
+            f"deploy/run.ps1 {command} failed ({completed.returncode}): {detail}"
+        )
 
 
 def docker_output(*args: str, timeout: int = 10, check: bool = True) -> str:
@@ -366,27 +363,6 @@ def replay_duration(path: Path) -> float:
     return float(result.stdout.strip())
 
 
-def replay_levels(path: Path) -> tuple[float, float]:
-    capture = cv2.VideoCapture(str(path))
-    values: list[float] = []
-    for seconds in (0.2, LEAD_SECONDS + 0.25):
-        capture.set(cv2.CAP_PROP_POS_MSEC, seconds * 1000)
-        ok, frame = capture.read()
-        if not ok or frame is None:
-            capture.release()
-            raise RuntimeError(f"cannot sample replay levels: {path}")
-        values.append(float(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).mean()))
-    capture.release()
-    black, content = values
-    if content - black < 15:
-        raise RuntimeError(f"black lead is not distinguishable in {path.name}")
-    # FFmpeg's limited-range YUV conversion lifts pure black from 0 to about
-    # 16 in latest.jpg. Keep the threshold above that conversion level.
-    return max(20.0, black + min(12.0, (content - black) * 0.35)), black + max(
-        15.0, (content - black) * 0.55
-    )
-
-
 def latest_sample(camera: str) -> tuple[float, float] | None:
     try:
         with urlopen(
@@ -403,6 +379,8 @@ def latest_sample(camera: str) -> tuple[float, float] | None:
 
 def wait_acceptance_ready(expected_image: str | None, timeout: float = 32.0) -> None:
     deadline = time.monotonic() + timeout
+    stable_since: float | None = None
+    stable_required = float(os.environ.get("CAMERA_READY_STABLE_SECONDS", "2"))
     last_reason = "stats unavailable"
     while time.monotonic() < deadline:
         try:
@@ -420,10 +398,9 @@ def wait_acceptance_ready(expected_image: str | None, timeout: float = 32.0) -> 
                 }
                 for camera in CAMERAS.values()
             }
-            # latest.jpg is intentionally not a startup gate. It may lag camera
-            # stats while the output process creates its first cached frame; the
-            # black-to-content anchor observer below already requires and validates
-            # latest.jpg for both cameras before accepting any replay round.
+            latest_ready = all(
+                latest_sample(camera) is not None for camera in CAMERAS.values()
+            )
             camera_ready = all(
                 status["camera_fps"] > 0 for status in camera_status.values()
             )
@@ -444,11 +421,24 @@ def wait_acceptance_ready(expected_image: str | None, timeout: float = 32.0) -> 
                     "inspect", "frigate", "--format", "{{.Image}}", timeout=3
                 )
                 image_ready = bool(expected_id) and expected_id == running_id
-            if camera_ready and detector_ready and face_ready and image_ready:
-                return
+            ready = (
+                camera_ready
+                and latest_ready
+                and detector_ready
+                and face_ready
+                and image_ready
+            )
+            if ready:
+                if stable_since is None:
+                    stable_since = time.monotonic()
+                elif time.monotonic() - stable_since >= stable_required:
+                    return
+            else:
+                stable_since = None
             last_reason = (
-                f"camera={camera_ready} {camera_status}, detector={detector_ready}, "
-                f"face={face_ready}, image={image_ready}"
+                f"camera={camera_ready} {camera_status}, latest={latest_ready}, "
+                f"detector={detector_ready}, face={face_ready}, image={image_ready}, "
+                f"stable_seconds={stable_required}"
             )
         except Exception as exc:
             last_reason = str(exc)
@@ -456,61 +446,25 @@ def wait_acceptance_ready(expected_image: str | None, timeout: float = 32.0) -> 
     raise TimeoutError(f"acceptance runtime not ready: {last_reason}")
 
 
-def controlled_replay_state(camera: str, state: str) -> tuple[str, float] | None:
-    container = f"camera-replay-{camera.replace('_', '-')}"
-    value = docker_output(
-        "exec",
-        container,
-        "sh",
-        "-c",
-        f"test -s /tmp/replay-{state} && cat /tmp/replay-{state}",
-        timeout=3,
-        check=False,
-    ).strip()
-    if not value:
-        return None
-    token, timestamp = value.split(maxsplit=1)
-    return token, float(timestamp)
-
-
-def trigger_controlled_replays(run_id: str, timeout: float = 5.0) -> dict[str, float]:
-    """Release both standby publishers into one source playback."""
-    for camera in CAMERAS.values():
-        container = f"camera-replay-{camera.replace('_', '-')}"
-        docker_output(
-            "exec",
-            container,
-            "sh",
-            "-c",
-            f"printf '%s\\n' '{run_id}' > /tmp/replay-trigger",
-            timeout=3,
-        )
+def wait_source_starts(directory: Path, timeout: float = 60.0) -> dict[str, float]:
+    """Read the first complete frame timestamp emitted by each direct source."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        states = {
-            camera: controlled_replay_state(camera, "started")
-            for camera in CAMERAS.values()
-        }
-        if all(value is not None and value[0] == run_id for value in states.values()):
-            return {camera: float(value[1]) for camera, value in states.items() if value}
+        values: dict[str, float] = {}
+        for camera in CAMERAS.values():
+            path = directory / f"{camera}.start"
+            if path.is_file():
+                text = path.read_text(encoding="utf-8").strip()
+                if not text:
+                    continue
+                try:
+                    values[camera] = float(text)
+                except ValueError:
+                    continue
+        if len(values) == len(CAMERAS):
+            return values
         time.sleep(0.05)
-    raise TimeoutError(f"controlled replay did not start for run {run_id}")
-
-
-def wait_controlled_replays_done(
-    run_id: str, timeout: float = 30.0
-) -> dict[str, float]:
-    """Wait until both publishers complete exactly one source playback."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        states = {
-            camera: controlled_replay_state(camera, "done")
-            for camera in CAMERAS.values()
-        }
-        if all(value is not None and value[0] == run_id for value in states.values()):
-            return {camera: float(value[1]) for camera, value in states.items() if value}
-        time.sleep(0.1)
-    raise TimeoutError(f"controlled replay did not finish for run {run_id}")
+    raise TimeoutError("direct MP4 sources did not emit their first frame")
 
 
 def restore_mounts_verified(config: Path) -> bool:
@@ -542,55 +496,6 @@ def restore_mounts_verified(config: Path) -> bool:
         ).lower().endswith(expected_suffix)
     except Exception:
         return False
-
-
-def update_anchor_state(
-    state: dict[str, Any],
-    mean: float,
-    black_max: float,
-    content_min: float,
-    observed_at: float,
-) -> None:
-    """Advance one black/content anchor state using consecutive observations."""
-    # Internal fixture gaps are at most 0.85 s. Require a longer black run so
-    # only the 1.5 s loop lead can become a source anchor.
-    min_black_seconds = float(
-        os.environ.get("PASSAGE_ANCHOR_MIN_BLACK_SECONDS", "1.2")
-    )
-    if observed_at <= state.get("last_observed_at", 0.0):
-        return
-    state["last_observed_at"] = observed_at
-    state.setdefault("means", []).append(round(mean, 2))
-    state["means"] = state["means"][-30:]
-    if state["mode"] == "black":
-        if mean <= black_max:
-            state.setdefault("black_started_at", observed_at)
-        elif mean >= content_min:
-            black_started_at = state.pop("black_started_at", None)
-            if (
-                black_started_at is not None
-                and observed_at - black_started_at >= min_black_seconds
-            ):
-                state["mode"] = "content"
-                state["content_count"] = 1
-                state["content_started_at"] = observed_at
-        else:
-            state.pop("black_started_at", None)
-    elif state["mode"] == "content":
-        if mean >= content_min:
-            state["content_count"] += 1
-            if state["content_count"] >= 2:
-                state["anchors"].append(state.pop("content_started_at", observed_at))
-                state["mode"] = "await_black"
-                state["black_count"] = 0
-        else:
-            state["content_count"] = 0
-            if mean <= black_max:
-                state["mode"] = "black"
-                state["black_started_at"] = observed_at
-    elif state["mode"] == "await_black" and mean <= black_max:
-        state["mode"] = "black"
-        state["black_started_at"] = observed_at
 
 
 def parse_bytes(value: str) -> int:
@@ -750,57 +655,52 @@ def wait_recognition_idle(timeout: float = 10.0) -> bool:
 
 
 def observe_round_anchors(
-    replays: dict[str, Path], hard_deadline: float
+    replays: dict[str, Path], replay_started: dict[str, float], hard_deadline: float
 ) -> tuple[dict[str, list[float]], dict[str, Any]]:
-    thresholds = {CAMERAS[kind]: replay_levels(path) for kind, path in replays.items()}
+    """Observe source progress using the publisher's exact one-shot boundary."""
     durations = {CAMERAS[kind]: replay_duration(path) for kind, path in replays.items()}
-    # acceptance-start has just recreated both replay publishers. Restarting
-    # only the publishers a second time leaves Frigate/go2rtc subscribed to a
-    # stale RTSP session and freezes latest.jpg on the final pre-restart frame.
-    # Wait for the next observed black -> content transition instead; this is
-            # the source anchor and deliberately does not infer source time from StartedAt.
-
     states: dict[str, dict[str, Any]] = {
         camera: {
-            "mode": "black",
-            "black_count": 0,
-            "content_count": 0,
-            "anchors": [],
             "means": [],
+            "first_observed_frame": None,
+            "last_observed_frame": None,
         }
-        for camera in thresholds
+        for camera in replay_started
     }
-    completion_deadline: float | None = None
+    completion_deadline = max(
+        replay_started[camera] + durations[camera] - LEAD_SECONDS + 0.8
+        for camera in replay_started
+    )
     while time.monotonic() < hard_deadline:
-        for camera, (black_max, content_min) in thresholds.items():
+        for camera in replay_started:
             sample = latest_sample(camera)
             if sample is None:
                 continue
             mean, frame_time = sample
             state = states[camera]
-            update_anchor_state(state, mean, black_max, content_min, frame_time)
+            state["means"].append(round(mean, 2))
+            state["means"] = state["means"][-30:]
+            if frame_time >= replay_started[camera]:
+                if state["first_observed_frame"] is None:
+                    state["first_observed_frame"] = frame_time
+                state["last_observed_frame"] = frame_time
 
-        if all(len(state["anchors"]) >= ROUNDS for state in states.values()):
-            if completion_deadline is None:
-                completion_deadline = max(
-                    states[camera]["anchors"][ROUNDS - 1]
-                    + durations[camera]
-                    - LEAD_SECONDS
-                    + 0.8
-                    for camera in states
-                )
-            if time.time() >= completion_deadline:
-                break
+        if time.time() >= completion_deadline and all(
+            state["first_observed_frame"] is not None for state in states.values()
+        ):
+            break
         time.sleep(0.12)
 
     anchors: dict[str, list[float]] = {
-        camera: list(state["anchors"][:ROUNDS]) for camera, state in states.items()
+        camera: [replay_started[camera]] for camera in states
     }
     details: dict[str, Any] = {
         camera: {
-            "count": len(anchors[camera]),
-            "black_max": round(thresholds[camera][0], 2),
-            "content_min": round(thresholds[camera][1], 2),
+            "count": 1,
+            "boundary": "publisher_source_start",
+            "source_start": replay_started[camera],
+            "first_observed_frame": state["first_observed_frame"],
+            "last_observed_frame": state["last_observed_frame"],
             "recent_means": state["means"],
         }
         for camera, state in states.items()
@@ -869,6 +769,53 @@ def assign_records(
             untracked.append(record)
 
     for (camera, _round_id, _owner_id), trajectory in grouped.items():
+        if camera == CAMERAS["lpr"]:
+            # LPR acceptance is output-only: the pipeline owns trace identity,
+            # and fixture time/bbox must not influence it. Compare only the
+            # terminal plate published by the completed runtime trace.
+            published = [
+                record
+                for record in trajectory
+                if record.get("stage") == "event_published" and record.get("plate")
+            ]
+            terminal = max(
+                enumerate(published),
+                key=lambda item: (
+                    float(
+                        item[1].get(
+                            "source_pts", item[1].get("frame_time", 0)
+                        )
+                        or 0
+                    ),
+                    item[0],
+                ),
+                default=None,
+            )
+            representative = (
+                normalize_plate(terminal[1].get("plate")) if terminal else ""
+            )
+            matches = []
+            if representative:
+                for passage in passages_by_camera.get(camera, []):
+                    accepted = {
+                        normalize_plate(passage.get("expected_plate")),
+                        *(
+                            normalize_plate(value)
+                            for value in passage.get("accepted_plates", [])
+                        ),
+                    } - {""}
+                    if representative in accepted:
+                        matches.append(str(passage["id"]))
+            if len(matches) == 1:
+                for record in trajectory:
+                    record["passage_id"] = matches[0]
+                    record["fixture_passage_id"] = matches[0]
+            elif len(matches) > 1:
+                for record in trajectory:
+                    record["association_error"] = "ambiguous_plate_fixture"
+                    record["association_candidates"] = sorted(matches)
+            continue
+
         scores: dict[str, float] = {}
         temporal_candidates: set[str] = set()
         scoring_records = trajectory
@@ -1233,12 +1180,17 @@ def lpr_results(
     active = [passage for passage in passages if passage.get("valid_passage", True)]
     rows = []
     for passage in active:
-        events = [
-            r
-            for r in records
-            if r.get("passage_id") == passage["id"]
-            and r.get("stage") == "event_published"
-        ]
+        events = sorted(
+            (
+                r
+                for r in records
+                if r.get("passage_id") == passage["id"]
+                and r.get("stage") == "event_published"
+            ),
+            key=lambda record: float(
+                record.get("source_pts", record.get("frame_time", 0)) or 0
+            ),
+        )
         by_round = {
             round_id: [r for r in events if r.get("round_id") == round_id]
             for round_id in range(1, ROUNDS + 1)
@@ -1248,9 +1200,7 @@ def lpr_results(
             for event in events
             if event.get("plate")
         ]
-        representative = (
-            collections.Counter(plates).most_common(1)[0][0] if plates else None
-        )
+        representative = plates[-1] if plates else None
         accepted = {
             normalize_plate(passage.get("expected_plate")),
             *(normalize_plate(v) for v in passage.get("accepted_plates", [])),
@@ -1277,21 +1227,6 @@ def lpr_results(
                 )
                 for round_id in range(1, ROUNDS + 1)
             )
-        miss_stage = next(
-            (
-                stage
-                for stage in (
-                    "detector_hit",
-                    "track_seen",
-                    "lpr_eligible",
-                    "plate_detected",
-                    "ocr_result",
-                    "event_published",
-                )
-                if stages[stage] < ROUNDS
-            ),
-            None,
-        )
         detected_rounds = stages["track_seen"]
         round_trace = {
             round_id: stage_trace(
@@ -1310,6 +1245,7 @@ def lpr_results(
         rows.append(
             {
                 "passage_id": passage["id"],
+                "expected_plate": normalize_plate(passage.get("expected_plate")),
                 "readable": passage["readable"],
                 "plates": plates,
                 "representative": representative,
@@ -1325,9 +1261,9 @@ def lpr_results(
                 "funnel": stages,
                 "round_trace": round_trace,
                 "mismatch_reason": (
-                    f"{miss_stage}_miss"
-                    if miss_stage
-                    else ("ocr_exact_mismatch" if exact is False else None)
+                    None
+                    if exact is not False
+                    else "expected_plate_not_returned"
                 ),
             }
         )
@@ -1689,25 +1625,25 @@ print(json.dumps(result))
     return json.loads(value or "{}")
 
 
-def sqlite_recording_ranges(
-    requests: list[dict[str, Any]], database_path: str
+def sqlite_recordings_for_trace_ranges(
+    ranges: list[dict[str, Any]], database_path: str
 ) -> dict[str, list[dict[str, Any]]]:
-    """Return native recording rows covering producer source-PTS ranges."""
-    if not requests:
+    """Resolve native recordings by producer camera and trace timestamps."""
+    if not ranges:
         return {}
     code = """
 import json, sqlite3, sys
-requests = json.loads(sys.argv[1])
+ranges = json.loads(sys.argv[1])
 db = sqlite3.connect(sys.argv[2])
 result = {}
-for request in requests:
+for item in ranges:
     rows = db.execute(
         'select id,camera,path,start_time,end_time,duration,segment_size '
         'from recordings where camera=? and end_time>=? and start_time<=? '
         'order by start_time',
-        (request['camera'], request['start_time'], request['end_time']),
+        (item['camera'], item['start_time'], item['end_time']),
     ).fetchall()
-    result[request['key']] = [
+    result[item['key']] = [
         {
             'id': row[0], 'camera': row[1], 'path': row[2],
             'start_time': row[3], 'end_time': row[4],
@@ -1723,7 +1659,7 @@ print(json.dumps(result))
         "python3",
         "-c",
         code,
-        json.dumps(requests),
+        json.dumps(ranges),
         database_path,
         timeout=15,
     )
@@ -1838,30 +1774,31 @@ def collect_native_trace_clips(
         {str(event["id"]) for event in resolved_events.values() if event.get("id")}
     )
     media_rows = sqlite_trace_media(event_ids, database_path)
-    range_requests: list[dict[str, Any]] = []
-    for (pipeline, trace_id), trace_records in groups.items():
-        event = resolved_events.get((pipeline, trace_id))
-        source_times = [
-            float(record.get("source_pts", record.get("frame_time")))
+    trace_ranges: dict[tuple[str, str], tuple[float, float]] = {}
+    range_queries: list[dict[str, Any]] = []
+    for key, trace_records in groups.items():
+        trace_times = [
+            float(record.get("source_pts") or record.get("frame_time"))
             for record in trace_records
-            if record.get("source_pts", record.get("frame_time")) is not None
+            if record.get("source_pts") is not None
+            or record.get("frame_time") is not None
         ]
-        if event is not None:
-            start_time = float(event["start_time"]) - 0.5
-            end_time = float(event["end_time"]) + 0.5
-        else:
-            start_time = min(source_times) - 0.5
-            end_time = max(source_times) + 0.5
-        range_requests.append(
+        if not trace_times:
+            continue
+        start_time = min(trace_times) - 0.25
+        end_time = max(trace_times) + 0.25
+        trace_ranges[key] = (start_time, end_time)
+        range_queries.append(
             {
-                "key": f"{pipeline}|{trace_id}",
+                "key": f"{key[0]}\0{key[1]}",
                 "camera": str(trace_records[0].get("camera") or ""),
                 "start_time": start_time,
                 "end_time": end_time,
             }
         )
-    range_media = sqlite_recording_ranges(range_requests, database_path)
-
+    recordings_by_range = sqlite_recordings_for_trace_ranges(
+        range_queries, database_path
+    )
     for (pipeline, trace_id), trace_records in sorted(groups.items()):
         safe_trace = re.sub(r"[^A-Za-z0-9_.-]+", "_", trace_id)
         trace_dir = output / "media" / pipeline / safe_trace
@@ -1874,55 +1811,41 @@ def collect_native_trace_clips(
             "camera": camera,
             "event_id": None,
             "clip_status": "missing",
-            "clip_reason": "recording_coverage_missing",
+            "clip_reason": "trace_timestamp_missing",
             "clip_path": None,
             "recordings": [],
             "record_count": len(trace_records),
         }
-        source_times = [
-            float(record.get("source_pts", record.get("frame_time")))
-            for record in trace_records
-            if record.get("source_pts", record.get("frame_time")) is not None
-        ]
-        range_key = f"{pipeline}|{trace_id}"
-        recordings = range_media.get(range_key) or []
-        start_time = min(source_times) - 0.5
-        end_time = max(source_times) + 0.5
-        metadata.update(
-            {
-                "clip_basis": "trace_source_pts",
-                "clip_start_time": start_time,
-                "clip_end_time": end_time,
-                "recordings": recordings,
-            }
-        )
+        range_key = f"{pipeline}\0{trace_id}"
+        recordings: list[dict[str, Any]] = recordings_by_range.get(range_key, [])
+        start_time: float | None = None
+        end_time: float | None = None
+        if (pipeline, trace_id) in trace_ranges:
+            start_time, end_time = trace_ranges[(pipeline, trace_id)]
+            metadata.update(
+                {
+                    "clip_basis": "trace_lifecycle",
+                    "clip_start_time": start_time,
+                    "clip_end_time": end_time,
+                    "recordings": recordings,
+                    "clip_reason": None if recordings else "recording_coverage_missing",
+                }
+            )
         if event is not None:
             event_id = str(event["id"])
             sqlite_media = media_rows.get(event_id, {})
             source_event = sqlite_media.get("event") or {}
-            event_recordings = sqlite_media.get("recordings") or []
-            start_time = float(event["start_time"]) - 0.5
-            end_time = float(event["end_time"]) + 0.5
             metadata.update(
                 {
-                    "clip_basis": "event_lifecycle",
                     "event_id": event_id,
                     "event_start_time": event.get("start_time"),
                     "event_end_time": event.get("end_time"),
-                    "clip_start_time": start_time,
-                    "clip_end_time": end_time,
                     "event_has_clip_api": bool(event.get("has_clip")),
                     "event_has_clip_sqlite": bool(source_event.get("has_clip")),
-                    "recordings": event_recordings,
                 }
             )
-            recordings = event_recordings
-            if recordings and (
-                not event.get("has_clip") or not source_event.get("has_clip")
-            ):
-                metadata["clip_reason"] = "event_clip_unavailable"
-                recordings = []
         if recordings:
+            assert start_time is not None and end_time is not None
             coverage_start = min(float(row["start_time"]) for row in recordings)
             coverage_end = max(float(row["end_time"]) for row in recordings)
             request_start = max(start_time, coverage_start)
@@ -2245,21 +2168,79 @@ def write_markdown_report(output: Path, summary: dict[str, Any]) -> Path:
 def write_failure_only_report(output: Path, summary: dict[str, Any]) -> Path:
     """Write a compact report containing only failed lifecycle traces."""
     runtime = summary.get("runtime", {})
-    failed_lpr = [
-        row for row in summary.get("lpr", {}).get("passages", [])
-        if not row.get("detected") or row.get("exact") is False
-    ]
     failed_face = [
         row for row in summary.get("face", {}).get("passages", [])
         if not row.get("correct")
     ]
-    lpr_passage_labels = {
-        str(row.get("passage_id")): f"lpr-{index:02d}"
-        for index, row in enumerate(summary.get("lpr", {}).get("passages", []), 1)
+    lpr_expectations = summary.get("lpr", {}).get("passages", [])
+    expected_by_plate = {
+        normalize_plate(row.get("expected_plate")): str(row.get("passage_id"))
+        for row in lpr_expectations
+        if normalize_plate(row.get("expected_plate"))
     }
 
-    def display_passage(kind: str, passage_id: str) -> str:
-        return lpr_passage_labels.get(passage_id, passage_id) if kind == "LPR" else passage_id
+    trace_path = output / "runtime-trace.json"
+    trace_records = (
+        json.loads(trace_path.read_text(encoding="utf-8")).get("records", [])
+        if trace_path.is_file()
+        else []
+    )
+    evidence_path = output / "runtime-evidence.json"
+    evidence_records = (
+        json.loads(evidence_path.read_text(encoding="utf-8")).get("records", [])
+        if evidence_path.is_file()
+        else []
+    )
+
+    lpr_records_by_trace: dict[str, list[dict[str, Any]]] = collections.defaultdict(list)
+    for record in [*trace_records, *evidence_records]:
+        if record.get("pipeline") != "lpr":
+            continue
+        trace_id = str(record.get("trace_id") or record.get("track_id") or "")
+        if not trace_id or trace_id.startswith("detector:"):
+            continue
+        lpr_records_by_trace[trace_id].append(record)
+
+    lpr_trace_rows: list[dict[str, Any]] = []
+    for trace_id, records in sorted(lpr_records_by_trace.items()):
+        published = sorted(
+            (
+                record
+                for record in records
+                if record.get("stage") == "event_published" and record.get("plate")
+            ),
+            key=lambda record: float(
+                record.get("source_pts", record.get("frame_time", 0)) or 0
+            ),
+        )
+        final_plate = normalize_plate(published[-1].get("plate")) if published else ""
+        fixture_match = expected_by_plate.get(final_plate)
+        stages: dict[str, dict[str, Any]] = {}
+        for record in sorted(
+            records,
+            key=lambda item: float(
+                item.get("source_pts", item.get("frame_time", 0)) or 0
+            ),
+        ):
+            stages[str(record.get("stage"))] = record
+        lpr_trace_rows.append(
+            {
+                "trace_id": trace_id,
+                "records": records,
+                "stages": stages,
+                "final_plate": final_plate,
+                "fixture_match": fixture_match,
+                "comparison": (
+                    "MATCH"
+                    if fixture_match
+                    else ("UNEXPECTED" if final_plate else "NO_OUTPUT")
+                ),
+            }
+        )
+
+    failed_lpr_traces = [
+        row for row in lpr_trace_rows if row["comparison"] != "MATCH"
+    ]
 
     groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
     group_passages: dict[tuple[str, str], str] = {}
@@ -2283,24 +2264,16 @@ def write_failure_only_report(output: Path, summary: dict[str, Any]) -> Path:
             groups.setdefault(key, []).append(record)
             group_passages[key] = passage_id
 
-    for row in failed_lpr:
-        for round_data in (row.get("round_trace") or {}).values():
-            add_records("LPR", str(row.get("passage_id")), round_data.get("records", []))
+    for row in failed_lpr_traces:
+        add_records(
+            "LPR",
+            str(row.get("fixture_match") or "-"),
+            row.get("records", []),
+        )
     for row in failed_face:
         for round_data in row.get("rounds", []):
             trace = round_data.get("trace") or {}
             add_records("Face", str(row.get("passage_id")), trace.get("records", []))
-    evidence_records: list[dict[str, Any]] = []
-    evidence_path = output / "runtime-evidence.json"
-    if evidence_path.is_file():
-        evidence_records = json.loads(evidence_path.read_text(encoding="utf-8")).get(
-            "records", []
-        )
-        failed_ids = {str(row.get("passage_id")) for row in failed_lpr}
-        for record in evidence_records:
-            if str(record.get("passage_id")) in failed_ids:
-                add_records("LPR", str(record.get("passage_id")), [record])
-
     for key, records in groups.items():
         passage_id = group_passages.get(key, "")
         records.extend(detector_records.get((key[0], passage_id), []))
@@ -2383,7 +2356,7 @@ def write_failure_only_report(output: Path, summary: dict[str, Any]) -> Path:
                         by_stage["detector_hit"] = detector
                 rows.append([
                     kind,
-                    display_passage(kind, passage_id),
+                    passage_id,
                     trace_id,
                     f"[clip]({clip_href(kind, trace_id)})" if clip_href(kind, trace_id) != "-" else "-",
                     passage.get("mismatch_reason") or ("recognition_not_correct" if kind == "Face" else "not_detected_or_not_exact"),
@@ -2398,7 +2371,7 @@ def write_failure_only_report(output: Path, summary: dict[str, Any]) -> Path:
         f"- **Status:** `{summary.get('report', {}).get('status', '-')}`",
         f"- **Measurement valid:** `{summary.get('measurement', {}).get('measurement_valid', '-')}`",
         "",
-        "Metrics và kết quả tổng hợp giữ đầy đủ. Chỉ phần failure trace bên dưới loại trace/pass và ảnh pass.",
+        "Trace LPR do pipeline sở hữu. Fixture chỉ được dùng để đối chiếu biển số cuối cùng; không dùng time/bbox để gán trace hoặc suy diễn stage.",
         "",
         "## Runtime metrics",
         "",
@@ -2443,7 +2416,7 @@ def write_failure_only_report(output: Path, summary: dict[str, Any]) -> Path:
         _md_table(
             ["Pipeline", "Recall", "Precision", "Accuracy", "Exact match", "Observed / expected"],
             [
-                ["LPR", summary.get("lpr", {}).get("passage_recall"), summary.get("lpr", {}).get("passage_precision"), summary.get("lpr", {}).get("accuracy"), summary.get("lpr", {}).get("exact_match"), f"{runtime.get('lpr_evidence', {}).get('observed_passages', '-')} / {runtime.get('lpr_evidence', {}).get('expected_passages', '-')}"],
+                ["LPR", summary.get("lpr", {}).get("recall"), summary.get("lpr", {}).get("precision"), summary.get("lpr", {}).get("accuracy"), summary.get("lpr", {}).get("exact_match"), f"{sum(bool(row.get('fixture_match')) for row in lpr_trace_rows)} / {len(lpr_expectations)}"],
                 ["Face", summary.get("face", {}).get("recall"), summary.get("face", {}).get("precision"), summary.get("face", {}).get("accuracy"), "-", "-"],
             ],
         ),
@@ -2477,12 +2450,64 @@ def write_failure_only_report(output: Path, summary: dict[str, Any]) -> Path:
         "### LPR",
         "",
         _md_table(
-            ["Pipeline", "Passage", "trace_id", "Clip", "Reason", "detector_hit", "track_seen", "lpr_eligible", "plate_detector_result", "ocr_result", "event_published"],
-            failure_table_rows(
-                "LPR",
-                failed_lpr,
-                ["detector_hit", "track_seen", "lpr_eligible", "plate_detector_result", "ocr_result", "event_published"],
-            ),
+            ["trace_id", "Clip", "Final plate", "Fixture match", "Comparison", "track_seen", "lpr_eligible", "plate_detector_result", "ocr_result", "event_published"],
+            [
+                [
+                    row["trace_id"],
+                    f"[clip]({clip_href('LPR', row['trace_id'])})"
+                    if clip_href("LPR", row["trace_id"]) != "-"
+                    else "-",
+                    row["final_plate"] or "-",
+                    row["fixture_match"] or "-",
+                    row["comparison"],
+                    *[
+                        failure_value(row["stages"].get(stage))
+                        for stage in (
+                            "track_seen",
+                            "lpr_eligible",
+                            "plate_detector_result",
+                            "ocr_result",
+                            "event_published",
+                        )
+                    ],
+                ]
+                for row in lpr_trace_rows
+            ],
+        ),
+        "",
+        "### LPR plate comparison",
+        "",
+        _md_table(
+            ["Fixture", "Expected plate", "Runtime trace", "Returned plate", "Comparison"],
+            [
+                [
+                    expectation.get("passage_id"),
+                    expectation.get("expected_plate") or "-",
+                    next(
+                        (
+                            row["trace_id"]
+                            for row in lpr_trace_rows
+                            if row.get("fixture_match") == expectation.get("passage_id")
+                        ),
+                        "-",
+                    ),
+                    next(
+                        (
+                            row["final_plate"]
+                            for row in lpr_trace_rows
+                            if row.get("fixture_match") == expectation.get("passage_id")
+                        ),
+                        "-",
+                    ),
+                    "MATCH"
+                    if any(
+                        row.get("fixture_match") == expectation.get("passage_id")
+                        for row in lpr_trace_rows
+                    )
+                    else "MISSING",
+                ]
+                for expectation in lpr_expectations
+            ],
         ),
         "",
         "### Face",
@@ -2593,7 +2618,7 @@ def write_failure_only_report(output: Path, summary: dict[str, Any]) -> Path:
             return json.dumps(values, ensure_ascii=False, separators=(",", ":")) or "{}"
         for (kind, trace_id), records in sorted(groups.items()):
             required_stages = (
-                ["detector_hit", "track_seen", "lpr_eligible", "plate_detector_input",
+                ["track_seen", "lpr_eligible", "plate_detector_input",
                  "plate_detector_result", "plate_crop", "ocr_plate_input",
                  "ocr_result", "ocr_text_crop", "ocr_recognition_tensor", "event_published"]
                 if kind == "LPR"
@@ -2646,12 +2671,11 @@ def write_failure_only_report(output: Path, summary: dict[str, Any]) -> Path:
     if not runtime.get("lpr_evidence", {}).get("valid", True):
         evidence = runtime.get("lpr_evidence", {})
         diagnostic_failures.append([
-            "lpr_evidence",
-            (
-                f"{evidence.get('reason')}; expected={evidence.get('expected_passages')}; "
-                f"observed={evidence.get('observed_passages')}; "
-                f"missing={', '.join(evidence.get('missing_passages', [])) or '-'}"
-            ),
+                "lpr_evidence",
+                (
+                    f"{evidence.get('reason')}; invocations={evidence.get('invocations')}; "
+                    f"errors={len(evidence.get('errors', []))}"
+                ),
         ])
     native_media = runtime.get("native_media", {})
     if native_media and not native_media.get("complete", False):
@@ -2705,20 +2729,19 @@ def main() -> int:
     previous_capture_start = os.environ.get("PASSAGE_CAPTURE_START_PATH")
     previous_capture_cutoff = os.environ.get("PASSAGE_CAPTURE_CUTOFF_PATH")
     previous_run_id = os.environ.get("PASSAGE_RUN_ID")
-    previous_controlled_replay = os.environ.get("CAMERA_REPLAY_CONTROLLED")
+    previous_source_start_dir = os.environ.get("PASSAGE_SOURCE_START_DIR")
     previous_evidence_bytes = os.environ.get("PASSAGE_EVIDENCE_MAX_BYTES")
     previous_evidence_records = os.environ.get("PASSAGE_EVIDENCE_MAX_RECORDS")
     previous_ready_seconds = os.environ.get("CAMERA_READY_STABLE_SECONDS")
     previous_skip_ready = os.environ.get("CAMERA_SKIP_READY_WAIT")
     previous_source_overlay = os.environ.get("CAMERA_SOURCE_OVERLAY")
     previous_report_media = os.environ.get("CAMERA_REPORT_MEDIA_DIR")
-    previous_anchor_black_seconds = os.environ.get("PASSAGE_ANCHOR_MIN_BLACK_SECONDS")
     runtime_started = False
-    replays_paused = False
     sampler: ResourceSampler | None = None
     isolated_start_wall: float | None = None
     exit_code = 1
-    runtime_workspace = tempfile.TemporaryDirectory(prefix="camera-platform-runtime-")
+    runtime_workspace = output / "test-assets"
+    runtime_workspace.mkdir(parents=True, exist_ok=True)
     try:
         step_started = time.monotonic()
         manifest = load_manifest(manifest_path, Path.cwd())
@@ -2731,12 +2754,10 @@ def main() -> int:
             "--output",
             str(output),
             "--workspace",
-            runtime_workspace.name,
+            str(runtime_workspace),
         ]
         base_config = yaml.safe_load(config.read_text(encoding="utf-8"))
-        # Replay inputs are deliberately OS-temporary and are not cacheable.
-        # Rebuilding them here keeps a run self-contained and prevents stale
-        # fixture assets from being mistaken for runtime output.
+        # Keep every generated fixture asset inside this timestamped run.
         cache_valid = False
         if not cache_valid:
             subprocess.run(
@@ -2771,21 +2792,24 @@ def main() -> int:
         os.environ["PASSAGE_CAPTURE_START_PATH"] = CAPTURE_START_CONTAINER_PATH
         os.environ["PASSAGE_CAPTURE_CUTOFF_PATH"] = CAPTURE_CUTOFF_CONTAINER_PATH
         os.environ["PASSAGE_RUN_ID"] = run_id
-        os.environ["CAMERA_REPLAY_CONTROLLED"] = "1"
         os.environ["CAMERA_SOURCE_OVERLAY"] = str(
             (Path.cwd() / "frigate" / "frigate").resolve()
         )
         report_media = output / "media"
         report_media.mkdir(parents=True, exist_ok=True)
+        source_start_dir = report_media / "source-start"
+        source_start_dir.mkdir(parents=True, exist_ok=True)
         os.environ["CAMERA_REPORT_MEDIA_DIR"] = str(report_media.resolve())
+        os.environ["PASSAGE_SOURCE_START_DIR"] = SOURCE_START_CONTAINER_DIR
         os.environ["PASSAGE_EVIDENCE_MAX_BYTES"] = str(128 * 1024**2)
         os.environ["PASSAGE_EVIDENCE_MAX_RECORDS"] = "4096"
-        os.environ["CAMERA_READY_STABLE_SECONDS"] = "1"
+        os.environ["CAMERA_READY_STABLE_SECONDS"] = "2"
         os.environ["CAMERA_SKIP_READY_WAIT"] = "1"
-        # The replay publisher can be online before Frigate subscribes, so the
-        # initial black lead may be missed.  The measured inter-loop black
-        # boundary remains distinct from internal black gaps at this bound.
-        os.environ["PASSAGE_ANCHOR_MIN_BLACK_SECONDS"] = "0.4"
+        capture_start = time.time()
+        (report_media / "capture-start").write_text(
+            f"{capture_start:.9f}\n", encoding="utf-8"
+        )
+        summary["capture_start_epoch"] = capture_start
         try:
             run_deploy("acceptance-start", Path(fixture["config"]), timeout=30)
         finally:
@@ -2793,58 +2817,38 @@ def main() -> int:
                 os.environ.pop("CAMERA_SOURCE_OVERLAY", None)
             else:
                 os.environ["CAMERA_SOURCE_OVERLAY"] = previous_source_overlay
+        source_started = wait_source_starts(source_start_dir, timeout=60)
         wait_acceptance_ready(str(value["runtime"]["image"]), timeout=60)
         summary["timing"]["isolated_start_seconds"] = round(time.monotonic() - step_started, 3)
         observation_wall = time.time()
-        capture_start = time.time()
-        docker_output(
-            "exec",
-            "frigate",
-            "sh",
-            "-c",
-            f"printf '%s\\n' '{capture_start:.9f}' > {CAPTURE_START_CONTAINER_PATH}",
-            timeout=5,
-        )
-        summary["capture_start_epoch"] = capture_start
         initial_restarts = restart_counts()
         sampler = ResourceSampler()
         sampler.start()
 
-        replay_sources = value["runtime"]["replay"]["sources"]
+        replay_sources = value["runtime"]["direct"]["sources"]
         replays = {
             "face": Path(replay_sources["face_camera"]),
             "lpr": Path(replay_sources["car_camera"]),
         }
         step_started = time.monotonic()
-        replay_started = trigger_controlled_replays(run_id)
-        anchors, anchor_details = observe_round_anchors(replays, started + 103)
-        replay_done = wait_controlled_replays_done(run_id)
+        anchors, anchor_details = observe_round_anchors(
+            replays, source_started, started + 103
+        )
         capture_cutoff = time.time()
         summary["capture_cutoff_epoch"] = capture_cutoff
-        docker_output(
-            "exec",
-            "frigate",
-            "sh",
-            "-c",
-            f"printf '%s\\n' '{capture_cutoff:.9f}' > {CAPTURE_CUTOFF_CONTAINER_PATH}",
-            timeout=5,
+        (report_media / "capture-cutoff").write_text(
+            f"{capture_cutoff:.9f}\n", encoding="utf-8"
         )
+        source_done = {
+            camera: source_started[camera] + replay_duration(replays[kind])
+            for kind, camera in CAMERAS.items()
+        }
         recognition_idle = wait_recognition_idle()
         recordings_ready, recordings_through = wait_recordings_through(
             str(value["database"]["path"]),
             list(CAMERAS.values()),
             capture_cutoff + 0.5,
         )
-        # Let tracker generations and quality leases expire while the replay
-        # still supplies frames.  Pausing first leaves the last active track
-        # pinned forever because no subsequent disappearance frame arrives.
-        docker_output(
-            "pause",
-            "camera-replay-face-camera",
-            "camera-replay-car-camera",
-            timeout=5,
-        )
-        replays_paused = True
         summary["timing"]["replay_seconds"] = round(time.monotonic() - step_started, 3)
         sampler.stop()
         resource_memory = list(sampler.memory_bytes)
@@ -3050,10 +3054,10 @@ def main() -> int:
             )
         runtime = {
             "anchors": anchor_details,
-            "controlled_replay": {
+            "direct_sources": {
                 "run_id": run_id,
-                "started": replay_started,
-                "done": replay_done,
+                "started": source_started,
+                "done": source_done,
             },
             "rounds_complete": all(len(value) == ROUNDS for value in anchors.values()),
             "pending": pending,
@@ -3181,14 +3185,6 @@ def main() -> int:
             summary.setdefault("diagnostic_errors", []).append(
                 f"{type(exc).__name__}: {exc}"
             )
-        if replays_paused:
-            docker_output(
-                "unpause",
-                "camera-replay-face-camera",
-                "camera-replay-car-camera",
-                timeout=5,
-                check=False,
-            )
         if sampler is not None:
             sampler.stop()
         step_started = time.monotonic()
@@ -3251,10 +3247,15 @@ def main() -> int:
             "container.log",
         )
         artifacts_complete = all((output / name).is_file() for name in artifact_names)
+        native_media_complete = bool(
+            summary.get("runtime", {}).get("native_media", {}).get("complete")
+        )
         summary["report"] = {
             "mode": "evidence_only",
             "status": "complete"
-            if "error" not in summary and artifacts_complete
+            if "error" not in summary
+            and artifacts_complete
+            and native_media_complete
             else "incomplete",
             "criteria": [],
             "artifacts": [
@@ -3291,18 +3292,14 @@ def main() -> int:
             os.environ.pop("PASSAGE_RUN_ID", None)
         else:
             os.environ["PASSAGE_RUN_ID"] = previous_run_id
-        if previous_controlled_replay is None:
-            os.environ.pop("CAMERA_REPLAY_CONTROLLED", None)
+        if previous_source_start_dir is None:
+            os.environ.pop("PASSAGE_SOURCE_START_DIR", None)
         else:
-            os.environ["CAMERA_REPLAY_CONTROLLED"] = previous_controlled_replay
+            os.environ["PASSAGE_SOURCE_START_DIR"] = previous_source_start_dir
         if previous_report_media is None:
             os.environ.pop("CAMERA_REPORT_MEDIA_DIR", None)
         else:
             os.environ["CAMERA_REPORT_MEDIA_DIR"] = previous_report_media
-        if previous_anchor_black_seconds is None:
-            os.environ.pop("PASSAGE_ANCHOR_MIN_BLACK_SECONDS", None)
-        else:
-            os.environ["PASSAGE_ANCHOR_MIN_BLACK_SECONDS"] = previous_anchor_black_seconds
         for name, previous in (
             ("PASSAGE_EVIDENCE_DIR", previous_evidence_dir),
             ("PASSAGE_EVIDENCE_MAX_BYTES", previous_evidence_bytes),
@@ -3335,7 +3332,6 @@ def main() -> int:
         )
         write_json(output / "summary.json", summary)
         exit_code = 0 if summary["report"]["status"] == "complete" else 1
-        runtime_workspace.cleanup()
     return exit_code
 
 

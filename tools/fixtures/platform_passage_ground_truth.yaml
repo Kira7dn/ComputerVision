@@ -71,90 +71,46 @@ lpr:
   duration_s: 15.0
   passages:
     - id: lpr-01
-      start_s: 0.75
-      end_s: 1.95
-      bbox: [469, 391, 889, 789]
-      roi: [455, 370, 910, 811]
       readable: true
       expected_plate: "619879"
       valid_passage: true
-    - id: lpr-transit-01
-      start_s: 0.75
-      end_s: 2.50
-      bbox: [1209, 85, 1550, 469]
-      roi: [1194, 71, 1564, 484]
+    - id: lpr-02
       readable: true
       expected_plate: C98191P
       valid_passage: true
-    - id: lpr-02
-      start_s: 1.50
-      end_s: 3.75
-      bbox: [412, 320, 853, 775]
-      roi: [398, 299, 874, 796]
+    - id: lpr-03
       readable: true
       expected_plate: "657648"
       valid_passage: true
-    - id: lpr-trailer-pickup-01
-      start_s: 6.50
-      end_s: 8.60
-      bbox: [611, 128, 1095, 526]
-      roi: [597, 114, 1109, 540]
+    - id: lpr-04
       readable: true
       expected_plate: 7BN2396
       valid_passage: true
-    - id: lpr-red-suv-01
-      start_s: 7.30
-      end_s: 9.50
-      bbox: [1351, 0, 1678, 270]
-      roi: [1337, 0, 1692, 284]
+    - id: lpr-05
       readable: true
       expected_plate: "1073"
       valid_passage: true
-    - id: lpr-service-van-01
-      start_s: 9.50
-      end_s: 11.00
-      bbox: [327, 57, 867, 668]
-      roi: [313, 43, 882, 683]
+    - id: lpr-06
       readable: true
       expected_plate: "3789"
       valid_passage: true
-    - id: lpr-rental-van-01
-      start_s: 9.50
-      end_s: 11.20
-      bbox: [1038, 0, 1607, 740]
-      roi: [1024, 0, 1621, 754]
+    - id: lpr-07
       readable: true
       expected_plate: C64457T
       valid_passage: true
-    - id: lpr-05
-      start_s: 10.90
-      end_s: 12.10
-      bbox: [100, 64, 519, 427]
-      roi: [85, 50, 533, 441]
+    - id: lpr-08
       readable: true
       expected_plate: 3B53567
       valid_passage: true
-    - id: lpr-07
-      start_s: 10.90
-      end_s: 12.10
-      bbox: [1315, 0, 1735, 292]
-      roi: [1301, 0, 1749, 306]
+    - id: lpr-09
       readable: true
       expected_plate: FKH9211
       valid_passage: true
-    - id: lpr-chevy-pickup-01
-      start_s: 11.00
-      end_s: 13.00
-      bbox: [697, 0, 1194, 356]
-      roi: [682, 0, 1209, 370]
+    - id: lpr-10
       readable: true
       expected_plate: XX6755
       valid_passage: true
-    - id: lpr-06
-      start_s: 13.10
-      end_s: 14.30
-      bbox: [739, 0, 1180, 256]
-      roi: [725, 0, 1194, 270]
+    - id: lpr-11
       readable: true
       expected_plate: BEE3975
       valid_passage: true

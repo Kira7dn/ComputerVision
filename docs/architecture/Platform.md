@@ -613,19 +613,18 @@ RAM, cleanup hoặc evidence, nhưng các lỗi vận hành đó không được
 Ngược lại, một run khởi động ổn định không làm KPI recognition hợp lệ nếu scorer không chứng minh
 được quan hệ giữa ground truth và candidate thực tế.
 
-Mỗi hàng đo bắt buộc có khóa `physical_passage_id/round_id` và giữ cùng một lineage từ frame nguồn
-đến kết quả cuối:
+Mỗi trace runtime giữ cùng một lineage từ frame nguồn đến kết quả cuối:
 
 ```text
 source PTS -> object bbox -> runtime track/generation -> candidate ID
            -> plate/face bbox -> raw outcome -> final publication
 ```
 
-Scorer phải dùng PTS của video nguồn, không suy PTS từ wall-clock runtime hoặc thời điểm RTSP
-anchor. Detection/candidate được match one-to-one với ground truth tại chính frame đó bằng time và
-bbox. Một raw track chạm nhiều physical passage phải tạo metric `track_switch`; scorer không được
-gán toàn bộ trajectory vào passage có IoU lớn nhất. Record thiếu PTS, bbox hoặc candidate lineage
-được ghi `unscorable`, không được tự động nhận nhãn từ record khác.
+PTS và bbox là bằng chứng nội bộ để kiểm tra candidate/result/evidence có cùng frame, không phải
+khóa gán ground truth LPR. Pipeline tự sinh trace và final publication trước; scorer LPR chỉ đối
+chiếu plate đã publish của trace hoàn tất với danh sách `expected_plate` duy nhất. Fixture không
+được dùng time/bbox để đổi ownership, tách hoặc hợp nhất trace. Face vẫn dùng passage nguồn vì
+identity `unknown` không thể đối chiếu chỉ bằng chuỗi kết quả.
 
 Ba replay round được chấm riêng trước khi aggregate. Mỗi passage/round chỉ có một final decision;
 không dùng mode của mọi `event_published` làm representative. Báo cáo tối thiểu phải tách:
@@ -1314,9 +1313,9 @@ evidence/quality/lifecycle path hiện có. Chi tiết code parity và replay đ
 Audit ảnh gốc và xác nhận thủ công ngày 2026-08-09 khóa đủ 11 lượt xe vật lý, theo thứ tự:
 `619879`, `C98191P`, `657648`, `7BN2396`, `1073`, `3789`, `C64457T`, `3B53567`,
 `FKH9211`, `XX6755`, `BEE3975`. Tất cả đều là exact label; không dùng accepted alternative và
-không dùng output OCR cũ làm ground truth. Fixture giữ các xe xuất hiện đồng thời trong cùng
-đoạn nguồn rồi phân biệt bằng time + bbox. Test khóa đủ 11 nhãn và bốn nhóm thời gian chồng lấn
-nằm trong `tools/tests/unit/test_passage_acceptance.py`.
+không dùng output OCR cũ làm ground truth. Fixture LPR chỉ giữ 11 `expected_plate` duy nhất theo
+thứ tự audit; không giữ time/bbox/ROI và không tham gia tạo hoặc gán trace. Test khóa danh sách
+nhãn và contract đối chiếu plate-only nằm trong `tools/tests/unit/test_passage_acceptance.py`.
 
 Artifact `.tmp/platform-phase6-0-gt-fixed/summary.json` được tạo trước audit 11 xe nên chỉ là
 bằng chứng lịch sử của bộ ground truth cũ, không được dùng làm acceptance cho fixture hiện tại.
@@ -1491,7 +1490,7 @@ acceptance ở mục 13:
 | --- | --- | --- |
 | `[DONE]` | `frigate/frigate/video/detect.py`, `frigate/frigate/data_processing/common/license_plate/mixin.py`, `frigate/frigate/util/passage_trace.py` | Instrument detector/track/eligibility/plate/OCR/Event funnel và sửa motion calibration, first-frame eligibility cùng crop context ở đúng tầng passage. |
 | `[DONE]` | `frigate/frigate/data_processing/real_time/face.py`, `frigate/frigate/util/face_snapshot.py` | Trace theo track generation, reset close-follow và giảm thời gian từ passage đến confirmed bằng cadence/selection hiện có; chưa thêm shared quality/top-K. |
-| `[DONE]` | `tools/fixtures/platform_passage_ground_truth.yaml`, `tools/fixtures/prepare_passage_fixture.py`, `tools/runtime/validate_platform_runtime.py`, `tools/tests/unit/test_passage_acceptance.py` | Fixture khai báo frame riêng theo camera, replay anchor theo frame time, physical-passage scoring và funnel/latency breakdown. |
+| `[DONE]` | `tools/fixtures/platform_passage_ground_truth.yaml`, `tools/fixtures/prepare_passage_fixture.py`, `tools/runtime/direct_track_mp4.py`, `tools/runtime/validate_platform_runtime.py`, `tools/tests/unit/test_passage_acceptance.py` | LPR physical trace được dựng trực tiếp từ MP4 gốc bằng motion-region, detector, tracker và passage registry online; không qua replay/transcode. Runtime enrichment giữ trace lineage. LPR chỉ đối chiếu final plate với danh sách audit sau khi pipeline hoàn tất; Face giữ passage scoring riêng. |
 
 ### 15.3 Phase 3 — LPR execution foundation
 
@@ -1534,7 +1533,7 @@ acceptance ở mục 13:
 | --- | --- | --- |
 | `[DONE]` | `frigate/frigate/data_processing/common/quality.py`, `frigate/frigate/config/camera/quality.py` | `P6-0.1/P6-0.2`: task-specific `image_rank` và rolling diverse top-3 đã triển khai, hiện vẫn dùng cho Face nhưng bị LPR realtime upstream bypass. |
 | `[PARTIAL]` | `frigate/frigate/data_processing/common/recognition.py`, Face/LPR pipeline và config | `P6-0.3`: shared best-result reducer và Face path còn tồn tại; LPR production decision hiện dùng upstream `variants`/clustering nên không được ghi là best-result path duy nhất. |
-| `[CURRENT]` | Evidence/recognition/Face/LPR tests, scorer và Phase 6-0 artifacts | `P6-0.4`: report-only mặc định; scorer dùng source PTS, physical-passage/round lineage và xuất `measurement_valid`. Mọi KPI/runtime/cleanup chỉ là diagnostic, không có acceptance threshold. Report giữ bảng 11 passage × 3 round, raw lineage, logs và hash artifact. |
+| `[CURRENT]` | Evidence/recognition/Face/LPR tests, scorer và Phase 6-0 artifacts | `P6-0.4`: report-only mặc định và mỗi invocation chạy đúng một replay. Face dùng source PTS/passage lineage; LPR dùng trực tiếp trace do pipeline tạo và chỉ đối chiếu terminal plate với 11 biển audit, không dùng fixture time/bbox. Report giữ runtime trace summary, plate comparison, logs, media và hash artifact; không có acceptance threshold. |
 | `[CURRENT]` | `frigate/frigate/data_processing/real_time/license_plate.py`, `frigate/frigate/data_processing/common/license_plate/mixin.py`, `frigate/frigate/embeddings/maintainer.py` | LPR giữ nguyên detector/OCR/decision upstream và canonical tracked-object Event ownership. Adapter có bounded pending eligibility retry: raw detection chỉ cung cấp frame đồng bộ cho Event ID đã được canonical đăng ký sau `no_position_changes`; timestamp dedupe, tombstone và Event end/epoch/shutdown cleanup ngăn revive/duplicate. Focused adapter/evidence đạt 49 test. Source-overlay replay cuối có evidence đủ 11/11 và exact LPR 3/11; `lpr-01` đã qua plate detector trong run debug nhưng OCR crop mờ trả `text_detector_empty`, còn run cuối Event lag quá cửa sổ retry. Acceptance vẫn fail và không được ghi là model-only failure. |
 | `[NEW]` | `frigate/frigate/data_processing/common/detection.py`, `frigate/frigate/embeddings/detection_source.py` | `P6-A`: typed detection envelope/source, in-process adapter, bounded latest-only inbox và order/dedupe/epoch contract. |
 | `[TODO]` | `frigate/frigate/embeddings/maintainer.py`, Face/LPR worker modules | `P6-B`: coordinator là single lifecycle/best-result writer; worker compute-only trả typed `RecognitionOutcome`. |
@@ -1548,8 +1547,8 @@ acceptance ở mục 13:
 
 `car_camera` dùng file nguồn đã chuẩn hóa `1820×1024`, detect `1820×1024/5 FPS`;
 `face_camera` vẫn là `1280×720/5 FPS`. Fixture builder không còn dùng một hằng số
-1280×720 chung mà đọc frame theo từng pipeline. Ground-truth LPR bbox/ROI đã chuyển
-sang hệ tọa độ 1820×1024; validator tiếp tục so time+bbox trong cùng hệ tọa độ detect.
+1280×720 chung mà đọc frame theo từng pipeline. Ground-truth LPR không còn bbox/ROI/time;
+validator chỉ so final published plate sau khi pipeline đã tạo trace độc lập.
 Replay acceptance LPR cũng được chuẩn hóa về 5 FPS thay vì phát 15 FPS vào detect 5 FPS,
 tránh tạo RTSP buffer không thuộc contract và làm sai round anchor khi chạy 1024p.
 
