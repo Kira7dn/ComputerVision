@@ -7,6 +7,7 @@ import hashlib
 import json
 import shutil
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -222,8 +223,10 @@ def group_composite_passages(
 
 def make_composite(manifest: dict[str, Any], root: Path, output: Path, kind: str) -> tuple[Path, list[dict[str, Any]]]:
     width, height, fps = frame_spec(manifest, kind)
-    media = output / "media"
-    media.mkdir(parents=True, exist_ok=True)
+    # Replay construction is input preparation, not runtime media. Use an
+    # OS-temporary input directory so fixture segments never enter the run's
+    # report tree and can never be mistaken for runtime evidence.
+    media = Path(tempfile.mkdtemp(prefix=f"camera-platform-{kind}-"))
     parts: list[Path] = []
     windows: list[dict[str, Any]] = []
     timeline = BLACK_LEAD_SECONDS
@@ -267,7 +270,7 @@ def make_composite(manifest: dict[str, Any], root: Path, output: Path, kind: str
         timeline += duration
     concat = media / f"{kind}-concat.txt"
     concat.write_text("\n".join(f"file '{p.as_posix()}'" for p in parts) + "\n", encoding="utf-8")
-    result = output / f"{kind}-replay.mp4"
+    result = media / f"{kind}-replay.mp4"
     ffmpeg([
         "-f", "concat", "-safe", "0", "-i", str(concat), "-an", "-vf", f"fps={fps}",
         "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
@@ -308,6 +311,7 @@ def main() -> int:
     config["runtime"]["media_dir"] = str(output / "media")
     config["runtime"]["replay"]["sources"] = {"face_camera": str(face_replay), "car_camera": str(lpr_replay)}
     config["notifications"]["enabled"] = False; config["record"]["enabled"] = False
+    config["snapshots"]["enabled"] = False
     config["database"] = {"path": "/media/frigate/passage/frigate.db"}
     config["cameras"]["car_camera"]["detect"]["min_initialized"] = 1
     # The fixture includes a measured 2.58 s source-PTS gap.  Keep the

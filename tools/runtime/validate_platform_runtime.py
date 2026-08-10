@@ -24,14 +24,14 @@ import numpy as np
 import yaml
 
 if __package__ in {None, ""}:
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from tools.lib.passage_metrics import bbox_iou, normalize_plate, percentile
 from tools.fixtures.prepare_passage_fixture import load_manifest
 
 CAMERAS = {"face": "face_camera", "lpr": "car_camera"}
 TRACE_CONTAINER_PATH = "/config/passage-trace.jsonl"
-EVIDENCE_CONTAINER_DIR = "/media/frigate/passage-evidence"
+EVIDENCE_CONTAINER_DIR = "/media/frigate"
 CAPTURE_CUTOFF_CONTAINER_PATH = "/tmp/passage-capture-cutoff"
 LEAD_SECONDS = 1.5
 ROUNDS = 1
@@ -100,7 +100,9 @@ def validate_runtime_lpr_evidence(
     passages_by_camera: dict[str, list[dict[str, Any]]],
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Load, attribute, and integrity-check acceptance-only LPR evidence."""
-    manifest = evidence_dir / "evidence.jsonl"
+    manifest = evidence_dir / "lpr" / "evidence.jsonl"
+    if not manifest.is_file():
+        manifest = evidence_dir / "evidence.jsonl"
     if not manifest.is_file():
         return [], {
             "valid": False,
@@ -1867,7 +1869,7 @@ def write_failure_only_report(output: Path, summary: dict[str, Any]) -> Path:
         trace_clip = output / "media" / pipeline / safe_trace / "replay" / "source.mp4"
         if trace_clip.is_file():
             return f"media/{pipeline}/{safe_trace}/replay/source.mp4"
-        return f"media/{pipeline}/replay/{pipeline}-replay.mp4"
+        return "-"
 
     def failure_table_rows(
         kind: str, passages: list[dict[str, Any]], required: list[str]
@@ -1893,7 +1895,7 @@ def write_failure_only_report(output: Path, summary: dict[str, Any]) -> Path:
                 for record in trace_records:
                     by_stage.setdefault(str(record.get("stage")), record)
                 rows.append([
-                    kind,
+                    f"{kind} observation" if trace_id.startswith("detector:") else kind,
                     display_passage(kind, passage_id),
                     trace_id,
                     f"[replay]({replay_href(kind, trace_id)})",
@@ -2102,7 +2104,9 @@ def write_failure_only_report(output: Path, summary: dict[str, Any]) -> Path:
             return json.dumps(values, ensure_ascii=False, separators=(",", ":")) or "{}"
         for (kind, trace_id), records in sorted(groups.items()):
             required_stages = (
-                ["detector_hit", "track_seen", "lpr_eligible", "plate_detector_input",
+                ["detector_hit"]
+                if trace_id.startswith("detector:")
+                else ["detector_hit", "track_seen", "lpr_eligible", "plate_detector_input",
                  "plate_detector_result", "plate_crop", "ocr_plate_input",
                  "ocr_result", "ocr_text_crop", "ocr_recognition_tensor", "event_published"]
                 if kind == "LPR"
@@ -2190,85 +2194,9 @@ def cleanup_runtime_output(output: Path) -> None:
     for path in removable_dirs:
         if path.is_dir() and path.resolve().is_relative_to(output):
             shutil.rmtree(path)
-    media_root = output / "media"
-    replay_root = media_root
-    if media_root.is_dir():
-        for prefix in ("face", "lpr"):
-            source = output / f"{prefix}-replay.mp4"
-            destination = media_root / prefix / "replay"
-            if source.is_file():
-                destination.mkdir(parents=True, exist_ok=True)
-                target = destination / source.name
-                if target.exists():
-                    target.unlink()
-                shutil.move(str(source), str(target))
-        legacy_replay_root = media_root / "replays"
-        if legacy_replay_root.is_dir():
-            for prefix in ("face", "lpr"):
-                legacy_dir = legacy_replay_root / prefix
-                destination = replay_root / prefix / "replay"
-                if legacy_dir.is_dir():
-                    destination.mkdir(parents=True, exist_ok=True)
-                    for path in legacy_dir.iterdir():
-                        target = destination / path.name
-                        if target.exists():
-                            target.unlink()
-                        shutil.move(str(path), str(target))
-                    legacy_dir.rmdir()
-            if legacy_replay_root.exists() and not any(legacy_replay_root.iterdir()):
-                legacy_replay_root.rmdir()
-        for prefix in ("face", "lpr"):
-            destination = replay_root / prefix / "replay"
-            destination.mkdir(parents=True, exist_ok=True)
-            for path in media_root.iterdir():
-                if not path.is_file() or not path.name.startswith(f"{prefix}-"):
-                    continue
-                target = destination / path.name
-                if target.exists():
-                    target.unlink()
-                shutil.move(str(path), str(target))
-
-    passage_evidence_root = media_root / "passage-evidence"
-    evidence_index = passage_evidence_root / "evidence.jsonl"
-    records = []
-    if evidence_index.is_file():
-        records = [
-            json.loads(line)
-            for line in evidence_index.read_text(encoding="utf-8").splitlines()
-            if line.strip()
-        ]
-    if records:
-        by_pipeline: dict[str, list[dict[str, Any]]] = collections.defaultdict(list)
-        for record in records:
-            by_pipeline[str(record.get("pipeline") or "lpr")].append(record)
-        for pipeline, pipeline_records in by_pipeline.items():
-            source_root = passage_evidence_root / pipeline
-            destination_root = media_root / pipeline
-            destination_root.mkdir(parents=True, exist_ok=True)
-            # New producer layout is already pipeline/trace_id/evidence_id.
-            # Move the complete trace tree without reconstructing lineage here.
-            if source_root.is_dir():
-                for trace_dir in list(source_root.iterdir()):
-                    if not trace_dir.is_dir():
-                        continue
-                    destination = destination_root / trace_dir.name
-                    if destination.exists():
-                        shutil.rmtree(destination)
-                    shutil.move(str(trace_dir), str(destination))
-            (destination_root / "evidence.jsonl").write_text(
-                "\n".join(
-                    json.dumps(record, ensure_ascii=False) for record in pipeline_records
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-        evidence_index.unlink(missing_ok=True)
-    if passage_evidence_root.exists():
-        for child in list(passage_evidence_root.iterdir()):
-            if child.is_dir() and not any(child.iterdir()):
-                child.rmdir()
-        if not any(passage_evidence_root.iterdir()):
-            passage_evidence_root.rmdir()
+    staging = output / "staging"
+    if staging.is_dir() and staging.resolve().is_relative_to(output):
+        shutil.rmtree(staging)
 
 
 def materialize_trace_replays(
@@ -2277,15 +2205,14 @@ def materialize_trace_replays(
     anchors: dict[str, list[float]],
 ) -> None:
     """Create a source-time replay clip inside every recorded trace folder."""
-    staging_root = output / "media" / "passage-evidence"
-    manifests = [staging_root / "evidence.jsonl"]
-    if not manifests[0].is_file():
-        manifests = [
-            path
-            for path in (output / "media" / "lpr" / "evidence.jsonl", output / "media" / "face" / "evidence.jsonl")
-            if path.is_file()
-        ]
-        staging_root = output / "media"
+    media_root = output / "media"
+    manifests = [
+        path
+        for path in (media_root / "lpr" / "evidence.jsonl", media_root / "face" / "evidence.jsonl")
+        if path.is_file()
+    ]
+    if not manifests:
+        return
     if not manifests:
         return
     records = []
@@ -2294,6 +2221,16 @@ def materialize_trace_replays(
             json.loads(line)
             for line in manifest.read_text(encoding="utf-8").splitlines()
             if line.strip()
+        )
+    runtime_trace = output / "runtime-trace.json"
+    if runtime_trace.is_file():
+        runtime_records = json.loads(runtime_trace.read_text(encoding="utf-8")).get(
+            "records", []
+        )
+        records.extend(
+            record
+            for record in runtime_records
+            if record.get("trace_id") and record.get("frame_time") is not None
         )
     grouped: dict[tuple[str, str], list[dict[str, Any]]] = collections.defaultdict(list)
     for record in records:
@@ -2327,7 +2264,7 @@ def materialize_trace_replays(
         end = min(duration, max(source_times) + 0.5)
         clip_duration = max(0.5, end - start)
         safe_trace = re.sub(r"[^A-Za-z0-9_.-]+", "_", trace_id)
-        target_dir = staging_root / pipeline / safe_trace / "replay"
+        target_dir = media_root / pipeline / safe_trace / "replay"
         target_dir.mkdir(parents=True, exist_ok=True)
         target = target_dir / "source.mp4"
         command = [
@@ -2412,20 +2349,10 @@ def main() -> int:
         base_config = yaml.safe_load(config.read_text(encoding="utf-8"))
         model_path = Path.cwd() / str(base_config["runtime"]["model_path"])
         cached_path = output / "fixture.json"
-        cached = (
-            json.loads(cached_path.read_text(encoding="utf-8"))
-            if cached_path.is_file()
-            else {}
-        )
-        cache_valid = (
-            cached.get("builder_version") == 8
-            and cached.get("manifest_sha256") == sha256(manifest_path)
-            and cached.get("base_config_sha256") == sha256(config)
-            and cached.get("model_sha256") == sha256(model_path)
-            and (output / "face-replay.mp4").is_file()
-            and (output / "lpr-replay.mp4").is_file()
-            and Path(cached.get("enrollment_image", "")).is_file()
-        )
+        # Replay inputs are deliberately OS-temporary and are not cacheable.
+        # Rebuilding them here keeps a run self-contained and prevents stale
+        # fixture assets from being mistaken for runtime output.
+        cache_valid = False
         if not cache_valid:
             subprocess.run(
                 [
@@ -2456,12 +2383,6 @@ def main() -> int:
         artifact_dir = output / "media" / "clips" / "artifacts"
         if artifact_dir.is_dir() and artifact_dir.resolve().is_relative_to(output):
             shutil.rmtree(artifact_dir)
-        runtime_evidence_dir = output / "media" / "passage-evidence"
-        if (
-            runtime_evidence_dir.is_dir()
-            and runtime_evidence_dir.resolve().is_relative_to(output)
-        ):
-            shutil.rmtree(runtime_evidence_dir)
         database_dir = output / "media" / "passage"
         if database_dir.is_dir() and database_dir.resolve().is_relative_to(output):
             shutil.rmtree(database_dir)
@@ -2499,7 +2420,11 @@ def main() -> int:
         sampler = ResourceSampler()
         sampler.start()
 
-        replays = {"face": output / "face-replay.mp4", "lpr": output / "lpr-replay.mp4"}
+        replay_sources = value["runtime"]["replay"]["sources"]
+        replays = {
+            "face": Path(replay_sources["face_camera"]),
+            "lpr": Path(replay_sources["car_camera"]),
+        }
         step_started = time.monotonic()
         # Preserve the final passage and following black boundary for the
         # single replay round.
@@ -2549,9 +2474,7 @@ def main() -> int:
         )
         final_restarts = restart_counts()
 
-        evidence_manifest = (
-            output / "media" / "passage-evidence" / "evidence.jsonl"
-        )
+        evidence_manifest = output / "media" / "lpr" / "evidence.jsonl"
         if not wait_file_quiescent(evidence_manifest):
             raise RuntimeError(
                 "Runtime LPR evidence writer did not become quiescent after replay"
@@ -2593,7 +2516,7 @@ def main() -> int:
         observed_trace_metrics = trace_metrics(runtime_records, replay_seconds)
         observed_source_pts = source_pts_metrics(runtime_records)
         evidence_records, runtime_lpr_evidence = validate_runtime_lpr_evidence(
-            output / "media" / "passage-evidence",
+            output / "media",
             anchors,
             durations,
             passages_by_camera,
@@ -2772,7 +2695,7 @@ def main() -> int:
         write_json(output / "face.json", {**face, "latency": latency["face"]})
         write_json(output / "lpr.json", lpr)
 
-        # Runtime stage evidence under media/passage-evidence is authoritative.
+        # Runtime evidence under media/<pipeline>/<trace_id> is authoritative.
         # Do not create a duplicate ground-truth mismatch folder.
         evidence_ok = True
 
@@ -2979,6 +2902,10 @@ def main() -> int:
             summary.setdefault("diagnostic_errors", []).append(
                 f"trace_replay_materialization:{type(exc).__name__}: {exc}"
             )
+        for replay in locals().get("replays", {}).values():
+            replay_parent = Path(replay).parent
+            if replay_parent.name.startswith("camera-platform-"):
+                shutil.rmtree(replay_parent, ignore_errors=True)
         cleanup_runtime_output(output)
         report_path = write_failure_only_report(output, summary)
         summary["report"]["artifacts"].append(
