@@ -34,12 +34,12 @@ Script thực hiện:
 1. Chuẩn bị fixture/replay và manifest ground truth.
 2. Khởi động Frigate và hai replay camera.
 3. Chờ camera, detector, model và image readiness.
-4. Ghi source PTS/anchor của từng round.
+4. Ghi source PTS/anchor của từng round để đối chiếu fixture sau khi đo.
 5. Thu passage trace, runtime LPR evidence và hardware/runtime samples.
-6. Chờ deferred recognition/evidence lifecycle kết thúc để ghi trạng thái cuối.
-7. Thu Docker inspect/log trước khi restore runtime.
-8. Xuất `report.md`, JSON report, raw trace và runtime evidence.
-9. Gom replay nguồn vào `media/replays/face` và `media/replays/lpr`; giữ report, summary, trace/evidence, log, fixture/config và DB passage.
+6. Chờ deferred recognition/evidence lifecycle và native recording segment được commit.
+7. Lấy `Event.start_time/end_time` và tải clip bằng recording API có sẵn của Frigate.
+8. Thu Docker inspect/log trước khi restore runtime.
+9. Xuất `report.md`, JSON report, raw trace, runtime evidence, clip theo trace và recording segment nguồn.
 
 `tools/runtime/validate_platform_runtime.py` là implementation; entrypoint chuẩn duy nhất là
 `tools/tests/e2e/run_platform_runtime_test.py`.
@@ -89,6 +89,8 @@ outcome, margin, identity và terminal reason.
   thư mục timestamp riêng.
 - Bảng báo cáo tối thiểu là passage × round cho cả car và face; ở một invocation `round_id=1`.
 - `measurement_valid` chỉ mô tả tính đầy đủ/hợp lệ của dữ liệu đo, không phải acceptance.
+- Anchor/fixture video không được dùng để dựng lại clip. Media của trace chỉ được lấy từ
+  canonical Event và recording API của runtime đang được đo.
 
 ## 5. Metrics chức năng và pipeline
 
@@ -141,10 +143,30 @@ Mỗi lần chạy phải lưu tối thiểu:
 | `summary.json` | Report tổng hợp, measurement, runtime và diagnostic data |
 | `runtime-trace.json` | Trace detector/track/Event/Face/LPR theo source PTS |
 | `runtime-evidence.json` | LPR invocation, crop, plate detector và OCR evidence |
+| `native-media.json` | Quan hệ `trace_id → Event.id → recording segments → clip.mp4`, hash và ffprobe |
 | `face.json` | Bảng Face passage × round và latency |
 | `lpr.json` | Bảng car passage × round, funnel và raw plate result |
 | `container-inspect.json` | Docker container configuration/state |
 | `container.log` | Log runtime trong cửa sổ test |
+
+Media được giữ theo cấu trúc:
+
+```text
+media/
+├── recordings/                 # segment nguồn do Frigate record role tạo
+├── lpr/<safe_trace_id>/
+│   ├── clip.mp4                # tải từ native recording API
+│   ├── trace.json
+│   └── <evidence_id>/*.jpg
+└── face/<safe_trace_id>/
+    ├── clip.mp4
+    ├── trace.json
+    └── <evidence_id>/*.jpg
+```
+
+Detector observation không phải lifecycle trace, không có thư mục hoặc clip riêng. Passage
+không tạo được runtime trace được báo `trace_id = -`; script không tạo trace/video giả và
+không fallback sang cắt fixture.
 
 Report phải ghi SHA-256 và byte size của artifact quan trọng. Artifact thiếu hoặc hash sai được
 ghi là report `incomplete`; đây là kiểm tra tính đầy đủ của bằng chứng, không phải đánh giá chất

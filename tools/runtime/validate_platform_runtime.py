@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
+from urllib.parse import quote
 from urllib.request import urlopen
 
 import cv2
@@ -25,8 +26,8 @@ import yaml
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from tools.lib.passage_metrics import bbox_iou, normalize_plate, percentile
 from tools.fixtures.prepare_passage_fixture import load_manifest
+from tools.lib.passage_metrics import bbox_iou, normalize_plate, percentile
 
 CAMERAS = {"face": "face_camera", "lpr": "car_camera"}
 TRACE_CONTAINER_PATH = "/config/passage-trace.jsonl"
@@ -1528,6 +1529,375 @@ def api_event(event_id: str) -> dict[str, Any] | None:
         return None
 
 
+def trace_lifecycle_groups(
+    records: list[dict[str, Any]],
+) -> dict[tuple[str, str], list[dict[str, Any]]]:
+    """Return producer-owned recognition lifecycles, never detector observations."""
+    groups: dict[tuple[str, str], list[dict[str, Any]]] = collections.defaultdict(list)
+    for record in records:
+        pipeline = str(record.get("pipeline") or record.get("task") or "")
+        trace_id = str(record.get("trace_id") or "")
+        if pipeline not in {"lpr", "face"} or not trace_id:
+            continue
+        if trace_id.startswith("detector:"):
+            continue
+        groups[(pipeline, trace_id)].append(record)
+    return {
+        key: trace_records
+        for key, trace_records in groups.items()
+        if any(
+            record.get("source_pts") is not None
+            or record.get("frame_time") is not None
+            for record in trace_records
+        )
+    }
+
+
+def media_evidence_records(media_root: Path) -> list[dict[str, Any]]:
+    """Load producer-owned image evidence so every media trace gets a native clip."""
+    records: list[dict[str, Any]] = []
+    for pipeline in ("lpr", "face"):
+        manifest = media_root / pipeline / "evidence.jsonl"
+        if not manifest.is_file():
+            continue
+        records.extend(
+            json.loads(line)
+            for line in manifest.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        )
+    return records
+
+
+def sqlite_trace_media(
+    event_ids: list[str], database_path: str
+) -> dict[str, dict[str, Any]]:
+    """Read canonical Event and overlapping native recording rows in one query."""
+    if not event_ids:
+        return {}
+    code = """
+import json, sqlite3, sys
+ids = json.loads(sys.argv[1])
+db = sqlite3.connect(sys.argv[2])
+result = {}
+for event_id in ids:
+    event = db.execute(
+        'select id,camera,start_time,end_time,has_clip from event where id=?',
+        (event_id,),
+    ).fetchone()
+    if event is None:
+        continue
+    start = float(event[2]) - 0.5
+    end = (float(event[3]) if event[3] is not None else float(event[2])) + 0.5
+    recordings = db.execute(
+        'select id,camera,path,start_time,end_time,duration,segment_size '
+        'from recordings where camera=? and end_time>=? and start_time<=? '
+        'order by start_time',
+        (event[1], start, end),
+    ).fetchall()
+    result[event_id] = {
+        'event': {
+            'id': event[0], 'camera': event[1], 'start_time': event[2],
+            'end_time': event[3], 'has_clip': bool(event[4]),
+        },
+        'recordings': [
+            {
+                'id': row[0], 'camera': row[1], 'path': row[2],
+                'start_time': row[3], 'end_time': row[4],
+                'duration': row[5], 'segment_size': row[6],
+            }
+            for row in recordings
+        ],
+    }
+print(json.dumps(result))
+"""
+    value = docker_output(
+        "exec",
+        "frigate",
+        "python3",
+        "-c",
+        code,
+        json.dumps(event_ids),
+        database_path,
+        timeout=15,
+    )
+    return json.loads(value or "{}")
+
+
+def sqlite_recording_ranges(
+    requests: list[dict[str, Any]], database_path: str
+) -> dict[str, list[dict[str, Any]]]:
+    """Return native recording rows covering producer source-PTS ranges."""
+    if not requests:
+        return {}
+    code = """
+import json, sqlite3, sys
+requests = json.loads(sys.argv[1])
+db = sqlite3.connect(sys.argv[2])
+result = {}
+for request in requests:
+    rows = db.execute(
+        'select id,camera,path,start_time,end_time,duration,segment_size '
+        'from recordings where camera=? and end_time>=? and start_time<=? '
+        'order by start_time',
+        (request['camera'], request['start_time'], request['end_time']),
+    ).fetchall()
+    result[request['key']] = [
+        {
+            'id': row[0], 'camera': row[1], 'path': row[2],
+            'start_time': row[3], 'end_time': row[4],
+            'duration': row[5], 'segment_size': row[6],
+        }
+        for row in rows
+    ]
+print(json.dumps(result))
+"""
+    value = docker_output(
+        "exec",
+        "frigate",
+        "python3",
+        "-c",
+        code,
+        json.dumps(requests),
+        database_path,
+        timeout=15,
+    )
+    return json.loads(value or "{}")
+
+
+def recordings_available_through(database_path: str) -> dict[str, float]:
+    """Return the latest committed native recording timestamp per camera."""
+    code = (
+        "import sqlite3,json,sys; c=sqlite3.connect(sys.argv[1]); "
+        "print(json.dumps({r[0]:r[1] for r in c.execute("
+        "'select camera,max(end_time) from recordings group by camera').fetchall()}))"
+    )
+    value = docker_output(
+        "exec", "frigate", "python3", "-c", code, database_path, timeout=5
+    )
+    return {str(key): float(item) for key, item in json.loads(value or "{}").items() if item is not None}
+
+
+def wait_recordings_through(
+    database_path: str,
+    cameras: list[str],
+    target_time: float,
+    timeout: float = 15.0,
+) -> tuple[bool, dict[str, float]]:
+    """Wait for Frigate's own recording maintainer to commit the measured window."""
+    deadline = time.monotonic() + timeout
+    latest: dict[str, float] = {}
+    while time.monotonic() < deadline:
+        try:
+            latest = recordings_available_through(database_path)
+            if all(latest.get(camera, 0.0) >= target_time for camera in cameras):
+                return True, latest
+        except Exception:
+            pass
+        time.sleep(0.25)
+    return False, latest
+
+
+def ffprobe_clip(path: Path) -> dict[str, Any]:
+    """Inspect a downloaded native clip without modifying it."""
+    result = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-show_entries",
+            "format=duration,size:stream=codec_name,width,height,avg_frame_rate",
+            "-of", "json", str(path),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    if result.returncode != 0:
+        return {"valid": False, "error": result.stderr.strip() or "ffprobe_failed"}
+    try:
+        value = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return {"valid": False, "error": "ffprobe_invalid_json"}
+    streams = value.get("streams") or []
+    return {"valid": bool(streams), **value}
+
+
+def collect_native_trace_clips(
+    output: Path,
+    records: list[dict[str, Any]],
+    database_path: str,
+    *,
+    api_base: str = "http://127.0.0.1:5001",
+) -> dict[str, Any]:
+    """Download trace clips from Frigate's native recording API.
+
+    Fixture files and replay anchors are intentionally not accepted by this
+    interface, making reverse materialization impossible.
+    """
+    groups = trace_lifecycle_groups(records)
+    traces: list[dict[str, Any]] = []
+    resolved_events: dict[tuple[str, str], dict[str, Any]] = {}
+
+    # Event finalization is asynchronous.  Resolve only the exact producer
+    # track id and fail closed when a lifecycle has zero or multiple Events.
+    deadline = time.monotonic() + 8.0
+    while True:
+        pending = False
+        for key, trace_records in groups.items():
+            if key in resolved_events:
+                continue
+            camera = str(trace_records[0].get("camera") or "")
+            event_ids = sorted(
+                {
+                    str(record.get("event_id") or record.get("track_id"))
+                    for record in trace_records
+                    if record.get("event_id") or record.get("track_id")
+                }
+            )
+            matches = [
+                event
+                for event_id in event_ids
+                if (event := api_event(event_id)) is not None
+                and str(event.get("camera")) == camera
+            ]
+            if len(matches) == 1 and matches[0].get("end_time") is not None:
+                resolved_events[key] = matches[0]
+            else:
+                pending = True
+        if not pending or time.monotonic() >= deadline:
+            break
+        time.sleep(0.25)
+
+    event_ids = sorted(
+        {str(event["id"]) for event in resolved_events.values() if event.get("id")}
+    )
+    media_rows = sqlite_trace_media(event_ids, database_path)
+    range_requests: list[dict[str, Any]] = []
+    for (pipeline, trace_id), trace_records in groups.items():
+        event = resolved_events.get((pipeline, trace_id))
+        source_times = [
+            float(record.get("source_pts", record.get("frame_time")))
+            for record in trace_records
+            if record.get("source_pts", record.get("frame_time")) is not None
+        ]
+        if event is not None:
+            start_time = float(event["start_time"]) - 0.5
+            end_time = float(event["end_time"]) + 0.5
+        else:
+            start_time = min(source_times) - 0.5
+            end_time = max(source_times) + 0.5
+        range_requests.append(
+            {
+                "key": f"{pipeline}|{trace_id}",
+                "camera": str(trace_records[0].get("camera") or ""),
+                "start_time": start_time,
+                "end_time": end_time,
+            }
+        )
+    range_media = sqlite_recording_ranges(range_requests, database_path)
+
+    for (pipeline, trace_id), trace_records in sorted(groups.items()):
+        safe_trace = re.sub(r"[^A-Za-z0-9_.-]+", "_", trace_id)
+        trace_dir = output / "media" / pipeline / safe_trace
+        trace_dir.mkdir(parents=True, exist_ok=True)
+        camera = str(trace_records[0].get("camera") or "")
+        event = resolved_events.get((pipeline, trace_id))
+        metadata: dict[str, Any] = {
+            "trace_id": trace_id,
+            "pipeline": pipeline,
+            "camera": camera,
+            "event_id": None,
+            "clip_status": "missing",
+            "clip_reason": "recording_coverage_missing",
+            "clip_path": None,
+            "recordings": [],
+            "record_count": len(trace_records),
+        }
+        source_times = [
+            float(record.get("source_pts", record.get("frame_time")))
+            for record in trace_records
+            if record.get("source_pts", record.get("frame_time")) is not None
+        ]
+        range_key = f"{pipeline}|{trace_id}"
+        recordings = range_media.get(range_key) or []
+        start_time = min(source_times) - 0.5
+        end_time = max(source_times) + 0.5
+        metadata.update(
+            {
+                "clip_basis": "trace_source_pts",
+                "clip_start_time": start_time,
+                "clip_end_time": end_time,
+                "recordings": recordings,
+            }
+        )
+        if event is not None:
+            event_id = str(event["id"])
+            sqlite_media = media_rows.get(event_id, {})
+            source_event = sqlite_media.get("event") or {}
+            event_recordings = sqlite_media.get("recordings") or []
+            start_time = float(event["start_time"]) - 0.5
+            end_time = float(event["end_time"]) + 0.5
+            metadata.update(
+                {
+                    "clip_basis": "event_lifecycle",
+                    "event_id": event_id,
+                    "event_start_time": event.get("start_time"),
+                    "event_end_time": event.get("end_time"),
+                    "clip_start_time": start_time,
+                    "clip_end_time": end_time,
+                    "event_has_clip_api": bool(event.get("has_clip")),
+                    "event_has_clip_sqlite": bool(source_event.get("has_clip")),
+                    "recordings": event_recordings,
+                }
+            )
+            recordings = event_recordings
+            if recordings and (
+                not event.get("has_clip") or not source_event.get("has_clip")
+            ):
+                metadata["clip_reason"] = "event_clip_unavailable"
+                recordings = []
+        if recordings:
+            url = (
+                f"{api_base}/api/{quote(camera, safe='')}/start/"
+                f"{start_time:.6f}/end/{end_time:.6f}/clip.mp4"
+            )
+            try:
+                with urlopen(url, timeout=45) as response:
+                    payload = response.read()
+                    content_type = response.headers.get("Content-Type", "")
+                if not payload:
+                    raise RuntimeError("native clip response was empty")
+                target = trace_dir / "clip.mp4"
+                target.write_bytes(payload)
+                probe = ffprobe_clip(target)
+                metadata.update(
+                    {
+                        "clip_status": "recorded" if probe.get("valid") else "invalid",
+                        "clip_reason": None if probe.get("valid") else "ffprobe_invalid",
+                        "clip_path": target.relative_to(output).as_posix(),
+                        "clip_bytes": len(payload),
+                        "clip_sha256": sha256(target),
+                        "content_type": content_type,
+                        "ffprobe": probe,
+                    }
+                )
+            except Exception as exc:
+                metadata["clip_reason"] = f"native_clip_error:{type(exc).__name__}:{exc}"
+        write_json(trace_dir / "trace.json", metadata)
+        traces.append(metadata)
+
+    result = {
+        "mode": "frigate_native_recording",
+        "trace_count": len(traces),
+        "recorded_count": sum(item["clip_status"] == "recorded" for item in traces),
+        "missing_count": sum(item["clip_status"] != "recorded" for item in traces),
+        "complete": bool(traces) and all(
+            item["clip_status"] == "recorded" for item in traces
+        ),
+        "traces": traces,
+    }
+    write_json(output / "native-media.json", result)
+    return result
+
+
 def api_sqlite_consistency(
     records: list[dict[str, Any]], database_path: str
 ) -> tuple[bool, list[dict[str, Any]], list[dict[str, Any]]]:
@@ -1803,15 +2173,26 @@ def write_failure_only_report(output: Path, summary: dict[str, Any]) -> Path:
         return lpr_passage_labels.get(passage_id, passage_id) if kind == "LPR" else passage_id
 
     groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    group_passages: dict[tuple[str, str], str] = {}
+    detector_records: dict[tuple[str, str], list[dict[str, Any]]] = collections.defaultdict(list)
 
     def add_records(kind: str, passage_id: str, records: list[dict[str, Any]]) -> None:
         for record in records:
+            if record.get("pipeline") == "detector" or str(
+                record.get("trace_id") or ""
+            ).startswith("detector:"):
+                detector_records[(kind, passage_id)].append(record)
+                continue
             trace_id = str(
                 record.get("trace_id")
                 or record.get("track_id")
-                or f"UNASSIGNED:{passage_id}"
+                or ""
             )
-            groups.setdefault((kind, trace_id), []).append(record)
+            if not trace_id:
+                continue
+            key = (kind, trace_id)
+            groups.setdefault(key, []).append(record)
+            group_passages[key] = passage_id
 
     for row in failed_lpr:
         for round_data in (row.get("round_trace") or {}).values():
@@ -1831,13 +2212,10 @@ def write_failure_only_report(output: Path, summary: dict[str, Any]) -> Path:
             if str(record.get("passage_id")) in failed_ids:
                 add_records("LPR", str(record.get("passage_id")), [record])
 
-    stage_order = (
-        "detector_hit", "track_seen", "lpr_eligible", "plate_detector_input",
-        "plate_detector_result", "plate_crop", "ocr_plate_input",
-        "ocr_result", "ocr_text_crop", "ocr_recognition_tensor",
-        "event_published", "first_qualified_face", "candidate_submitted",
-        "first_attempt", "confirmed_result",
-    )
+    for key, records in groups.items():
+        passage_id = group_passages.get(key, "")
+        records.extend(detector_records.get((key[0], passage_id), []))
+
     resources = runtime.get("resources", {})
     gpu = resources.get("gpu", {})
     timing = summary.get("timing", {})
@@ -1862,12 +2240,14 @@ def write_failure_only_report(output: Path, summary: dict[str, Any]) -> Path:
             return f"PASS:{float(record['score']):.2f}"
         return "PASS"
 
-    def replay_href(kind: str, trace_id: str) -> str:
+    def clip_href(kind: str, trace_id: str) -> str:
+        if trace_id == "-":
+            return "-"
         pipeline = kind.lower()
         safe_trace = re.sub(r"[^A-Za-z0-9_.-]+", "_", trace_id)
-        trace_clip = output / "media" / pipeline / safe_trace / "replay" / "source.mp4"
+        trace_clip = output / "media" / pipeline / safe_trace / "clip.mp4"
         if trace_clip.is_file():
-            return f"media/{pipeline}/{safe_trace}/replay/source.mp4"
+            return f"media/{pipeline}/{safe_trace}/clip.mp4"
         return "-"
 
     def failure_table_rows(
@@ -1887,17 +2267,36 @@ def write_failure_only_report(output: Path, summary: dict[str, Any]) -> Path:
             else:
                 for round_data in passage.get("rounds", []):
                     source_records.extend((round_data.get("trace") or {}).get("records", []))
-            trace_ids = sorted({str(record.get("trace_id")) for record in source_records if record.get("trace_id")}) or [f"UNASSIGNED:{passage_id}"]
+            trace_ids = sorted(
+                {
+                    str(record.get("trace_id"))
+                    for record in source_records
+                    if record.get("trace_id")
+                    and record.get("pipeline") != "detector"
+                    and not str(record.get("trace_id")).startswith("detector:")
+                }
+            ) or ["-"]
             for trace_id in trace_ids:
                 trace_records = [record for record in source_records if str(record.get("trace_id")) == trace_id]
                 by_stage: dict[str, dict[str, Any]] = {}
                 for record in trace_records:
                     by_stage.setdefault(str(record.get("stage")), record)
+                if "detector_hit" not in by_stage:
+                    detector = next(
+                        (
+                            record
+                            for record in source_records
+                            if record.get("stage") == "detector_hit"
+                        ),
+                        None,
+                    )
+                    if detector is not None:
+                        by_stage["detector_hit"] = detector
                 rows.append([
-                    f"{kind} observation" if trace_id.startswith("detector:") else kind,
+                    kind,
                     display_passage(kind, passage_id),
                     trace_id,
-                    f"[replay]({replay_href(kind, trace_id)})",
+                    f"[clip]({clip_href(kind, trace_id)})" if clip_href(kind, trace_id) != "-" else "-",
                     passage.get("mismatch_reason") or ("recognition_not_correct" if kind == "Face" else "not_detected_or_not_exact"),
                     *[failure_value(by_stage.get(stage)) for stage in required],
                 ])
@@ -1926,6 +2325,8 @@ def write_failure_only_report(output: Path, summary: dict[str, Any]) -> Path:
                 ["Pending", runtime.get("pending")],
                 ["Restart delta", runtime.get("restart_delta")],
                 ["LPR evidence", runtime.get("lpr_evidence", {}).get("reason")],
+                ["Native clips", f"{runtime.get('native_media', {}).get('recorded_count', 0)} / {runtime.get('native_media', {}).get('trace_count', 0)}"],
+                ["Native clip evidence complete", runtime.get("native_media", {}).get("complete")],
             ],
         ),
         "",
@@ -1987,7 +2388,7 @@ def write_failure_only_report(output: Path, summary: dict[str, Any]) -> Path:
         "### LPR",
         "",
         _md_table(
-            ["Pipeline", "Passage", "trace_id", "Replay", "Reason", "detector_hit", "track_seen", "lpr_eligible", "plate_detector_result", "ocr_result", "event_published"],
+            ["Pipeline", "Passage", "trace_id", "Clip", "Reason", "detector_hit", "track_seen", "lpr_eligible", "plate_detector_result", "ocr_result", "event_published"],
             failure_table_rows(
                 "LPR",
                 failed_lpr,
@@ -1998,7 +2399,7 @@ def write_failure_only_report(output: Path, summary: dict[str, Any]) -> Path:
         "### Face",
         "",
         _md_table(
-            ["Pipeline", "Passage", "trace_id", "Replay", "Reason", "detector_hit", "track_seen", "first_qualified_face", "candidate_submitted", "first_attempt", "confirmed_result"],
+            ["Pipeline", "Passage", "trace_id", "Clip", "Reason", "detector_hit", "track_seen", "first_qualified_face", "candidate_submitted", "first_attempt", "confirmed_result"],
             failure_table_rows(
                 "Face",
                 failed_face,
@@ -2103,9 +2504,7 @@ def write_failure_only_report(output: Path, summary: dict[str, Any]) -> Path:
             return json.dumps(values, ensure_ascii=False, separators=(",", ":")) or "{}"
         for (kind, trace_id), records in sorted(groups.items()):
             required_stages = (
-                ["detector_hit"]
-                if trace_id.startswith("detector:")
-                else ["detector_hit", "track_seen", "lpr_eligible", "plate_detector_input",
+                ["detector_hit", "track_seen", "lpr_eligible", "plate_detector_input",
                  "plate_detector_result", "plate_crop", "ocr_plate_input",
                  "ocr_result", "ocr_text_crop", "ocr_recognition_tensor", "event_published"]
                 if kind == "LPR"
@@ -2144,6 +2543,10 @@ def write_failure_only_report(output: Path, summary: dict[str, Any]) -> Path:
             lines.extend([
                 f"### `{kind}` track_id `{trace_id}`",
                 "",
+                f"Clip: [{clip_href(kind, trace_id)}]({clip_href(kind, trace_id)})"
+                if clip_href(kind, trace_id) != "-"
+                else "Clip: -",
+                "",
                 _md_table(
                     ["Stage", "Source PTS", "Runtime time", "Status", "Result", "Image"],
                     lifecycle_rows,
@@ -2161,6 +2564,14 @@ def write_failure_only_report(output: Path, summary: dict[str, Any]) -> Path:
                 f"missing={', '.join(evidence.get('missing_passages', [])) or '-'}"
             ),
         ])
+    native_media = runtime.get("native_media", {})
+    if native_media and not native_media.get("complete", False):
+        missing = [
+            f"{item.get('trace_id')}={item.get('clip_reason')}"
+            for item in native_media.get("traces", [])
+            if item.get("clip_status") != "recorded"
+        ]
+        diagnostic_failures.append(["native_media", "; ".join(missing) or "incomplete"])
     if runtime.get("correlation_mismatches"):
         diagnostic_failures.append(["correlation", len(runtime["correlation_mismatches"])])
     if runtime.get("hardware_sampler_errors"):
@@ -2174,110 +2585,6 @@ def write_failure_only_report(output: Path, summary: dict[str, Any]) -> Path:
     report_path = output / "report.md"
     report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return report_path
-
-
-def materialize_trace_replays(
-    output: Path,
-    replays: dict[str, Path],
-    anchors: dict[str, list[float]],
-) -> None:
-    """Create a source-time replay clip inside every recorded trace folder."""
-    media_root = output / "media"
-    manifests = [
-        path
-        for path in (media_root / "lpr" / "evidence.jsonl", media_root / "face" / "evidence.jsonl")
-        if path.is_file()
-    ]
-    if not manifests:
-        return
-    if not manifests:
-        return
-    records = []
-    for manifest in manifests:
-        records.extend(
-            json.loads(line)
-            for line in manifest.read_text(encoding="utf-8").splitlines()
-            if line.strip()
-        )
-    runtime_trace = output / "runtime-trace.json"
-    if runtime_trace.is_file():
-        runtime_records = json.loads(runtime_trace.read_text(encoding="utf-8")).get(
-            "records", []
-        )
-        records.extend(
-            record
-            for record in runtime_records
-            if record.get("trace_id") and record.get("frame_time") is not None
-        )
-    grouped: dict[tuple[str, str], list[dict[str, Any]]] = collections.defaultdict(list)
-    for record in records:
-        pipeline = str(record.get("pipeline") or "lpr")
-        camera = str(record.get("camera") or "")
-        if camera == CAMERAS["face"]:
-            pipeline = "face"
-        elif camera == CAMERAS["lpr"]:
-            pipeline = "lpr"
-        trace_id = record.get("trace_id")
-        if trace_id and record.get("frame_time") is not None:
-            normalized_trace_id = str(trace_id)
-            if pipeline == "face" and normalized_trace_id.startswith("lpr:"):
-                normalized_trace_id = "face:" + normalized_trace_id[len("lpr:"):]
-            grouped[(pipeline, normalized_trace_id)].append(record)
-
-    for (pipeline, trace_id), trace_records in grouped.items():
-        replay = replays.get(pipeline)
-        if replay is None or not replay.is_file():
-            continue
-        camera = str(trace_records[0].get("camera") or "")
-        camera_anchors = anchors.get(camera, [])
-        if not camera_anchors:
-            continue
-        source_times: list[float] = []
-        duration = replay_duration(replay)
-        for record in trace_records:
-            frame_time = float(record["frame_time"])
-            candidates = [
-                LEAD_SECONDS + frame_time - float(anchor)
-                for anchor in camera_anchors
-                if -0.5 <= LEAD_SECONDS + frame_time - float(anchor) <= duration + 0.5
-            ]
-            if candidates:
-                source_times.append(min(candidates, key=lambda value: abs(value - LEAD_SECONDS)))
-        if not source_times:
-            continue
-        start = max(0.0, min(source_times) - 0.5)
-        end = min(duration, max(source_times) + 0.5)
-        clip_duration = max(0.5, end - start)
-        safe_trace = re.sub(r"[^A-Za-z0-9_.-]+", "_", trace_id)
-        target_dir = media_root / pipeline / safe_trace / "replay"
-        target_dir.mkdir(parents=True, exist_ok=True)
-        target = target_dir / "source.mp4"
-        command = [
-            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-            "-ss", f"{start:.3f}", "-i", str(replay),
-            "-t", f"{clip_duration:.3f}", "-an", "-c:v", "libx264",
-            "-preset", "ultrafast", str(target),
-        ]
-        result = subprocess.run(command, check=False, capture_output=True, text=True)
-        if result.returncode != 0 or not target.is_file():
-            continue
-        (target_dir / "source.json").write_text(
-            json.dumps(
-                {
-                    "trace_id": trace_id,
-                    "pipeline": pipeline,
-                    "camera": camera,
-                    "source_replay": replay.name,
-                    "source_start_s": round(start, 3),
-                    "source_end_s": round(start + clip_duration, 3),
-                    "record_count": len(trace_records),
-                },
-                ensure_ascii=False,
-                indent=2,
-            )
-            + "\n",
-            encoding="utf-8",
-        )
 
 
 def main() -> int:
@@ -2331,8 +2638,6 @@ def main() -> int:
             str(output),
         ]
         base_config = yaml.safe_load(config.read_text(encoding="utf-8"))
-        model_path = Path.cwd() / str(base_config["runtime"]["model_path"])
-        cached_path = output / "fixture.json"
         # Replay inputs are deliberately OS-temporary and are not cacheable.
         # Rebuilding them here keeps a run self-contained and prevents stale
         # fixture assets from being mistaken for runtime output.
@@ -2419,6 +2724,11 @@ def main() -> int:
             timeout=5,
         )
         recognition_idle = wait_recognition_idle()
+        recordings_ready, recordings_through = wait_recordings_through(
+            str(value["database"]["path"]),
+            list(CAMERAS.values()),
+            capture_cutoff + 0.5,
+        )
         # Let tracker generations and quality leases expire while the replay
         # still supplies frames.  Pausing first leaves the last active track
         # pinned forever because no subsequent disappearance frame arrives.
@@ -2484,6 +2794,11 @@ def main() -> int:
         # Runtime lineage is producer-owned.  Keep this record set immutable for
         # runtime metrics; fixture association is a separate comparison view.
         runtime_records = records
+        native_media = collect_native_trace_clips(
+            output,
+            runtime_records + media_evidence_records(output / "media"),
+            str(value["database"]["path"]),
+        )
         comparison_records = assign_records(
             [dict(record) for record in runtime_records],
             anchors,
@@ -2656,6 +2971,9 @@ def main() -> int:
             "lpr_evidence": runtime_lpr_evidence,
             "recognition_lifecycle": recognition,
             "recognition_idle_after_replay": recognition_idle,
+            "recordings_ready": recordings_ready,
+            "recordings_available_through": recordings_through,
+            "native_media": native_media,
         }
         summary.update(
             {
@@ -2801,11 +3119,15 @@ def main() -> int:
                 and summary.get("runtime", {})
                 .get("lpr_evidence", {})
                 .get("valid")
+                and summary.get("runtime", {})
+                .get("native_media", {})
+                .get("complete")
             ),
         }
         artifact_names = (
             "runtime-trace.json",
             "runtime-evidence.json",
+            "native-media.json",
             "face.json",
             "lpr.json",
             "container-inspect.json",
@@ -2870,16 +3192,6 @@ def main() -> int:
         else:
             os.environ["CAMERA_SOURCE_OVERLAY"] = previous_source_overlay
         write_json(output / "summary.json", summary)
-        try:
-            materialize_trace_replays(
-                output,
-                locals().get("replays", {}),
-                locals().get("anchors", {}),
-            )
-        except Exception as exc:
-            summary.setdefault("diagnostic_errors", []).append(
-                f"trace_replay_materialization:{type(exc).__name__}: {exc}"
-            )
         report_path = write_failure_only_report(output, summary)
         summary["report"]["artifacts"].append(
             {

@@ -304,8 +304,10 @@ def main() -> int:
     config = copy.deepcopy(config)
     config["runtime"]["media_dir"] = str(output / "media")
     config["runtime"]["replay"]["sources"] = {"face_camera": str(face_replay), "car_camera": str(lpr_replay)}
-    config["notifications"]["enabled"] = False; config["record"]["enabled"] = False
-    config["snapshots"]["enabled"] = False
+    # Runtime evidence must exercise the production media path.  Keep the
+    # configured record/snapshot features intact and suppress only external
+    # notification delivery.
+    config["notifications"]["enabled"] = False
     config["database"] = {"path": "/media/frigate/passage/frigate.db"}
     config["cameras"]["car_camera"]["detect"]["min_initialized"] = 1
     # The fixture includes a measured 2.58 s source-PTS gap.  Keep the

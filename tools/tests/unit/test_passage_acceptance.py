@@ -5,20 +5,26 @@ import pytest
 import yaml
 
 import tools.runtime.validate_platform_runtime as passage_validator
+from tools.fixtures.prepare_passage_fixture import (
+    group_composite_passages,
+    load_manifest,
+)
 from tools.lib.passage_metrics import (
     match_by_time_and_bbox,
     normalize_plate,
     score_face_passages,
 )
-from tools.fixtures.prepare_passage_fixture import group_composite_passages, load_manifest
 from tools.runtime.validate_platform_runtime import (
     api_sqlite_consistency,
     assign_records,
+    collect_native_trace_clips,
     correlation_mismatches,
     face_results,
     false_passage_count,
     lpr_results,
+    media_evidence_records,
     recognition_lifecycle_summary,
+    trace_lifecycle_groups,
     update_anchor_state,
     validate_runtime_lpr_evidence,
     wait_file_quiescent,
@@ -40,6 +46,248 @@ def test_wait_file_quiescent_requires_stable_manifest(tmp_path: Path) -> None:
         )
         is False
     )
+
+
+def test_trace_lifecycle_groups_excludes_detector_observations() -> None:
+    records = [
+        {
+            "pipeline": "detector",
+            "trace_id": "detector:car_camera:observation-1",
+            "stage": "detector_hit",
+        },
+        {
+            "pipeline": "lpr",
+            "trace_id": "lpr:car_camera:event-1",
+            "track_id": "event-1",
+            "stage": "track_seen",
+            "source_pts": 1.0,
+        },
+        {
+            "pipeline": "face",
+            "trace_id": "face:face_camera:event-2:g1",
+            "track_id": "event-2",
+            "stage": "first_qualified_face",
+            "source_pts": 1.0,
+        },
+    ]
+
+    groups = trace_lifecycle_groups(records)
+
+    assert set(groups) == {
+        ("lpr", "lpr:car_camera:event-1"),
+        ("face", "face:face_camera:event-2:g1"),
+    }
+
+
+def test_media_evidence_records_loads_lpr_and_face_utf8(tmp_path: Path) -> None:
+    for pipeline, trace_id in (
+        ("lpr", "lpr:car_camera:xe-đỏ"),
+        ("face", "face:face_camera:người-1:g1"),
+    ):
+        manifest = tmp_path / pipeline / "evidence.jsonl"
+        manifest.parent.mkdir(parents=True)
+        manifest.write_text(
+            json.dumps(
+                {
+                    "pipeline": pipeline,
+                    "trace_id": trace_id,
+                    "source_pts": 1.0,
+                },
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+    records = media_evidence_records(tmp_path)
+
+    assert {record["trace_id"] for record in records} == {
+        "lpr:car_camera:xe-đỏ",
+        "face:face_camera:người-1:g1",
+    }
+
+
+def test_native_trace_clip_uses_frigate_api_without_replay_materialization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    records = [
+        {
+            "pipeline": "lpr",
+            "trace_id": "lpr:car_camera:event-1",
+            "camera": "car_camera",
+            "track_id": "event-1",
+            "stage": "track_seen",
+            "source_pts": 101.0,
+        }
+    ]
+    requested: list[str] = []
+
+    class Response:
+        def __init__(self):
+            self.headers = {"Content-Type": "video/mp4"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self):
+            return b"native-frigate-clip"
+
+    monkeypatch.setattr(
+        passage_validator,
+        "api_event",
+        lambda event_id: {
+            "id": event_id,
+            "camera": "car_camera",
+            "start_time": 100.0,
+            "end_time": 102.0,
+            "has_clip": True,
+        },
+    )
+    monkeypatch.setattr(
+        passage_validator,
+        "sqlite_trace_media",
+        lambda event_ids, database_path: {
+            "event-1": {
+                "event": {
+                    "id": "event-1",
+                    "camera": "car_camera",
+                    "start_time": 100.0,
+                    "end_time": 102.0,
+                    "has_clip": True,
+                },
+                "recordings": [
+                    {
+                        "path": "/media/frigate/recordings/car_camera/segment.mp4",
+                        "start_time": 99.0,
+                        "end_time": 103.0,
+                    }
+                ],
+            }
+        },
+    )
+    monkeypatch.setattr(
+        passage_validator,
+        "sqlite_recording_ranges",
+        lambda requests, database_path: {
+            "lpr|lpr:car_camera:event-1": [
+                {
+                    "path": "/media/frigate/recordings/car_camera/segment.mp4",
+                    "start_time": 99.0,
+                    "end_time": 103.0,
+                }
+            ]
+        },
+    )
+
+    def open_clip(url: str, timeout: float):
+        requested.append(url)
+        return Response()
+
+    monkeypatch.setattr(passage_validator, "urlopen", open_clip)
+    monkeypatch.setattr(
+        passage_validator,
+        "ffprobe_clip",
+        lambda path: {"valid": True, "format": {"duration": "3.0"}},
+    )
+
+    result = collect_native_trace_clips(tmp_path, records, "runtime.db")
+
+    trace_root = tmp_path / "media/lpr/lpr_car_camera_event-1"
+    assert requested == [
+        "http://127.0.0.1:5001/api/car_camera/start/99.500000/end/102.500000/clip.mp4"
+    ]
+    assert (trace_root / "clip.mp4").read_bytes() == b"native-frigate-clip"
+    assert (trace_root / "trace.json").is_file()
+    assert not (trace_root / "replay").exists()
+    assert result["complete"] is True
+
+
+def test_native_trace_clip_uses_source_pts_when_event_is_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    records = [
+        {
+            "pipeline": "face",
+            "trace_id": "face:face_camera:event-2:g1",
+            "camera": "face_camera",
+            "track_id": "event-2",
+            "stage": "track_seen",
+            "source_pts": 200.0,
+        }
+    ]
+    requested: list[str] = []
+
+    class Response:
+        def __init__(self):
+            self.headers = {"Content-Type": "video/mp4"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self):
+            return b"native-range-clip"
+
+    monkeypatch.setattr(passage_validator, "api_event", lambda event_id: None)
+    monkeypatch.setattr(
+        passage_validator, "sqlite_trace_media", lambda event_ids, database_path: {}
+    )
+    monkeypatch.setattr(
+        passage_validator,
+        "sqlite_recording_ranges",
+        lambda requests, database_path: {
+            "face|face:face_camera:event-2:g1": [
+                {
+                    "path": "/media/frigate/recordings/face_camera/segment.mp4",
+                    "start_time": 199.0,
+                    "end_time": 201.0,
+                }
+            ]
+        },
+    )
+    monkeypatch.setattr(
+        passage_validator,
+        "urlopen",
+        lambda url, timeout: (requested.append(url) or Response()),
+    )
+    monkeypatch.setattr(
+        passage_validator, "ffprobe_clip", lambda path: {"valid": True}
+    )
+    times = iter((0.0, 9.0))
+    monkeypatch.setattr(passage_validator.time, "monotonic", lambda: next(times))
+
+    result = collect_native_trace_clips(tmp_path, records, "runtime.db")
+
+    trace_root = tmp_path / "media/face/face_face_camera_event-2_g1"
+    metadata = json.loads((trace_root / "trace.json").read_text(encoding="utf-8"))
+    assert requested == [
+        "http://127.0.0.1:5001/api/face_camera/start/199.500000/end/200.500000/clip.mp4"
+    ]
+    assert metadata["clip_basis"] == "trace_source_pts"
+    assert metadata["event_id"] is None
+    assert metadata["clip_status"] == "recorded"
+    assert (trace_root / "clip.mp4").read_bytes() == b"native-range-clip"
+    assert result["complete"] is True
+
+
+def test_terminal_only_record_does_not_create_media_trace() -> None:
+    groups = trace_lifecycle_groups(
+        [
+            {
+                "pipeline": "face",
+                "trace_id": "face:face_camera:event-3:g2",
+                "track_id": "event-3",
+                "stage": "recognition_terminal",
+            }
+        ]
+    )
+
+    assert groups == {}
 
 
 def manifest_value() -> dict:
