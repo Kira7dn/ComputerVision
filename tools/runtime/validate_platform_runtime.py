@@ -2212,9 +2212,17 @@ def materialize_trace_replays(
     grouped: dict[tuple[str, str], list[dict[str, Any]]] = collections.defaultdict(list)
     for record in records:
         pipeline = str(record.get("pipeline") or "lpr")
+        camera = str(record.get("camera") or "")
+        if camera == CAMERAS["face"]:
+            pipeline = "face"
+        elif camera == CAMERAS["lpr"]:
+            pipeline = "lpr"
         trace_id = record.get("trace_id")
         if trace_id and record.get("frame_time") is not None:
-            grouped[(pipeline, str(trace_id))].append(record)
+            normalized_trace_id = str(trace_id)
+            if pipeline == "face" and normalized_trace_id.startswith("lpr:"):
+                normalized_trace_id = "face:" + normalized_trace_id[len("lpr:"):]
+            grouped[(pipeline, normalized_trace_id)].append(record)
 
     for (pipeline, trace_id), trace_records in grouped.items():
         replay = replays.get(pipeline)
