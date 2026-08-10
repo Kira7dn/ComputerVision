@@ -1861,6 +1861,14 @@ def write_failure_only_report(output: Path, summary: dict[str, Any]) -> Path:
             return f"PASS:{float(record['score']):.2f}"
         return "PASS"
 
+    def replay_href(kind: str, trace_id: str) -> str:
+        pipeline = kind.lower()
+        safe_trace = re.sub(r"[^A-Za-z0-9_.-]+", "_", trace_id)
+        trace_clip = output / "media" / pipeline / safe_trace / "replay" / "source.mp4"
+        if trace_clip.is_file():
+            return f"media/{pipeline}/{safe_trace}/replay/source.mp4"
+        return f"media/{pipeline}/replay/{pipeline}-replay.mp4"
+
     def failure_table_rows(
         kind: str, passages: list[dict[str, Any]], required: list[str]
     ) -> list[list[Any]]:
@@ -1888,7 +1896,7 @@ def write_failure_only_report(output: Path, summary: dict[str, Any]) -> Path:
                     kind,
                     display_passage(kind, passage_id),
                     trace_id,
-                    f"[replay](media/{kind.lower()}/replay/{kind.lower()}-replay.mp4)",
+                    f"[replay]({replay_href(kind, trace_id)})",
                     passage.get("mismatch_reason") or ("recognition_not_correct" if kind == "Face" else "not_detected_or_not_exact"),
                     *[failure_value(by_stage.get(stage)) for stage in required],
                 ])
@@ -2261,6 +2269,94 @@ def cleanup_runtime_output(output: Path) -> None:
                 child.rmdir()
         if not any(passage_evidence_root.iterdir()):
             passage_evidence_root.rmdir()
+
+
+def materialize_trace_replays(
+    output: Path,
+    replays: dict[str, Path],
+    anchors: dict[str, list[float]],
+) -> None:
+    """Create a source-time replay clip inside every recorded trace folder."""
+    staging_root = output / "media" / "passage-evidence"
+    manifests = [staging_root / "evidence.jsonl"]
+    if not manifests[0].is_file():
+        manifests = [
+            path
+            for path in (output / "media" / "lpr" / "evidence.jsonl", output / "media" / "face" / "evidence.jsonl")
+            if path.is_file()
+        ]
+        staging_root = output / "media"
+    if not manifests:
+        return
+    records = []
+    for manifest in manifests:
+        records.extend(
+            json.loads(line)
+            for line in manifest.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        )
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = collections.defaultdict(list)
+    for record in records:
+        pipeline = str(record.get("pipeline") or "lpr")
+        trace_id = record.get("trace_id")
+        if trace_id and record.get("frame_time") is not None:
+            grouped[(pipeline, str(trace_id))].append(record)
+
+    for (pipeline, trace_id), trace_records in grouped.items():
+        replay = replays.get(pipeline)
+        if replay is None or not replay.is_file():
+            continue
+        camera = str(trace_records[0].get("camera") or "")
+        camera_anchors = anchors.get(camera, [])
+        if not camera_anchors:
+            continue
+        source_times: list[float] = []
+        duration = replay_duration(replay)
+        for record in trace_records:
+            frame_time = float(record["frame_time"])
+            candidates = [
+                LEAD_SECONDS + frame_time - float(anchor)
+                for anchor in camera_anchors
+                if -0.5 <= LEAD_SECONDS + frame_time - float(anchor) <= duration + 0.5
+            ]
+            if candidates:
+                source_times.append(min(candidates, key=lambda value: abs(value - LEAD_SECONDS)))
+        if not source_times:
+            continue
+        start = max(0.0, min(source_times) - 0.5)
+        end = min(duration, max(source_times) + 0.5)
+        clip_duration = max(0.5, end - start)
+        safe_trace = re.sub(r"[^A-Za-z0-9_.-]+", "_", trace_id)
+        target_dir = staging_root / pipeline / safe_trace / "replay"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target = target_dir / "source.mp4"
+        command = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-ss", f"{start:.3f}", "-i", str(replay),
+            "-t", f"{clip_duration:.3f}", "-an", "-c:v", "libx264",
+            "-preset", "ultrafast", str(target),
+        ]
+        result = subprocess.run(command, check=False, capture_output=True, text=True)
+        if result.returncode != 0 or not target.is_file():
+            target.unlink(missing_ok=True)
+            continue
+        (target_dir / "source.json").write_text(
+            json.dumps(
+                {
+                    "trace_id": trace_id,
+                    "pipeline": pipeline,
+                    "camera": camera,
+                    "source_replay": replay.name,
+                    "source_start_s": round(start, 3),
+                    "source_end_s": round(start + clip_duration, 3),
+                    "record_count": len(trace_records),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
 
 
 def main() -> int:
@@ -2873,6 +2969,16 @@ def main() -> int:
         else:
             os.environ["CAMERA_SOURCE_OVERLAY"] = previous_source_overlay
         write_json(output / "summary.json", summary)
+        try:
+            materialize_trace_replays(
+                output,
+                locals().get("replays", {}),
+                locals().get("anchors", {}),
+            )
+        except Exception as exc:
+            summary.setdefault("diagnostic_errors", []).append(
+                f"trace_replay_materialization:{type(exc).__name__}: {exc}"
+            )
         cleanup_runtime_output(output)
         report_path = write_failure_only_report(output, summary)
         summary["report"]["artifacts"].append(
