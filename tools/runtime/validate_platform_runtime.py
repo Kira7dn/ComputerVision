@@ -2177,28 +2177,6 @@ def write_failure_only_report(output: Path, summary: dict[str, Any]) -> Path:
     return report_path
 
 
-def cleanup_runtime_output(output: Path) -> None:
-    """Keep only reproducibility, report, logs and runtime evidence artifacts."""
-    output = output.resolve()
-    removable_files = ("runtime-trace.jsonl",)
-    for name in removable_files:
-        path = output / name
-        if path.is_file() and path.resolve().is_relative_to(output):
-            path.unlink()
-    removable_dirs = (
-        output / "media" / "clips",
-        output / "media" / "recordings",
-        output / "media" / ".face-commits",
-        output / "media" / "exports",
-    )
-    for path in removable_dirs:
-        if path.is_dir() and path.resolve().is_relative_to(output):
-            shutil.rmtree(path)
-    staging = output / "staging"
-    if staging.is_dir() and staging.resolve().is_relative_to(output):
-        shutil.rmtree(staging)
-
-
 def materialize_trace_replays(
     output: Path,
     replays: dict[str, Path],
@@ -2380,12 +2358,7 @@ def main() -> int:
         # WAL/checkpoint work and release its files cleanly.
         runtime_started = True
         docker_output("stop", "--time", "10", "frigate", timeout=15, check=False)
-        artifact_dir = output / "media" / "clips" / "artifacts"
-        if artifact_dir.is_dir() and artifact_dir.resolve().is_relative_to(output):
-            shutil.rmtree(artifact_dir)
         database_dir = output / "media" / "passage"
-        if database_dir.is_dir() and database_dir.resolve().is_relative_to(output):
-            shutil.rmtree(database_dir)
         database_dir.mkdir(parents=True, exist_ok=True)
 
         isolated_start_wall = time.time()
@@ -2906,7 +2879,6 @@ def main() -> int:
             replay_parent = Path(replay).parent
             if replay_parent.name.startswith("camera-platform-"):
                 shutil.rmtree(replay_parent, ignore_errors=True)
-        cleanup_runtime_output(output)
         report_path = write_failure_only_report(output, summary)
         summary["report"]["artifacts"].append(
             {

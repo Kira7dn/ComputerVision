@@ -5,7 +5,6 @@ import argparse
 import copy
 import hashlib
 import json
-import shutil
 import subprocess
 import tempfile
 import time
@@ -292,12 +291,7 @@ def main() -> int:
     root = Path.cwd()
     manifest = load_manifest(args.manifest, root)
     output = args.output.resolve(); output.mkdir(parents=True, exist_ok=True)
-    artifact_dir = output / "media" / "clips" / "artifacts"
-    if artifact_dir.is_dir() and artifact_dir.resolve().is_relative_to(output):
-        shutil.rmtree(artifact_dir)
     database_dir = output / "media" / "passage"
-    if database_dir.is_dir() and database_dir.resolve().is_relative_to(output):
-        shutil.rmtree(database_dir)
     database_dir.mkdir(parents=True, exist_ok=True)
     enrollment = manifest["face"]["enrollment"]
     enrollment_image = output / "media" / "clips" / "faces" / str(enrollment["identity"]) / "enrollment.jpg"
