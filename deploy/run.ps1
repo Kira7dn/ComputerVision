@@ -355,14 +355,26 @@ function Wait-NgrokReady([string]$ExpectedUrl) {
 function New-ReplayOverride([object[]]$Sources, $Runtime, [bool]$NotificationsEnabled) {
   $lines = [Collections.Generic.List[string]]::new()
   $lines.Add('services:')
+  $frigateVolumes = [Collections.Generic.List[string]]::new()
   if (-not [string]::IsNullOrWhiteSpace($env:CAMERA_SOURCE_OVERLAY)) {
     $sourceOverlay = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($env:CAMERA_SOURCE_OVERLAY)
     if (-not (Test-Path -LiteralPath $sourceOverlay -PathType Container)) {
       throw "Missing CAMERA_SOURCE_OVERLAY directory: $sourceOverlay"
     }
-    $sourceMount = (($sourceOverlay.Replace('\','/') + ':/opt/frigate/frigate:ro') | ConvertTo-Json -Compress)
+    $sourceMount = $sourceOverlay.Replace('\','/') + ':/opt/frigate/frigate:ro'
+    $frigateVolumes.Add($sourceMount)
+  }
+  if (-not [string]::IsNullOrWhiteSpace($env:CAMERA_REPORT_MEDIA_DIR)) {
+    $reportMedia = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($env:CAMERA_REPORT_MEDIA_DIR)
+    if (-not (Test-Path -LiteralPath $reportMedia -PathType Container)) {
+      throw "Missing CAMERA_REPORT_MEDIA_DIR directory: $reportMedia"
+    }
+    $frigateVolumes.Add($reportMedia.Replace('\','/') + ':/runtime-evidence')
+  }
+  if ($frigateVolumes.Count -gt 0) {
+    $mounts = @($frigateVolumes | ForEach-Object { $_ | ConvertTo-Json -Compress }) -join ', '
     $lines.Add('  frigate:')
-    $lines.Add("    volumes: [$sourceMount]")
+    $lines.Add("    volumes: [$mounts]")
   }
   if (-not $NotificationsEnabled) {
     $lines.Add('  ngrok:')
@@ -382,6 +394,7 @@ function New-ReplayOverride([object[]]$Sources, $Runtime, [bool]$NotificationsEn
     $container = 'camera-replay-' + $source.Name.ToLowerInvariant().Replace('_','-')
     $volume = (($source.Path.Replace('\','/') + ':/runtime/source:ro') | ConvertTo-Json -Compress)
     $loop = if ($Runtime.ReplayLoop) { '-1' } else { '0' }
+    $controlled = $env:CAMERA_REPLAY_CONTROLLED -eq '1'
     $lines.Add("  ${service}:")
     $lines.Add('    image: ${FRIGATE_IMAGE}')
     $lines.Add("    container_name: $container")
@@ -389,6 +402,15 @@ function New-ReplayOverride([object[]]$Sources, $Runtime, [bool]$NotificationsEn
     $lines.Add('    restart: unless-stopped')
     $lines.Add('    healthcheck: { disable: true }')
     $lines.Add('    depends_on: [mediamtx]')
+    if ($controlled) {
+      $scriptPath = (Join-Path $PSScriptRoot 'replay-controlled.sh').Replace('\','/')
+      $scriptMount = (($scriptPath + ':/runtime/replay-controlled.sh:ro') | ConvertTo-Json -Compress)
+      $lines.Add('    entrypoint: ["/bin/sh", "/runtime/replay-controlled.sh"]')
+      $lines.Add("    volumes: [$volume, $scriptMount]")
+      $command = @($source.Name) | ConvertTo-Json -Compress
+      $lines.Add("    command: $command")
+      continue
+    }
     $lines.Add('    entrypoint: ["/usr/lib/ffmpeg/7.0/bin/ffmpeg"]')
     $lines.Add("    volumes: [$volume]")
       # Frequent IDR frames let Frigate/go2rtc attach immediately after a

@@ -24,6 +24,7 @@ from tools.runtime.validate_platform_runtime import (
     lpr_results,
     media_evidence_records,
     recognition_lifecycle_summary,
+    source_pts_metrics,
     trace_lifecycle_groups,
     update_anchor_state,
     validate_runtime_lpr_evidence,
@@ -77,6 +78,28 @@ def test_trace_lifecycle_groups_excludes_detector_observations() -> None:
         ("lpr", "lpr:car_camera:event-1"),
         ("face", "face:face_camera:event-2:g1"),
     }
+
+
+def test_source_pts_completeness_ignores_non_frame_terminal_records() -> None:
+    result = source_pts_metrics(
+        [
+            {
+                "camera": "face_camera",
+                "stage": "first_attempt",
+                "frame_time": 10.0,
+                "source_pts": 10.0,
+            },
+            {
+                "camera": "face_camera",
+                "stage": "recognition_terminal",
+                "frame_time": None,
+                "source_pts": None,
+            },
+        ]
+    )
+
+    assert result["face_camera"]["missing_source_pts"] == 0
+    assert result["face_camera"]["records_without_frame"] == 1
 
 
 def test_media_evidence_records_loads_lpr_and_face_utf8(tmp_path: Path) -> None:
@@ -244,7 +267,7 @@ def test_native_trace_clip_uses_source_pts_when_event_is_absent(
             "face|face:face_camera:event-2:g1": [
                 {
                     "path": "/media/frigate/recordings/face_camera/segment.mp4",
-                    "start_time": 199.0,
+                    "start_time": 200.0,
                     "end_time": 201.0,
                 }
             ]
@@ -266,7 +289,7 @@ def test_native_trace_clip_uses_source_pts_when_event_is_absent(
     trace_root = tmp_path / "media/face/face_face_camera_event-2_g1"
     metadata = json.loads((trace_root / "trace.json").read_text(encoding="utf-8"))
     assert requested == [
-        "http://127.0.0.1:5001/api/face_camera/start/199.500000/end/200.500000/clip.mp4"
+        "http://127.0.0.1:5001/api/face_camera/start/200.000000/end/201.000000/clip.mp4"
     ]
     assert metadata["clip_basis"] == "trace_source_pts"
     assert metadata["event_id"] is None

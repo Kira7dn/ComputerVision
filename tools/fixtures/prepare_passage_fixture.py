@@ -220,12 +220,23 @@ def group_composite_passages(
     return grouped
 
 
-def make_composite(manifest: dict[str, Any], root: Path, output: Path, kind: str) -> tuple[Path, list[dict[str, Any]]]:
+def make_composite(
+    manifest: dict[str, Any],
+    root: Path,
+    output: Path,
+    kind: str,
+    workspace: Path | None = None,
+) -> tuple[Path, list[dict[str, Any]]]:
     width, height, fps = frame_spec(manifest, kind)
     # Replay construction is input preparation, not runtime media. Use an
     # OS-temporary input directory so fixture segments never enter the run's
     # report tree and can never be mistaken for runtime evidence.
-    media = Path(tempfile.mkdtemp(prefix=f"camera-platform-{kind}-"))
+    media = (
+        workspace / kind
+        if workspace is not None
+        else Path(tempfile.mkdtemp(prefix=f"camera-platform-{kind}-"))
+    )
+    media.mkdir(parents=True, exist_ok=True)
     parts: list[Path] = []
     windows: list[dict[str, Any]] = []
     timeline = BLACK_LEAD_SECONDS
@@ -286,23 +297,31 @@ def main() -> int:
     parser.add_argument("--config", type=Path, default=Path("deploy/config.yaml"))
     parser.add_argument("--manifest", type=Path, default=Path("tools/fixtures/platform_passage_ground_truth.yaml"))
     parser.add_argument("--output", type=Path, default=Path(".tmp/platform-passage"))
+    parser.add_argument("--workspace", type=Path)
     args = parser.parse_args()
     started = time.monotonic()
     root = Path.cwd()
     manifest = load_manifest(args.manifest, root)
     output = args.output.resolve(); output.mkdir(parents=True, exist_ok=True)
-    database_dir = output / "media" / "passage"
+    workspace = (
+        args.workspace.resolve()
+        if args.workspace is not None
+        else Path(tempfile.mkdtemp(prefix="camera-platform-runtime-"))
+    )
+    workspace.mkdir(parents=True, exist_ok=True)
+    runtime_media = workspace / "media"
+    database_dir = runtime_media / "passage"
     database_dir.mkdir(parents=True, exist_ok=True)
     enrollment = manifest["face"]["enrollment"]
-    enrollment_image = output / "media" / "clips" / "faces" / str(enrollment["identity"]) / "enrollment.jpg"
+    enrollment_image = runtime_media / "clips" / "faces" / str(enrollment["identity"]) / "enrollment.jpg"
     enrollment_image.parent.mkdir(parents=True, exist_ok=True)
     write_enrollment_crop(manifest, root, enrollment_image)
-    face_replay, face_windows = make_composite(manifest, root, output, "face")
+    face_replay, face_windows = make_composite(manifest, root, output, "face", workspace)
     # LPR is a single source timeline; retain its independent passage windows.
-    lpr_replay, lpr_windows = make_composite(manifest, root, output, "lpr")
+    lpr_replay, lpr_windows = make_composite(manifest, root, output, "lpr", workspace)
     config = yaml.safe_load(args.config.read_text(encoding="utf-8"))
     config = copy.deepcopy(config)
-    config["runtime"]["media_dir"] = str(output / "media")
+    config["runtime"]["media_dir"] = str(runtime_media)
     config["runtime"]["replay"]["sources"] = {"face_camera": str(face_replay), "car_camera": str(lpr_replay)}
     # Runtime evidence must exercise the production media path.  Keep the
     # configured record/snapshot features intact and suppress only external

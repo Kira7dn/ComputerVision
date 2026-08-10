@@ -32,14 +32,17 @@ Mỗi invocation tự tạo một thư mục timestamp:
 Script thực hiện:
 
 1. Chuẩn bị fixture/replay và manifest ground truth.
-2. Khởi động Frigate và hai replay camera.
-3. Chờ camera, detector, model và image readiness.
-4. Ghi source PTS/anchor của từng round để đối chiếu fixture sau khi đo.
-5. Thu passage trace, runtime LPR evidence và hardware/runtime samples.
+2. Khởi động hai publisher RTSP ở chế độ standby bằng frame đen; phiên RTSP không bị ngắt
+   khi chuyển sang video nguồn.
+3. Khởi động Frigate, chờ camera, detector, model và image readiness.
+4. Mở capture gate bằng `run_id`, sau đó trigger đồng thời mỗi publisher phát video nguồn
+   đúng một lần rồi tự trở về standby.
+5. Ghi source PTS/anchor và thu passage trace, runtime LPR evidence, hardware/runtime samples
+   chỉ trong cửa sổ capture của run hiện tại.
 6. Chờ deferred recognition/evidence lifecycle và native recording segment được commit.
 7. Lấy `Event.start_time/end_time` và tải clip bằng recording API có sẵn của Frigate.
 8. Thu Docker inspect/log trước khi restore runtime.
-9. Xuất `report.md`, JSON report, raw trace, runtime evidence, clip theo trace và recording segment nguồn.
+9. Xuất `report.md`, JSON report, raw trace, runtime evidence và clip theo trace.
 
 `tools/runtime/validate_platform_runtime.py` là implementation; entrypoint chuẩn duy nhất là
 `tools/tests/e2e/run_platform_runtime_test.py`.
@@ -87,6 +90,8 @@ outcome, margin, identity và terminal reason.
 - Record thiếu PTS, bbox hoặc candidate lineage được ghi `unscorable`/`lineage_missing`.
 - Mỗi invocation chạy đúng một replay round; nếu cần so sánh nhiều lần thì mỗi lần có một
   thư mục timestamp riêng.
+- Mọi trace/evidence phải mang đúng `run_id` của invocation. Runtime không ghi warm-up
+  trước capture gate và report không đọc record của run cũ.
 - Bảng báo cáo tối thiểu là passage × round cho cả car và face; ở một invocation `round_id=1`.
 - `measurement_valid` chỉ mô tả tính đầy đủ/hợp lệ của dữ liệu đo, không phải acceptance.
 - Anchor/fixture video không được dùng để dựng lại clip. Media của trace chỉ được lấy từ
@@ -153,7 +158,7 @@ Media được giữ theo cấu trúc:
 
 ```text
 media/
-├── recordings/                 # segment nguồn do Frigate record role tạo
+├── runtime-trace.jsonl          # raw trace của đúng run_id hiện tại
 ├── lpr/<safe_trace_id>/
 │   ├── clip.mp4                # tải từ native recording API
 │   ├── trace.json
@@ -163,6 +168,10 @@ media/
     ├── trace.json
     └── <evidence_id>/*.jpg
 ```
+
+Kho `recordings`, SQLite, snapshot/cache và enrollment phục vụ Frigate nằm trong workspace
+runtime tạm, không nằm trong cây report. Script đọc recording khi Frigate còn chạy và tải clip
+thẳng vào trace tương ứng; report không sinh rồi xóa hoặc di chuyển các thư mục media trung gian.
 
 Detector observation không phải lifecycle trace, không có thư mục hoặc clip riêng. Passage
 không tạo được runtime trace được báo `trace_id = -`; script không tạo trace/video giả và

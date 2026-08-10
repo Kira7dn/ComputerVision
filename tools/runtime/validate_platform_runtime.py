@@ -11,6 +11,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -30,9 +31,10 @@ from tools.fixtures.prepare_passage_fixture import load_manifest
 from tools.lib.passage_metrics import bbox_iou, normalize_plate, percentile
 
 CAMERAS = {"face": "face_camera", "lpr": "car_camera"}
-TRACE_CONTAINER_PATH = "/config/passage-trace.jsonl"
-EVIDENCE_CONTAINER_DIR = "/media/frigate"
+TRACE_CONTAINER_PATH = "/runtime-evidence/runtime-trace.jsonl"
+EVIDENCE_CONTAINER_DIR = "/runtime-evidence"
 CAPTURE_CUTOFF_CONTAINER_PATH = "/tmp/passage-capture-cutoff"
+CAPTURE_START_CONTAINER_PATH = "/tmp/passage-capture-start"
 LEAD_SECONDS = 1.5
 ROUNDS = 1
 MIN_PASSAGE_RATE = 0.8
@@ -452,6 +454,63 @@ def wait_acceptance_ready(expected_image: str | None, timeout: float = 32.0) -> 
             last_reason = str(exc)
         time.sleep(0.5)
     raise TimeoutError(f"acceptance runtime not ready: {last_reason}")
+
+
+def controlled_replay_state(camera: str, state: str) -> tuple[str, float] | None:
+    container = f"camera-replay-{camera.replace('_', '-')}"
+    value = docker_output(
+        "exec",
+        container,
+        "sh",
+        "-c",
+        f"test -s /tmp/replay-{state} && cat /tmp/replay-{state}",
+        timeout=3,
+        check=False,
+    ).strip()
+    if not value:
+        return None
+    token, timestamp = value.split(maxsplit=1)
+    return token, float(timestamp)
+
+
+def trigger_controlled_replays(run_id: str, timeout: float = 5.0) -> dict[str, float]:
+    """Release both standby publishers into one source playback."""
+    for camera in CAMERAS.values():
+        container = f"camera-replay-{camera.replace('_', '-')}"
+        docker_output(
+            "exec",
+            container,
+            "sh",
+            "-c",
+            f"printf '%s\\n' '{run_id}' > /tmp/replay-trigger",
+            timeout=3,
+        )
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        states = {
+            camera: controlled_replay_state(camera, "started")
+            for camera in CAMERAS.values()
+        }
+        if all(value is not None and value[0] == run_id for value in states.values()):
+            return {camera: float(value[1]) for camera, value in states.items() if value}
+        time.sleep(0.05)
+    raise TimeoutError(f"controlled replay did not start for run {run_id}")
+
+
+def wait_controlled_replays_done(
+    run_id: str, timeout: float = 30.0
+) -> dict[str, float]:
+    """Wait until both publishers complete exactly one source playback."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        states = {
+            camera: controlled_replay_state(camera, "done")
+            for camera in CAMERAS.values()
+        }
+        if all(value is not None and value[0] == run_id for value in states.values()):
+            return {camera: float(value[1]) for camera, value in states.items() if value}
+        time.sleep(0.1)
+    raise TimeoutError(f"controlled replay did not finish for run {run_id}")
 
 
 def restore_mounts_verified(config: Path) -> bool:
@@ -959,7 +1018,7 @@ def trace_metrics(records: list[dict[str, Any]], elapsed_seconds: float) -> dict
 
 
 def source_pts_metrics(records: list[dict[str, Any]]) -> dict[str, Any]:
-    """Describe source-PTS completeness and gaps without inventing a gate."""
+    """Describe source-PTS completeness for records tied to an input frame."""
     result: dict[str, Any] = {}
     for camera in sorted({str(record.get("camera")) for record in records}):
         values = sorted(
@@ -970,12 +1029,19 @@ def source_pts_metrics(records: list[dict[str, Any]]) -> dict[str, Any]:
         gaps = [current - previous for previous, current in zip(values, values[1:])]
         result[camera] = {
             "records_with_source_pts": len(values),
+            "records_without_frame": sum(
+                1
+                for record in records
+                if str(record.get("camera")) == camera
+                and record.get("frame_time") is None
+            ),
             "max_gap_seconds": round(max(gaps, default=0.0), 6),
             "mean_gap_seconds": round(sum(gaps) / len(gaps), 6) if gaps else None,
             "missing_source_pts": sum(
                 1
                 for record in records
                 if str(record.get("camera")) == camera
+                and record.get("frame_time") is not None
                 and record.get("source_pts") is None
             ),
         }
@@ -1701,8 +1767,8 @@ def ffprobe_clip(path: Path) -> dict[str, Any]:
     """Inspect a downloaded native clip without modifying it."""
     result = subprocess.run(
         [
-            "ffprobe", "-v", "error", "-show_entries",
-            "format=duration,size:stream=codec_name,width,height,avg_frame_rate",
+            "ffprobe", "-v", "error", "-count_frames", "-show_entries",
+            "format=duration,size:stream=codec_name,width,height,avg_frame_rate,nb_read_frames",
             "-of", "json", str(path),
         ],
         check=False,
@@ -1717,7 +1783,9 @@ def ffprobe_clip(path: Path) -> dict[str, Any]:
     except json.JSONDecodeError:
         return {"valid": False, "error": "ffprobe_invalid_json"}
     streams = value.get("streams") or []
-    return {"valid": bool(streams), **value}
+    duration = float((value.get("format") or {}).get("duration") or 0.0)
+    frame_count = sum(int(stream.get("nb_read_frames") or 0) for stream in streams)
+    return {"valid": bool(streams) and duration > 0 and frame_count > 0, **value}
 
 
 def collect_native_trace_clips(
@@ -1855,9 +1923,30 @@ def collect_native_trace_clips(
                 metadata["clip_reason"] = "event_clip_unavailable"
                 recordings = []
         if recordings:
+            coverage_start = min(float(row["start_time"]) for row in recordings)
+            coverage_end = max(float(row["end_time"]) for row in recordings)
+            request_start = max(start_time, coverage_start)
+            request_end = min(end_time, coverage_end)
+            # Frigate's recording API emits whole encoded-frame groups. A
+            # sub-second edge window can contain the trace timestamp yet still
+            # return only an MP4 header, so retain at least one second of the
+            # same native recording when coverage permits.
+            request_end = min(coverage_end, max(request_end, request_start + 1.0))
+            metadata.update(
+                {
+                    "recording_coverage_start": coverage_start,
+                    "recording_coverage_end": coverage_end,
+                    "clip_request_start": request_start,
+                    "clip_request_end": request_end,
+                }
+            )
+            if request_end <= request_start:
+                metadata["clip_reason"] = "recording_coverage_missing"
+                recordings = []
+        if recordings:
             url = (
                 f"{api_base}/api/{quote(camera, safe='')}/start/"
-                f"{start_time:.6f}/end/{end_time:.6f}/clip.mp4"
+                f"{request_start:.6f}/end/{request_end:.6f}/clip.mp4"
             )
             try:
                 with urlopen(url, timeout=45) as response:
@@ -2613,18 +2702,23 @@ def main() -> int:
     }
     previous_trace_path = os.environ.get("PASSAGE_TRACE_PATH")
     previous_evidence_dir = os.environ.get("PASSAGE_EVIDENCE_DIR")
+    previous_capture_start = os.environ.get("PASSAGE_CAPTURE_START_PATH")
     previous_capture_cutoff = os.environ.get("PASSAGE_CAPTURE_CUTOFF_PATH")
+    previous_run_id = os.environ.get("PASSAGE_RUN_ID")
+    previous_controlled_replay = os.environ.get("CAMERA_REPLAY_CONTROLLED")
     previous_evidence_bytes = os.environ.get("PASSAGE_EVIDENCE_MAX_BYTES")
     previous_evidence_records = os.environ.get("PASSAGE_EVIDENCE_MAX_RECORDS")
     previous_ready_seconds = os.environ.get("CAMERA_READY_STABLE_SECONDS")
     previous_skip_ready = os.environ.get("CAMERA_SKIP_READY_WAIT")
     previous_source_overlay = os.environ.get("CAMERA_SOURCE_OVERLAY")
+    previous_report_media = os.environ.get("CAMERA_REPORT_MEDIA_DIR")
     previous_anchor_black_seconds = os.environ.get("PASSAGE_ANCHOR_MIN_BLACK_SECONDS")
     runtime_started = False
     replays_paused = False
     sampler: ResourceSampler | None = None
     isolated_start_wall: float | None = None
     exit_code = 1
+    runtime_workspace = tempfile.TemporaryDirectory(prefix="camera-platform-runtime-")
     try:
         step_started = time.monotonic()
         manifest = load_manifest(manifest_path, Path.cwd())
@@ -2636,6 +2730,8 @@ def main() -> int:
             str(manifest_path),
             "--output",
             str(output),
+            "--workspace",
+            runtime_workspace.name,
         ]
         base_config = yaml.safe_load(config.read_text(encoding="utf-8"))
         # Replay inputs are deliberately OS-temporary and are not cacheable.
@@ -2664,19 +2760,24 @@ def main() -> int:
         summary["fixture"] = fixture
         summary["fixture_contract"] = contract
         summary["timing"]["fixture_seconds"] = round(time.monotonic() - step_started, 3)
-        # A prior run may still have this output's SQLite database bind-mounted.
-        # Stop Frigate before resetting run-owned artifacts so SQLite can finish
-        # WAL/checkpoint work and release its files cleanly.
+        # Stop the current runtime before replacing its config and media mount.
         runtime_started = True
         docker_output("stop", "--time", "10", "frigate", timeout=15, check=False)
-        database_dir = output / "media" / "passage"
-        database_dir.mkdir(parents=True, exist_ok=True)
 
         isolated_start_wall = time.time()
         step_started = time.monotonic()
         os.environ["PASSAGE_TRACE_PATH"] = TRACE_CONTAINER_PATH
         os.environ["PASSAGE_EVIDENCE_DIR"] = EVIDENCE_CONTAINER_DIR
+        os.environ["PASSAGE_CAPTURE_START_PATH"] = CAPTURE_START_CONTAINER_PATH
         os.environ["PASSAGE_CAPTURE_CUTOFF_PATH"] = CAPTURE_CUTOFF_CONTAINER_PATH
+        os.environ["PASSAGE_RUN_ID"] = run_id
+        os.environ["CAMERA_REPLAY_CONTROLLED"] = "1"
+        os.environ["CAMERA_SOURCE_OVERLAY"] = str(
+            (Path.cwd() / "frigate" / "frigate").resolve()
+        )
+        report_media = output / "media"
+        report_media.mkdir(parents=True, exist_ok=True)
+        os.environ["CAMERA_REPORT_MEDIA_DIR"] = str(report_media.resolve())
         os.environ["PASSAGE_EVIDENCE_MAX_BYTES"] = str(128 * 1024**2)
         os.environ["PASSAGE_EVIDENCE_MAX_RECORDS"] = "4096"
         os.environ["CAMERA_READY_STABLE_SECONDS"] = "1"
@@ -2692,14 +2793,19 @@ def main() -> int:
                 os.environ.pop("CAMERA_SOURCE_OVERLAY", None)
             else:
                 os.environ["CAMERA_SOURCE_OVERLAY"] = previous_source_overlay
-        wait_acceptance_ready(str(value["runtime"]["image"]), timeout=40)
+        wait_acceptance_ready(str(value["runtime"]["image"]), timeout=60)
         summary["timing"]["isolated_start_seconds"] = round(time.monotonic() - step_started, 3)
         observation_wall = time.time()
-        subprocess.run(
-            ["docker", "exec", "frigate", "rm", "-f", TRACE_CONTAINER_PATH],
-            check=False,
-            timeout=10,
+        capture_start = time.time()
+        docker_output(
+            "exec",
+            "frigate",
+            "sh",
+            "-c",
+            f"printf '%s\\n' '{capture_start:.9f}' > {CAPTURE_START_CONTAINER_PATH}",
+            timeout=5,
         )
+        summary["capture_start_epoch"] = capture_start
         initial_restarts = restart_counts()
         sampler = ResourceSampler()
         sampler.start()
@@ -2710,9 +2816,9 @@ def main() -> int:
             "lpr": Path(replay_sources["car_camera"]),
         }
         step_started = time.monotonic()
-        # Preserve the final passage and following black boundary for the
-        # single replay round.
+        replay_started = trigger_controlled_replays(run_id)
         anchors, anchor_details = observe_round_anchors(replays, started + 103)
+        replay_done = wait_controlled_replays_done(run_id)
         capture_cutoff = time.time()
         summary["capture_cutoff_epoch"] = capture_cutoff
         docker_output(
@@ -2769,12 +2875,7 @@ def main() -> int:
                 "Runtime LPR evidence writer did not become quiescent after replay"
             )
 
-        trace_path = output / "runtime-trace.jsonl"
-        subprocess.run(
-            ["docker", "cp", f"frigate:{TRACE_CONTAINER_PATH}", str(trace_path)],
-            check=False,
-            timeout=10,
-        )
+        trace_path = output / "media" / "runtime-trace.jsonl"
         if not trace_path.is_file():
             raise RuntimeError("Passage runtime trace is missing")
         records = [
@@ -2782,6 +2883,17 @@ def main() -> int:
             for line in trace_path.read_text(encoding="utf-8").splitlines()
             if line.strip()
         ]
+        foreign_run_ids = sorted(
+            {
+                str(record.get("run_id"))
+                for record in records
+                if record.get("run_id") != run_id
+            }
+        )
+        if foreign_run_ids:
+            raise RuntimeError(
+                f"Runtime trace contains records from other runs: {foreign_run_ids}"
+            )
         face_passages = merge_passages(manifest, fixture, "face")
         lpr_passages = merge_passages(manifest, fixture, "lpr")
         durations = {
@@ -2938,6 +3050,11 @@ def main() -> int:
             )
         runtime = {
             "anchors": anchor_details,
+            "controlled_replay": {
+                "run_id": run_id,
+                "started": replay_started,
+                "done": replay_done,
+            },
             "rounds_complete": all(len(value) == ROUNDS for value in anchors.values()),
             "pending": pending,
             "pending_source": pending_source,
@@ -3162,10 +3279,26 @@ def main() -> int:
             os.environ.pop("PASSAGE_TRACE_PATH", None)
         else:
             os.environ["PASSAGE_TRACE_PATH"] = previous_trace_path
+        if previous_capture_start is None:
+            os.environ.pop("PASSAGE_CAPTURE_START_PATH", None)
+        else:
+            os.environ["PASSAGE_CAPTURE_START_PATH"] = previous_capture_start
         if previous_capture_cutoff is None:
             os.environ.pop("PASSAGE_CAPTURE_CUTOFF_PATH", None)
         else:
             os.environ["PASSAGE_CAPTURE_CUTOFF_PATH"] = previous_capture_cutoff
+        if previous_run_id is None:
+            os.environ.pop("PASSAGE_RUN_ID", None)
+        else:
+            os.environ["PASSAGE_RUN_ID"] = previous_run_id
+        if previous_controlled_replay is None:
+            os.environ.pop("CAMERA_REPLAY_CONTROLLED", None)
+        else:
+            os.environ["CAMERA_REPLAY_CONTROLLED"] = previous_controlled_replay
+        if previous_report_media is None:
+            os.environ.pop("CAMERA_REPORT_MEDIA_DIR", None)
+        else:
+            os.environ["CAMERA_REPORT_MEDIA_DIR"] = previous_report_media
         if previous_anchor_black_seconds is None:
             os.environ.pop("PASSAGE_ANCHOR_MIN_BLACK_SECONDS", None)
         else:
@@ -3202,6 +3335,7 @@ def main() -> int:
         )
         write_json(output / "summary.json", summary)
         exit_code = 0 if summary["report"]["status"] == "complete" else 1
+        runtime_workspace.cleanup()
     return exit_code
 
 
