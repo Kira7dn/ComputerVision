@@ -467,6 +467,40 @@ def wait_source_starts(directory: Path, timeout: float = 60.0) -> dict[str, floa
     raise TimeoutError("direct MP4 sources did not emit their first frame")
 
 
+def wait_source_ends(directory: Path, deadline: float) -> dict[str, float]:
+    """Wait for each finite detect input to enqueue its final source frame."""
+    while time.monotonic() < deadline:
+        values: dict[str, float] = {}
+        for camera in CAMERAS.values():
+            path = directory / f"{camera}.end"
+            if not path.is_file():
+                continue
+            text = path.read_text(encoding="utf-8").strip()
+            try:
+                values[camera] = float(text)
+            except ValueError:
+                continue
+        if len(values) == len(CAMERAS):
+            return values
+        time.sleep(0.05)
+    raise TimeoutError("direct MP4 sources did not reach EOF")
+
+
+def wait_latest_through(source_ended: dict[str, float], deadline: float) -> None:
+    """Wait until processing has published the final queued frame per camera."""
+    while time.monotonic() < deadline:
+        complete = True
+        for camera, frame_time in source_ended.items():
+            latest = latest_sample(camera)
+            if latest is None or latest[1] + 1e-6 < frame_time:
+                complete = False
+                break
+        if complete:
+            return
+        time.sleep(0.05)
+    raise TimeoutError("direct MP4 final frames were not processed")
+
+
 def restore_mounts_verified(config: Path) -> bool:
     expected = str(config.resolve()).replace("\\", "/").lower()
     expected_suffix = (
@@ -2834,15 +2868,14 @@ def main() -> int:
         anchors, anchor_details = observe_round_anchors(
             replays, source_started, started + 103
         )
+        source_ended = wait_source_ends(source_start_dir, started + 103)
+        wait_latest_through(source_ended, started + 103)
         capture_cutoff = time.time()
         summary["capture_cutoff_epoch"] = capture_cutoff
         (report_media / "capture-cutoff").write_text(
             f"{capture_cutoff:.9f}\n", encoding="utf-8"
         )
-        source_done = {
-            camera: source_started[camera] + replay_duration(replays[kind])
-            for kind, camera in CAMERAS.items()
-        }
+        source_done = source_ended
         recognition_idle = wait_recognition_idle()
         recordings_ready, recordings_through = wait_recordings_through(
             str(value["database"]["path"]),
