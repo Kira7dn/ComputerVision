@@ -92,11 +92,17 @@ function Get-CameraConfig {
   if (-not (Test-Path -LiteralPath $configFile -PathType Leaf)) {
     throw "Missing runtime config: $configFile"
   }
-  if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
+  $workspacePython = Join-Path $workspace '.venv\Scripts\python.exe'
+  $pythonExecutable = if (Test-Path -LiteralPath $workspacePython -PathType Leaf) {
+    $workspacePython
+  } else {
+    (Get-Command python -ErrorAction SilentlyContinue).Source
+  }
+  if ([string]::IsNullOrWhiteSpace($pythonExecutable)) {
     throw 'Python 3 with PyYAML is required to read config.yaml.'
   }
   $python = "import json,sys,yaml; value=yaml.safe_load(open(sys.argv[1],encoding='utf-8')); print(json.dumps(value,ensure_ascii=False))"
-  $json = & python -c $python $configFile 2>&1
+  $json = & $pythonExecutable -c $python $configFile 2>&1
   if ($LASTEXITCODE -ne 0) { throw "Invalid config.yaml: $($json -join ' ')" }
   $value = ($json -join "`n") | ConvertFrom-Json
   if ($null -eq $value -or $value -isnot [pscustomobject]) { throw 'config.yaml must contain a YAML mapping.' }
@@ -119,6 +125,7 @@ function Get-Runtime($Config) {
   if ($transport -notin @('tcp', 'udp')) { throw 'runtime.rtsp_transport must be tcp or udp.' }
   $configuredImage = [string](Get-Value $runtime 'image' $defaultImage)
   $image = $configuredImage
+  $manifest = $null
   if (Test-Path -LiteralPath $imageManifestFile) {
     try {
       $manifest = Get-Content -LiteralPath $imageManifestFile -Encoding utf8 -Raw | ConvertFrom-Json
@@ -131,6 +138,8 @@ function Get-Runtime($Config) {
     Image = $image
     ConfiguredImage = $configuredImage
     BuildBaseImage = [string](Get-Value $runtime 'build_base_image' 'camera-frigate:0.18.0-33c00a27e-runtime3-tensorrt')
+    RecognitionImage = if ($manifest -and $manifest.recognition_image) { [string]$manifest.recognition_image } else { 'camera-recognition:current' }
+    ExternalRecognition = $null -ne $Config.recognition -and [string](Get-Value $Config.recognition 'runtime' 'local') -eq 'external'
     CpuLimit = $cpu
     ModelPath = Resolve-WorkspacePath ([string](Get-Value $runtime 'model_path' 'models/yolov9-t-320.onnx'))
     MediaDir = Resolve-WorkspacePath ([string](Get-Value $runtime 'media_dir' 'E:/Docker/Frigate/media'))
@@ -288,10 +297,14 @@ function Test-Sources([object[]]$Sources, [string]$Transport) {
 function Set-ComposeEnvironment($Runtime) {
   New-Item -ItemType Directory -Force -Path $Runtime.MediaDir | Out-Null
   $env:FRIGATE_IMAGE = $Runtime.Image
+  $env:RECOGNITION_IMAGE = $Runtime.RecognitionImage
   $env:FRIGATE_CPU_LIMIT = [string]$Runtime.CpuLimit
   $env:CAMERA_CONFIG_FILE = $configFile.Replace('\','/')
   $env:CAMERA_MODEL_PATH = $Runtime.ModelPath.Replace('\','/')
   $env:FRIGATE_MEDIA_DIR = $Runtime.MediaDir.Replace('\','/')
+  if ([string]::IsNullOrWhiteSpace($env:RECOGNITION_TLS_DIR)) {
+    $env:RECOGNITION_TLS_DIR = (Join-Path $runtimeDir 'recognition-tls').Replace('\','/')
+  }
   $env:NGROK_URL = Get-EnvFileValue 'NGROK_URL'
   foreach ($mapping in @(
     @('FRIGATE_TELEGRAM_BOT_TOKEN', 'TELEGRAM_BOT_TOKEN'),
@@ -454,16 +467,26 @@ function New-ReplayOverride([object[]]$Sources, $Runtime, [bool]$NotificationsEn
   Write-AtomicUtf8 $mediaMtxReplayConfig (($mediaLines -join "`n") + "`n")
 }
 
-function Get-ComposePrefix([bool]$Replay) {
+function Get-ComposePrefix([bool]$Replay, [bool]$ExternalRecognition) {
   if (-not (Test-Path -LiteralPath $envFile -PathType Leaf)) { throw "Missing required secrets file: $envFile" }
   $args = @('compose','-f',$composeFile,'-f',$composeOverride,'--env-file',$envFile)
   if ($Replay) { $args += @('--profile','replay') }
+  if ($ExternalRecognition) { $args += @('--profile','external-recognition') }
   return $args
 }
 
 function Invoke-Compose([string[]]$Prefix, [string[]]$Arguments) {
-  & docker @Prefix @Arguments
-  if ($LASTEXITCODE -ne 0) { throw "Docker Compose failed with exit code $LASTEXITCODE." }
+  $savedErrorActionPreference = $ErrorActionPreference
+  try {
+    # Docker Compose writes progress and warnings to stderr even on success.
+    # Native exit status, not the stderr stream, is the command contract.
+    $ErrorActionPreference = 'Continue'
+    & docker @Prefix @Arguments
+    $composeExitCode = $LASTEXITCODE
+  } finally {
+    $ErrorActionPreference = $savedErrorActionPreference
+  }
+  if ($composeExitCode -ne 0) { throw "Docker Compose failed with exit code $composeExitCode." }
 }
 
 function Test-RuntimeDependencies($Runtime) {
@@ -475,7 +498,60 @@ function Test-RuntimeDependencies($Runtime) {
     throw "runtime.cpu_limit ($($Runtime.CpuLimit)) exceeds Docker CPU capacity ($dockerCpuCount)."
   }
   & docker image inspect $Runtime.Image *> $null; if ($LASTEXITCODE -ne 0) { throw "Missing runtime image: $($Runtime.Image)" }
+  if ($Runtime.ExternalRecognition) {
+    & docker image inspect $Runtime.RecognitionImage *> $null
+    if ($LASTEXITCODE -ne 0) { throw "Missing recognition image: $($Runtime.RecognitionImage)" }
+    foreach ($name in @('ca.crt','server.crt','server.key','client.crt','client.key')) {
+      $path = Join-Path $env:RECOGNITION_TLS_DIR $name
+      if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Missing recognition TLS file: $path" }
+    }
+  }
   if (-not (Test-Path -LiteralPath $Runtime.ModelPath -PathType Leaf)) { throw "Missing model: $($Runtime.ModelPath)" }
+}
+
+function Wait-RecognitionReady([int]$TimeoutSeconds = 60) {
+  $probe = @'
+import grpc
+from pathlib import Path
+from frigate.recognition.service import health_pb2, health_pb2_grpc
+root = Path('/run/recognition-tls')
+credentials = grpc.ssl_channel_credentials(
+    root_certificates=(root / 'ca.crt').read_bytes(),
+    private_key=(root / 'client.key').read_bytes(),
+    certificate_chain=(root / 'client.crt').read_bytes(),
+)
+try:
+    channel = grpc.secure_channel(
+        '127.0.0.1:50051', credentials,
+        options=(('grpc.ssl_target_name_override', 'recognition'),),
+    )
+    response = health_pb2_grpc.HealthStub(channel).Check(
+        health_pb2.HealthCheckRequest(service='camera.recognition.v1.RecognitionService'),
+        timeout=2,
+    )
+except Exception:
+    raise SystemExit(1) from None
+raise SystemExit(0 if response.status == health_pb2.HealthCheckResponse.SERVING else 1)
+'@
+  $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+  $savedErrorActionPreference = $ErrorActionPreference
+  try {
+    # Connection failures are expected while models and the gRPC server start.
+    # Treat them as a failed poll instead of terminating the deployment script.
+    $ErrorActionPreference = 'SilentlyContinue'
+    do {
+      $running = (& docker inspect camera-recognition --format '{{.State.Running}}' 2>$null).Trim()
+      if ($running -eq 'true') {
+        & docker exec camera-recognition python3 -c $probe *> $null
+        if ($LASTEXITCODE -eq 0) { return }
+      }
+      Start-Sleep -Milliseconds 500
+    } while ([DateTime]::UtcNow -lt $deadline)
+  } finally {
+    $ErrorActionPreference = $savedErrorActionPreference
+  }
+  $logs = (& docker logs --tail 80 camera-recognition 2>&1) -join "`n"
+  throw "Recognition service did not become healthy: $logs"
 }
 
 function Ensure-FrigateConfigVolume {
@@ -520,16 +596,27 @@ function Build-RuntimeImage($Runtime) {
   $repository = $Runtime.ConfiguredImage.Split(':')[0]
   $immutableImage = "${repository}:overlay-$($imageId.Substring(7,12))"
   & docker tag $Runtime.ConfiguredImage $immutableImage
+
+  $recognitionDockerfile = Join-Path $referenceDir 'Dockerfile.recognition'
+  Assert-OverlayDockerfile $recognitionDockerfile
+  $recognitionCurrent = 'camera-recognition:current'
+  $recognitionArgs = @('buildx','build','--load','--pull=false','--file',$recognitionDockerfile,'--build-arg',"BASE_IMAGE=$immutableImage",'--tag',$recognitionCurrent,$sourceDir)
+  Invoke-BuildStep 'recognition overlay' $dockerPath $recognitionArgs $stopwatch
+  $recognitionId = (& docker image inspect --format '{{.Id}}' $recognitionCurrent).Trim()
+  if (-not $recognitionId.StartsWith('sha256:')) { throw "Invalid recognition image id: $recognitionId" }
+  $recognitionImage = "camera-recognition:overlay-$($recognitionId.Substring(7,12))"
+  & docker tag $recognitionCurrent $recognitionImage
   if ($LASTEXITCODE -ne 0) { throw 'Unable to create immutable runtime image tag.' }
   $manifest = [ordered]@{
     source_image = $Runtime.ConfiguredImage
     image = $immutableImage
+    recognition_image = $recognitionImage
     digest = $imageId
     built_at = [DateTime]::UtcNow.ToString('o')
   }
   Write-AtomicUtf8 $imageManifestFile (($manifest | ConvertTo-Json) + "`n")
   $stopwatch.Stop()
-  Write-Host ("Built runtime image: {0} in {1:n1}s (overlay only; full dependency build disabled)." -f $immutableImage,$stopwatch.Elapsed.TotalSeconds)
+  Write-Host ("Built runtime images: {0}, {1} in {2:n1}s (overlay only; full dependency build disabled)." -f $immutableImage,$recognitionImage,$stopwatch.Elapsed.TotalSeconds)
 }
 
 function Test-FrigateConfig($Runtime, [object[]]$Sources) {
@@ -675,7 +762,7 @@ try {
   $hasReplay = @($sources | Where-Object Mode -eq 'replay').Count -gt 0
   Set-ComposeEnvironment $runtime
   New-ReplayOverride $sources $runtime $notificationsEnabled
-  $prefix = Get-ComposePrefix $hasReplay
+  $prefix = Get-ComposePrefix $hasReplay $runtime.ExternalRecognition
 
   switch ($effectiveCommand) {
     'doctor' {
@@ -706,7 +793,17 @@ try {
       Test-FrigateConfig $runtime $sources
       Ensure-FrigateConfigVolume
       Invoke-Compose $prefix @('config','--quiet')
-      Invoke-Compose $prefix @('up','-d','--no-build','--remove-orphans','--force-recreate')
+      if ($runtime.ExternalRecognition) {
+        Invoke-Compose $prefix @('up','-d','--no-build','--force-recreate','--no-deps','recognition')
+        Wait-RecognitionReady
+        Invoke-Compose $prefix @('up','-d','--no-build','--remove-orphans','--force-recreate','--no-deps','frigate')
+        Invoke-Compose $prefix @('up','-d','--no-build')
+      } else {
+        if ((& docker ps -a --format '{{.Names}}') -contains 'camera-recognition') {
+          & docker rm -f camera-recognition *> $null
+        }
+        Invoke-Compose $prefix @('up','-d','--no-build','--remove-orphans','--force-recreate')
+      }
       if ($env:CAMERA_SKIP_READY_WAIT -ne '1') {
         Wait-RuntimeReady $sources $config
       }
@@ -750,6 +847,12 @@ try {
       # SQLite must finish WAL/checkpoint work before Compose replaces the
       # container or an acceptance timeout can surface as a disk I/O failure.
       Invoke-Compose $prefix @('stop','--timeout','10','frigate')
+      if ($runtime.ExternalRecognition) {
+        Invoke-Compose $prefix @('up','-d','--no-build','--force-recreate','--no-deps','recognition')
+        Wait-RecognitionReady
+      } elseif ((& docker ps -a --format '{{.Names}}') -contains 'camera-recognition') {
+        & docker rm -f camera-recognition *> $null
+      }
       $acceptanceServices = [Collections.Generic.List[string]]::new()
       $replaySources = @($sources | Where-Object Mode -eq 'replay')
       if ($replaySources.Count -gt 0) {
@@ -783,6 +886,9 @@ try {
       Invoke-Compose $prefix @('config','--quiet')
       Invoke-Compose $prefix @('stop','--timeout','10','frigate')
       Invoke-Compose $prefix @('up','-d','--no-build','--force-recreate','--no-deps','frigate')
+      if (-not $runtime.ExternalRecognition -and ((& docker ps -a --format '{{.Names}}') -contains 'camera-recognition')) {
+        & docker rm -f camera-recognition *> $null
+      }
       $state = [ordered]@{ started_at=[DateTime]::UtcNow.ToString('o'); cameras=@() }
       foreach ($source in $sources) { $state.cameras += [ordered]@{ name=$source.Name; mode=$source.Mode; source=$source.Redacted } }
       Write-AtomicUtf8 $stateFile (($state | ConvertTo-Json -Depth 5) + "`n")
@@ -804,6 +910,12 @@ try {
   exit 0
 } catch {
   $knownSources = if ($null -ne (Get-Variable sources -ErrorAction SilentlyContinue)) { $sources } else { @() }
-  Write-Host (Protect-Text $_.Exception.Message $knownSources) -ForegroundColor Red
+  $failure = @(
+    $_.Exception.GetType().FullName
+    $_.Exception.Message
+    $_.InvocationInfo.PositionMessage
+    $_.ScriptStackTrace
+  ) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }
+  Write-Host (Protect-Text ($failure -join "`n") $knownSources) -ForegroundColor Red
   exit 1
 }

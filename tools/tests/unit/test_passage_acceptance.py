@@ -291,7 +291,7 @@ def test_media_evidence_records_loads_lpr_and_face_utf8(tmp_path: Path) -> None:
     }
 
 
-def test_annotate_face_evidence_preserves_raw_and_draws_both_boxes(
+def test_face_bbox_evidence_is_producer_owned_and_not_rewritten(
     tmp_path: Path,
 ) -> None:
     image = passage_validator.np.zeros((80, 120, 3), dtype=passage_validator.np.uint8)
@@ -304,7 +304,7 @@ def test_annotate_face_evidence_preserves_raw_and_draws_both_boxes(
     records = [
         {
             "pipeline": "face",
-            "stage": "recognition_attempt",
+            "stage": "recognition_attempt_bbox",
             "trace_id": "face:face_camera:trace-1",
             "artifact_path": raw_path.relative_to(tmp_path).as_posix(),
             "object_box": [10, 10, 100, 70],
@@ -321,11 +321,11 @@ def test_annotate_face_evidence_preserves_raw_and_draws_both_boxes(
     assert passage_validator.sha256(raw_path) == raw_hash
     annotated_path = tmp_path / result["records"][0]["annotated_artifact_path"]
     assert annotated_path.is_file()
-    assert passage_validator.sha256(annotated_path) != raw_hash
-    annotated = passage_validator.cv2.imread(str(annotated_path))
-    assert annotated is not None
-    assert int(annotated[10, 10].sum()) > 0
-    assert int(annotated[20, 40].sum()) > 0
+    assert annotated_path == raw_path
+    assert passage_validator.sha256(annotated_path) == raw_hash
+    assert result["records"][0]["annotation_mode"] == "producer_owned_bbox_image"
+    assert result["records"][0]["object_box"] == [10, 10, 100, 70]
+    assert result["records"][0]["detail_box"] == [40, 20, 65, 50]
 
 
 def test_annotate_face_evidence_fails_closed_without_bbox(tmp_path: Path) -> None:
@@ -339,7 +339,7 @@ def test_annotate_face_evidence_fails_closed_without_bbox(tmp_path: Path) -> Non
         [
             {
                 "pipeline": "face",
-                "stage": "recognition_attempt",
+                "stage": "recognition_attempt_bbox",
                 "artifact_path": "face/raw.jpg",
             }
         ],

@@ -4,9 +4,9 @@ Ngày cập nhật: 11/08/2026
 
 ## 1. Mục tiêu
 
-Tài liệu này định nghĩa cách tối ưu pipeline Computer Vision của runtime hai camera và tạo
-boundary đầu vào ổn định để detection có thể được tách thành process/service riêng sau này mà
-không viết lại recognition, Event hoặc notification.
+Tài liệu này định nghĩa cách tối ưu pipeline Computer Vision của runtime hai camera và boundary
+để recognition có thể chạy trong một container độc lập mà không chuyển tracker, Event, media hoặc
+notification ra khỏi Frigate.
 
 Mục tiêu kinh doanh ưu tiên là **Gate Intelligence cho nhà máy, kho vận, depot và
 bãi xe đang có camera RTSP nhiều hãng**. Sản phẩm không cạnh tranh trực diện với
@@ -75,46 +75,57 @@ Các bằng chứng hiện có được phân loại như sau; `pass` unit test 
 8. Recognition chỉ phụ thuộc typed tracked-observation/evidence contract; detection, Event và
    transport cụ thể nằm trong adapter.
 9. Trace là side-channel bounded, không phải source of truth và không được block critical path.
+10. Mỗi deployment chỉ chọn một recognition runtime. External mode lỗi phải fail closed và trả
+    typed failure; không được chạy lại job bằng local runtime hoặc một model khác.
+11. Nhãn `Phase N` chỉ dùng trong roadmap/tài liệu/acceptance artifact; production code, config,
+    public API, metric và test name dùng tên chức năng, không mang phase label.
 
-### 4.1 Phạm vi đơn giản hóa cho phiên bản đầu
+### 4.1 Phạm vi đơn giản hóa cho external runtime
 
-V1 vẫn là một Frigate runtime. Phase 6 tách một recognition core đồng bộ khỏi
-`DetectionSubscriber`/Event bằng adapter trong cùng process; chưa thêm network hoặc worker queue.
-Phase 7 mới đóng gói async/process/service và adapter nguồn bên ngoài. Mỗi camera dùng detect stream
-thấp và một high-resolution stream dùng chung cho evidence/record khi có thể. Việc triển khai service sau
-này chỉ thay adapter đầu vào, không chuyển Event ownership hoặc recognition policy ra ngoài.
+Phase 6 giữ một core đồng bộ trong `EmbeddingProcess` để khóa parity. Phase 7 chuyển đúng core,
+Face/LPR model adapters và session state sang một recognition container riêng. Production chỉ dùng
+gRPC/mTLS giữa Frigate và container này; không xây thêm ZeroMQ production path, generic SDK hoặc
+content-addressed evidence trước khi runtime thật đạt acceptance. Local synchronous mode chỉ còn là
+topology được chọn rõ cho development/parity, không phải fallback của external mode. Packaging thành
+wheel thực hiện sau khi runtime boundary đã được chứng minh.
 
 ## 5. Kiến trúc đích
 
+Sơ đồ dưới đây là topology đích của Phase 7, chưa phải runtime hiện tại. Runtime hiện tại vẫn chạy
+Face/LPR model và `RecognitionCore` đồng bộ bên trong `EmbeddingProcess`; Phase 7 thay phần đó bằng
+external client và recognition container, không tạo decision path thứ hai chạy song song.
+
 ```mermaid
 flowchart LR
-    Camera[Camera RTSP / ONVIF]
-    Detect[Capture / Detect / Track]
-    Adapter[FrigateRecognitionAdapter]
-    Core[RecognitionCore]
-    Evidence[EvidenceResolver port]
-    Face[Face master engine]
-    LPR[LPR master engine]
-    EventAdapter[FrigateEventAdapter]
-    Event[EventAggregator canonical writer]
-    Database[Event / API / SQLite]
-    Outbox[Notification outbox]
-    Notify[Notification workers]
-    TraceQueue[Bounded trace queue]
-    TraceWriter[Trace writer thread]
+    subgraph Frigate[Frigate container]
+        Camera[Capture / detect / track]
+        Client[ExternalRecognitionClient]
+        Guard[Epoch / sequence / idempotency guard]
+        EventAdapter[FrigateEventAdapter]
+        Event[EventAggregator]
+        Media[Media / trace writer]
+        Database[API / SQLite / notification outbox]
+    end
 
-    Camera --> Detect --> Adapter --> Core
-    Detect --> Evidence
-    Detect --> Event
-    Evidence --> Core
-    Core --> Face --> EventAdapter
-    Core --> LPR --> EventAdapter
-    EventAdapter --> Event --> Database --> Outbox --> Notify
-    Detect -. trace .-> TraceQueue
-    Core -. observer .-> TraceQueue
-    Face -. trace .-> TraceQueue
-    LPR -. trace .-> TraceQueue
-    Event -. trace .-> TraceQueue --> TraceWriter
+    subgraph Service[Recognition container]
+        Grpc[gRPC mTLS server]
+        Queue[Bounded executor]
+        Models[Face / LPR model adapters]
+        Core[RecognitionCore + session state]
+        Control[Config + Face library control]
+        Health[Health / capabilities / service_epoch]
+    end
+
+    Camera --> Client
+    Client -->|RecognitionJob + raw I420 evidence| Grpc
+    Grpc -->|JobReceipt / RecognitionOutcome| Client
+    Grpc --> Queue --> Models --> Core
+    Core -->|RecognitionOutcome| Grpc
+    Client --> Guard --> EventAdapter --> Event --> Database
+    Guard --> Media
+    Camera --> Event
+    Client -. configure / Face operations .-> Control
+    Health -. readiness .-> Client
 ```
 
 ### 5.1 Runtime lanes và ownership
@@ -122,63 +133,83 @@ flowchart LR
 | Lane | Owner | Được phép làm | Không được làm |
 | --- | --- | --- | --- |
 | Detection | Capture/detect/track runtime | Phát tracked-object update, frame/evidence reference và lifecycle end | OCR/embed, recognition decision, notification hoặc disk trace |
-| Frigate input adapter | `FrigateRecognitionAdapter` | Map canonical tracked update sang `TrackedObservation`; giữ nguyên order và raw track ID | Tạo passage ID, vote, sửa bbox theo fixture hoặc sở hữu recognition state |
-| Recognition core | Face/LPR master engines | Resolve evidence, inference, history/voting và phát typed `RecognitionUpdate` | Import detection subscriber, Event/SQLite/API, notification hoặc filesystem writer |
-| Frigate output adapter | `FrigateEventAdapter` | Map `RecognitionUpdate` sang Event metadata đúng contract hiện hành | Chọn lại winner, đổi score hoặc sở hữu track lifecycle |
+| Frigate external client | `ExternalRecognitionClient` | Map canonical update sang ordered job; sở hữu evidence TTL; kiểm tra epoch/sequence/idempotency | Chạy model, vote, tự retry sang runtime khác hoặc publish result chưa hợp lệ |
+| Recognition service | Executor + model adapters + `RecognitionCore` | Inference, Face/LPR history/voting, explicit end, Face library control và typed outcome | Import Event/SQLite/notification, ghi media hoặc tự tải URL/path evidence |
+| Frigate output adapter | `FrigateEventAdapter` | Map outcome đã qua guard sang Event metadata và media contract hiện hành | Chọn lại winner, đổi score hoặc nối history qua service epoch |
 | Event | `EventAggregator` | Canonical Event/API/SQLite commit và correlation | Chạy OCR/embed hoặc sở hữu recognition history |
 | Notification | Durable outbox/worker | Gửi từ committed Event, retry/idempotency | Nhận lệnh trực tiếp từ recognition worker |
 | Trace | Một bounded queue + writer thread | Persist JSONL/metrics best-effort | Block detection/recognition/Event hoặc sở hữu evidence |
 
-Detector/tracker vẫn cập nhật base Event path trực tiếp. Recognition core chỉ sở hữu task state
-LPR/Face theo explicit track lifecycle; adapter không áp dụng attempt budget, candidate rank hay
-terminal transition riêng. Cùng chuỗi observation phải tạo đúng decision như Frigate `master`.
+Detector/tracker vẫn cập nhật base Event path trực tiếp. Frigate là owner duy nhất của track
+lifecycle, Event và media; recognition container là owner duy nhất của model, Face/LPR history và
+decision state. Cùng chuỗi observation phải tạo đúng update sequence như synchronous core.
 
 ### 5.2 Recognition input/output boundary
 
-Recognition core nhận duy nhất một input contract ổn định:
+Frigate gửi một ordered job contract ổn định:
 
 ```python
-TrackedObservation(
-    schema_version,
-    camera_id,
-    stream_epoch,
-    track_id,
-    task,
-    frame_time,
-    object_box,
-    detail_box,
-    observed_in_frame,
-    evidence_ref,
-    attributes,
+RecognitionJob(
+    job_id,
+    client_id,
+    expected_service_epoch,
+    track_key,
+    sequence,
+    operation,          # observe | end_track | cancel
+    observation,
+    deadline_budget_ms,
+    evidence,
 )
 ```
 
-`camera_id + stream_epoch + track_id` là key session do tracker/caller cung cấp; recognition không
-tự tracker, ghép trace hoặc phát sinh passage identity. `observed_in_frame` phân biệt bbox vừa được
-detector quan sát với bbox tracker dự đoán/carry-forward nhưng Phase 6 không tự suy diễn khi nguồn
-không cung cấp field này. Track end/shutdown là message lifecycle riêng, không được suy ra từ một
-observation bị thiếu.
+`track_key = camera_id + stream_epoch + track_id` do Frigate cung cấp. `sequence` tăng đơn điệu
+trong từng track; `end_track` đứng sau mọi observation đã được accept của track đó và idempotent.
+Service không tự tracker, tạo passage identity hoặc suy diễn end từ observation bị thiếu.
+Wire contract dùng budget tương đối; client giữ gRPC deadline bằng monotonic clock của chính nó,
+service đổi budget còn lại thành monotonic deadline cục bộ khi nhận job. Không truyền giá trị
+monotonic tuyệt đối giữa hai máy.
 
-Core trả `RecognitionUpdate` chứa task/key, frame/evidence lineage, raw result, aggregate result,
-score và decision reason. Phase 6 dùng lời gọi đồng bộ để khóa order/parity; Phase 7 mới đặt bounded
-async transport hoặc network quanh cùng contract.
+Service trả `JobReceipt` ngay khi admission và `RecognitionOutcome` sau xử lý. Receipt chỉ có
+`accepted=true` hoặc typed reject như `queue_full`, `invalid_evidence`, `epoch_mismatch` và
+`unavailable`. Outcome giữ job/key/sequence/epoch, frame/evidence lineage, `RecognitionUpdate`
+hoặc typed failure. Client chỉ chuyển update sang `FrigateEventAdapter` một lần sau khi guard đạt.
 
 ### 5.3 Evidence và message contract
 
-Không truyền raw frame copy không bounded qua queue. `evidence_ref` là opaque reference được
-`EvidenceResolver` chuyển thành lease:
+External V1 gửi raw contiguous I420 bytes cùng `shape`, `dtype`, `layout`, byte length, evidence ID
+và expiry. Giới hạn hard là 8 MiB/job; length phải khớp shape/dtype trước khi model attach. Không JPEG
+evidence trên inference path vì encode có thể đổi model input. Không chia sẻ `/dev/shm` hoặc IPC
+namespace giữa hai container, không gửi URL/path và không để service đọc filesystem tùy ý.
 
-```text
-Local runtime        → SharedMemoryEvidenceRef
-Service cùng host    → IpcEvidenceRef
-Service khác host    → EncodedEvidenceRef hoặc content-addressed URI có TTL
+Frigate giữ evidence đến khi nhận outcome/ack hoặc TTL hết. Service chỉ giữ buffer trong phạm vi
+job và không ghi raw/annotated media. Evidence contract không được lọc observation, xếp hạng
+candidate, vote hoặc trì hoãn publication.
+
+### 5.4 Deployment, control plane và no-fallback contract
+
+```yaml
+recognition:
+  runtime: external
+  endpoint: recognition:50051
+  deadline: 5s
+  tls:
+    ca: /config/certs/recognition-ca.crt
+    certificate: /config/certs/frigate-client.crt
+    key: /config/certs/frigate-client.key
 ```
 
-Evidence reference và typed outcome chỉ phục vụ lineage/transport. Chúng không được lọc lại
-observation, xếp hạng candidate, giữ top-K, vote hoặc trì hoãn publication. LPR clustering và Face
-weighted history của Frigate `master` tiếp tục là decision owner duy nhất.
+Recognition image chạy thành service riêng trên private Docker network và không publish port ra
+host mặc định. Model assets mount read-only; Face library là volume service sở hữu. Frigate gửi
+validated recognition config qua control RPC và forward các operation `register`, `clear`,
+`recognize` và `reprocess` Face hiện hành. Config change hoặc service restart tạo `service_epoch`
+mới, đóng toàn bộ session/pending cũ và không nối history.
 
-### 5.4 Trace transport
+Chọn `external` thì Frigate không khởi tạo local Face/LPR inference model. Thiếu endpoint/TLS hoặc
+config bị service từ chối làm startup validation fail. Sau startup, mất kết nối hoặc service
+unhealthy chỉ làm recognition fail closed bằng typed outcome; capture/detect/base Event vẫn chạy,
+không fallback sang local runtime, CPU hoặc model khác và không tự resubmit job.
+
+### 5.5 Trace transport
 
 Mọi lane chỉ `put_nowait()` một trace record nhỏ vào bounded trace queue. Trace không chứa image
 bytes và không giữ evidence lease. Khi queue đầy, production drop record chưa persist và tăng
@@ -243,10 +274,10 @@ Candidate chỉ cần đủ thông tin để recognition dùng đúng ảnh đã
 camera_id + track_id + frame_timestamp + frame_ref + object/detail bbox
 ```
 
-Không tạo time model hoặc clock-drift subsystem riêng. Với local pipeline, `frame_ref`
-trỏ tới frame/crop trong bounded buffer. Khi detection nằm ngoài process/host, cùng field này
-mang opaque `IpcEvidenceRef`/`EncodedEvidenceRef`; recognition luôn resolve qua
-`EvidenceResolver`, không phụ thuộc transport.
+Không tạo time model hoặc clock-drift subsystem riêng. Với local pipeline, `frame_ref` trỏ tới
+frame/crop trong bounded buffer. Với external runtime, client copy đúng I420 frame thành bounded
+gRPC evidence kèm shape/layout/byte length, evidence ID và expiry; service không dereference
+filesystem path hoặc URL do caller cung cấp.
 
 ## 9. Unified Quality Selector
 
@@ -492,8 +523,8 @@ tick chỉ vì code đã tồn tại.
 Đây là lộ trình **triển khai kiến trúc**. Mỗi phase bên dưới phải tạo ra runtime contract,
 module hoặc deployment topology được nêu rõ; unit test, replay và benchmark chỉ là bằng chứng
 để đóng phase, không phải work package thay thế cho phần triển khai. Phase 1–4 đã hoàn tất;
-Phase 5 là thử nghiệm `[SUPERSEDED]`; Phase 6-0 đã `[DONE]`, Phase 6 tách recognition core và
-Phase 7 đóng gói transport/service bên ngoài.
+Phase 5 là thử nghiệm `[SUPERSEDED]`; Phase 6 đã `[DONE]` với recognition core đồng bộ và Frigate
+adapters; Phase 7 là bước `[NEXT]` để chuyển model/core/session sang recognition container riêng.
 Acceptance
 tổng thể được đánh giá riêng sau khi hoàn thành toàn bộ roadmap, không dùng để đổi trạng thái từng
 phase đã hoàn tất.
@@ -502,17 +533,17 @@ phase đã hoàn tất.
 
 | Mục thiết kế | Requirement triển khai | Phase owner | Kết quả phải tồn tại |
 | --- | --- | --- | --- |
-| 1. Mục tiêu | On-premise Camera AI với recognition có thể nhúng và Event output ổn định | Phase 4–7 | Core chạy độc lập detection/Event; adapter không đổi decision contract |
+| 1. Mục tiêu | On-premise Camera AI với recognition runtime độc lập và Event output ổn định | Phase 4–7 | Recognition container không sở hữu tracker/Event/media; adapter không đổi decision contract |
 | 2. Baseline | Giữ Frigate capture/detect/track/Face/LPR/Event làm nền tảng | Phase 1–2 | Baseline và passage remediation có artifact `[DONE]` |
-| 3. Khoảng trống | Passage, quality, evidence, recognition core, adapters và trace có owner riêng | Phase 2–7 | Core/adapters/transport có phase boundary rõ, không trộn vào một patch |
-| 4. Nguyên tắc | Lineage, explicit lifecycle, non-blocking side effect và single-writer ownership | Phase 3–7 | Contract được enforce trong core/adapter/runtime, không chỉ mô tả |
-| 5. Kiến trúc đích | `TrackedObservation → RecognitionCore → RecognitionUpdate`; Frigate nằm ở adapters | Phase 6–7 | Core import/test độc lập detection/Event; transport ngoài process không đổi semantics |
+| 3. Khoảng trống | Passage, quality, evidence, recognition core, transport và trace có owner riêng | Phase 2–7 | Frigate host và recognition service có boundary rõ; không thêm parallel decision path |
+| 4. Nguyên tắc | Lineage, explicit lifecycle, bounded admission, no fallback và single-writer ownership | Phase 3–7 | Overload/restart trả typed failure; không silent drop, retry chéo runtime hoặc duplicate publish |
+| 5. Kiến trúc đích | `RecognitionJob → gRPC service → RecognitionOutcome`; Frigate giữ publication | Phase 6–7 | Docker service độc lập; core semantics không đổi và Event/media không rời Frigate |
 | 6. Quality contract | Camera profile và reject reasons có schema/runtime owner | Phase 4 | Config validate được và selector xuất quality/reject reason |
 | 7. Detect/evidence stream | Live detect dùng latest-frame; finite MP4 dùng FIFO/backpressure; evidence/record bounded riêng | Phase 4, 6-0 | Source role, frame ownership, source timeline và byte/time bound được triển khai |
-| 8. Frame reference | Observation/result/evidence giữ cùng camera, track, epoch, frame và bbox | Phase 3–7 | `EvidenceResolver` hỗ trợ local trước, IPC/encoded reference ở Phase 7 |
+| 8. Frame reference | Observation/result/evidence giữ cùng camera, track, epoch, frame và bbox | Phase 3–7 | External V1 dùng bounded raw I420 evidence, length/shape/layout validation và TTL |
 | 9. Quality/evidence observability | Face/LPR có cùng lineage và diagnostic metric | Phase 4, 6-1 | Selector không gate observation hoặc tham gia recognition decision |
 | 10. Recognition/result selection | Khôi phục nguyên vẹn LPR clustering và Face weighted voting từ Frigate master | Phase 6-1 | Khóa master commit, restore decision semantics và chứng minh parity |
-| 11. Compute control | Core đồng bộ khóa parity trước; bounded async transport bọc ngoài sau | Phase 6–7 | Async/service không thay cadence, order hoặc recognition output của core |
+| 11. Compute control | Core đồng bộ khóa parity trước; service dùng bounded ordered executor | Phase 6–7 | Queue full reject ngay; service không thay cadence, order hoặc recognition output của core |
 
 Dependency bắt buộc:
 
@@ -521,9 +552,9 @@ baseline/passage [DONE]
 → LPR execution foundation [DONE]
 → camera quality + evidence observability [DONE]
 → finite-source timeline + raw trace + native media [DONE: Phase 6-0]
-→ Frigate master voting/consensus parity [NEXT: Phase 6-1]
-→ standalone synchronous recognition core + Frigate adapters [Phase 6]
-→ async/IPC/service/external-source adapters [Phase 7]
+→ Frigate master voting/consensus parity [DONE: Phase 6-1]
+→ standalone synchronous recognition core + Frigate adapters [DONE: Phase 6]
+→ external gRPC recognition container + Frigate host adapter [NEXT: Phase 7]
 ```
 
 ### Phase 1 — Đo baseline hai camera [DONE]
@@ -799,13 +830,13 @@ recognition. Code custom còn tồn tại không được hiểu là kiến trú
 | Phase 6-0 runtime/trace/media | `[DONE]` | 11 raw LPR traces, 11/11 clips và report đã xác minh |
 | Phase 6-1 master parity | `[DONE]` | Exact LPR clustering và Face weighted voting đã có differential test |
 | Phase 6 recognition core/adapters | `[DONE]` | Production adapter/core duy nhất đã test; finite-source caller phát explicit end sau EOF và runtime cleanup đạt zero |
-| Phase 7 external transport/service | `[PLANNED]` | Chỉ làm sau khi core và Frigate adapter đã parity |
+| Phase 7 external recognition runtime | `[NEXT]` | Core và Frigate adapter đã parity; Docker/gRPC service và host integration chưa triển khai |
 
 ### Phase 6 — Master-compatible standalone recognition core [DONE]
 
 **Owner thiết kế:** mục 5, 10 và 12. Phase 6 không kế thừa custom decision contract Phase 5.
 Phase này restore master parity, sau đó tách LPR/Face thành core đồng bộ có thể import/nhúng độc lập
-với detection subscriber, Event, database và notification. Async/process/service thuộc Phase 7.
+với detection subscriber, Event, database và notification. External Docker/gRPC runtime thuộc Phase 7.
 
 #### Phase 6-0 — Finite-source runtime, raw trace lineage và native media [DONE]
 
@@ -1118,41 +1149,54 @@ cleanup cuối đạt `sessions=0`, `in_flight=0`, `evidence_pinned=0`, `writer_
 `complete`, `measurement_valid=true`, `runtime_restored=true`; Docker sau restore được kiểm tra
 `running healthy`, restart `0`.
 
-### Phase 7 — External embedding, async transport và service isolation [PLANNED]
+### Phase 7 — External recognition runtime [IN PROGRESS]
 
-Phase 7 bọc transport/deployment quanh core đã hoàn tất; không fork thuật toán LPR/Face và không
-chuyển Event/media ownership khỏi host adapter nếu deployment không yêu cầu.
+Phase 7 chuyển model inference, `RecognitionCore` và toàn bộ Face/LPR session state khỏi
+`EmbeddingProcess` sang một recognition container. Frigate giữ tracker, evidence ownership,
+Event/media publication và không có local fallback khi deployment chọn external runtime.
 
-#### Phase 7-1 — Bounded async executor [PLANNED]
+#### Phase 7-1 — Ordered executor và transport-neutral contract [DONE: SOURCE/UNIT]
 
-- Định nghĩa `RecognitionJob`/`RecognitionOutcome` từ contract Phase 6; partition/order theo
-  `camera_id + stream_epoch + track_id`.
-- Bounded queue, backpressure, cancellation và late-result policy phải được differential test với
-  synchronous core; transport không chứa reducer/winner policy.
+- Thêm `RecognitionJob`, `JobReceipt`, `RecognitionOutcome` và bounded executor một partition quanh
+  synchronous core. Observation admission dùng `put_nowait`; queue đầy trả `queue_full`, không block,
+  không loại job cũ và không gọi synchronous path.
+- Giữ sequence theo `TrackKey`; dành control capacity cho `end_track`; deadline/cancel chỉ discard
+  late update, không tuyên bố dừng model call đang chạy. Differential test phải khớp synchronous
+  update sequence khi không overload.
+- Default: một partition, 128 observation slots, 64 active-session/control slots, 128 outcomes,
+  deadline 5 giây và shutdown drain 10 giây. Capacity được cấu hình nhưng reject semantics không đổi.
 
-#### Phase 7-2 — SDK và evidence adapters [PLANNED]
+#### Phase 7-2 — gRPC/mTLS recognition service [DONE: SOURCE/UNIT]
 
-- Công bố Python embedding API cùng adapter local frame, shared memory, IPC và encoded/content-
-  addressed evidence có TTL.
-- Caller phải cung cấp stable track ID và explicit track end. SDK không tự tracker hoặc suy diễn
-  identity từ bbox/time.
+- Dựng container riêng chứa Face/LPR model adapters, executor, core, standard health,
+  `GetCapabilities`, config/Face control RPC và bidirectional recognition stream. Mỗi start tạo
+  `service_epoch`; dedupe tối đa 4.096 outcome trong 60 giây theo `client_id + job_id`.
+- Chỉ dùng gRPC cho production external path. Raw I420 evidence có metadata/TTL và hard limit
+  8 MiB; không ZeroMQ production transport, shared IPC namespace, URL/path resolver hoặc plaintext
+  non-loopback binding.
 
-#### Phase 7-3 — Recognition process/service [PLANNED]
+#### Phase 7-3 — Frigate runtime integration [DONE: SOURCE/UNIT]
 
-- Thêm IPC/gRPC adapter, schema versioning, authentication khi đi qua network, retry/idempotency và
-  health/readiness; deployment in-process vẫn được hỗ trợ.
-- Frigate, camera server hoặc ứng dụng khác chỉ thay adapter; core tests và decision semantics giữ
-  nguyên.
+- Sửa trực tiếp `EmbeddingProcess`/Face/LPR runtime để external mode không khởi tạo local inference
+  model. Host client tạo ordered jobs, forward Face control operation, kiểm tra epoch/sequence/
+  idempotency và chuyển update hợp lệ duy nhất sang `FrigateEventAdapter` hiện hành.
+- Config chỉ chọn `local` hoặc `external`. Đây là hai topology độc lập: external startup validation
+  fail khi endpoint/TLS/config sai; runtime disconnect trả unhealthy/typed failure và không fallback,
+  tự retry job hoặc nối session qua epoch.
 
-#### Phase 7-4 — Fault isolation và capacity [PLANNED]
+#### Phase 7-4 — Docker acceptance và packaging [PARTIAL]
 
-- Benchmark in-process/IPC/service trên cùng fixture, đo throughput, queue age, CPU/GPU/VRAM/RAM,
-  latency và failure recovery.
-- Chứng minh worker restart, network timeout hoặc overload không làm đổi track ownership, duplicate
-  Event hoặc trộn result giữa camera/epoch.
+- Build Frigate image và recognition image riêng; recognition service có GPU/resource/health policy,
+  private network, model mount read-only, Face library read-write volume và certificate mount. Chưa
+  tách wheel trước khi integration runtime đạt.
+- Chứng minh synchronous baseline và external service tạo cùng ordered decision/update sequence trên
+  fixture khi healthy; overload, deadline, disconnect và restart không duplicate/stale publication.
+  Terminal gate bắt buộc: sessions, in-flight, queue depth và evidence leases đều bằng `0`.
+- Sau runtime acceptance mới đóng gói core/executor và client/schema thành hai wheel; packaging không
+  được tạo namespace hay semantics song song với code đã chạy trong hai image.
 
-Phase 6-0 đã `[DONE]` nhưng không đồng nghĩa recognition core đã hoàn tất. Phase 6 chỉ chuyển
-`[DONE]` khi Phase 6-1…6-5 hoàn thành. Phase 7 được đánh giá độc lập sau đó; `Acceptance tổng thể`
+Phase 6-0 hoàn tất riêng không đồng nghĩa recognition core đã hoàn tất. Hiện Phase 6-1…6-5 đều đã
+hoàn thành và Phase 6 đã đóng `[DONE]`. Phase 7 được đánh giá độc lập sau đó; `Acceptance tổng thể`
 vẫn kết luận riêng theo mục 14 trên artifact của toàn bộ roadmap đã chọn triển khai.
 
 ## 14. Acceptance tổng thể
@@ -1170,7 +1214,7 @@ kết quả đo hiện tại, không suy diễn Acceptance từ riêng Phase 5 h
 | --- | --- |
 | CV quality | Passage recall/precision, recognition precision/recall và latency đạt product profile trên denominator công bố; không mặc định 100% |
 | Data correctness | Không gắn plate/identity sang physical passage khác; commit, frame reference, bbox và evidence cùng generation |
-| Runtime correctness | Queue/memory bounded, không stale result, duplicate owner hoặc duplicate commit; failure có degraded behavior rõ |
+| Runtime correctness | Queue/memory bounded, không stale result, duplicate owner hoặc duplicate commit; external failure trả typed outcome và không fallback |
 | Development acceptance | Unit/integration/replay case độc lập hoàn thành dưới 120 giây để giữ vòng lặp phát triển ngắn |
 
 ## 15. Bản đồ code và đường dẫn cần can thiệp
@@ -1254,14 +1298,15 @@ acceptance ở mục 13:
 | `[DONE]` | Core/differential/adapter tests, whole project và deployment | Phase 6-5: parity/import-isolation/single-owner tests đạt; run `20260811-201337-397` report complete, measurement valid, 4/4 Face raw traces recognized, 15/15 native clips, 22/22 bbox images và runtime healthy sau restore. |
 | `[CURRENT]` | `tools/runtime/validate_platform_runtime.py`, `tools/reporting/summarize_platform_runtime.py`, Phase artifacts | Runtime test xuyên roadmap, full evidence report và diagnostic summary; không kết luận pass/fail bằng threshold. |
 
-### 15.7 Phase 7 — External embedding, async transport và service isolation [PLANNED]
+### 15.7 Phase 7 — External recognition runtime [NEXT]
 
 | Trạng thái | Đường dẫn | Can thiệp |
 | --- | --- | --- |
-| `[PLANNED]` | `frigate/frigate/recognition/executor.py` | Per-track ordered bounded async wrapper quanh synchronous core; không chứa voting/winner policy. |
-| `[PLANNED]` | `frigate/frigate/recognition/sdk.py`, evidence adapters | Python SDK và local/shared-memory/IPC/encoded evidence providers với explicit track lifecycle. |
-| `[PLANNED]` | `frigate/frigate/recognition/service/`, transport schemas | IPC/gRPC service, schema versioning, idempotency, authentication và health/readiness. |
-| `[PLANNED]` | Deployment, integration và capacity tests | So sánh in-process/IPC/service, fault isolation, restart/timeout và hardware/queue metrics. |
+| `[DONE: SOURCE/UNIT]` | `frigate/frigate/recognition/executor.py`, transport-neutral contracts | Bounded one-partition executor, ordered track lifecycle, typed receipt/outcome, deadline/cancel và terminal drain; không voting/winner/Event logic. |
+| `[DONE: SOURCE/UNIT]` | `frigate/frigate/recognition/service/`, protobuf schema | gRPC/mTLS stream, health/capabilities, config và Face control operations, service epoch, bounded dedupe và raw I420 validation đã có targeted test. |
+| `[DONE: SOURCE/UNIT]` | `frigate/frigate/embeddings/maintainer.py`, `external_recognition.py` | External client được chọn trực tiếp trong runtime; nhánh này không khởi tạo local Face/LPR model, guard epoch/sequence trước publication và không có fallback. |
+| `[PARTIAL]` | Recognition Docker target, Compose/deployment và integration tests | Image target/container riêng cùng Compose mTLS đã được khai báo và `docker compose config` đạt; actual image build, GPU runtime, restart fault và terminal cleanup acceptance chưa chạy nên chưa đóng phase. |
+| `[PLANNED]` | Core/client wheel packaging | Chỉ tách hai wheel sau runtime acceptance; wheel phải đóng gói code đã chạy, không tạo implementation song song. |
 
 ### 15.8 Profile nguồn LPR 1024p hiện tại
 

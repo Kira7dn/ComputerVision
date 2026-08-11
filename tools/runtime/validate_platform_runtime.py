@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -262,6 +263,143 @@ def validate_runtime_lpr_evidence(
     return records, summary
 
 
+def validate_external_recognition_evidence(
+    media_root: Path,
+    runtime_records: list[dict[str, Any]],
+    evidence_records: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Require source artifacts for attempts and typed reasons for skipped traces."""
+    errors: list[str] = []
+    resolved_root = media_root.resolve()
+    evidence_by_trace: dict[str, list[dict[str, Any]]] = collections.defaultdict(list)
+    for record in evidence_records:
+        trace_id = str(record.get("trace_id") or "")
+        if trace_id:
+            evidence_by_trace[trace_id].append(record)
+
+    attempts = [
+        record
+        for record in runtime_records
+        if record.get("pipeline") == "face"
+        and record.get("stage") == "first_attempt"
+    ]
+    for attempt in attempts:
+        trace_id = str(attempt.get("trace_id") or "")
+        frame_time = attempt.get("frame_time")
+        matching = [
+            record
+            for record in evidence_by_trace.get(trace_id, ())
+            if record.get("frame_time") == frame_time
+        ]
+        stages = {str(record.get("stage")) for record in matching}
+        for stage in (
+            "recognition_attempt",
+            "recognition_attempt_bbox",
+            "face_crop",
+        ):
+            if stage not in stages:
+                errors.append(f"{trace_id}@{frame_time}:missing stage: {stage}")
+
+        source = next(
+            (record for record in matching if record.get("stage") == "recognition_attempt"),
+            None,
+        )
+        crop = next(
+            (record for record in matching if record.get("stage") == "face_crop"),
+            None,
+        )
+        if source is None or crop is None:
+            continue
+        if source.get("bbox_format") != "xyxy_pixels":
+            errors.append(f"{trace_id}@{frame_time}:invalid bbox format")
+        if source.get("bbox_coordinate_space") != "recognition_attempt":
+            errors.append(f"{trace_id}@{frame_time}:invalid bbox coordinate space")
+        detail_box = source.get("effective_crop_box")
+        source_shape = source.get("image_shape")
+        crop_shape = crop.get("image_shape")
+        if (
+            not isinstance(detail_box, list)
+            or len(detail_box) != 4
+            or not isinstance(source_shape, list)
+            or len(source_shape) < 2
+            or not isinstance(crop_shape, list)
+            or len(crop_shape) < 2
+        ):
+            errors.append(f"{trace_id}@{frame_time}:missing face bbox geometry")
+            continue
+        x1, y1, x2, y2 = (int(value) for value in detail_box)
+        height, width = (int(source_shape[0]), int(source_shape[1]))
+        if not (0 <= x1 < x2 <= width and 0 <= y1 < y2 <= height):
+            errors.append(f"{trace_id}@{frame_time}:face bbox outside source image")
+        if [int(crop_shape[0]), int(crop_shape[1])] != [y2 - y1, x2 - x1]:
+            errors.append(f"{trace_id}@{frame_time}:face crop does not match bbox")
+
+        artifact_path = source.get("artifact_path")
+        if artifact_path:
+            sidecar = (media_root / str(artifact_path)).parent / "evidence.json"
+            if not sidecar.is_file():
+                errors.append(f"{trace_id}@{frame_time}:missing evidence.json")
+            else:
+                try:
+                    sidecar_payload = json.loads(sidecar.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    errors.append(f"{trace_id}@{frame_time}:invalid evidence.json")
+                else:
+                    if (
+                        sidecar_payload.get("bbox_format") != "xyxy_pixels"
+                        or sidecar_payload.get("bbox_coordinate_space")
+                        != "recognition_attempt"
+                    ):
+                        errors.append(
+                            f"{trace_id}@{frame_time}:sidecar missing bbox contract"
+                        )
+
+    for trace_id, records in evidence_by_trace.items():
+        for record in records:
+            relative = record.get("artifact_path")
+            if not relative:
+                continue
+            target = (media_root / str(relative)).resolve()
+            if not target.is_relative_to(resolved_root) or not target.is_file():
+                errors.append(f"{trace_id}:missing artifact: {relative}")
+                continue
+            if sha256(target) != record.get("artifact_sha256"):
+                errors.append(f"{trace_id}:sha256 mismatch: {relative}")
+            if target.stat().st_size != int(record.get("artifact_bytes", -1)):
+                errors.append(f"{trace_id}:byte size mismatch: {relative}")
+
+    tracked = {
+        str(record.get("trace_id"))
+        for record in runtime_records
+        if record.get("stage") == "track_seen"
+        and record.get("pipeline") in {"face", "lpr"}
+        and record.get("trace_id")
+    }
+    explained = set(evidence_by_trace) | {
+        str(record.get("trace_id"))
+        for record in runtime_records
+        if record.get("stage") in {
+            "recognition_skipped",
+            "recognition_failed",
+            "ocr_result",
+            "first_attempt",
+        }
+        and record.get("trace_id")
+    }
+    for trace_id in sorted(tracked - explained):
+        errors.append(f"{trace_id}:missing source artifact or typed skip reason")
+
+    return {
+        "valid": bool(attempts) and not errors,
+        "attempt_count": len(attempts),
+        "face_artifact_count": sum(
+            record.get("pipeline") == "face" and bool(record.get("artifact_path"))
+            for record in evidence_records
+        ),
+        "errors": errors,
+    }
+
+
 def run_deploy(command: str, config: Path | None = None, timeout: int = 45) -> None:
     args = [
         "powershell",
@@ -294,6 +432,117 @@ def run_deploy(command: str, config: Path | None = None, timeout: int = 45) -> N
         )
 
 
+def create_recognition_tls(directory: Path) -> None:
+    """Create a run-scoped CA and server/client identities for mTLS."""
+    openssl = shutil.which("openssl")
+    directory.mkdir(parents=True, exist_ok=True)
+    server_ext = directory / "server.ext"
+    client_ext = directory / "client.ext"
+    server_ext.write_text(
+        "subjectAltName=DNS:recognition\nextendedKeyUsage=serverAuth\n",
+        encoding="utf-8",
+    )
+    client_ext.write_text("extendedKeyUsage=clientAuth\n", encoding="utf-8")
+    commands = (
+        (
+            "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+            "-keyout", "ca.key", "-out", "ca.crt", "-days", "1",
+            "-subj", "/CN=recognition-test-ca",
+        ),
+        (
+            "req", "-newkey", "rsa:2048", "-nodes", "-keyout", "server.key",
+            "-out", "server.csr", "-subj", "/CN=recognition",
+        ),
+        (
+            "x509", "-req", "-in", "server.csr", "-CA", "ca.crt",
+            "-CAkey", "ca.key", "-CAcreateserial", "-out", "server.crt",
+            "-days", "1", "-extfile", "server.ext",
+        ),
+        (
+            "req", "-newkey", "rsa:2048", "-nodes", "-keyout", "client.key",
+            "-out", "client.csr", "-subj", "/CN=frigate",
+        ),
+        (
+            "x509", "-req", "-in", "client.csr", "-CA", "ca.crt",
+            "-CAkey", "ca.key", "-CAcreateserial", "-out", "client.crt",
+            "-days", "1", "-extfile", "client.ext",
+        ),
+    )
+    if openssl is None:
+        script = "\n".join(
+            "openssl " + subprocess.list2cmdline(list(command))
+            for command in commands
+        )
+        completed = subprocess.run(
+            [
+                "docker",
+                "run",
+                "--rm",
+                "--volume",
+                f"{directory.resolve()}:/tls",
+                "--workdir",
+                "/tls",
+                "--entrypoint",
+                "/bin/sh",
+                "camera-recognition:current",
+                "-ec",
+                script,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=60,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(
+                f"Recognition TLS generation failed: {completed.stderr.strip()}"
+            )
+        return
+    for command in commands:
+        completed = subprocess.run(
+            [openssl, *command],
+            cwd=directory,
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(
+                f"Recognition TLS generation failed: {completed.stderr.strip()}"
+            )
+
+
+def configure_recognition_topology(
+    config: dict[str, Any], topology: str, workspace: Path
+) -> Path | None:
+    if topology == "local":
+        config["recognition"] = {"runtime": "local"}
+        return None
+    tls_directory = workspace / "recognition-tls"
+    create_recognition_tls(tls_directory)
+    config["recognition"] = {
+        "runtime": "external",
+        "endpoint": "recognition:50051",
+        "deadline": 5,
+        "observation_capacity": 128,
+        "control_capacity": 64,
+        "outcome_capacity": 128,
+        "shutdown_drain": 10,
+        "tls": {
+            "ca": "/run/recognition-tls/ca.crt",
+            "certificate": "/run/recognition-tls/client.crt",
+            "key": "/run/recognition-tls/client.key",
+            "server_name": "recognition",
+        },
+    }
+    return tls_directory
+
+
 def docker_output(*args: str, timeout: int = 10, check: bool = True) -> str:
     result = subprocess.run(
         ["docker", *args],
@@ -307,25 +556,10 @@ def docker_output(*args: str, timeout: int = 10, check: bool = True) -> str:
     return result.stdout.strip()
 
 
-def capture_container_diagnostics(output: Path, since: float | None) -> None:
-    """Persist acceptance-container evidence before restore replaces it."""
-    inspect = subprocess.run(
-        ["docker", "inspect", "frigate"],
-        check=False,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=10,
-    )
-    (output / "container-inspect.json").write_text(
-        inspect.stdout or inspect.stderr, encoding="utf-8"
-    )
-    args = ["docker", "logs", "frigate"]
-    if since is not None:
-        args += ["--since", str(int(since))]
-    logs = subprocess.run(
-        args,
+def docker_logs(container: str, since: float) -> str:
+    """Read both container streams because Python logging uses stderr."""
+    result = subprocess.run(
+        ["docker", "logs", "--since", str(int(since)), container],
         check=False,
         capture_output=True,
         text=True,
@@ -333,14 +567,55 @@ def capture_container_diagnostics(output: Path, since: float | None) -> None:
         errors="replace",
         timeout=15,
     )
-    (output / "container.log").write_text(logs.stdout + logs.stderr, encoding="utf-8")
+    return "\n".join(
+        part.strip() for part in (result.stdout, result.stderr) if part.strip()
+    )
+
+
+def capture_container_diagnostics(
+    output: Path, since: float | None, topology: str = "local"
+) -> None:
+    """Persist acceptance-container evidence before restore replaces it."""
+    containers = ["frigate"]
+    if topology == "external":
+        containers.append("camera-recognition")
+    for container in containers:
+        suffix = "" if container == "frigate" else "-recognition"
+        inspect = subprocess.run(
+            ["docker", "inspect", container],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+        )
+        (output / f"container-inspect{suffix}.json").write_text(
+            inspect.stdout or inspect.stderr, encoding="utf-8"
+        )
+        args = ["docker", "logs", container]
+        if since is not None:
+            args += ["--since", str(int(since))]
+        logs = subprocess.run(
+            args,
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+        )
+        (output / f"container{suffix}.log").write_text(
+            logs.stdout + logs.stderr, encoding="utf-8"
+        )
 
 
 def restart_counts() -> dict[str, int]:
     names = [
         name
         for name in docker_output("ps", "--format", "{{.Names}}").splitlines()
-        if name == "frigate" or name.startswith("camera-replay-")
+        if name in {"frigate", "camera-recognition"}
+        or name.startswith("camera-replay-")
     ]
     return {
         name: int(docker_output("inspect", name, "--format", "{{.RestartCount}}"))
@@ -557,7 +832,10 @@ def parse_bytes(value: str) -> int:
 
 
 class ResourceSampler:
-    def __init__(self) -> None:
+    def __init__(self, topology: str = "local") -> None:
+        self.containers = ["frigate"] + (
+            ["camera-recognition"] if topology == "external" else []
+        )
         self.stop_event = threading.Event()
         self.memory_bytes: list[int] = []
         self.cpu_percent: list[float] = []
@@ -584,17 +862,22 @@ class ResourceSampler:
     def _run(self) -> None:
         while not self.stop_event.is_set():
             try:
-                usage = docker_output(
-                    "stats",
-                    "--no-stream",
-                    "--format",
-                    "{{.CPUPerc}}|{{.MemUsage}}",
-                    "frigate",
-                    timeout=5,
-                )
-                cpu_text, memory_text = usage.split("|", 1)
-                self.cpu_percent.append(float(cpu_text.rstrip("%")))
-                self.memory_bytes.append(parse_bytes(memory_text.split("/")[0]))
+                cpu_total = 0.0
+                memory_total = 0
+                for container in self.containers:
+                    usage = docker_output(
+                        "stats",
+                        "--no-stream",
+                        "--format",
+                        "{{.CPUPerc}}|{{.MemUsage}}",
+                        container,
+                        timeout=5,
+                    )
+                    cpu_text, memory_text = usage.split("|", 1)
+                    cpu_total += float(cpu_text.rstrip("%"))
+                    memory_total += parse_bytes(memory_text.split("/")[0])
+                self.cpu_percent.append(cpu_total)
+                self.memory_bytes.append(memory_total)
                 gpu = subprocess.run(
                     [
                         "nvidia-smi",
@@ -662,6 +945,8 @@ def wait_recognition_idle(timeout: float = 10.0) -> bool:
                 and int(recognition.get("sessions", 0)) == 0
                 and int(recognition.get("evidence_pinned", 0)) == 0
                 and int(recognition.get("writer_depth", 0)) == 0
+                and int(recognition.get("queue_depth", 0)) == 0
+                and int(recognition.get("outcome_depth", 0)) == 0
             ):
                 return True
         except Exception:
@@ -1728,7 +2013,7 @@ def media_evidence_records(media_root: Path) -> list[dict[str, Any]]:
 def annotate_face_evidence(
     media_root: Path, records: list[dict[str, Any]]
 ) -> dict[str, Any]:
-    """Create report-only bbox overlays while preserving producer JPEGs byte-for-byte."""
+    """Validate and expose producer-owned Face images without deriving new media."""
     result: dict[str, Any] = {
         "eligible_records": 0,
         "annotated_count": 0,
@@ -1754,30 +2039,10 @@ def annotate_face_evidence(
         y2 = max(0, min(height - 1, y2))
         return (x1, y1, x2, y2) if x2 > x1 and y2 > y1 else None
 
-    def draw_box(
-        image: np.ndarray,
-        box: tuple[int, int, int, int],
-        label: str,
-        color: tuple[int, int, int],
-    ) -> None:
-        x1, y1, x2, y2 = box
-        cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
-        label_y = max(16, y1 - 5)
-        cv2.putText(
-            image,
-            label,
-            (x1, label_y),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            color,
-            1,
-            cv2.LINE_AA,
-        )
-
     for source_record in records:
         if (
             source_record.get("pipeline") != "face"
-            or source_record.get("stage") != "recognition_attempt"
+            or source_record.get("stage") != "recognition_attempt_bbox"
         ):
             continue
         result["eligible_records"] += 1
@@ -1805,38 +2070,15 @@ def annotate_face_evidence(
         if person_box is None or face_box is None:
             result["missing_bbox"] += 1
             continue
-        annotated = image.copy()
-        draw_box(annotated, person_box, "person", (0, 255, 0))
-        draw_box(annotated, face_box, "face", (0, 255, 255))
-        identity = str(record.get("raw_identity") or "unknown")
-        score = record.get("raw_score")
-        header = f"{record.get('trace_id', '-')} | {identity}"
-        if score is not None:
-            header += f" | {float(score):.3f}"
-        cv2.putText(
-            annotated,
-            header,
-            (8, 22),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            (255, 255, 255),
-            2,
-            cv2.LINE_AA,
-        )
-        annotated_path = raw_path.with_name(f"{raw_path.stem}-annotated.jpg")
-        if not cv2.imwrite(str(annotated_path), annotated):
-            result["errors"].append(f"cannot write {annotated_path}")
-            continue
         if sha256(raw_path) != raw_hash:
             result["errors"].append(f"raw artifact changed {artifact_path}")
-            annotated_path.unlink(missing_ok=True)
             continue
-        relative = annotated_path.relative_to(resolved_root).as_posix()
         record.update(
             {
-                "annotated_artifact_path": relative,
-                "annotated_artifact_sha256": sha256(annotated_path),
-                "annotated_artifact_bytes": annotated_path.stat().st_size,
+                "annotated_artifact_path": str(artifact_path),
+                "annotated_artifact_sha256": raw_hash,
+                "annotated_artifact_bytes": raw_path.stat().st_size,
+                "annotation_mode": "producer_owned_bbox_image",
             }
         )
         result["records"].append(record)
@@ -2106,6 +2348,49 @@ def collect_native_trace_clips(
             "clip_path": None,
             "recordings": [],
             "record_count": len(trace_records),
+        }
+        recognition_history = []
+        for record in trace_records:
+            stage = str(record.get("stage") or "")
+            if stage not in {
+                "ocr_result",
+                "event_published",
+                "first_attempt",
+                "confirmed_result",
+                "recognition_failed",
+                "recognition_skipped",
+            }:
+                continue
+            recognition_history.append(
+                {
+                    "stage": stage,
+                    "frame_time": record.get("frame_time"),
+                    "value": record.get("plate", record.get("identity")),
+                    "score": record.get("score"),
+                    "reason": record.get("reason"),
+                }
+            )
+        published_stages = {"event_published", "confirmed_result"}
+        final_result = next(
+            (
+                item
+                for item in reversed(recognition_history)
+                if item["stage"] in published_stages
+            ),
+            recognition_history[-1] if recognition_history else None,
+        )
+        metadata["recognition"] = {
+            "status": (
+                "published"
+                if final_result and final_result["stage"] in published_stages
+                else "skipped"
+                if final_result and final_result["stage"] == "recognition_skipped"
+                else "observed"
+                if final_result
+                else "not_recognized"
+            ),
+            "final_result": final_result,
+            "history": recognition_history,
         }
         range_key = f"{pipeline}\0{trace_id}"
         recordings: list[dict[str, Any]] = recordings_by_range.get(range_key, [])
@@ -3530,10 +3815,15 @@ def write_failure_only_report(output: Path, summary: dict[str, Any]) -> Path:
     return report_path
 
 
-def main() -> int:
-    argparse.ArgumentParser(
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
         description="Run one Platform runtime evidence replay and create a timestamped report."
-    ).parse_args()
+    )
+    parser.add_argument(
+        "--topology", choices=("local", "external"), default="local"
+    )
+    args = parser.parse_args(argv)
+    topology = str(args.topology)
     config = Path("deploy/config.yaml")
     manifest_path = Path("tools/fixtures/platform_passage_ground_truth.yaml")
     output_root = Path(".tmp/platform-runtime")
@@ -3545,6 +3835,7 @@ def main() -> int:
     summary: dict[str, Any] = {
         "schema_version": 2,
         "profile": "platform-runtime-evidence",
+        "topology": topology,
         "accepted": None,
         "acceptance": {
             "mode": "evidence_only",
@@ -3566,6 +3857,7 @@ def main() -> int:
     previous_skip_ready = os.environ.get("CAMERA_SKIP_READY_WAIT")
     previous_source_overlay = os.environ.get("CAMERA_SOURCE_OVERLAY")
     previous_report_media = os.environ.get("CAMERA_REPORT_MEDIA_DIR")
+    previous_recognition_tls = os.environ.get("RECOGNITION_TLS_DIR")
     runtime_started = False
     sampler: ResourceSampler | None = None
     isolated_start_wall: float | None = None
@@ -3603,6 +3895,11 @@ def main() -> int:
         isolated_config = Path(fixture["config"])
         value = yaml.safe_load(isolated_config.read_text(encoding="utf-8"))
         value["runtime"]["image"] = base_config["runtime"]["image"]
+        tls_directory = configure_recognition_topology(
+            value, topology, runtime_workspace
+        )
+        if tls_directory is not None:
+            os.environ["RECOGNITION_TLS_DIR"] = str(tls_directory.resolve())
         isolated_config.write_text(
             yaml.safe_dump(value, sort_keys=False, allow_unicode=True), encoding="utf-8"
         )
@@ -3622,9 +3919,12 @@ def main() -> int:
         os.environ["PASSAGE_CAPTURE_START_PATH"] = CAPTURE_START_CONTAINER_PATH
         os.environ["PASSAGE_CAPTURE_CUTOFF_PATH"] = CAPTURE_CUTOFF_CONTAINER_PATH
         os.environ["PASSAGE_RUN_ID"] = run_id
-        os.environ["CAMERA_SOURCE_OVERLAY"] = str(
-            (Path.cwd() / "frigate" / "frigate").resolve()
-        )
+        if topology == "local":
+            os.environ["CAMERA_SOURCE_OVERLAY"] = str(
+                (Path.cwd() / "frigate" / "frigate").resolve()
+            )
+        else:
+            os.environ.pop("CAMERA_SOURCE_OVERLAY", None)
         report_media = output / "media"
         report_media.mkdir(parents=True, exist_ok=True)
         source_start_dir = report_media / "source-start"
@@ -3641,7 +3941,11 @@ def main() -> int:
         )
         summary["capture_start_epoch"] = capture_start
         try:
-            run_deploy("acceptance-start", Path(fixture["config"]), timeout=30)
+            run_deploy(
+                "acceptance-start",
+                Path(fixture["config"]),
+                timeout=90 if topology == "external" else 30,
+            )
         finally:
             if previous_source_overlay is None:
                 os.environ.pop("CAMERA_SOURCE_OVERLAY", None)
@@ -3654,7 +3958,7 @@ def main() -> int:
         )
         observation_wall = time.time()
         initial_restarts = restart_counts()
-        sampler = ResourceSampler()
+        sampler = ResourceSampler(topology)
         sampler.start()
 
         replay_sources = value["runtime"]["direct"]["sources"]
@@ -3718,7 +4022,10 @@ def main() -> int:
         recognition_stats = sampler.recognition[-1] if sampler.recognition else {}
         final_restarts = restart_counts()
 
-        for pipeline in ("lpr", "face"):
+        # Frigate owns persisted evidence in both topologies. The external
+        # service transports source artifacts but never writes this volume.
+        evidence_pipelines = ("lpr", "face")
+        for pipeline in evidence_pipelines:
             evidence_manifest = output / "media" / pipeline / "evidence.jsonl"
             if not wait_file_quiescent(evidence_manifest):
                 raise RuntimeError(
@@ -3759,6 +4066,19 @@ def main() -> int:
         runtime_records = records
         raw_lpr_trace_ids = pipeline_trace_ids(runtime_records, "lpr")
         all_media_evidence = media_evidence_records(output / "media")
+        external_evidence = (
+            validate_external_recognition_evidence(
+                output / "media", runtime_records, all_media_evidence
+            )
+            if topology == "external"
+            else {"valid": True, "errors": []}
+        )
+        if not external_evidence["valid"]:
+            raise RuntimeError(
+                "External recognition evidence is invalid: "
+                + "; ".join(external_evidence.get("errors", ()))
+            )
+        write_json(output / "external-recognition-evidence.json", external_evidence)
         face_annotated_evidence = annotate_face_evidence(
             output / "media", all_media_evidence
         )
@@ -3783,6 +4103,11 @@ def main() -> int:
             durations,
             passages_by_camera,
         )
+        if not runtime_lpr_evidence["valid"]:
+            raise RuntimeError(
+                "Runtime LPR evidence is invalid: "
+                + "; ".join(runtime_lpr_evidence.get("errors", ()))
+            )
         observed_lpr_trace_metrics = trace_metrics(evidence_records, replay_seconds)
         write_json(
             output / "runtime-evidence.json",
@@ -3796,6 +4121,8 @@ def main() -> int:
                     "sessions",
                     "in_flight",
                     "evidence_pinned",
+                    "queue_depth",
+                    "outcome_depth",
                     "writer_depth",
                 )
             ),
@@ -3821,21 +4148,12 @@ def main() -> int:
         lpr["raw_trace_count"] = len(raw_lpr_trace_ids)
         lpr["expected_trace_count"] = len(lpr_passages)
         correlation = correlation_mismatches(comparison_records)
-        runtime_logs = docker_output(
-            "logs",
-            "frigate",
-            "--since",
-            str(int(observation_wall)),
-            timeout=15,
-            check=False,
-        )
-        model_logs = docker_output(
-            "logs",
-            "frigate",
-            "--since",
-            str(int(isolated_start_wall)),
-            timeout=15,
-            check=False,
+        runtime_logs = docker_logs("frigate", observation_wall)
+        model_logs = docker_logs("frigate", isolated_start_wall)
+        recognition_logs = (
+            docker_logs("camera-recognition", isolated_start_wall)
+            if topology == "external"
+            else ""
         )
         pending = parse_pending(runtime_logs)
         pending_source = "recognition_log"
@@ -3853,6 +4171,12 @@ def main() -> int:
                 r"reconnect|stall|no frames|ffmpeg.*(?:error|crash)", line, re.I
             )
         ]
+        if topology == "external":
+            bad_log_lines.extend(
+                line
+                for line in recognition_logs.splitlines()
+                if re.search(r"traceback|service_disconnected|epoch_mismatch", line, re.I)
+            )
         api_consistent, api_mismatches, uncommitted_updates = api_sqlite_consistency(
             records, str(value["database"]["path"])
         )
@@ -3870,6 +4194,11 @@ def main() -> int:
         )
         model_loads = len(re.findall(r"ONNX: loading .*yolov9-t-320\.onnx", model_logs))
         face_model_loads = len(re.findall(r"Face recognition initialized", model_logs))
+        service_epochs = re.findall(
+            r"Recognition service listening .* epoch=([0-9a-f]+)", recognition_logs
+        )
+        recognition_service_started = topology == "local" or len(service_epochs) == 1
+        local_models_disabled = topology == "local" or face_model_loads == 0
 
         latency = {
             "face": {
@@ -3940,6 +4269,15 @@ def main() -> int:
                 "face_expected": 1,
                 "face_actual": face_model_loads,
             },
+            "recognition_service": {
+                "topology": topology,
+                "started": recognition_service_started,
+                "service_epoch": service_epochs[0] if len(service_epochs) == 1 else None,
+                "local_models_disabled": local_models_disabled,
+                "healthy": bool(recognition_stats.get("service_healthy", 0))
+                if topology == "external"
+                else None,
+            },
             "resources": resources,
             "hardware_samples": {
                 "cpu_percent": hardware_cpu_samples,
@@ -3953,6 +4291,7 @@ def main() -> int:
             "source_pts": observed_source_pts,
             "recognition_metrics": {"samples": sampler.recognition},
             "lpr_evidence": runtime_lpr_evidence,
+            "external_recognition_evidence": external_evidence,
             "face_annotated_evidence": {
                 key: value
                 for key, value in face_annotated_evidence.items()
@@ -4029,7 +4368,15 @@ def main() -> int:
             "shm": resources["shm_max_percent"] is not None
             and resources["shm_max_percent"] < 70,
             "model_load_once_per_instance": model_loads == detector_count
-            and face_model_loads == 1,
+            and (
+                face_model_loads == 1
+                if topology == "local"
+                else recognition_service_started and local_models_disabled
+            ),
+            "recognition_service_started": recognition_service_started,
+            "external_has_no_local_models": local_models_disabled,
+            "recognition_service_healthy": topology == "local"
+            or bool(recognition_stats.get("service_healthy", 0)),
             "recognition_cleanup_zero": recognition["cleanup_zero"],
             "recognition_writer_drops_zero": recognition.get("writer_drops", 0) == 0,
             "recognition_writer_errors_zero": recognition.get("writer_errors", 0) == 0,
@@ -4040,7 +4387,7 @@ def main() -> int:
         summary.setdefault("gates", {})["error_free"] = False
     finally:
         try:
-            capture_container_diagnostics(output, isolated_start_wall)
+            capture_container_diagnostics(output, isolated_start_wall, topology)
         except Exception as exc:
             summary.setdefault("diagnostic_errors", []).append(
                 f"{type(exc).__name__}: {exc}"
@@ -4102,6 +4449,10 @@ def main() -> int:
             "lpr.json",
             "container-inspect.json",
             "container.log",
+        ) + (
+            ("container-inspect-recognition.json", "container-recognition.log")
+            if topology == "external"
+            else ()
         )
         artifacts_complete = all((output / name).is_file() for name in artifact_names)
         native_media_complete = bool(
@@ -4176,6 +4527,10 @@ def main() -> int:
             os.environ.pop("CAMERA_SOURCE_OVERLAY", None)
         else:
             os.environ["CAMERA_SOURCE_OVERLAY"] = previous_source_overlay
+        if previous_recognition_tls is None:
+            os.environ.pop("RECOGNITION_TLS_DIR", None)
+        else:
+            os.environ["RECOGNITION_TLS_DIR"] = previous_recognition_tls
         write_json(output / "summary.json", summary)
         report_path = write_failure_only_report(output, summary)
         summary["report"]["artifacts"].append(

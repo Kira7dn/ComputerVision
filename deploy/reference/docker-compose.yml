@@ -4,6 +4,28 @@ x-frigate-image: &frigate-image
   image: ${FRIGATE_IMAGE:-camera-frigate:0.18.0-33c00a27e-runtime3-reviewfix1-tensorrt}
 
 services:
+  recognition:
+    image: ${RECOGNITION_IMAGE:-camera-recognition:current}
+    profiles: ["external-recognition"]
+    container_name: camera-recognition
+    restart: unless-stopped
+    shm_size: "1gb"
+    gpus: all
+    env_file:
+      - path: ../../.env.local
+        required: true
+    environment:
+      FRIGATE_TELEGRAM_BOT_TOKEN: ${FRIGATE_TELEGRAM_BOT_TOKEN:-${TELEGRAM_BOT_TOKEN:-}}
+      FRIGATE_TELEGRAM_CHAT_ID: ${FRIGATE_TELEGRAM_CHAT_ID:-${TELEGRAM_CHAT_ID:-}}
+      FRIGATE_ZALO_BOT_TOKEN: ${FRIGATE_ZALO_BOT_TOKEN:-${ZALO_BOT_TOKEN:-}}
+      FRIGATE_ZALO_CHAT_ID: ${FRIGATE_ZALO_CHAT_ID:-${ZALO_CHAT_ID:-}}
+    volumes:
+      - frigate-config:/config:ro
+      - ${CAMERA_CONFIG_FILE:?run.ps1 must set CAMERA_CONFIG_FILE}:/config/config.yml:ro
+      - ${FRIGATE_MEDIA_DIR:-E:/Docker/Frigate/media}:/media/frigate
+      - ${RECOGNITION_TLS_DIR:-../../.tmp/runtime/recognition-tls}:/run/recognition-tls:ro
+      - /etc/localtime:/etc/localtime:ro
+
   frigate:
     <<: *frigate-image
     container_name: frigate
@@ -48,6 +70,7 @@ services:
       - ${CAMERA_CONFIG_FILE:?run.ps1 must set CAMERA_CONFIG_FILE}:/config/config.yml
       - ${FRIGATE_MEDIA_DIR:-E:/Docker/Frigate/media}:/media/frigate
       - ${CAMERA_MODEL_PATH:?run.ps1 must set CAMERA_MODEL_PATH}:/models/yolov9-t-320.onnx:ro
+      - ${RECOGNITION_TLS_DIR:-../../.tmp/runtime/recognition-tls}:/run/recognition-tls:ro
       - /etc/localtime:/etc/localtime:ro
 
   ngrok:
