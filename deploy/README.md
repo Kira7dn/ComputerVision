@@ -216,7 +216,7 @@ revision sử dụng chung `media_artifact_id`, không render ảnh riêng theo 
 
 - URL: `https://localhost:8971/login`
 - Username: `admin`
-- Password: `4f0fae80e861c68cb55176f6110b922a`
+- Password: `123456`
 
 Password này được lưu dạng plaintext theo yêu cầu vận hành. Sau khi đổi password
 trên dashboard, cần cập nhật lại mục này nếu vẫn muốn README là tài liệu bàn giao.

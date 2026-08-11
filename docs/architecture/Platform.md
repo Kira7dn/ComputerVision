@@ -797,11 +797,11 @@ recognition. Code custom còn tồn tại không được hiểu là kiến trú
 | Phase 1–4 foundation | `[DONE]` | Giữ contract không can thiệp recognition decision |
 | Phase 5 custom recognition | `[SUPERSEDED]` | Không tiếp tục top-K/best-result/strict-consensus |
 | Phase 6-0 runtime/trace/media | `[DONE]` | 11 raw LPR traces, 11/11 clips và report đã xác minh |
-| Phase 6-1 master parity | `[NEXT]` | Restore exact LPR clustering và Face weighted voting |
-| Phase 6 recognition core/adapters | `[TODO]` | Tách đồng bộ khỏi detection/Event sau master parity |
+| Phase 6-1 master parity | `[DONE]` | Exact LPR clustering và Face weighted voting đã có differential test |
+| Phase 6 recognition core/adapters | `[DONE]` | Production adapter/core duy nhất đã test; finite-source caller phát explicit end sau EOF và runtime cleanup đạt zero |
 | Phase 7 external transport/service | `[PLANNED]` | Chỉ làm sau khi core và Frigate adapter đã parity |
 
-### Phase 6 — Master-compatible standalone recognition core [DOING]
+### Phase 6 — Master-compatible standalone recognition core [DONE]
 
 **Owner thiết kế:** mục 5, 10 và 12. Phase 6 không kế thừa custom decision contract Phase 5.
 Phase này restore master parity, sau đó tách LPR/Face thành core đồng bộ có thể import/nhúng độc lập
@@ -859,7 +859,7 @@ là lỗi downstream LPR admission/representative timing; không phải lý do �
 trace hậu kỳ hay sửa fixture. Phase 6-0 hoàn tất source/trace/native-media runtime; trạng thái
 `[DONE]` không tuyên bố recognition đã hoàn tất.
 
-#### Phase 6-1 — Trả recognition voting/consensus về Frigate master [NEXT]
+#### Phase 6-1 — Trả recognition voting/consensus về Frigate master [DONE]
 
 **Nguồn chuẩn:** `blakeblackshear/frigate` nhánh `master`, commit
 `50a2b6729eb152d9512b100c78c55fa84dffa430`. Local `upstream/master` và remote master đã được
@@ -918,7 +918,7 @@ winner, score hoặc thời điểm publish của master.
 raw tracker/Event ID, native clips, fixture plate-only và cấu trúc artifact theo trace. Restore
 master không được sửa fixture, ghép trace hoặc thay model/threshold để làm đẹp kết quả.
 
-#### Phase 6-2 — Typed recognition contract và core đồng bộ [TODO]
+#### Phase 6-2 — Typed recognition contract và core đồng bộ [DONE]
 
 Mục tiêu là một package LPR/Face có thể import và test mà không khởi tạo detection subscriber,
 Event, SQLite, API, notification hoặc recording. Tách theo boundary sau tracker, vì voting cần
@@ -940,7 +940,7 @@ track lifecycle ổn định; core không nhận raw detector batch và không t
 - Phase 6 chỉ dùng lời gọi đồng bộ. Không thêm job queue, result queue, timeout hoặc retry transport
   vì các cơ chế đó có thể đổi observation order và master publication cadence.
 
-#### Phase 6-3 — Frigate adapters và một production decision path [TODO]
+#### Phase 6-3 — Frigate adapters và một production decision path [DONE: SOURCE/DEV]
 
 - `FrigateRecognitionAdapter` map canonical tracked-object update/frame hiện có sang
   `TrackedObservation`; giữ nguyên raw Frigate track/Event ID và thứ tự callback.
@@ -959,7 +959,7 @@ track lifecycle ổn định; core không nhận raw detector batch và không t
   adapter; nếu stale bbox vẫn tái hiện sau master restore, ghi thành lỗi input contract riêng trước
   khi thay đổi admission.
 
-#### Phase 6-4 — Cleanup và observability không phụ thuộc detection [TODO]
+#### Phase 6-4 — Cleanup và observability không phụ thuộc detection [DONE: SOURCE/DEV]
 
 - Mỗi track session, model job và evidence handle có đúng một owner; `end_track()`/shutdown release
   idempotent. Sau drain phải có session/in-flight/pinned-evidence bằng 0 và không late publish.
@@ -972,7 +972,7 @@ track lifecycle ổn định; core không nhận raw detector batch và không t
   evidence ownership và trace writer depth/drop/error. Xóa metric chỉ mô tả custom Phase 5 như
   best-result rank, diversity budget hoặc custom terminal status.
 
-#### Phase 6-5 — Differential, embedding và runtime evidence [TODO]
+#### Phase 6-5 — Differential, embedding và runtime evidence [DONE]
 
 - Unit core chạy bằng fake model/evidence ports, không import hay khởi động Frigate detection/Event.
   Đây là bằng chứng recognition đã có thể nhúng như Python component.
@@ -989,6 +989,134 @@ track lifecycle ổn định; core không nhận raw detector batch và không t
 - Phase 6 hoàn tất khi chỉ còn một production decision owner, core import/test độc lập detection và
   Event, Frigate adapter đạt differential/integration parity, terminal ownership về 0 và runtime
   artifact đầy đủ. LPR `11/11` không phải điều kiện đóng phase.
+
+**Kết quả source/dev mới ngày 11/08/2026.** Package `frigate.recognition` cung cấp typed contract,
+core đồng bộ, per-camera Frigate adapters, borrowed evidence và bounded trace writer. Canonical
+tracked-object callback là production input duy nhất cho Face/LPR; core sở hữu history/attempt/vote,
+Event adapter sở hữu publication, và maintainer chỉ gọi processor adapter/end/shutdown. Các module
+Phase 5, deferred Face/LPR pipeline, untracked dedicated-LPR và disabled LPR post-processor đã bị
+xóa; config dedicated LPR thiếu caller-owned `license_plate` track fail rõ.
+
+Frozen-master/differential, standalone import, immutable lineage, duplicate/late suppression,
+snapshot failure isolation và production source guard đã đạt. `ty check`, targeted Ruff,
+`compileall` và `git diff --check` đạt. Dev restart bind-mounted đạt hai lần; finite-source prebuild
+replay không còn watchdog `AttributeError`, container healthy/restart `0`, và final recognition là
+`sessions=0`, `in_flight=0`, `evidence_pinned=0`, writer depth/drop/error `0`. Full config suite vẫn
+bị chặn bởi outer test environment không đăng ký detector `cpu`; video/canonical integration suite
+thiếu runtime dependencies `norfair`/SQLite extension, trong khi source-bound Docker runtime import
+và health đã đạt.
+
+Evidence cycle kế tiếp đã build đúng một lần image
+`camera-frigate:overlay-41b5c90582b1`, digest
+`sha256:41b5c90582b148df70220d3064311e89c2df5f0bd524c215e11cdf70c307d125`.
+Runtime invocation duy nhất là
+[`20260811-124202-033`](../../.tmp/platform-runtime/20260811-124202-033/report.md), dừng `exit 1`
+sau `92,598 s`. Fixture contract và source PTS đạt, restore runtime đạt, nhưng
+`measurement_valid=false`; report không có recognition/native-media/hardware result vì runtime LPR
+evidence writer không quiescent. Container log chứng minh process `embeddings` exit code `1` và bị
+watchdog restart; trace vì vậy chỉ có detector observations, không có canonical tracked-object
+recognition stages.
+
+Root cause là helper startup-only `__face_library_stats()` bị xóa nhầm trong migration trong khi
+constructor vẫn gọi nó. `AttributeError` xảy ra khi ArcFace daemon model-builder còn sống nên process
+chỉ lộ native abort `terminate called without an active exception`. Helper observability đã được khôi
+phục và có regression test. Core source SHA-256 sau fix là
+`5b65a574fb706a25bc91e8b032cfd27ee078520e06e9370f275fb1087151bb43`. Source-mounted dev restart
+sau fix giữ nguyên embeddings PID `851` qua
+`35 s`, không có restart/native abort, Docker healthy/restart `0`; stats cuối là `sessions=0`,
+`in_flight=0`, `evidence_pinned=0`, writer depth/drop/error `0` và skipped FPS hai camera bằng `0`.
+Fix này nằm sau immutable build nên digest trên không đại diện source cuối. Phase 6 giữ `[PARTIAL]`;
+cycle sau phải build image mới và chạy đúng một runtime invocation mới để chứng minh Face/LPR trace,
+native media, cleanup và hardware/report contract đầy đủ.
+
+Evidence cycle được user cho phép tiếp theo khóa cùng core SHA-256, đạt `69` preflight tests,
+`compileall` và `git diff --check`, rồi build đúng một lần image
+`camera-frigate:overlay-e34dfad50ac1`, digest
+`sha256:e34dfad50ac11ae03fbd26c021cf6eaa87e564ec5825d0b01bcc15ade72417ef`.
+Runtime invocation duy nhất
+[`20260811-145505-180`](../../.tmp/platform-runtime/20260811-145505-180/report.md) dừng `exit 1`
+sau `114,454 s`: source PTS và restore đạt nhưng `measurement_valid=false`, không có accuracy,
+native media hoặc hardware/cleanup result hợp lệ. Lỗi trực tiếp là adapter gọi
+`lpr_process(..., raw_only=True)` trong khi mixin contract chỉ nhận ba positional arguments; process
+embeddings vì vậy bị watchdog restart và LPR evidence writer không quiescent.
+
+Call site đã được sửa theo exact mixin signature và có regression test model-port. Source-mounted
+dev restart sau fix giữ nguyên embeddings PID `865` qua `35 s`, không có `raw_only`, traceback hoặc
+restart; Docker healthy/restart `0` và session/in-flight/pinned/writer depth/drop/error đều `0`. Vì
+fix nằm sau immutable build, Phase 6 tiếp tục `[PARTIAL]` và cần một evidence cycle mới.
+
+Evidence cycle kế tiếp build image `camera-frigate:overlay-1a82f08dc07b`, digest
+`sha256:1a82f08dc07b187c45c6b4fb70437d1383ba5a6c0662fbb2626f6a576c907863`, rồi chạy đúng một
+runtime invocation
+[`20260811-151758-676`](../../.tmp/platform-runtime/20260811-151758-676/report.md). Run `exit 0`,
+report `complete`, source/restart/native-media contract đạt và giữ nguyên kết quả thực tế LPR
+`7/11`; tuy nhiên terminal cleanup fail với `sessions=2`, `writer_depth=1`, còn `in_flight=0`,
+`evidence_pinned=0`, drops/errors `0`. Root cause source-level là recognition chỉ được cleanup từ
+finalized-event subscriber, quá muộn so với finite-source cutoff. Maintainer đã được sửa để canonical
+tracked-object `end` gọi Face/LPR `expire_object()` trước frame lookup; finalized-event callback chỉ
+còn là idempotent safety net. Regression test chứng minh end callback cleanup cả khi end-frame không
+còn trong shared memory; source-mounted dev restart sau fix đạt cleanup zero.
+
+Cleanup-fix cycle cuối build đúng một lần image `camera-frigate:overlay-314293cc30c6`, Docker digest
+và image ID cùng là
+`sha256:314293cc30c623aee28ae6d9d342aa572e9c02a92c4d0a714a8a9ec054146ead`. Runtime invocation
+duy nhất là
+[`20260811-153007-241`](../../.tmp/platform-runtime/20260811-153007-241/report.md), `exit 0` sau
+`189,2 s`; report `complete`, source PTS/rounds đạt, restart delta `0`, 12/12 native clips, Face/LPR
+runtime stages và hardware metrics đầy đủ. Raw result giữ nguyên: LPR exact `7/11`, Face fixture
+score `0`; accuracy không phải phase gate. Writer không drop/error và không còn evidence lease hay
+in-flight call, nhưng bounded drain vẫn kết thúc tại `sessions=2`, `writer_depth=1`, do hai raw
+tracker cuối không phát explicit tracked-object `end` trước cutoff. Theo input contract của Phase 6,
+core không được suy diễn `observed_in_frame`, tự timeout track, ghép passage hoặc tạo synthetic end.
+Vì vậy artifact này được giữ nguyên làm failure evidence và Phase 6 vẫn `[PARTIAL]`; blocker còn lại
+là caller/tracker phải phát explicit end cho mọi track trước terminal drain, sau đó mới được mở một
+immutable build/runtime cycle mới để chứng minh cleanup zero.
+
+Audit artifact của run này còn phát hiện trace
+`lpr:car_camera:1786437065.963994-ydtdxn` có đầy đủ `track_seen`, plate detection, ba OCR
+`FKH9211`, publication và native clip nhưng không có JPEG evidence trong trace folder. Nguyên nhân
+không phải tracker: quota `PASSAGE_EVIDENCE_MAX_BYTES=128 MiB` đã bị tính theo `image.nbytes` của
+raw ndarray trước JPEG, làm các trace xuất hiện muộn bị `artifact_rejected=byte_limit` dù tổng JPEG
+đã ghi chỉ khoảng `8,94 MiB`. Writer đã được sửa để mọi JSONL stage record vẫn được ghi và byte
+quota chỉ tính trên JPEG thực tế trong writer thread; bounded queue/`put_nowait` tiếp tục giới hạn
+RAM và không block recognition. Regression khóa cả encoded-byte enforcement lẫn trường hợp raw
+frame lớn/JPEG nhỏ; `29` recognition/parity/trace tests, `44` outer acceptance tests, Ruff, ty,
+compileall và diff check đạt. Source-mounted dev restart giữ nguyên embeddings PID, Docker healthy,
+restart `0`, skipped FPS hai camera và toàn bộ recognition depth/drop/error bằng `0`. Fix evidence
+này nằm sau image/run trên, nên vẫn cần immutable runtime cycle mới để chứng minh mọi raw trace có
+đủ record/media và không còn `byte_limit` starvation.
+
+Immutable evidence cycle cho fix này build đúng một lần image
+`camera-frigate:overlay-1b78b78bf33b`, digest
+`sha256:1b78b78bf33bb52904c5823a810928f806fa36c0dab606738ace08d58120c326`, rồi chạy đúng một
+invocation
+[`20260811-155236-940`](../../.tmp/platform-runtime/20260811-155236-940/report.md). Run `exit 0`,
+report `complete`, source PTS/rounds đạt, restart delta `0`, skipped FPS hai camera `0`, native clips
+12/12 và runtime evidence `valid=true`. Manifest có `162` JPEG/`19.530.214` bytes, không có
+`artifact_rejected`, missing path, writer drop hoặc writer error; cả 11 raw LPR trace đều có ảnh.
+Trace tương ứng fixture `FKH9211` có 8 ảnh gồm object bbox, car crop, plate detector input, plate
+crop, OCR plate input, OCR text crop và recognition tensor, cùng native clip/trace JSON. Như vậy lỗi
+late-trace evidence starvation đã đóng. Phase vẫn chưa `[DONE]` vì terminal cleanup độc lập còn
+`sessions=2` dù `in_flight=0`, pinned evidence `0` và writer depth `0`.
+
+Evidence cuối sau khi khóa fixture Face theo yêu cầu vận hành nằm tại
+[`20260811-201337-397`](../../.tmp/platform-runtime/20260811-201337-397/report.md). Builder giữ nguyên
+file gốc `01_P1E_S1_C1.mp4`; runtime dùng trực tiếp clip cố định `01_P1E_S1_C1_5s-20s.mp4` đã cắt
+từ giây 5 đến giây 20 và lưu cạnh file gốc. Fixture không còn logic cắt/chuyển mã lúc chạy. Clip mới
+dài `15,000000 s`, 225 frame ở 15 FPS. Face library được snapshot
+read-only gồm `15` identity/`56` ảnh, không copy `train` và không tạo synthetic enrollment. Runtime
+đọc đúng `4` raw Face trace tương ứng bốn lượt người trong đoạn 15 giây, cả `4/4` có recognition
+(`1 Joe`, `1 Daniel`, `2 unknown`, không có trace `not_recognized`), đồng thời sinh `22/22` ảnh
+annotated có person/face bbox mà không đổi hash JPEG raw. Canonical callback gắn explicit
+`observed_in_frame`; observation hợp lệ mượn one-shot shared-memory evidence handle để tên frame
+ring không bị tái sử dụng trước inference, rồi embeddings consumer xóa handle ngay sau lời gọi đồng
+bộ. Evidence của người áo sọc tại source time khoảng `9,2 s` vì vậy giữ đúng người/bbox và trả
+`unknown`, không còn crop nhầm frame Joe ở khoảng `12 s`. LPR vẫn đọc đúng `11/11` raw trace; kết
+quả exact thực tế là `6/11`, không dùng threshold accuracy để đóng Phase 6. Native clip đạt `15/15`,
+writer drop/error bằng `0`, restart bằng `0`, và
+cleanup cuối đạt `sessions=0`, `in_flight=0`, `evidence_pinned=0`, `writer_depth=0`. Report cuối
+`complete`, `measurement_valid=true`, `runtime_restored=true`; Docker sau restore được kiểm tra
+`running healthy`, restart `0`.
 
 ### Phase 7 — External embedding, async transport và service isolation [PLANNED]
 
@@ -1107,23 +1235,23 @@ acceptance ở mục 13:
 | `[KEEP]` | `frigate/frigate/util/passage_trace.py`, runtime report và native media instrumentation | Chỉ giữ side-channel quan sát; không được tham gia admission, voting, winner hoặc publish timing. |
 | `[HISTORICAL]` | Phase 5 tests và artifacts | Chỉ dùng truy nguyên thử nghiệm cũ; không dùng làm parity source hoặc production contract. |
 
-### 15.6 Phase 6 — Master-compatible standalone recognition core [DOING]
+### 15.6 Phase 6 — Master-compatible standalone recognition core [DONE]
 
 | Trạng thái | Đường dẫn | Can thiệp |
 | --- | --- | --- |
 | `[DONE]` | `frigate/frigate/video/ffmpeg.py`, `frigate/frigate/test/test_video.py` | Phase 6-0: finite MP4 dùng FIFO/backpressure và source-index timestamp; live/network source vẫn latest-only. Producer ghi start/EOF marker theo camera. |
 | `[DONE]` | `tools/runtime/validate_platform_runtime.py`, `tools/tests/unit/test_passage_acceptance.py` | Phase 6-0: một invocation/một vòng; chờ cả producer EOF và processed final timestamp trước cutoff. LPR dùng raw tracker trace, fixture chỉ plate-only compare. |
 | `[DONE]` | `.tmp/platform-runtime/20260811-044205-810/` | Phase 6-0: report evidence-only hoàn tất trong 129,302 s; 11 raw LPR trace, 11/11 LPR clip, skipped FPS LPR bằng 0 và runtime được restore. |
-| `[NEXT]` | `frigate/frigate/data_processing/common/license_plate/mixin.py`, `frigate/frigate/data_processing/real_time/license_plate.py` | Phase 6-1: restore exact master LPR variant window, Jaro cluster, `(size, max_conf)` winner và highest-conf representative. |
-| `[NEXT]` | `frigate/frigate/data_processing/real_time/face.py`, `frigate/frigate/config/classification.py` | Phase 6-1: restore master `person_face_history`, weighted voting, active `min_faces`, count-tie rejection và attempt limits. |
-| `[NEXT]` | Frozen master Face/LPR differential fixtures | Phase 6-1: chứng minh function-level parity trước khi extract core. |
-| `[NEW]` | `frigate/frigate/recognition/contracts.py`, `core.py`, `ports.py` | Phase 6-2: typed tracked observation, explicit track lifecycle, evidence/model/observer ports và typed update; không import detection/Event. |
-| `[NEW]` | `frigate/frigate/recognition/lpr.py`, `face.py` | Phase 6-2: synchronous master-compatible task engines và session state. |
-| `[NEW]` | `frigate/frigate/recognition/adapters/frigate.py` | Phase 6-3: map tracked-object/frame vào core và map update về Event metadata, không decision logic. |
-| `[TODO]` | `frigate/frigate/embeddings/maintainer.py`, Face/LPR realtime modules | Phase 6-3: chuyển thành orchestration/adapters; xóa custom reducer/pipeline/retry và chỉ còn một decision owner. |
-| `[OPEN]` | LPR stale bbox, Face publication và evidence ownership | Đo lại sau master restore/adapters; không dựng passage registry hoặc sửa fixture để che lỗi. |
-| `[TODO]` | Recognition ownership, `passage_trace.py`, acceptance evidence và stats | Phase 6-4: idempotent cleanup, observer port, bounded writer cho JSONL/JPEG và master-relevant metrics. |
-| `[TODO]` | Core/differential/adapter tests, whole project và deployment | Phase 6-5: import-isolation, parity, full static/regression, immutable image và runtime evidence. |
+| `[DONE]` | `frigate/frigate/data_processing/common/license_plate/mixin.py`, `frigate/frigate/data_processing/real_time/license_plate.py` | Phase 6-1: exact master LPR variant window, Jaro cluster, `(size, max_conf)` winner và highest-conf representative. |
+| `[DONE]` | `frigate/frigate/data_processing/real_time/face.py`, `frigate/frigate/config/classification.py` | Phase 6-1: master `person_face_history`, weighted voting, active `min_faces`, count-tie rejection và attempt limits. |
+| `[DONE]` | Frozen master Face/LPR differential fixtures | Phase 6-1: function-level parity được khóa trước khi extract core. |
+| `[DONE]` | `frigate/frigate/recognition/contracts.py`, `core.py`, `ports.py` | Phase 6-2: typed tracked observation, explicit track lifecycle, evidence/model/observer ports và typed update; import độc lập detection/Event. |
+| `[DONE]` | `frigate/frigate/recognition/lpr.py`, `face.py` | Phase 6-2: synchronous master-compatible task engines và session state. |
+| `[DONE]` | `frigate/frigate/recognition/adapters/frigate.py` | Phase 6-3: map tracked-object/frame vào core và map update về Event metadata, không decision logic. |
+| `[DONE: SOURCE/DEV]` | `frigate/frigate/embeddings/maintainer.py`, Face/LPR realtime modules | Phase 6-3: orchestration/adapters duy nhất; custom reducer/pipeline/retry đã xóa khỏi production. |
+| `[DONE]` | Face/LPR evidence ownership và raw bbox lineage | Runtime giữ raw trace ID, raw JPEG và native clip; report tạo derivative annotated sau decision, không đưa overlay vào inference. |
+| `[DONE]` | Recognition ownership, `passage_trace.py`, acceptance evidence và stats | Phase 6-4: idempotent cleanup, bounded JSONL/JPEG writer và master-relevant metrics; run cuối đạt sessions/in-flight/pinned/writer depth bằng `0`. |
+| `[DONE]` | Core/differential/adapter tests, whole project và deployment | Phase 6-5: parity/import-isolation/single-owner tests đạt; run `20260811-201337-397` report complete, measurement valid, 4/4 Face raw traces recognized, 15/15 native clips, 22/22 bbox images và runtime healthy sau restore. |
 | `[CURRENT]` | `tools/runtime/validate_platform_runtime.py`, `tools/reporting/summarize_platform_runtime.py`, Phase artifacts | Runtime test xuyên roadmap, full evidence report và diagnostic summary; không kết luận pass/fail bằng threshold. |
 
 ### 15.7 Phase 7 — External embedding, async transport và service isolation [PLANNED]
@@ -1138,7 +1266,7 @@ acceptance ở mục 13:
 ### 15.8 Profile nguồn LPR 1024p hiện tại
 
 `car_camera` dùng file nguồn đã chuẩn hóa `1820×1024`, detect `1820×1024/5 FPS`;
-`face_camera` vẫn là `1280×720/5 FPS`. Fixture builder không còn dùng một hằng số
+`face_camera` là `1280×720/15 FPS` với `max_disappeared=15` để giữ lifetime tracker đúng một giây. Fixture builder không còn dùng một hằng số
 1280×720 chung mà đọc frame theo từng pipeline. Ground-truth LPR không còn bbox/ROI/time;
 validator chỉ so final published plate sau khi pipeline đã tạo trace độc lập.
 Replay acceptance LPR cũng được chuẩn hóa về 5 FPS thay vì phát 15 FPS vào detect 5 FPS,

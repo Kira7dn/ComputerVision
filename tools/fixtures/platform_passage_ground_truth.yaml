@@ -6,61 +6,7 @@ frame:
   fps: 15
 
 face:
-  enrollment:
-    identity: Jack
-    source: mock_videos/face-recognition/segments/01_P1E_S1_C1.mp4
-    frame_s: 21.125
-  passages:
-    - id: face-p1-01
-      source: mock_videos/face-recognition/segments/01_P1E_S1_C1.mp4
-      start_s: 20.25
-      end_s: 21.65
-      face_visible_s: 20.25
-      expected_identity: Jack
-      valid_passage: true
-      bbox: [690, 110, 990, 720]
-    - id: face-p1-02
-      source: mock_videos/face-recognition/segments/04_P1E_S2_C1.mp4
-      start_s: 17.10
-      end_s: 18.50
-      face_visible_s: 17.10
-      expected_identity: Jack
-      valid_passage: true
-      bbox: [665, 120, 930, 720]
-    - id: face-unknown-03
-      source: mock_videos/face-recognition/segments/04_P1E_S2_C1.mp4
-      start_s: 20.00
-      end_s: 21.40
-      face_visible_s: 20.00
-      expected_identity: unknown
-      valid_passage: true
-      bbox: [735, 80, 1010, 720]
-    - id: face-unknown-01
-      source: mock_videos/face-recognition/segments/07_P2E_S2_C1.1.mp4
-      start_s: 20.25
-      end_s: 21.65
-      face_visible_s: 20.25
-      expected_identity: unknown
-      valid_passage: true
-      bbox: [745, 180, 1110, 720]
-    - id: face-unknown-02
-      source: mock_videos/face-recognition/segments/09_P2E_S2_C2.1.mp4
-      start_s: 20.25
-      end_s: 21.65
-      face_visible_s: 20.25
-      expected_identity: unknown
-      valid_passage: true
-      bbox: [470, 170, 825, 720]
-    - id: face-negative-01
-      source: mock_videos/face-recognition/segments/02_P1E_S1_C2.mp4
-      start_s: 20.65
-      end_s: 21.15
-      face_visible_s: 20.65
-      expected_identity: null
-      valid_passage: false
-      bbox: null
-  close_follow:
-    - [face-p1-02, face-unknown-03]
+  source: mock_videos/face-recognition/segments/01_P1E_S1_C1_5s-20s.mp4
 
 lpr:
   source: mock_videos/car-number-plate-video/cam-in/pexels-casey-whalen-6571483 (1024p).mp4

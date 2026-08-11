@@ -16,7 +16,7 @@ def aggregate(
     runs = []
     for index, summary in enumerate(summaries, start=1):
         failed = [name for name, value in summary.get("gates", {}).items() if not value]
-        recognition = summary.get("runtime", {}).get("recognition_lifecycle", {})
+        recognition = summary.get("runtime", {}).get("recognition", {})
         runs.append(
             {
                 "run": index,
@@ -47,9 +47,9 @@ def aggregate(
                 "face_accuracy": summary.get("face", {}).get("accuracy"),
                 "face_recall": summary.get("face", {}).get("recall"),
                 "face_precision": summary.get("face", {}).get("precision"),
-                "max_attempts_per_track": recognition.get("max_attempts_per_track"),
-                "duplicate_inference": len(recognition.get("duplicate_inference", [])),
-                "early_stop_by_task": recognition.get("early_stop_by_task", {}),
+                "recognition_cleanup_zero": recognition.get("cleanup_zero"),
+                "recognition_writer_drops": recognition.get("writer_drops"),
+                "recognition_writer_errors": recognition.get("writer_errors"),
                 "measurement": summary.get("measurement", {}),
                 "source_hash": summary.get("source_hash", {}),
                 "passages": {
@@ -78,6 +78,14 @@ def aggregate(
         value = row.get("lpr_exact_match")
         return isinstance(value, int | float) and float(value) >= 2 / 3
 
+    def passages_complete(row: dict[str, Any]) -> bool:
+        passages = row.get("passages")
+        return (
+            isinstance(passages, dict)
+            and len(passages.get("lpr", [])) == 11
+            and bool(passages.get("face"))
+        )
+
     result = {
         "schema_version": 2,
         "runs": runs,
@@ -96,16 +104,20 @@ def aggregate(
             "face_accuracy_min": min(numeric("face_accuracy"), default=None),
             "face_recall_min": min(numeric("face_recall"), default=None),
             "face_precision_min": min(numeric("face_precision"), default=None),
-            "max_attempts_per_track": max(
-                numeric("max_attempts_per_track"), default=None
+            "recognition_cleanup_zero": all(
+                row.get("recognition_cleanup_zero") is True for row in runs
             ),
-            "duplicate_inference": sum(numeric("duplicate_inference")),
+            "recognition_writer_drops": sum(
+                numeric("recognition_writer_drops")
+            ),
+            "recognition_writer_errors": sum(
+                numeric("recognition_writer_errors")
+            ),
         },
         "mode": "gated" if enforce_gates else "evidence_only",
         "criteria": [],
         "report_complete": all(
-            len(row.get("passages", {}).get("lpr", [])) == 11
-            and bool(row.get("passages", {}).get("face"))
+            passages_complete(row)
             and row.get("seconds") is not None
             and bool(row.get("source_hash"))
             for row in runs

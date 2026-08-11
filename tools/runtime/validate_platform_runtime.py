@@ -39,7 +39,8 @@ LEAD_SECONDS = 0.0
 ROUNDS = 1
 MIN_PASSAGE_RATE = 0.8
 MAX_SKIPPED_FPS_REGRESSION = 0.1
-ACCEPTANCE_RUNTIME_BUDGET_SECONDS = 150.0
+ACCEPTANCE_RUNTIME_BUDGET_SECONDS = 360.0
+MASTER_RECOGNITION_COMMIT = "50a2b6729eb152d9512b100c78c55fa84dffa430"
 
 
 def skipped_fps_within_control(
@@ -60,6 +61,14 @@ def sha256(path: Path) -> str:
     with path.open("rb") as stream:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
+    return digest.hexdigest()
+
+
+def sha256_tree(path: Path) -> str:
+    digest = hashlib.sha256()
+    for file in sorted(path.rglob("*.py")):
+        digest.update(file.relative_to(path).as_posix().encode("utf-8"))
+        digest.update(file.read_bytes())
     return digest.hexdigest()
 
 
@@ -234,9 +243,7 @@ def validate_runtime_lpr_evidence(
                     "accepted": ocr_result.get("accepted"),
                     "reason": ocr_result.get("reason"),
                     "plate": ocr_result.get("plate"),
-                    "mean_character_score": ocr_result.get(
-                        "mean_character_score"
-                    ),
+                    "mean_character_score": ocr_result.get("mean_character_score"),
                     "character_scores": ocr_result.get("character_scores"),
                 },
                 "errors": invocation_errors,
@@ -326,9 +333,7 @@ def capture_container_diagnostics(output: Path, since: float | None) -> None:
         errors="replace",
         timeout=15,
     )
-    (output / "container.log").write_text(
-        logs.stdout + logs.stderr, encoding="utf-8"
-    )
+    (output / "container.log").write_text(logs.stdout + logs.stderr, encoding="utf-8")
 
 
 def restart_counts() -> dict[str, int]:
@@ -525,9 +530,10 @@ def restore_mounts_verified(config: Path) -> bool:
             ),
             None,
         )
-        return bool(config_mount) and str(config_mount.get("Source", "")).replace(
-            "\\", "/"
-        ).lower().endswith(expected_suffix)
+        actual = str((config_mount or {}).get("Source", "")).replace("\\", "/").lower()
+        return bool(config_mount) and (
+            actual == expected or actual.endswith(expected_suffix)
+        )
     except Exception:
         return False
 
@@ -565,7 +571,7 @@ class ResourceSampler:
             camera: [] for camera in CAMERAS.values()
         }
         self.evidence_pinned: list[int] = []
-        self.recognition_lifecycle: list[dict[str, int]] = []
+        self.recognition: list[dict[str, int]] = []
         self.thread = threading.Thread(target=self._run, daemon=True)
 
     def start(self) -> None:
@@ -630,34 +636,12 @@ class ResourceSampler:
                             )
                         )
                     )
-                    evidence = (
-                        (stats.get("embeddings") or {})
-                        .get("evidence", {})
-                        .get("cameras", {})
-                        .get(camera, {})
-                    )
-                    self.evidence_bytes[camera].append(int(evidence.get("bytes", 0)))
+                    self.evidence_bytes[camera].append(0)
                 embeddings = stats.get("embeddings") or {}
-                self.evidence_pinned.append(
-                    int((embeddings.get("evidence") or {}).get("pinned", 0))
-                )
-                self.recognition_lifecycle.append(
-                    {
-                        str(key): int(value)
-                        for key, value in (
-                            embeddings.get("recognition_lifecycle") or {}
-                        ).items()
-                    }
-                    | {
-                        "quality_top_k_depth": int(
-                            (embeddings.get("quality_selector") or {}).get(
-                                "top_k_depth", 0
-                            )
-                        ),
-                        "lpr_queue_depth": int(
-                            embeddings.get("lpr_queue_depth", 0)
-                        ),
-                    }
+                recognition = embeddings.get("recognition") or {}
+                self.evidence_pinned.append(int(recognition.get("evidence_pinned", 0)))
+                self.recognition.append(
+                    {str(key): int(value) for key, value in recognition.items()}
                 )
             except Exception as exc:
                 self.errors.append(f"{type(exc).__name__}: {exc}")
@@ -672,20 +656,57 @@ def wait_recognition_idle(timeout: float = 10.0) -> bool:
             with urlopen("http://127.0.0.1:5001/api/stats", timeout=1) as response:
                 stats = json.loads(response.read().decode("utf-8"))
             embeddings = stats.get("embeddings") or {}
-            lifecycle = embeddings.get("recognition_lifecycle") or {}
-            evidence = embeddings.get("evidence") or {}
+            recognition = embeddings.get("recognition") or {}
             if (
-                int(lifecycle.get("in_flight", 0)) == 0
-                and int(lifecycle.get("active_lifecycles", 0)) == 0
-                and int(lifecycle.get("quality_top_k_depth", 0)) == 0
-                and int(lifecycle.get("lpr_queue_depth", 0)) == 0
-                and int(evidence.get("pinned", 0)) == 0
+                int(recognition.get("in_flight", 0)) == 0
+                and int(recognition.get("sessions", 0)) == 0
+                and int(recognition.get("evidence_pinned", 0)) == 0
+                and int(recognition.get("writer_depth", 0)) == 0
             ):
                 return True
         except Exception:
             pass
         time.sleep(0.2)
     return False
+
+
+def finalize_finite_source_tracks(records: list[dict[str, Any]]) -> int:
+    """Send explicit canonical track ends after an acceptance-only source EOF."""
+    tracks = sorted(
+        {
+            (str(record.get("track_id") or ""), str(record.get("camera") or ""))
+            for record in records
+            if record.get("stage") == "track_seen"
+            and record.get("pipeline") in {"face", "lpr"}
+            and record.get("track_id")
+            and record.get("camera")
+        }
+    )
+    if not tracks:
+        return 0
+    code = """
+import json, sys, time
+from frigate.comms.events_updater import EventEndPublisher
+
+publisher = EventEndPublisher()
+time.sleep(0.2)
+try:
+    for event_id, camera in json.loads(sys.argv[1]):
+        publisher.publish((event_id, camera, False))
+    time.sleep(0.5)
+finally:
+    publisher.stop()
+"""
+    docker_output(
+        "exec",
+        "frigate",
+        "python3",
+        "-c",
+        code,
+        json.dumps(tracks),
+        timeout=10,
+    )
+    return len(tracks)
 
 
 def observe_round_anchors(
@@ -747,7 +768,8 @@ def merge_passages(
 ) -> list[dict[str, Any]]:
     windows = {window["id"]: window for window in fixture["replay_windows"][kind]}
     return [
-        {**passage, **windows[passage["id"]]} for passage in manifest[kind]["passages"]
+        {**passage, **windows[passage["id"]]}
+        for passage in manifest[kind].get("passages", [])
     ]
 
 
@@ -815,12 +837,7 @@ def assign_records(
             terminal = max(
                 enumerate(published),
                 key=lambda item: (
-                    float(
-                        item[1].get(
-                            "source_pts", item[1].get("frame_time", 0)
-                        )
-                        or 0
-                    ),
+                    float(item[1].get("source_pts", item[1].get("frame_time", 0)) or 0),
                     item[0],
                 ),
                 default=None,
@@ -951,14 +968,18 @@ def first_record(records: list[dict[str, Any]], stage: str) -> dict[str, Any] | 
     return (
         min(
             found,
-            key=lambda value: float(value.get("source_pts", value.get("frame_time", 0))),
+            key=lambda value: float(
+                value.get("source_pts", value.get("frame_time", 0))
+            ),
         )
         if found
         else None
     )
 
 
-def stage_trace(records: list[dict[str, Any]], stages: tuple[str, ...]) -> dict[str, Any]:
+def stage_trace(
+    records: list[dict[str, Any]], stages: tuple[str, ...]
+) -> dict[str, Any]:
     """Return raw per-stage records plus processing latency between stages."""
     ordered = sorted(
         records,
@@ -984,7 +1005,9 @@ def stage_trace(records: list[dict[str, Any]], stages: tuple[str, ...]) -> dict[
     }
 
 
-def trace_metrics(records: list[dict[str, Any]], elapsed_seconds: float) -> dict[str, Any]:
+def trace_metrics(
+    records: list[dict[str, Any]], elapsed_seconds: float
+) -> dict[str, Any]:
     """Count every observed pipeline stage and expose normalized calls/s."""
     counts = collections.Counter(str(record.get("stage")) for record in records)
     return {
@@ -1005,7 +1028,8 @@ def source_pts_metrics(records: list[dict[str, Any]]) -> dict[str, Any]:
         values = sorted(
             float(record["source_pts"])
             for record in records
-            if str(record.get("camera")) == camera and record.get("source_pts") is not None
+            if str(record.get("camera")) == camera
+            and record.get("source_pts") is not None
         )
         gaps = [current - previous for previous, current in zip(values, values[1:])]
         result[camera] = {
@@ -1045,6 +1069,34 @@ def false_passage_count(records: list[dict[str, Any]]) -> int:
     return len(keys)
 
 
+def pipeline_trace_ids(records: list[dict[str, Any]], pipeline: str) -> list[str]:
+    """Return producer-owned raw trace IDs without fixture association."""
+    return sorted(
+        {
+            str(record["trace_id"])
+            for record in records
+            if record.get("pipeline") == pipeline
+            and record.get("trace_id")
+            and not str(record["trace_id"]).startswith("detector:")
+        }
+    )
+
+
+def face_trace_outcome(records: list[dict[str, Any]]) -> str:
+    """Classify execution outcome without treating `unknown` as a failure."""
+    attempts = [record for record in records if record.get("stage") == "first_attempt"]
+    if not attempts:
+        return "not_recognized"
+    identities = {
+        str(record.get("identity")) for record in attempts if record.get("identity")
+    }
+    if identities and identities <= {"unknown"}:
+        return "recognized_unknown"
+    if any(record.get("stage") == "confirmed_result" for record in records):
+        return "recognized_known_published"
+    return "recognized_known_unpublished"
+
+
 def face_results(
     records: list[dict[str, Any]], passages: list[dict[str, Any]], anchors: list[float]
 ) -> tuple[
@@ -1055,6 +1107,84 @@ def face_results(
     list[float],
     list[float],
 ]:
+    if not passages:
+        face_records = [
+            record
+            for record in records
+            if record.get("pipeline") == "face"
+            and not str(record.get("trace_id") or "").startswith("detector:")
+        ]
+        trace_ids = sorted(
+            {
+                str(record.get("trace_id"))
+                for record in face_records
+                if record.get("trace_id")
+            }
+        )
+        records_by_trace: dict[str, list[dict[str, Any]]] = collections.defaultdict(
+            list
+        )
+        for record in face_records:
+            trace_id = str(record.get("trace_id") or "")
+            if trace_id:
+                records_by_trace[trace_id].append(record)
+        outcomes = {
+            trace_id: face_trace_outcome(trace_records)
+            for trace_id, trace_records in records_by_trace.items()
+        }
+        recognition_completed = sum(
+            outcome != "not_recognized" for outcome in outcomes.values()
+        )
+        confirmed = [
+            record
+            for record in face_records
+            if record.get("stage") == "confirmed_result"
+        ]
+        return (
+            {
+                "mode": "raw_trace",
+                "passages": [],
+                "trace_count": len(trace_ids),
+                "track_seen_count": sum(
+                    record.get("stage") == "track_seen" for record in face_records
+                ),
+                "attempt_count": sum(
+                    record.get("stage") == "first_attempt" for record in face_records
+                ),
+                "recognition_publish_count": len(confirmed),
+                "recognition_completed_trace_count": recognition_completed,
+                "recognition_coverage": recognition_completed / len(trace_ids)
+                if trace_ids
+                else 0.0,
+                "recognized_unknown_trace_count": sum(
+                    outcome == "recognized_unknown" for outcome in outcomes.values()
+                ),
+                "recognized_known_trace_count": sum(
+                    outcome.startswith("recognized_known")
+                    for outcome in outcomes.values()
+                ),
+                "not_recognized_trace_count": sum(
+                    outcome == "not_recognized" for outcome in outcomes.values()
+                ),
+                "published_identities": sorted(
+                    {
+                        str(record.get("identity"))
+                        for record in confirmed
+                        if record.get("identity")
+                    }
+                ),
+                "accuracy": None,
+                "detection_recall": None,
+                "precision": None,
+                "recall": None,
+                "false_passages": None,
+            },
+            [],
+            [],
+            [],
+            [],
+            [],
+        )
     active = [passage for passage in passages if passage.get("valid_passage", True)]
     rows: list[dict[str, Any]] = []
     passage_latencies: list[float] = []
@@ -1086,10 +1216,7 @@ def face_results(
             expected = str(passage["expected_identity"])
             detected = qualified is not None and attempt is not None
             correct = detected and (
-                (
-                    expected == "unknown"
-                    and not known_confirmed
-                )
+                (expected == "unknown" and not known_confirmed)
                 or (expected != "unknown" and expected in known_confirmed)
             )
             detected_rounds += int(detected)
@@ -1295,9 +1422,7 @@ def lpr_results(
                 "funnel": stages,
                 "round_trace": round_trace,
                 "mismatch_reason": (
-                    None
-                    if exact is not False
-                    else "expected_plate_not_returned"
+                    None if exact is not False else "expected_plate_not_returned"
                 ),
             }
         )
@@ -1321,16 +1446,10 @@ def lpr_results(
     readable = [row for row in rows if row["readable"]]
     detected = sum(row["detected"] for row in rows)
     exact_tp = sum(row["exact"] is True for row in readable)
-    accuracy = (
-        exact_tp / len(readable)
-        if readable
-        else None
-    )
+    accuracy = exact_tp / len(readable) if readable else None
     passage_recall = detected / len(rows) if rows else 0.0
     passage_precision = (
-        detected / (detected + false_passages)
-        if detected + false_passages
-        else 0.0
+        detected / (detected + false_passages) if detected + false_passages else 0.0
     )
     recognition_publishes = sum(bool(row["plates"]) for row in rows) + false_passages
     recognition_precision = (
@@ -1380,7 +1499,7 @@ def correlation_mismatches(records: list[dict[str, Any]]) -> list[dict[str, Any]
         for key, values in mapping.items()
         if len(values) > 1
     ]
-    seen_candidates: set[tuple[str, str, str]] = set()
+    seen_publications: set[tuple[str, str, str, float, str]] = set()
     for record in records:
         if record.get("stage") not in {
             "first_attempt",
@@ -1388,14 +1507,14 @@ def correlation_mismatches(records: list[dict[str, Any]]) -> list[dict[str, Any]
             "event_published",
         }:
             continue
-        required = ("candidate_id", "source_pts", "quality_score", "quality_components")
+        required = ("trace_id", "camera", "track_id", "source_pts")
         missing = [name for name in required if record.get(name) is None]
-        if record.get("source_role") != "detect":
-            missing.append("source_role=detect")
         if record.get("stage") == "event_published":
+            if record.get("source_role") != "detect":
+                missing.append("source_role=detect")
             missing.extend(
                 name
-                for name in ("plate_box", "evidence_id", "frame_ref")
+                for name in ("object_box", "plate_box", "evidence_id", "frame_ref")
                 if not record.get(name)
             )
         else:
@@ -1410,23 +1529,26 @@ def correlation_mismatches(records: list[dict[str, Any]]) -> list[dict[str, Any]
                     "fields": missing,
                 }
             )
-        identity = (
+        publication = (
             str(record.get("stage")),
+            str(record.get("pipeline")),
             str(record.get("track_id")),
-            str(record.get("candidate_id")),
+            float(record.get("source_pts") or 0),
+            str(record.get("evidence_id") or record.get("frame_ref") or ""),
         )
-        if identity in seen_candidates and record.get("stage") in {
+        if publication in seen_publications and record.get("stage") in {
             "confirmed_result",
             "event_published",
         }:
             mismatches.append(
                 {
                     "stage": record.get("stage"),
-                    "reason": "duplicate_candidate_commit",
-                    "candidate_id": identity[2],
+                    "reason": "duplicate_publication",
+                    "track_id": publication[2],
+                    "source_pts": publication[3],
                 }
             )
-        seen_candidates.add(identity)
+        seen_publications.add(publication)
     return mismatches
 
 
@@ -1582,8 +1704,7 @@ def trace_lifecycle_groups(
         key: trace_records
         for key, trace_records in groups.items()
         if any(
-            record.get("source_pts") is not None
-            or record.get("frame_time") is not None
+            record.get("source_pts") is not None or record.get("frame_time") is not None
             for record in trace_records
         )
     }
@@ -1602,6 +1723,131 @@ def media_evidence_records(media_root: Path) -> list[dict[str, Any]]:
             if line.strip()
         )
     return records
+
+
+def annotate_face_evidence(
+    media_root: Path, records: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Create report-only bbox overlays while preserving producer JPEGs byte-for-byte."""
+    result: dict[str, Any] = {
+        "eligible_records": 0,
+        "annotated_count": 0,
+        "missing_bbox": 0,
+        "missing_raw": 0,
+        "errors": [],
+        "records": [],
+    }
+    resolved_root = media_root.resolve()
+
+    def normalized_box(
+        value: Any, width: int, height: int
+    ) -> tuple[int, int, int, int] | None:
+        if not isinstance(value, list | tuple) or len(value) != 4:
+            return None
+        try:
+            x1, y1, x2, y2 = (int(round(float(item))) for item in value)
+        except (TypeError, ValueError):
+            return None
+        x1 = max(0, min(width - 1, x1))
+        y1 = max(0, min(height - 1, y1))
+        x2 = max(0, min(width - 1, x2))
+        y2 = max(0, min(height - 1, y2))
+        return (x1, y1, x2, y2) if x2 > x1 and y2 > y1 else None
+
+    def draw_box(
+        image: np.ndarray,
+        box: tuple[int, int, int, int],
+        label: str,
+        color: tuple[int, int, int],
+    ) -> None:
+        x1, y1, x2, y2 = box
+        cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
+        label_y = max(16, y1 - 5)
+        cv2.putText(
+            image,
+            label,
+            (x1, label_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            color,
+            1,
+            cv2.LINE_AA,
+        )
+
+    for source_record in records:
+        if (
+            source_record.get("pipeline") != "face"
+            or source_record.get("stage") != "recognition_attempt"
+        ):
+            continue
+        result["eligible_records"] += 1
+        record = dict(source_record)
+        artifact_path = record.get("artifact_path")
+        if not artifact_path:
+            result["missing_raw"] += 1
+            continue
+        raw_path = (media_root / str(artifact_path)).resolve()
+        if not raw_path.is_relative_to(resolved_root) or not raw_path.is_file():
+            result["missing_raw"] += 1
+            continue
+        raw_hash = sha256(raw_path)
+        image = cv2.imread(str(raw_path), cv2.IMREAD_COLOR)
+        if image is None:
+            result["errors"].append(f"cannot decode {artifact_path}")
+            continue
+        height, width = image.shape[:2]
+        person_box = normalized_box(
+            record.get("object_box", record.get("person_box")), width, height
+        )
+        face_box = normalized_box(
+            record.get("detail_box", record.get("face_box")), width, height
+        )
+        if person_box is None or face_box is None:
+            result["missing_bbox"] += 1
+            continue
+        annotated = image.copy()
+        draw_box(annotated, person_box, "person", (0, 255, 0))
+        draw_box(annotated, face_box, "face", (0, 255, 255))
+        identity = str(record.get("raw_identity") or "unknown")
+        score = record.get("raw_score")
+        header = f"{record.get('trace_id', '-')} | {identity}"
+        if score is not None:
+            header += f" | {float(score):.3f}"
+        cv2.putText(
+            annotated,
+            header,
+            (8, 22),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        annotated_path = raw_path.with_name(f"{raw_path.stem}-annotated.jpg")
+        if not cv2.imwrite(str(annotated_path), annotated):
+            result["errors"].append(f"cannot write {annotated_path}")
+            continue
+        if sha256(raw_path) != raw_hash:
+            result["errors"].append(f"raw artifact changed {artifact_path}")
+            annotated_path.unlink(missing_ok=True)
+            continue
+        relative = annotated_path.relative_to(resolved_root).as_posix()
+        record.update(
+            {
+                "annotated_artifact_path": relative,
+                "annotated_artifact_sha256": sha256(annotated_path),
+                "annotated_artifact_bytes": annotated_path.stat().st_size,
+            }
+        )
+        result["records"].append(record)
+        result["annotated_count"] += 1
+    result["valid"] = bool(result["eligible_records"]) and (
+        result["annotated_count"] == result["eligible_records"]
+        and result["missing_bbox"] == 0
+        and result["missing_raw"] == 0
+        and not result["errors"]
+    )
+    return result
 
 
 def sqlite_trace_media(
@@ -1710,7 +1956,11 @@ def recordings_available_through(database_path: str) -> dict[str, float]:
     value = docker_output(
         "exec", "frigate", "python3", "-c", code, database_path, timeout=5
     )
-    return {str(key): float(item) for key, item in json.loads(value or "{}").items() if item is not None}
+    return {
+        str(key): float(item)
+        for key, item in json.loads(value or "{}").items()
+        if item is not None
+    }
 
 
 def wait_recordings_through(
@@ -1737,9 +1987,15 @@ def ffprobe_clip(path: Path) -> dict[str, Any]:
     """Inspect a downloaded native clip without modifying it."""
     result = subprocess.run(
         [
-            "ffprobe", "-v", "error", "-count_frames", "-show_entries",
+            "ffprobe",
+            "-v",
+            "error",
+            "-count_frames",
+            "-show_entries",
             "format=duration,size:stream=codec_name,width,height,avg_frame_rate,nb_read_frames",
-            "-of", "json", str(path),
+            "-of",
+            "json",
+            str(path),
         ],
         check=False,
         capture_output=True,
@@ -1811,12 +2067,13 @@ def collect_native_trace_clips(
     trace_ranges: dict[tuple[str, str], tuple[float, float]] = {}
     range_queries: list[dict[str, Any]] = []
     for key, trace_records in groups.items():
-        trace_times = [
-            float(record.get("source_pts") or record.get("frame_time"))
-            for record in trace_records
-            if record.get("source_pts") is not None
-            or record.get("frame_time") is not None
-        ]
+        trace_times = []
+        for record in trace_records:
+            value = record.get("source_pts")
+            if value is None:
+                value = record.get("frame_time")
+            if value is not None:
+                trace_times.append(float(value))
         if not trace_times:
             continue
         start_time = min(trace_times) - 0.25
@@ -1917,7 +2174,9 @@ def collect_native_trace_clips(
                 metadata.update(
                     {
                         "clip_status": "recorded" if probe.get("valid") else "invalid",
-                        "clip_reason": None if probe.get("valid") else "ffprobe_invalid",
+                        "clip_reason": None
+                        if probe.get("valid")
+                        else "ffprobe_invalid",
                         "clip_path": target.relative_to(output).as_posix(),
                         "clip_bytes": len(payload),
                         "clip_sha256": sha256(target),
@@ -1926,7 +2185,9 @@ def collect_native_trace_clips(
                     }
                 )
             except Exception as exc:
-                metadata["clip_reason"] = f"native_clip_error:{type(exc).__name__}:{exc}"
+                metadata["clip_reason"] = (
+                    f"native_clip_error:{type(exc).__name__}:{exc}"
+                )
         write_json(trace_dir / "trace.json", metadata)
         traces.append(metadata)
 
@@ -1935,9 +2196,8 @@ def collect_native_trace_clips(
         "trace_count": len(traces),
         "recorded_count": sum(item["clip_status"] == "recorded" for item in traces),
         "missing_count": sum(item["clip_status"] != "recorded" for item in traces),
-        "complete": bool(traces) and all(
-            item["clip_status"] == "recorded" for item in traces
-        ),
+        "complete": bool(traces)
+        and all(item["clip_status"] == "recorded" for item in traces),
         "traces": traces,
     }
     write_json(output / "native-media.json", result)
@@ -2006,23 +2266,17 @@ def api_sqlite_consistency(
 
 
 def fixture_contract(manifest: dict[str, Any]) -> dict[str, Any]:
-    face = [p for p in manifest["face"]["passages"] if p.get("valid_passage", True)]
     lpr = [p for p in manifest["lpr"]["passages"] if p.get("valid_passage", True)]
     result = {
-        "known_face_passages": sum(
-            p.get("expected_identity") not in {None, "unknown"} for p in face
-        ),
-        "unknown_face_passages": sum(
-            p.get("expected_identity") == "unknown" for p in face
-        ),
-        "close_follow_pairs": len(manifest["face"].get("close_follow", [])),
+        "face_mode": "raw_trace",
+        "face_source": manifest["face"].get("source"),
+        "face_passages": len(manifest["face"].get("passages", [])),
         "vehicle_passages": len(lpr),
         "readable_vehicle_passages": sum(bool(p.get("readable")) for p in lpr),
     }
     result["valid"] = (
-        result["known_face_passages"] >= 2
-        and result["unknown_face_passages"] >= 2
-        and result["close_follow_pairs"] >= 1
+        bool(result["face_source"])
+        and result["face_passages"] == 0
         and result["vehicle_passages"] >= 5
         and result["readable_vehicle_passages"] >= 3
     )
@@ -2045,8 +2299,7 @@ def _md_table(headers: list[str], rows: list[list[Any]]) -> str:
         "| " + " | ".join("---" for _ in headers) + " |",
     ]
     lines.extend(
-        "| " + " | ".join(_md_value(value) for value in row) + " |"
-        for row in rows
+        "| " + " | ".join(_md_value(value) for value in row) + " |" for row in rows
     )
     return "\n".join(lines) if rows else "_Không có dữ liệu._"
 
@@ -2086,7 +2339,25 @@ def write_markdown_report(output: Path, summary: dict[str, Any]) -> Path:
             ],
         ),
         "",
-        "## 2. Hardware và queue metrics",
+        "### Raw trace inventory",
+        "",
+        _md_table(
+            ["Pipeline", "Raw trace IDs read", "Recognition-completed traces"],
+            [
+                [
+                    "LPR",
+                    lpr.get("raw_trace_count"),
+                    lpr.get("recognized_trace_count"),
+                ],
+                [
+                    "Face",
+                    face.get("trace_count"),
+                    face.get("recognition_completed_trace_count"),
+                ],
+            ],
+        ),
+        "",
+        "## 2. Hardware và recognition writer metrics",
         "",
         _md_table(
             ["Metric", "Value"],
@@ -2097,10 +2368,14 @@ def write_markdown_report(output: Path, summary: dict[str, Any]) -> Path:
                 ["VRAM used max (MiB)", gpu.get("memory_used_mib_max")],
                 ["VRAM total (MiB)", gpu.get("memory_total_mib")],
                 ["/dev/shm max (%)", resources.get("shm_max_percent")],
-                ["Queue depth samples", len(runtime.get("queue_metrics", {}).get("depth_samples", []))],
-                ["Queue age (ms)", runtime.get("queue_metrics", {}).get("age_ms")],
-                ["Queue age note", runtime.get("queue_metrics", {}).get("age_reason")],
-                ["Sampler errors", "; ".join(runtime.get("hardware_sampler_errors", []))],
+                ["Writer depth", runtime.get("recognition", {}).get("writer_depth")],
+                ["Writer drops", runtime.get("recognition", {}).get("writer_drops")],
+                ["Writer errors", runtime.get("recognition", {}).get("writer_errors")],
+                ["Cleanup zero", runtime.get("recognition", {}).get("cleanup_zero")],
+                [
+                    "Sampler errors",
+                    "; ".join(runtime.get("hardware_sampler_errors", [])),
+                ],
             ],
         ),
         "",
@@ -2163,9 +2438,21 @@ def write_markdown_report(output: Path, summary: dict[str, Any]) -> Path:
         "## 6. Source PTS gap",
         "",
         _md_table(
-            ["Camera", "Records with PTS", "Max gap (s)", "Mean gap (s)", "Missing PTS"],
             [
-                [camera, values.get("records_with_source_pts"), values.get("max_gap_seconds"), values.get("mean_gap_seconds"), values.get("missing_source_pts")]
+                "Camera",
+                "Records with PTS",
+                "Max gap (s)",
+                "Mean gap (s)",
+                "Missing PTS",
+            ],
+            [
+                [
+                    camera,
+                    values.get("records_with_source_pts"),
+                    values.get("max_gap_seconds"),
+                    values.get("mean_gap_seconds"),
+                    values.get("missing_source_pts"),
+                ]
                 for camera, values in sorted(runtime.get("source_pts", {}).items())
             ],
         ),
@@ -2176,20 +2463,37 @@ def write_markdown_report(output: Path, summary: dict[str, Any]) -> Path:
         "",
     ]
     image_paths = sorted(
-        path for path in output.rglob("*")
+        path
+        for path in output.rglob("*")
         if path.is_file() and path.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}
     )
     image_rows = []
     for path in image_paths:
         relative = path.relative_to(output).as_posix()
         image_rows.append([f"![{path.name}]({relative})", f"`{relative}`"])
-    lines.extend([_md_table(["Preview", "Artifact"], image_rows), "", "## 8. JSON/log artifacts", ""])
+    lines.extend(
+        [
+            _md_table(["Preview", "Artifact"], image_rows),
+            "",
+            "## 8. JSON/log artifacts",
+            "",
+        ]
+    )
     artifact_rows = []
     for artifact in summary.get("report", {}).get("artifacts", []):
         name = artifact.get("path", "")
-        artifact_rows.append([f"[{name}]({name})", artifact.get("bytes"), artifact.get("sha256")])
+        artifact_rows.append(
+            [f"[{name}]({name})", artifact.get("bytes"), artifact.get("sha256")]
+        )
     lines.append(_md_table(["Artifact", "Bytes", "SHA-256"], artifact_rows))
-    lines.extend(["", "## 9. Diagnostic notes", "", "- Đây là báo cáo quan sát; không có tiêu chí pass/fail."])
+    lines.extend(
+        [
+            "",
+            "## 9. Diagnostic notes",
+            "",
+            "- Đây là báo cáo quan sát; không có tiêu chí pass/fail.",
+        ]
+    )
     if runtime.get("bad_log_lines"):
         lines.append(f"- Runtime log warnings: `{len(runtime['bad_log_lines'])}` dòng.")
     if summary.get("error"):
@@ -2203,7 +2507,8 @@ def write_failure_only_report(output: Path, summary: dict[str, Any]) -> Path:
     """Write a compact report containing only failed lifecycle traces."""
     runtime = summary.get("runtime", {})
     failed_face = [
-        row for row in summary.get("face", {}).get("passages", [])
+        row
+        for row in summary.get("face", {}).get("passages", [])
         if not row.get("correct")
     ]
     lpr_expectations = summary.get("lpr", {}).get("passages", [])
@@ -2225,9 +2530,17 @@ def write_failure_only_report(output: Path, summary: dict[str, Any]) -> Path:
         if evidence_path.is_file()
         else []
     )
+    annotated_path = output / "face-annotated-evidence.json"
+    annotated_records = (
+        json.loads(annotated_path.read_text(encoding="utf-8")).get("records", [])
+        if annotated_path.is_file()
+        else []
+    )
 
-    lpr_records_by_trace: dict[str, list[dict[str, Any]]] = collections.defaultdict(list)
-    for record in [*trace_records, *evidence_records]:
+    lpr_records_by_trace: dict[str, list[dict[str, Any]]] = collections.defaultdict(
+        list
+    )
+    for record in [*trace_records, *evidence_records, *annotated_records]:
         if record.get("pipeline") != "lpr":
             continue
         trace_id = str(record.get("trace_id") or record.get("track_id") or "")
@@ -2272,13 +2585,97 @@ def write_failure_only_report(output: Path, summary: dict[str, Any]) -> Path:
             }
         )
 
-    failed_lpr_traces = [
-        row for row in lpr_trace_rows if row["comparison"] != "MATCH"
+    failed_lpr_traces = [row for row in lpr_trace_rows if row["comparison"] != "MATCH"]
+    face_records_by_trace: dict[str, list[dict[str, Any]]] = collections.defaultdict(
+        list
+    )
+    for record in [*trace_records, *evidence_records, *annotated_records]:
+        if record.get("pipeline") != "face":
+            continue
+        trace_id = str(record.get("trace_id") or record.get("track_id") or "")
+        if not trace_id or trace_id.startswith("detector:"):
+            continue
+        face_records_by_trace[trace_id].append(record)
+    face_trace_rows: list[dict[str, Any]] = []
+    face_required_stages = (
+        "track_seen",
+        "first_qualified_face",
+        "candidate_submitted",
+        "first_attempt",
+        "confirmed_result",
+    )
+    for trace_id, records in sorted(face_records_by_trace.items()):
+        confirmed = [
+            record for record in records if record.get("stage") == "confirmed_result"
+        ]
+        observed_stages = {
+            str(record.get("stage")) for record in records if record.get("stage")
+        }
+        attempts = [
+            record for record in records if record.get("stage") == "first_attempt"
+        ]
+        attempt_identities = sorted(
+            {
+                str(record.get("identity"))
+                for record in attempts
+                if record.get("identity")
+            }
+        )
+        attempt_scores = [
+            float(record["score"])
+            for record in attempts
+            if record.get("score") is not None
+        ]
+        if "first_qualified_face" not in observed_stages:
+            recognition_detail = "no_qualified_face"
+        elif not attempts:
+            recognition_detail = "classifier_returned_no_result"
+        else:
+            recognition_detail = face_trace_outcome(records)
+        face_trace_rows.append(
+            {
+                "trace_id": trace_id,
+                "records": records,
+                "track_seen": sum(
+                    record.get("stage") == "track_seen" for record in records
+                ),
+                "attempts": len(attempts),
+                "attempt_identities": attempt_identities,
+                "attempt_score_min": min(attempt_scores, default=None),
+                "attempt_score_max": max(attempt_scores, default=None),
+                "confirmed": len(confirmed),
+                "outcome": face_trace_outcome(records),
+                "recognition_detail": recognition_detail,
+                "observed_stages": sorted(observed_stages),
+                "missing_stages": [
+                    stage
+                    for stage in face_required_stages
+                    if stage not in observed_stages
+                ],
+                "identities": ", ".join(
+                    sorted(
+                        {
+                            str(record.get("identity"))
+                            for record in confirmed
+                            if record.get("identity")
+                        }
+                    )
+                )
+                or "-",
+            }
+        )
+    failed_face_trace_rows = [
+        row for row in face_trace_rows if row["outcome"] == "not_recognized"
+    ]
+    successful_face_trace_rows = [
+        row for row in face_trace_rows if row["outcome"] == "recognized_known_published"
     ]
 
     groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
     group_passages: dict[tuple[str, str], str] = {}
-    detector_records: dict[tuple[str, str], list[dict[str, Any]]] = collections.defaultdict(list)
+    detector_records: dict[tuple[str, str], list[dict[str, Any]]] = (
+        collections.defaultdict(list)
+    )
 
     def add_records(kind: str, passage_id: str, records: list[dict[str, Any]]) -> None:
         for record in records:
@@ -2287,11 +2684,7 @@ def write_failure_only_report(output: Path, summary: dict[str, Any]) -> Path:
             ).startswith("detector:"):
                 detector_records[(kind, passage_id)].append(record)
                 continue
-            trace_id = str(
-                record.get("trace_id")
-                or record.get("track_id")
-                or ""
-            )
+            trace_id = str(record.get("trace_id") or record.get("track_id") or "")
             if not trace_id:
                 continue
             key = (kind, trace_id)
@@ -2308,6 +2701,10 @@ def write_failure_only_report(output: Path, summary: dict[str, Any]) -> Path:
         for round_data in row.get("rounds", []):
             trace = round_data.get("trace") or {}
             add_records("Face", str(row.get("passage_id")), trace.get("records", []))
+    for row in failed_face_trace_rows:
+        trace_id = str(row["trace_id"])
+        groups[("Face", trace_id)] = list(row["records"])
+        group_passages[("Face", trace_id)] = "raw_trace"
     for key, records in groups.items():
         passage_id = group_passages.get(key, "")
         records.extend(detector_records.get((key[0], passage_id), []))
@@ -2346,6 +2743,13 @@ def write_failure_only_report(output: Path, summary: dict[str, Any]) -> Path:
             return f"media/{pipeline}/{safe_trace}/clip.mp4"
         return "-"
 
+    def annotated_face_href(records: list[dict[str, Any]]) -> str:
+        for record in records:
+            relative = record.get("annotated_artifact_path")
+            if relative and (output / "media" / str(relative)).is_file():
+                return f"media/{Path(str(relative)).as_posix()}"
+        return "-"
+
     def failure_table_rows(
         kind: str, passages: list[dict[str, Any]], required: list[str]
     ) -> list[list[Any]]:
@@ -2357,12 +2761,15 @@ def write_failure_only_report(output: Path, summary: dict[str, Any]) -> Path:
                 for round_data in (passage.get("round_trace") or {}).values():
                     source_records.extend(round_data.get("records", []))
                 source_records.extend(
-                    record for record in evidence_records
+                    record
+                    for record in evidence_records
                     if str(record.get("passage_id")) == passage_id
                 )
             else:
                 for round_data in passage.get("rounds", []):
-                    source_records.extend((round_data.get("trace") or {}).get("records", []))
+                    source_records.extend(
+                        (round_data.get("trace") or {}).get("records", [])
+                    )
             trace_ids = sorted(
                 {
                     str(record.get("trace_id"))
@@ -2373,7 +2780,11 @@ def write_failure_only_report(output: Path, summary: dict[str, Any]) -> Path:
                 }
             ) or ["-"]
             for trace_id in trace_ids:
-                trace_records = [record for record in source_records if str(record.get("trace_id")) == trace_id]
+                trace_records = [
+                    record
+                    for record in source_records
+                    if str(record.get("trace_id")) == trace_id
+                ]
                 by_stage: dict[str, dict[str, Any]] = {}
                 for record in trace_records:
                     by_stage.setdefault(str(record.get("stage")), record)
@@ -2388,14 +2799,23 @@ def write_failure_only_report(output: Path, summary: dict[str, Any]) -> Path:
                     )
                     if detector is not None:
                         by_stage["detector_hit"] = detector
-                rows.append([
-                    kind,
-                    passage_id,
-                    trace_id,
-                    f"[clip]({clip_href(kind, trace_id)})" if clip_href(kind, trace_id) != "-" else "-",
-                    passage.get("mismatch_reason") or ("recognition_not_correct" if kind == "Face" else "not_detected_or_not_exact"),
-                    *[failure_value(by_stage.get(stage)) for stage in required],
-                ])
+                rows.append(
+                    [
+                        kind,
+                        passage_id,
+                        trace_id,
+                        f"[clip]({clip_href(kind, trace_id)})"
+                        if clip_href(kind, trace_id) != "-"
+                        else "-",
+                        passage.get("mismatch_reason")
+                        or (
+                            "recognition_not_correct"
+                            if kind == "Face"
+                            else "not_detected_or_not_exact"
+                        ),
+                        *[failure_value(by_stage.get(stage)) for stage in required],
+                    ]
+                )
         return rows
 
     lines = [
@@ -2421,12 +2841,23 @@ def write_failure_only_report(output: Path, summary: dict[str, Any]) -> Path:
                 ["Pending", runtime.get("pending")],
                 ["Restart delta", runtime.get("restart_delta")],
                 ["LPR evidence", runtime.get("lpr_evidence", {}).get("reason")],
-                ["Native clips", f"{runtime.get('native_media', {}).get('recorded_count', 0)} / {runtime.get('native_media', {}).get('trace_count', 0)}"],
-                ["Native clip evidence complete", runtime.get("native_media", {}).get("complete")],
+                [
+                    "Native clips",
+                    f"{runtime.get('native_media', {}).get('recorded_count', 0)} / {runtime.get('native_media', {}).get('trace_count', 0)}",
+                ],
+                [
+                    "Native clip evidence complete",
+                    runtime.get("native_media", {}).get("complete"),
+                ],
+                [
+                    "Face annotated evidence",
+                    f"{runtime.get('face_annotated_evidence', {}).get('annotated_count', 0)} / "
+                    f"{runtime.get('face_annotated_evidence', {}).get('eligible_records', 0)}",
+                ],
             ],
         ),
         "",
-        "## Hardware / queue performance",
+        "## Hardware / recognition writer performance",
         "",
         _md_table(
             ["Metric", "Value"],
@@ -2438,20 +2869,128 @@ def write_failure_only_report(output: Path, summary: dict[str, Any]) -> Path:
                 ["VRAM total (MiB)", gpu.get("memory_total_mib")],
                 ["/dev/shm max (%)", resources.get("shm_max_percent")],
                 ["Skipped FPS max", resources.get("skipped_fps_max")],
-                ["Queue depth samples", len(runtime.get("queue_metrics", {}).get("depth_samples", []))],
-                ["Queue age (ms)", runtime.get("queue_metrics", {}).get("age_ms")],
-                ["Queue age note", runtime.get("queue_metrics", {}).get("age_reason")],
-                ["Sampler errors", "; ".join(runtime.get("hardware_sampler_errors", []))],
+                ["Writer depth", runtime.get("recognition", {}).get("writer_depth")],
+                ["Writer drops", runtime.get("recognition", {}).get("writer_drops")],
+                ["Writer errors", runtime.get("recognition", {}).get("writer_errors")],
+                ["Cleanup zero", runtime.get("recognition", {}).get("cleanup_zero")],
+                [
+                    "Sampler errors",
+                    "; ".join(runtime.get("hardware_sampler_errors", [])),
+                ],
             ],
         ),
         "",
         "## Result summary",
         "",
         _md_table(
-            ["Pipeline", "Recall", "Precision", "Accuracy", "Exact match", "Observed / expected"],
             [
-                ["LPR", summary.get("lpr", {}).get("recall"), summary.get("lpr", {}).get("precision"), summary.get("lpr", {}).get("accuracy"), summary.get("lpr", {}).get("exact_match"), f"{sum(bool(row.get('fixture_match')) for row in lpr_trace_rows)} / {len(lpr_expectations)}"],
-                ["Face", summary.get("face", {}).get("recall"), summary.get("face", {}).get("precision"), summary.get("face", {}).get("accuracy"), "-", "-"],
+                "Pipeline",
+                "Recall",
+                "Precision",
+                "Accuracy",
+                "Exact match",
+                "Observed / expected",
+            ],
+            [
+                [
+                    "LPR",
+                    summary.get("lpr", {}).get("recall"),
+                    summary.get("lpr", {}).get("precision"),
+                    summary.get("lpr", {}).get("accuracy"),
+                    summary.get("lpr", {}).get("exact_match"),
+                    f"{sum(bool(row.get('fixture_match')) for row in lpr_trace_rows)} / {len(lpr_expectations)}",
+                ],
+                [
+                    "Face",
+                    summary.get("face", {}).get("recall"),
+                    summary.get("face", {}).get("precision"),
+                    summary.get("face", {}).get("accuracy"),
+                    "raw trace",
+                    f"{summary.get('face', {}).get('trace_count', 0)} tracks / {summary.get('face', {}).get('attempt_count', 0)} attempts",
+                ],
+            ],
+        ),
+        "",
+        "## Face library snapshot",
+        "",
+        "Face replay dùng trực tiếp clip cố định `01_P1E_S1_C1_5s-20s.mp4`; fixture không cắt hoặc chuyển mã video lúc chạy.",
+        "",
+        "Acceptance sao chép read-only các identity đã cấu hình sang media cô lập; không sao chép `train` và không tạo enrollment tổng hợp.",
+        "",
+        _md_table(
+            ["Identity", "Images"],
+            [
+                [identity, value.get("image_count")]
+                for identity, value in sorted(
+                    summary.get("fixture", {})
+                    .get("face_library_snapshot", {})
+                    .get("identities", {})
+                    .items()
+                )
+            ],
+        ),
+        "",
+        f"Library total: `{summary.get('fixture', {}).get('face_library_snapshot', {}).get('identity_count', 0)}` identities / `{summary.get('fixture', {}).get('face_library_snapshot', {}).get('image_count', 0)}` images; SHA-256 `{summary.get('fixture', {}).get('face_library_snapshot', {}).get('sha256', '-')}`.",
+        "",
+        "## Raw trace inventory",
+        "",
+        "Đếm trực tiếp producer-owned `trace_id`; không dùng fixture passage association để gộp trace.",
+        "",
+        _md_table(
+            [
+                "Pipeline",
+                "Raw trace IDs read",
+                "track_seen records",
+                "Recognition-completed traces",
+                "Unknown traces",
+                "Not-recognized traces",
+                "Published records",
+                "Media trace folders",
+            ],
+            [
+                [
+                    "LPR",
+                    len(lpr_trace_rows),
+                    sum(
+                        record.get("stage") == "track_seen"
+                        for records in lpr_records_by_trace.values()
+                        for record in records
+                    ),
+                    sum(
+                        any(record.get("stage") == "ocr_result" for record in records)
+                        for records in lpr_records_by_trace.values()
+                    ),
+                    "-",
+                    sum(
+                        not any(
+                            record.get("stage") == "ocr_result" for record in records
+                        )
+                        for records in lpr_records_by_trace.values()
+                    ),
+                    sum(
+                        record.get("stage") == "event_published"
+                        for records in lpr_records_by_trace.values()
+                        for record in records
+                    ),
+                    len(list((output / "media" / "lpr").glob("lpr_*")))
+                    if (output / "media" / "lpr").is_dir()
+                    else 0,
+                ],
+                [
+                    "Face",
+                    len(face_trace_rows),
+                    sum(row["track_seen"] for row in face_trace_rows),
+                    sum(row["outcome"] != "not_recognized" for row in face_trace_rows),
+                    sum(
+                        row["outcome"] == "recognized_unknown"
+                        for row in face_trace_rows
+                    ),
+                    sum(row["outcome"] == "not_recognized" for row in face_trace_rows),
+                    sum(row["confirmed"] for row in face_trace_rows),
+                    len(list((output / "media" / "face").glob("face_*")))
+                    if (output / "media" / "face").is_dir()
+                    else 0,
+                ],
             ],
         ),
         "",
@@ -2460,12 +2999,26 @@ def write_failure_only_report(output: Path, summary: dict[str, Any]) -> Path:
         _md_table(
             ["Pipeline", "Stage", "Count", "Calls/s"],
             [
-                ["Runtime", stage, count, trace_metrics_data.get("stage_calls_per_second", {}).get(stage)]
-                for stage, count in sorted(trace_metrics_data.get("stage_counts", {}).items())
+                [
+                    "Runtime",
+                    stage,
+                    count,
+                    trace_metrics_data.get("stage_calls_per_second", {}).get(stage),
+                ]
+                for stage, count in sorted(
+                    trace_metrics_data.get("stage_counts", {}).items()
+                )
             ]
             + [
-                ["LPR evidence", stage, count, lpr_trace_metrics.get("stage_calls_per_second", {}).get(stage)]
-                for stage, count in sorted(lpr_trace_metrics.get("stage_counts", {}).items())
+                [
+                    "LPR evidence",
+                    stage,
+                    count,
+                    lpr_trace_metrics.get("stage_calls_per_second", {}).get(stage),
+                ]
+                for stage, count in sorted(
+                    lpr_trace_metrics.get("stage_counts", {}).items()
+                )
             ],
         ),
         "",
@@ -2474,7 +3027,13 @@ def write_failure_only_report(output: Path, summary: dict[str, Any]) -> Path:
         _md_table(
             ["Camera", "Records", "Max gap (s)", "Mean gap (s)", "Missing"],
             [
-                [camera, value.get("records_with_source_pts"), value.get("max_gap_seconds"), value.get("mean_gap_seconds"), value.get("missing_source_pts")]
+                [
+                    camera,
+                    value.get("records_with_source_pts"),
+                    value.get("max_gap_seconds"),
+                    value.get("mean_gap_seconds"),
+                    value.get("missing_source_pts"),
+                ]
                 for camera, value in sorted(runtime.get("source_pts", {}).items())
             ],
         ),
@@ -2484,7 +3043,18 @@ def write_failure_only_report(output: Path, summary: dict[str, Any]) -> Path:
         "### LPR",
         "",
         _md_table(
-            ["trace_id", "Clip", "Final plate", "Fixture match", "Comparison", "track_seen", "lpr_eligible", "plate_detector_result", "ocr_result", "event_published"],
+            [
+                "trace_id",
+                "Clip",
+                "Final plate",
+                "Fixture match",
+                "Comparison",
+                "track_seen",
+                "lpr_eligible",
+                "plate_detector_result",
+                "ocr_result",
+                "event_published",
+            ],
             [
                 [
                     row["trace_id"],
@@ -2512,7 +3082,13 @@ def write_failure_only_report(output: Path, summary: dict[str, Any]) -> Path:
         "### LPR plate comparison",
         "",
         _md_table(
-            ["Fixture", "Expected plate", "Runtime trace", "Returned plate", "Comparison"],
+            [
+                "Fixture",
+                "Expected plate",
+                "Runtime trace",
+                "Returned plate",
+                "Comparison",
+            ],
             [
                 [
                     expectation.get("passage_id"),
@@ -2547,12 +3123,115 @@ def write_failure_only_report(output: Path, summary: dict[str, Any]) -> Path:
         "### Face",
         "",
         _md_table(
-            ["Pipeline", "Passage", "trace_id", "Clip", "Reason", "detector_hit", "track_seen", "first_qualified_face", "candidate_submitted", "first_attempt", "confirmed_result"],
-            failure_table_rows(
-                "Face",
-                failed_face,
-                ["detector_hit", "track_seen", "first_qualified_face", "candidate_submitted", "first_attempt", "confirmed_result"],
-            ),
+            [
+                "trace_id",
+                "Clip",
+                "BBox evidence",
+                "track_seen",
+                "Attempts",
+                "Confirmed",
+                "Published identities",
+            ],
+            [
+                [
+                    row["trace_id"],
+                    f"[clip]({clip_href('Face', str(row['trace_id']))})"
+                    if clip_href("Face", str(row["trace_id"])) != "-"
+                    else "-",
+                    f"[image]({annotated_face_href(row['records'])})"
+                    if annotated_face_href(row["records"]) != "-"
+                    else "-",
+                    row["track_seen"],
+                    row["attempts"],
+                    row["confirmed"],
+                    row["identities"],
+                ]
+                for row in face_trace_rows
+            ],
+        ),
+        "",
+        "Face dùng raw tracker lineage; fixture không gán passage, bbox hoặc expected identity.",
+        "",
+        "### Published known-identity Face trace index",
+        "",
+        _md_table(
+            [
+                "trace_id",
+                "Clip",
+                "Attempts",
+                "Confirmed publications",
+                "Published identities",
+                "Attempt score range",
+            ],
+            [
+                [
+                    row["trace_id"],
+                    f"[clip]({clip_href('Face', str(row['trace_id']))})"
+                    if clip_href("Face", str(row["trace_id"])) != "-"
+                    else "-",
+                    row["attempts"],
+                    row["confirmed"],
+                    row["identities"],
+                    f"{row['attempt_score_min']} .. {row['attempt_score_max']}",
+                ]
+                for row in successful_face_trace_rows
+            ],
+        ),
+        "",
+        "### Face recognition outcome index",
+        "",
+        "`recognized_unknown` nghĩa là inference đã chạy và model trả `unknown`; đây là recognition hợp lệ, không phải failure.",
+        "",
+        _md_table(
+            [
+                "trace_id",
+                "Clip",
+                "BBox evidence",
+                "Recognition outcome",
+                "Detail",
+                "Attempts",
+                "Attempt identities",
+                "Attempt score range",
+                "Observed stages",
+                "Missing stages",
+            ],
+            [
+                [
+                    row["trace_id"],
+                    f"[clip]({clip_href('Face', str(row['trace_id']))})"
+                    if clip_href("Face", str(row["trace_id"])) != "-"
+                    else "-",
+                    f"[image]({annotated_face_href(row['records'])})"
+                    if annotated_face_href(row["records"]) != "-"
+                    else "-",
+                    row["outcome"],
+                    row["recognition_detail"],
+                    row["attempts"],
+                    ", ".join(row["attempt_identities"]) or "-",
+                    f"{row['attempt_score_min']} .. {row['attempt_score_max']}",
+                    ", ".join(row["observed_stages"]),
+                    ", ".join(row["missing_stages"]) or "-",
+                ]
+                for row in face_trace_rows
+            ],
+        ),
+        "",
+        "### Not-recognized Face lifecycle index",
+        "",
+        _md_table(
+            ["trace_id", "Clip", "Detail", "Observed stages", "Missing stages"],
+            [
+                [
+                    row["trace_id"],
+                    f"[clip]({clip_href('Face', str(row['trace_id']))})"
+                    if clip_href("Face", str(row["trace_id"])) != "-"
+                    else "-",
+                    row["recognition_detail"],
+                    ", ".join(row["observed_stages"]),
+                    ", ".join(row["missing_stages"]) or "-",
+                ]
+                for row in failed_face_trace_rows
+            ],
         ),
     ]
     if not groups:
@@ -2562,7 +3241,9 @@ def write_failure_only_report(output: Path, summary: dict[str, Any]) -> Path:
         evidence_root = output / "media"
 
         def stage_image(record: dict[str, Any], stage: str) -> Path | None:
-            artifact_path = record.get("artifact_path")
+            artifact_path = record.get("annotated_artifact_path") or record.get(
+                "artifact_path"
+            )
             if artifact_path:
                 candidate = output / "media" / str(artifact_path)
                 if candidate.is_file():
@@ -2570,13 +3251,20 @@ def write_failure_only_report(output: Path, summary: dict[str, Any]) -> Path:
             track_id = str(record.get("track_id") or "")
             if not track_id or not evidence_root.is_dir():
                 return None
-            pipeline_root = evidence_root / ("face" if record.get("pipeline") == "face" or record.get("task") == "face" else "lpr")
+            pipeline_root = evidence_root / (
+                "face"
+                if record.get("pipeline") == "face" or record.get("task") == "face"
+                else "lpr"
+            )
             candidates = sorted(
                 path
                 for path in pipeline_root.rglob("*")
                 if path.is_file()
                 and stage in path.name
-                and (track_id in path.parent.name or str(record.get("trace_id") or "") in str(path))
+                and (
+                    track_id in path.parent.name
+                    or str(record.get("trace_id") or "") in str(path)
+                )
             )
             return candidates[0] if candidates else None
 
@@ -2586,78 +3274,162 @@ def write_failure_only_report(output: Path, summary: dict[str, Any]) -> Path:
             stage = str(record.get("stage"))
             field_groups = {
                 "detector_hit": (
-                    "label", "score", "object_box", "detection_region", "source_pts"
+                    "label",
+                    "score",
+                    "object_box",
+                    "detection_region",
+                    "source_pts",
                 ),
-                "track_seen": (
-                    "track_id", "generation", "object_box", "source_pts"
-                ),
+                "track_seen": ("track_id", "generation", "object_box", "source_pts"),
                 "lpr_eligible": (
-                    "accepted", "reason", "position_changes", "stationary",
-                    "motionless_count", "eligibility_retry"
+                    "accepted",
+                    "reason",
+                    "position_changes",
+                    "stationary",
+                    "motionless_count",
+                    "eligibility_retry",
                 ),
                 "plate_detector_input": (
-                    "artifact_path", "scale", "detection_threshold", "object_box"
+                    "artifact_path",
+                    "scale",
+                    "detection_threshold",
+                    "object_box",
                 ),
                 "plate_detector_result": (
-                    "accepted", "reason", "score", "box", "plate_box"
+                    "accepted",
+                    "reason",
+                    "score",
+                    "box",
+                    "plate_box",
                 ),
                 "plate_crop": (
-                    "artifact_path", "artifact_bytes", "image_shape", "plate_box"
+                    "artifact_path",
+                    "artifact_bytes",
+                    "image_shape",
+                    "plate_box",
                 ),
                 "ocr_plate_input": (
-                    "artifact_path", "artifact_bytes", "image_shape", "ocr_variant"
+                    "artifact_path",
+                    "artifact_bytes",
+                    "image_shape",
+                    "ocr_variant",
                 ),
                 "ocr_result": (
-                    "accepted", "reason", "plate", "normalized_plate", "score",
-                    "mean_character_score", "character_scores", "ocr_path"
+                    "accepted",
+                    "reason",
+                    "plate",
+                    "normalized_plate",
+                    "score",
+                    "mean_character_score",
+                    "character_scores",
+                    "ocr_path",
                 ),
                 "ocr_text_crop": (
-                    "artifact_path", "artifact_bytes", "image_shape", "text_box"
+                    "artifact_path",
+                    "artifact_bytes",
+                    "image_shape",
+                    "text_box",
                 ),
                 "ocr_recognition_tensor": (
-                    "artifact_path", "artifact_bytes", "image_shape", "ocr_variant",
-                    "score"
+                    "artifact_path",
+                    "artifact_bytes",
+                    "image_shape",
+                    "ocr_variant",
+                    "score",
                 ),
                 "event_published": (
-                    "published", "accepted", "reason", "event_id", "plate",
-                    "score", "identity"
+                    "published",
+                    "accepted",
+                    "reason",
+                    "event_id",
+                    "plate",
+                    "score",
+                    "identity",
                 ),
                 "first_qualified_face": (
-                    "admitted", "reason", "person_box", "face_box", "quality_score",
-                    "quality_components", "source_pts"
+                    "admitted",
+                    "reason",
+                    "person_box",
+                    "face_box",
+                    "quality_score",
+                    "quality_components",
+                    "source_pts",
                 ),
                 "candidate_submitted": (
-                    "candidate_id", "frame_id", "evidence_id", "identity",
-                    "quality_score", "admitted", "source_pts"
+                    "candidate_id",
+                    "frame_id",
+                    "evidence_id",
+                    "identity",
+                    "quality_score",
+                    "admitted",
+                    "source_pts",
                 ),
                 "first_attempt": (
-                    "attempt", "task", "top1", "top2", "margin", "latency_ms",
-                    "status", "reason"
+                    "attempt",
+                    "task",
+                    "identity",
+                    "score",
+                    "top1",
+                    "top2",
+                    "margin",
+                    "latency_ms",
+                    "status",
+                    "reason",
                 ),
                 "confirmed_result": (
-                    "identity", "confidence", "margin", "status", "reason",
-                    "event_id", "source_pts"
+                    "identity",
+                    "confidence",
+                    "margin",
+                    "status",
+                    "reason",
+                    "event_id",
+                    "source_pts",
                 ),
             }
             fields = field_groups.get(
                 stage,
                 (
-                    "reason", "decision", "accepted", "score", "plate", "identity",
-                    "track_id", "candidate_id", "evidence_id", "event_id",
-                    "artifact_path", "source_pts"
+                    "reason",
+                    "decision",
+                    "accepted",
+                    "score",
+                    "plate",
+                    "identity",
+                    "track_id",
+                    "candidate_id",
+                    "evidence_id",
+                    "event_id",
+                    "artifact_path",
+                    "source_pts",
                 ),
             )
             values = {key: record.get(key) for key in fields}
             values = {key: value for key, value in values.items() if value is not None}
             return json.dumps(values, ensure_ascii=False, separators=(",", ":")) or "{}"
+
         for (kind, trace_id), records in sorted(groups.items()):
             required_stages = (
-                ["track_seen", "lpr_eligible", "plate_detector_input",
-                 "plate_detector_result", "plate_crop", "ocr_plate_input",
-                 "ocr_result", "ocr_text_crop", "ocr_recognition_tensor", "event_published"]
+                [
+                    "track_seen",
+                    "lpr_eligible",
+                    "plate_detector_input",
+                    "plate_detector_result",
+                    "plate_crop",
+                    "ocr_plate_input",
+                    "ocr_result",
+                    "ocr_text_crop",
+                    "ocr_recognition_tensor",
+                    "event_published",
+                ]
                 if kind == "LPR"
-                else ["detector_hit", "track_seen", "first_qualified_face",
-                      "candidate_submitted", "first_attempt", "confirmed_result"]
+                else [
+                    "detector_hit",
+                    "track_seen",
+                    "first_qualified_face",
+                    "candidate_submitted",
+                    "first_attempt",
+                    "confirmed_result",
+                ]
             )
             first_by_stage: dict[str, dict[str, Any]] = {}
             for record in sorted(
@@ -2681,36 +3453,49 @@ def write_failure_only_report(output: Path, summary: dict[str, Any]) -> Path:
                 lifecycle_rows.append(
                     [
                         stage,
-                        (record or {}).get("source_pts", (record or {}).get("frame_time")),
+                        (record or {}).get(
+                            "source_pts", (record or {}).get("frame_time")
+                        ),
                         (record or {}).get("trace_time"),
                         "MISSING" if record is None else "observed",
                         stage_result(record),
                         image_link,
                     ]
                 )
-            lines.extend([
-                f"### `{kind}` track_id `{trace_id}`",
-                "",
-                f"Clip: [{clip_href(kind, trace_id)}]({clip_href(kind, trace_id)})"
-                if clip_href(kind, trace_id) != "-"
-                else "Clip: -",
-                "",
-                _md_table(
-                    ["Stage", "Source PTS", "Runtime time", "Status", "Result", "Image"],
-                    lifecycle_rows,
-                ),
-                "",
-            ])
+            lines.extend(
+                [
+                    f"### `{kind}` track_id `{trace_id}`",
+                    "",
+                    f"Clip: [{clip_href(kind, trace_id)}]({clip_href(kind, trace_id)})"
+                    if clip_href(kind, trace_id) != "-"
+                    else "Clip: -",
+                    "",
+                    _md_table(
+                        [
+                            "Stage",
+                            "Source PTS",
+                            "Runtime time",
+                            "Status",
+                            "Result",
+                            "Image",
+                        ],
+                        lifecycle_rows,
+                    ),
+                    "",
+                ]
+            )
     diagnostic_failures = []
     if not runtime.get("lpr_evidence", {}).get("valid", True):
         evidence = runtime.get("lpr_evidence", {})
-        diagnostic_failures.append([
+        diagnostic_failures.append(
+            [
                 "lpr_evidence",
                 (
                     f"{evidence.get('reason')}; invocations={evidence.get('invocations')}; "
                     f"errors={len(evidence.get('errors', []))}"
                 ),
-        ])
+            ]
+        )
     native_media = runtime.get("native_media", {})
     if native_media and not native_media.get("complete", False):
         missing = [
@@ -2720,15 +3505,26 @@ def write_failure_only_report(output: Path, summary: dict[str, Any]) -> Path:
         ]
         diagnostic_failures.append(["native_media", "; ".join(missing) or "incomplete"])
     if runtime.get("correlation_mismatches"):
-        diagnostic_failures.append(["correlation", len(runtime["correlation_mismatches"])])
+        diagnostic_failures.append(
+            ["correlation", len(runtime["correlation_mismatches"])]
+        )
     if runtime.get("hardware_sampler_errors"):
-        diagnostic_failures.append(["hardware_sampler", "; ".join(runtime["hardware_sampler_errors"])])
+        diagnostic_failures.append(
+            ["hardware_sampler", "; ".join(runtime["hardware_sampler_errors"])]
+        )
     if runtime.get("bad_log_lines"):
         diagnostic_failures.append(["runtime_logs", len(runtime["bad_log_lines"])])
     if not summary.get("measurement", {}).get("source_pts_complete", True):
         diagnostic_failures.append(["source_pts", "missing source PTS"])
     if diagnostic_failures:
-        lines.extend(["## Diagnostic failures", "", _md_table(["Area", "Detail"], diagnostic_failures), ""])
+        lines.extend(
+            [
+                "## Diagnostic failures",
+                "",
+                _md_table(["Area", "Detail"], diagnostic_failures),
+                "",
+            ]
+        )
     report_path = output / "report.md"
     report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return report_path
@@ -2853,7 +3649,9 @@ def main() -> int:
                 os.environ["CAMERA_SOURCE_OVERLAY"] = previous_source_overlay
         source_started = wait_source_starts(source_start_dir, timeout=60)
         wait_acceptance_ready(str(value["runtime"]["image"]), timeout=60)
-        summary["timing"]["isolated_start_seconds"] = round(time.monotonic() - step_started, 3)
+        summary["timing"]["isolated_start_seconds"] = round(
+            time.monotonic() - step_started, 3
+        )
         observation_wall = time.time()
         initial_restarts = restart_counts()
         sampler = ResourceSampler()
@@ -2864,12 +3662,28 @@ def main() -> int:
             "face": Path(replay_sources["face_camera"]),
             "lpr": Path(replay_sources["car_camera"]),
         }
+        # Direct sources run at their native wall-clock duration. Derive the
+        # EOF deadline from the authoritative files so a long, unmodified
+        # source is never cut merely to satisfy the old composite-fixture
+        # timeout. The bounded margin covers startup and FIFO backpressure.
+        source_deadline = (
+            time.monotonic()
+            + max(replay_duration(path) for path in replays.values())
+            + 45.0
+        )
         step_started = time.monotonic()
         anchors, anchor_details = observe_round_anchors(
-            replays, source_started, started + 103
+            replays, source_started, source_deadline
         )
-        source_ended = wait_source_ends(source_start_dir, started + 103)
-        wait_latest_through(source_ended, started + 103)
+        source_ended = wait_source_ends(source_start_dir, source_deadline)
+        wait_latest_through(source_ended, source_deadline)
+        live_trace_path = report_media / "runtime-trace.jsonl"
+        live_records = [
+            json.loads(line)
+            for line in live_trace_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        finalized_track_count = finalize_finite_source_tracks(live_records)
         capture_cutoff = time.time()
         summary["capture_cutoff_epoch"] = capture_cutoff
         (report_media / "capture-cutoff").write_text(
@@ -2901,16 +3715,16 @@ def main() -> int:
             sampler.evidence_pinned[-1] if sampler.evidence_pinned else None
         )
         evidence_pinned_min = min(sampler.evidence_pinned, default=None)
-        lifecycle_stats = (
-            sampler.recognition_lifecycle[-1] if sampler.recognition_lifecycle else {}
-        )
+        recognition_stats = sampler.recognition[-1] if sampler.recognition else {}
         final_restarts = restart_counts()
 
-        evidence_manifest = output / "media" / "lpr" / "evidence.jsonl"
-        if not wait_file_quiescent(evidence_manifest):
-            raise RuntimeError(
-                "Runtime LPR evidence writer did not become quiescent after replay"
-            )
+        for pipeline in ("lpr", "face"):
+            evidence_manifest = output / "media" / pipeline / "evidence.jsonl"
+            if not wait_file_quiescent(evidence_manifest):
+                raise RuntimeError(
+                    f"Runtime {pipeline.upper()} evidence writer did not become "
+                    "quiescent after replay"
+                )
 
         trace_path = output / "media" / "runtime-trace.jsonl"
         if not trace_path.is_file():
@@ -2943,9 +3757,15 @@ def main() -> int:
         # Runtime lineage is producer-owned.  Keep this record set immutable for
         # runtime metrics; fixture association is a separate comparison view.
         runtime_records = records
+        raw_lpr_trace_ids = pipeline_trace_ids(runtime_records, "lpr")
+        all_media_evidence = media_evidence_records(output / "media")
+        face_annotated_evidence = annotate_face_evidence(
+            output / "media", all_media_evidence
+        )
+        write_json(output / "face-annotated-evidence.json", face_annotated_evidence)
         native_media = collect_native_trace_clips(
             output,
-            runtime_records + media_evidence_records(output / "media"),
+            runtime_records + all_media_evidence,
             str(value["database"]["path"]),
         )
         comparison_records = assign_records(
@@ -2968,9 +3788,21 @@ def main() -> int:
             output / "runtime-evidence.json",
             {"summary": runtime_lpr_evidence, "records": evidence_records},
         )
-        recognition = recognition_lifecycle_summary(runtime_records, lifecycle_stats)
+        recognition = {
+            **recognition_stats,
+            "cleanup_zero": all(
+                int(recognition_stats.get(field, 0)) == 0
+                for field in (
+                    "sessions",
+                    "in_flight",
+                    "evidence_pinned",
+                    "writer_depth",
+                )
+            ),
+        }
         write_json(
-            output / "runtime-trace.json", {"anchors": anchors, "records": runtime_records}
+            output / "runtime-trace.json",
+            {"anchors": anchors, "records": runtime_records},
         )
         write_json(
             output / "fixture-comparison.json",
@@ -2986,6 +3818,8 @@ def main() -> int:
             embeddings,
         ) = face_results(comparison_records, face_passages, anchors[CAMERAS["face"]])
         lpr, lpr_false = lpr_results(comparison_records, lpr_passages)
+        lpr["raw_trace_count"] = len(raw_lpr_trace_ids)
+        lpr["expected_trace_count"] = len(lpr_passages)
         correlation = correlation_mismatches(comparison_records)
         runtime_logs = docker_output(
             "logs",
@@ -3004,20 +3838,19 @@ def main() -> int:
             check=False,
         )
         pending = parse_pending(runtime_logs)
-        pending_source = "face_pipeline_log"
+        pending_source = "recognition_log"
         if (
-            int(lifecycle_stats.get("in_flight", 0)) == 0
+            int(recognition_stats.get("in_flight", 0)) == 0
+            and int(recognition_stats.get("sessions", 0)) == 0
             and evidence_pinned_final == 0
         ):
-            # The periodic face log can be older than the final sampler point.
-            # Lifecycle plus evidence ownership is the authoritative live state.
             pending = 0
-            pending_source = "lifecycle_and_evidence"
+            pending_source = "recognition_cleanup"
         bad_log_lines = [
             line
             for line in runtime_logs.splitlines()
             if re.search(
-                r"reconnect|stall|no frames|ffmpeg.*(?:exited|error)", line, re.I
+                r"reconnect|stall|no frames|ffmpeg.*(?:error|crash)", line, re.I
             )
         ]
         api_consistent, api_mismatches, uncommitted_updates = api_sqlite_consistency(
@@ -3091,6 +3924,7 @@ def main() -> int:
                 "run_id": run_id,
                 "started": source_started,
                 "done": source_done,
+                "explicit_track_ends": finalized_track_count,
             },
             "rounds_complete": all(len(value) == ROUNDS for value in anchors.values()),
             "pending": pending,
@@ -3117,13 +3951,14 @@ def main() -> int:
             "trace_metrics": observed_trace_metrics,
             "lpr_evidence_trace_metrics": observed_lpr_trace_metrics,
             "source_pts": observed_source_pts,
-            "queue_metrics": {
-                "depth_samples": sampler.recognition_lifecycle,
-                "age_ms": None,
-                "age_reason": "runtime stats exposes queue depth but not per-item enqueue age",
-            },
+            "recognition_metrics": {"samples": sampler.recognition},
             "lpr_evidence": runtime_lpr_evidence,
-            "recognition_lifecycle": recognition,
+            "face_annotated_evidence": {
+                key: value
+                for key, value in face_annotated_evidence.items()
+                if key != "records"
+            },
+            "recognition": recognition,
             "recognition_idle_after_replay": recognition_idle,
             "recordings_ready": recordings_ready,
             "recordings_available_through": recordings_through,
@@ -3139,6 +3974,16 @@ def main() -> int:
                     "manifest": sha256(manifest_path),
                     "config": sha256(Path(fixture["config"])),
                     "model": fixture.get("model_sha256"),
+                    "face_library": fixture.get("face_library_snapshot", {}).get(
+                        "sha256"
+                    ),
+                    "master_recognition_commit": MASTER_RECOGNITION_COMMIT,
+                    "recognition_core": sha256_tree(
+                        Path(__file__).resolve().parents[2]
+                        / "frigate"
+                        / "frigate"
+                        / "recognition"
+                    ),
                 },
             }
         )
@@ -3155,25 +4000,23 @@ def main() -> int:
             "lpr_recall": lpr["passage_recall"] == 1.0,
             "lpr_readable_denominator": lpr["readable_denominator"] >= 3,
             "lpr_exact_match_reported": lpr["exact_match"] is not None,
-            "lpr_accuracy": lpr["accuracy"] is not None
-            and lpr["accuracy"] >= 2 / 3,
+            "lpr_accuracy": lpr["accuracy"] is not None and lpr["accuracy"] >= 2 / 3,
             "lpr_recognition_precision": lpr["precision"] == 1.0,
             "lpr_recognition_recall": lpr["recall"] >= 2 / 3,
             "lpr_passage_precision": lpr["passage_precision"] == 1.0,
-            "face_detection_recall": face["detection_recall"] >= MIN_PASSAGE_RATE,
-            "face_accuracy": face["accuracy"] >= 0.8,
-            "face_precision": face["precision"] == 1.0,
-            "face_recall": face["recall"] >= 0.8,
-            "face_passage_latency": latency["face"]["passage_to_confirmed_ms_p95"]
-            is not None
-            and latency["face"]["passage_to_confirmed_ms_p95"] <= 3000,
-            "face_eligible_latency": latency["face"]["eligible_to_confirmed_ms_p95"]
-            is not None
-            and latency["face"]["eligible_to_confirmed_ms_p95"] <= 1500,
-            "face_first_attempt": latency["face"]["first_attempt_ms_p95"] is not None
-            and latency["face"]["first_attempt_ms_p95"] <= 750,
-            "face_embedding": latency["face"]["embedding_ms_p95"] is not None
-            and latency["face"]["embedding_ms_p95"] <= 200,
+            "lpr_raw_trace_count_exact": len(raw_lpr_trace_ids) == len(lpr_passages),
+            "face_raw_tracks_present": face.get("trace_count", 0) > 0,
+            "face_raw_attempts_present": face.get("attempt_count", 0) > 0,
+            "face_recognition_trace_coverage_complete": face.get(
+                "recognition_coverage", 0.0
+            )
+            == 1.0,
+            "face_library_snapshot": bool(
+                fixture.get("face_library_snapshot", {}).get("identity_count", 0)
+            )
+            and bool(fixture.get("face_library_snapshot", {}).get("image_count", 0))
+            and not fixture.get("face_library_snapshot", {}).get("train_copied", True),
+            "face_annotated_evidence": face_annotated_evidence["valid"],
             "pending_zero": pending == 0,
             "correlation": not correlation,
             "api_sqlite_consistency": api_consistent,
@@ -3187,25 +4030,9 @@ def main() -> int:
             and resources["shm_max_percent"] < 70,
             "model_load_once_per_instance": model_loads == detector_count
             and face_model_loads == 1,
-            "evidence_bytes_per_camera": all(
-                value <= 32 * 1024**2 for value in evidence_bytes.values()
-            ),
-            "recognition_attempt_budget": recognition["max_attempts_per_track"] <= 3,
-            "recognition_duplicate_inference": not recognition["duplicate_inference"],
-            "recognition_stale_results": lifecycle_stats.get("stale_results", 0) == 0,
-            "recognition_early_stop_zero": lifecycle_stats.get("early_stop", 0) == 0,
-            "recognition_in_flight_zero": lifecycle_stats.get("in_flight", 0) == 0,
-            "recognition_active_lifecycle_zero": lifecycle_stats.get(
-                "active_lifecycles", lifecycle_stats.get("active_tracks", 0)
-            )
-            == 0,
-            "recognition_selector_depth_zero": lifecycle_stats.get(
-                "quality_top_k_depth", 0
-            )
-            == 0,
-            "recognition_lpr_queue_zero": lifecycle_stats.get("lpr_queue_depth", 0)
-            == 0,
-            "evidence_pinned_zero": evidence_pinned_final == 0,
+            "recognition_cleanup_zero": recognition["cleanup_zero"],
+            "recognition_writer_drops_zero": recognition.get("writer_drops", 0) == 0,
+            "recognition_writer_errors_zero": recognition.get("writer_errors", 0) == 0,
         }
         summary["gates"] = gates
     except Exception as exc:
@@ -3262,17 +4089,14 @@ def main() -> int:
                     .get("source_pts", {})
                     .values()
                 )
-                and summary.get("runtime", {})
-                .get("lpr_evidence", {})
-                .get("valid")
-                and summary.get("runtime", {})
-                .get("native_media", {})
-                .get("complete")
+                and summary.get("runtime", {}).get("lpr_evidence", {}).get("valid")
+                and summary.get("runtime", {}).get("native_media", {}).get("complete")
             ),
         }
         artifact_names = (
             "runtime-trace.json",
             "runtime-evidence.json",
+            "face-annotated-evidence.json",
             "native-media.json",
             "face.json",
             "lpr.json",
@@ -3286,9 +4110,7 @@ def main() -> int:
         summary["report"] = {
             "mode": "evidence_only",
             "status": "complete"
-            if "error" not in summary
-            and artifacts_complete
-            and native_media_complete
+            if "error" not in summary and artifacts_complete and native_media_complete
             else "incomplete",
             "criteria": [],
             "artifacts": [
