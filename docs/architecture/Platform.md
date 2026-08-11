@@ -1,6 +1,6 @@
 # Kiến trúc Camera AI B2B
 
-Ngày cập nhật: 11/08/2026
+Ngày cập nhật: 12/08/2026
 
 ## 1. Mục tiêu
 
@@ -45,7 +45,7 @@ Các bằng chứng hiện có được phân loại như sau; `pass` unit test 
 | Hai-camera stream health | Replay giữ camera/process FPS ổn định | Diagnostic pass; không phải passage recognition acceptance |
 | LPR hai camera | Baseline passage recall 60%; Phase 2 đã tăng lên 100% trên fixture replay | Passage bottleneck Phase 2 đã đạt; recognition tiếp tục được cải thiện |
 | Face sáu/bảy camera | Các report gần nhất `accepted=false`, enrichment latency/pending vượt gate | Không có approved capacity sáu/bảy camera |
-| Recognition còn gắn với Frigate detection/Event | Khó nhúng LPR/Face vào runtime khác | Recognition core nhận typed tracked observation và trả typed update qua adapter |
+| Recognition runtime boundary | Local vẫn là mặc định; external là opt-in | Core nhận typed observation; external gRPC/mTLS container đã chạy mà tracker/Event/media vẫn ở Frigate |
 
 ## 3. Khoảng trống cần giải quyết
 
@@ -82,18 +82,17 @@ Các bằng chứng hiện có được phân loại như sau; `pass` unit test 
 
 ### 4.1 Phạm vi đơn giản hóa cho external runtime
 
-Phase 6 giữ một core đồng bộ trong `EmbeddingProcess` để khóa parity. Phase 7 chuyển đúng core,
-Face/LPR model adapters và session state sang một recognition container riêng. Production chỉ dùng
-gRPC/mTLS giữa Frigate và container này; không xây thêm ZeroMQ production path, generic SDK hoặc
-content-addressed evidence trước khi runtime thật đạt acceptance. Local synchronous mode chỉ còn là
-topology được chọn rõ cho development/parity, không phải fallback của external mode. Packaging thành
-wheel thực hiện sau khi runtime boundary đã được chứng minh.
+Runtime hiện hỗ trợ hai topology chọn độc quyền bằng `recognition.runtime`: `local` chạy đồng bộ
+trong `EmbeddingProcess`; `external` chuyển model adapters, `RecognitionCore` và session state sang
+container `camera-recognition`. External production chỉ dùng gRPC/mTLS; không có ZeroMQ production
+path, generic SDK hoặc content-addressed resolver. Local là topology độc lập để vận hành/parity,
+không phải fallback khi external lỗi. Wheel packaging chỉ thực hiện sau fault-injection acceptance.
 
 ## 5. Kiến trúc đích
 
-Sơ đồ dưới đây là topology đích của Phase 7, chưa phải runtime hiện tại. Runtime hiện tại vẫn chạy
-Face/LPR model và `RecognitionCore` đồng bộ bên trong `EmbeddingProcess`; Phase 7 thay phần đó bằng
-external client và recognition container, không tạo decision path thứ hai chạy song song.
+Sơ đồ dưới đây là external topology đã triển khai. Khi chọn external, Frigate chỉ khởi tạo host
+client; Face/LPR model và core chỉ chạy trong `camera-recognition`. Khi chọn local, container này
+không chạy. Không topology nào chạy hai recognition decision path song song.
 
 ```mermaid
 flowchart LR
@@ -134,7 +133,7 @@ flowchart LR
 | --- | --- | --- | --- |
 | Detection | Capture/detect/track runtime | Phát tracked-object update, frame/evidence reference và lifecycle end | OCR/embed, recognition decision, notification hoặc disk trace |
 | Frigate external client | `ExternalRecognitionClient` | Map canonical update sang ordered job; sở hữu evidence TTL; kiểm tra epoch/sequence/idempotency | Chạy model, vote, tự retry sang runtime khác hoặc publish result chưa hợp lệ |
-| Recognition service | Executor + model adapters + `RecognitionCore` | Inference, Face/LPR history/voting, explicit end, Face library control và typed outcome | Import Event/SQLite/notification, ghi media hoặc tự tải URL/path evidence |
+| Recognition service | Executor + model adapters + `RecognitionCore` | Inference, Face/LPR history/voting, explicit end, Face library control; tạo producer-owned evidence artifacts trong outcome khi capture được yêu cầu | Import Event/SQLite/notification, ghi filesystem media hoặc tự tải URL/path evidence |
 | Frigate output adapter | `FrigateEventAdapter` | Map outcome đã qua guard sang Event metadata và media contract hiện hành | Chọn lại winner, đổi score hoặc nối history qua service epoch |
 | Event | `EventAggregator` | Canonical Event/API/SQLite commit và correlation | Chạy OCR/embed hoặc sở hữu recognition history |
 | Notification | Durable outbox/worker | Gửi từ committed Event, retry/idempotency | Nhận lệnh trực tiếp từ recognition worker |
@@ -181,9 +180,12 @@ và expiry. Giới hạn hard là 8 MiB/job; length phải khớp shape/dtype tr
 evidence trên inference path vì encode có thể đổi model input. Không chia sẻ `/dev/shm` hoặc IPC
 namespace giữa hai container, không gửi URL/path và không để service đọc filesystem tùy ý.
 
-Frigate giữ evidence đến khi nhận outcome/ack hoặc TTL hết. Service chỉ giữ buffer trong phạm vi
-job và không ghi raw/annotated media. Evidence contract không được lọc observation, xếp hạng
-candidate, vote hoặc trì hoãn publication.
+Frigate giữ evidence đến khi nhận outcome/ack hoặc TTL hết. Service chỉ giữ input buffer trong phạm
+vi job và không tự ghi filesystem media. Khi acceptance capture được yêu cầu, code producer dùng
+chung tạo `recognition_attempt`, `recognition_attempt_bbox` và exact `face_crop`; service trả bytes,
+hash và bbox metadata trong outcome để Frigate writer persist. Validator chỉ kiểm tra/copy artifact,
+không vẽ lại bbox hay dựng record. Evidence contract không được lọc observation, xếp hạng candidate,
+vote hoặc trì hoãn publication.
 
 ### 5.4 Deployment, control plane và no-fallback contract
 
@@ -191,11 +193,13 @@ candidate, vote hoặc trì hoãn publication.
 recognition:
   runtime: external
   endpoint: recognition:50051
-  deadline: 5s
+  deadline: 5       # seconds; connect/RPC
+  job_deadline: 30  # seconds; accepted observation: queue + inference
   tls:
-    ca: /config/certs/recognition-ca.crt
-    certificate: /config/certs/frigate-client.crt
-    key: /config/certs/frigate-client.key
+    ca: /run/recognition-tls/ca.crt
+    certificate: /run/recognition-tls/client.crt
+    key: /run/recognition-tls/client.key
+    server_name: recognition
 ```
 
 Recognition image chạy thành service riêng trên private Docker network và không publish port ra
@@ -208,6 +212,12 @@ Chọn `external` thì Frigate không khởi tạo local Face/LPR inference mode
 config bị service từ chối làm startup validation fail. Sau startup, mất kết nối hoặc service
 unhealthy chỉ làm recognition fail closed bằng typed outcome; capture/detect/base Event vẫn chạy,
 không fallback sang local runtime, CPU hoặc model khác và không tự resubmit job.
+
+Local và external không có hai implementation recognition khác nhau. Cả hai gọi chung
+`RecognitionCore`, Face/LPR engine, Face detector/crop/bbox/evidence helpers và LPR processing
+mixin. External chỉ thêm copy evidence, bounded admission, gRPC/mTLS và epoch/sequence guard.
+Khi Frigate gửi `end_track`, track chuyển sang trạng thái `ending`; mọi observation đã accept và
+xếp trước end vẫn được apply. Chỉ outcome `ENDED` mới đóng lineage và dọn sequence/media state.
 
 ### 5.5 Trace transport
 
@@ -524,9 +534,10 @@ tick chỉ vì code đã tồn tại.
 module hoặc deployment topology được nêu rõ; unit test, replay và benchmark chỉ là bằng chứng
 để đóng phase, không phải work package thay thế cho phần triển khai. Phase 1–4 đã hoàn tất;
 Phase 5 là thử nghiệm `[SUPERSEDED]`; Phase 6 đã `[DONE]` với recognition core đồng bộ và Frigate
-adapters; Phase 7 là bước `[NEXT]` để chuyển model/core/session sang recognition container riêng.
-Acceptance
-tổng thể được đánh giá riêng sau khi hoàn thành toàn bộ roadmap, không dùng để đổi trạng thái từng
+adapters; Phase 7 đang `[IN PROGRESS]`: external container/runtime đã chạy cùng shared decision
+code và đạt runtime/E2E invariants, còn correlation audit, restart/disconnect fault injection và
+wheel packaging. Acceptance tổng thể được đánh giá riêng sau khi hoàn thành toàn bộ roadmap,
+không dùng để đổi trạng thái từng
 phase đã hoàn tất.
 
 ### 13.1 Ma trận truy vết thiết kế → triển khai
@@ -554,7 +565,8 @@ baseline/passage [DONE]
 → finite-source timeline + raw trace + native media [DONE: Phase 6-0]
 → Frigate master voting/consensus parity [DONE: Phase 6-1]
 → standalone synchronous recognition core + Frigate adapters [DONE: Phase 6]
-→ external gRPC recognition container + Frigate host adapter [NEXT: Phase 7]
+→ external gRPC recognition container + Frigate host adapter [DONE: RUNTIME/E2E]
+→ restart/disconnect fault injection + wheel packaging [NEXT]
 ```
 
 ### Phase 1 — Đo baseline hai camera [DONE]
@@ -830,7 +842,7 @@ recognition. Code custom còn tồn tại không được hiểu là kiến trú
 | Phase 6-0 runtime/trace/media | `[DONE]` | 11 raw LPR traces, 11/11 clips và report đã xác minh |
 | Phase 6-1 master parity | `[DONE]` | Exact LPR clustering và Face weighted voting đã có differential test |
 | Phase 6 recognition core/adapters | `[DONE]` | Production adapter/core duy nhất đã test; finite-source caller phát explicit end sau EOF và runtime cleanup đạt zero |
-| Phase 7 external recognition runtime | `[NEXT]` | Core và Frigate adapter đã parity; Docker/gRPC service và host integration chưa triển khai |
+| Phase 7 external recognition runtime | `[IN PROGRESS]` | Docker/gRPC/mTLS service, host integration, shared logic và local/external E2E đã đạt; còn restart/disconnect fault injection và wheel packaging |
 
 ### Phase 6 — Master-compatible standalone recognition core [DONE]
 
@@ -1164,7 +1176,8 @@ Event/media publication và không có local fallback khi deployment chọn exte
   late update, không tuyên bố dừng model call đang chạy. Differential test phải khớp synchronous
   update sequence khi không overload.
 - Default: một partition, 128 observation slots, 64 active-session/control slots, 128 outcomes,
-  deadline 5 giây và shutdown drain 10 giây. Capacity được cấu hình nhưng reject semantics không đổi.
+  RPC deadline 5 giây, accepted-job deadline 30 giây và shutdown drain 10 giây. Capacity được cấu
+  hình nhưng reject semantics không đổi.
 
 #### Phase 7-2 — gRPC/mTLS recognition service [DONE: SOURCE/UNIT]
 
@@ -1186,12 +1199,17 @@ Event/media publication và không có local fallback khi deployment chọn exte
 
 #### Phase 7-4 — Docker acceptance và packaging [PARTIAL]
 
-- Build Frigate image và recognition image riêng; recognition service có GPU/resource/health policy,
-  private network, model mount read-only, Face library read-write volume và certificate mount. Chưa
-  tách wheel trước khi integration runtime đạt.
-- Chứng minh synchronous baseline và external service tạo cùng ordered decision/update sequence trên
-  fixture khi healthy; overload, deadline, disconnect và restart không duplicate/stale publication.
-  Terminal gate bắt buộc: sessions, in-flight, queue depth và evidence leases đều bằng `0`.
+- `deploy/run.ps1 build` đã tạo Frigate overlay và recognition overlay riêng từ cùng source tree;
+  service có GPU/resource/health policy, private network, Face library và certificate mount.
+- Differential test với cùng ordered observations đã khóa cùng decision/update sequence giữa
+  synchronous core và executor/transport khi healthy. Hai E2E độc lập cùng đọc 4 Face lineage
+  (`3 known + 1 unknown`) và 11 raw LPR lineage; attempt count có thể khác do tracker scheduling,
+  không được dùng hai wall-clock replay độc lập làm bit-exact differential.
+- External run `20260812-013537-853` complete với 20 producer-owned Face bbox bundles,
+  deadline/failure bằng `0`, service healthy, local model load bằng `0`, cleanup/pending/writer về
+  `0`. Local run `20260812-013921-643` cũng complete với cùng Face terminal identities và cleanup.
+- Không ghi hai run này là global acceptance: external `measurement_valid=false` do correlation/
+  LPR quality diagnostics; restart/disconnect fault injection chưa chạy. Đây là các gate còn mở.
 - Sau runtime acceptance mới đóng gói core/executor và client/schema thành hai wheel; packaging không
   được tạo namespace hay semantics song song với code đã chạy trong hai image.
 
@@ -1293,19 +1311,20 @@ acceptance ở mục 13:
 | `[DONE]` | `frigate/frigate/recognition/lpr.py`, `face.py` | Phase 6-2: synchronous master-compatible task engines và session state. |
 | `[DONE]` | `frigate/frigate/recognition/adapters/frigate.py` | Phase 6-3: map tracked-object/frame vào core và map update về Event metadata, không decision logic. |
 | `[DONE: SOURCE/DEV]` | `frigate/frigate/embeddings/maintainer.py`, Face/LPR realtime modules | Phase 6-3: orchestration/adapters duy nhất; custom reducer/pipeline/retry đã xóa khỏi production. |
-| `[DONE]` | Face/LPR evidence ownership và raw bbox lineage | Runtime giữ raw trace ID, raw JPEG và native clip; report tạo derivative annotated sau decision, không đưa overlay vào inference. |
+| `[DONE]` | Face/LPR evidence ownership và raw bbox lineage | Runtime giữ raw trace ID, raw JPEG và native clip; ảnh bbox là artifact do chính producer tạo tại bước recognition, validator chỉ kiểm tra/copy và không dựng record giả hoặc vẽ lại media. |
 | `[DONE]` | Recognition ownership, `passage_trace.py`, acceptance evidence và stats | Phase 6-4: idempotent cleanup, bounded JSONL/JPEG writer và master-relevant metrics; run cuối đạt sessions/in-flight/pinned/writer depth bằng `0`. |
 | `[DONE]` | Core/differential/adapter tests, whole project và deployment | Phase 6-5: parity/import-isolation/single-owner tests đạt; run `20260811-201337-397` report complete, measurement valid, 4/4 Face raw traces recognized, 15/15 native clips, 22/22 bbox images và runtime healthy sau restore. |
 | `[CURRENT]` | `tools/runtime/validate_platform_runtime.py`, `tools/reporting/summarize_platform_runtime.py`, Phase artifacts | Runtime test xuyên roadmap, full evidence report và diagnostic summary; không kết luận pass/fail bằng threshold. |
 
-### 15.7 Phase 7 — External recognition runtime [NEXT]
+### 15.7 Phase 7 — External recognition runtime [IN PROGRESS]
 
 | Trạng thái | Đường dẫn | Can thiệp |
 | --- | --- | --- |
 | `[DONE: SOURCE/UNIT]` | `frigate/frigate/recognition/executor.py`, transport-neutral contracts | Bounded one-partition executor, ordered track lifecycle, typed receipt/outcome, deadline/cancel và terminal drain; không voting/winner/Event logic. |
 | `[DONE: SOURCE/UNIT]` | `frigate/frigate/recognition/service/`, protobuf schema | gRPC/mTLS stream, health/capabilities, config và Face control operations, service epoch, bounded dedupe và raw I420 validation đã có targeted test. |
-| `[DONE: SOURCE/UNIT]` | `frigate/frigate/embeddings/maintainer.py`, `external_recognition.py` | External client được chọn trực tiếp trong runtime; nhánh này không khởi tạo local Face/LPR model, guard epoch/sequence trước publication và không có fallback. |
-| `[PARTIAL]` | Recognition Docker target, Compose/deployment và integration tests | Image target/container riêng cùng Compose mTLS đã được khai báo và `docker compose config` đạt; actual image build, GPU runtime, restart fault và terminal cleanup acceptance chưa chạy nên chưa đóng phase. |
+| `[DONE: SOURCE/UNIT]` | `frigate/frigate/data_processing/common/face_pipeline.py`, LPR mixin, `RecognitionCore` | Local và external dùng chung detector, crop, bbox/evidence producer, LPR processing, voting và publication decision; targeted differential/lifecycle tests đạt. |
+| `[DONE: SOURCE/UNIT]` | `frigate/frigate/embeddings/maintainer.py`, `external_recognition.py` | External client được chọn trực tiếp trong runtime; nhánh này không khởi tạo local Face/LPR model, guard epoch/sequence trước publication, giữ accepted outcome đến ordered END và không có fallback. |
+| `[PARTIAL]` | Recognition Docker image, Compose/deployment và integration tests | Build `deploy/run.ps1` tạo hai overlay image. External run `20260812-013537-853` và local run `20260812-013921-643` đều complete: 4/4 Face lineage (`3 known + 1 unknown`), 11 raw LPR lineage, bbox/evidence hợp lệ, deadline/failure bằng `0`, cleanup/pending/writer về `0`; còn restart/disconnect fault injection trước khi đóng phase. |
 | `[PLANNED]` | Core/client wheel packaging | Chỉ tách hai wheel sau runtime acceptance; wheel phải đóng gói code đã chạy, không tạo implementation song song. |
 
 ### 15.8 Profile nguồn LPR 1024p hiện tại

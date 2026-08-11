@@ -22,8 +22,15 @@ report và diagnostic data, không phải một cờ pass/fail.
 Entrypoint chuẩn dùng xuyên suốt:
 
 ```powershell
+# Local synchronous topology (default)
 python tools/tests/e2e/run_platform_runtime_test.py
+
+# External gRPC/mTLS topology; cùng implementation, chỉ khóa topology=external
+python tools/tests/e2e/run_external_recognition_runtime_test.py
 ```
+
+`tools/runtime/validate_platform_runtime.py` là implementation tham số hóa duy nhất. Wrapper
+external không copy scorer, fixture, media writer hoặc report logic.
 
 Mỗi invocation tự tạo một thư mục timestamp:
 
@@ -39,7 +46,8 @@ Script thực hiện:
 2. Ghi `direct-lpr-tracks.json`; raw tracker ID chỉ là lineage, physical trace được ngắt online
    khi cùng raw ID có chuyển động đảo chiều phi vật lý. Fixture và OCR không tham gia tách trace.
 3. Chuẩn bị runtime media và danh sách plate audit dùng riêng cho bước đối chiếu cuối.
-4. Khởi động Frigate, chờ camera, detector, model và image readiness.
+4. Khởi động topology đã chọn. Local chỉ có Frigate; external khởi động thêm
+   `camera-recognition`, chờ standard health và xác nhận Frigate không load local Face/LPR model.
 5. Mở capture gate bằng `run_id`, sau đó trigger đồng thời mỗi publisher phát video nguồn
    đúng một lần rồi tự trở về standby.
 6. Ghi source PTS/anchor và thu passage trace, runtime LPR evidence, hardware/runtime samples
@@ -49,8 +57,8 @@ Script thực hiện:
 9. Thu Docker inspect/log trước khi restore runtime.
 10. Xuất `report.md`, JSON report, direct trace, runtime evidence và clip theo trace.
 
-`tools/runtime/validate_platform_runtime.py` là implementation; entrypoint chuẩn duy nhất là
-`tools/tests/e2e/run_platform_runtime_test.py`.
+Hai entrypoint trên đều gọi `tools/runtime/validate_platform_runtime.py`; không có hai runtime
+test implementation.
 
 ## 3. Trace bắt buộc
 
@@ -83,25 +91,32 @@ Trace Face phải tách được:
 - `first_attempt`
 - `confirmed_result`
 
-Kết quả phải giữ person bbox, face bbox, candidate/frame/evidence lineage, raw top-1/top-2
-outcome, margin, identity và terminal reason.
+Kết quả phải giữ person bbox, raw detector face bbox, effective crop bbox,
+candidate/frame/evidence lineage, raw identity/score, aggregate identity/score và terminal reason.
 
 ## 4. Quy tắc trace và đối chiếu kết quả
 
-- Pipeline tự tạo trace từ detector/tracker và passage registry online; fixture không được tạo,
+- Pipeline tự tạo trace từ detector/tracker và recognition lifecycle; fixture không được tạo,
   tách, hợp nhất hoặc đổi trace.
 - `direct-lpr-tracks.json` là bằng chứng authoritative cho số physical trace LPR. Runtime raw
   tracker ID chỉ là lineage và có thể được nhiều physical trace kế tiếp sử dụng.
 - LPR chỉ đối chiếu final `event_published.plate` của mỗi trace với danh sách `expected_plate`
   duy nhất sau khi pipeline hoàn tất. Không dùng fixture time/bbox/ROI để gán xe.
 - PTS, bbox và candidate lineage vẫn phải ghi đầy đủ để kiểm tra pixel/result/evidence cùng frame.
-- Face giữ passage association riêng vì kết quả `unknown` không có chuỗi identity để match.
+- Face report đếm trực tiếp producer-owned raw `trace_id`; kết quả `unknown` là recognition outcome
+  hợp lệ và không được biến thành failure hoặc dùng fixture để đặt tên track.
 - Mỗi invocation chạy đúng một replay round; nếu cần so sánh nhiều lần thì mỗi lần có một
   thư mục timestamp riêng.
 - Mọi trace/evidence phải mang đúng `run_id` của invocation. Runtime không ghi warm-up
   trước capture gate và report không đọc record của run cũ.
-- Bảng LPR lấy runtime trace làm hàng; bảng fixture comparison chỉ bổ sung expected plate nếu
-  final plate match duy nhất. Face tiếp tục dùng passage × round; một invocation có `round_id=1`.
+- Report chỉ có một bảng runtime lineage LPR, mỗi producer trace đúng một hàng. Bảng dùng các cột
+  ngắn `Clip`, `Outcome`, `Track`, `Eligible`, `Plate`, `OCR`, `Publish`; trạng thái, output và
+  reason cuối nằm ngay trong stage cell. Fixture/expected plate chỉ tham gia KPI tổng hợp, không
+  tạo hàng hoặc cột trong bảng runtime.
+- Report chỉ có một bảng lineage Face từ raw producer `trace_id`; mỗi hàng dùng ba stage nghiệp vụ
+  production: `Prepare face`, `Recognition`, `Decision / publish`. Guard/cadence, evidence resolve,
+  input-frame count và evidence writer là boundary/side effect để truy vết, không phải Face stage.
+  Trace labels chỉ kiểm chứng count/result. Bbox/crop chi tiết thuộc lifecycle ngay dưới bảng.
 - `measurement_valid` chỉ mô tả tính đầy đủ/hợp lệ của dữ liệu đo, không phải acceptance.
 - Anchor/fixture video không được dùng để dựng lại clip. Media của trace chỉ được lấy từ
   canonical Event và recording API của runtime đang được đo.
@@ -122,7 +137,7 @@ outcome, margin, identity và terminal reason.
 
 - Detection/qualified candidate count.
 - Candidate submission và inference attempts.
-- Top-1/top-2 raw result, margin và identity.
+- Raw identity/score, weighted-vote aggregate và publication reason.
 - Confirmed/unknown/ambiguous result.
 - Candidate/frame/evidence lineage.
 - Passage-to-confirmed, eligible-to-confirmed, first-attempt và embedding latency.
@@ -153,7 +168,7 @@ Mỗi lần chạy phải lưu tối thiểu:
 
 | Artifact | Nội dung |
 | --- | --- |
-| `report.md` | Metrics/kết quả tổng hợp và failure trace theo từng `track_id`, lifecycle step, link image thật nếu có |
+| `report.md` | Run header; khối LPR và Face tách riêng; hardware/runtime health rõ đơn vị; link gallery evidence thật |
 | `summary.json` | Report tổng hợp, measurement, runtime và diagnostic data |
 | `runtime-trace.json` | Trace detector/track/Event/Face/LPR theo source PTS |
 | `runtime-evidence.json` | LPR invocation, crop, plate detector và OCR evidence |
@@ -162,6 +177,10 @@ Mỗi lần chạy phải lưu tối thiểu:
 | `lpr.json` | Bảng car passage × round, funnel và raw plate result |
 | `container-inspect.json` | Docker container configuration/state |
 | `container.log` | Log runtime trong cửa sổ test |
+| `container-inspect-recognition.json` | External service state; chỉ bắt buộc ở external topology |
+| `container-recognition.log` | External service log; chỉ bắt buộc ở external topology |
+| `external-recognition-evidence.json` | Hash/shape/bbox/stage audit của producer-owned artifacts |
+| `media/images.md` | Gallery đầy đủ theo producer trace/evidence; gồm mọi LPR artifact và bộ Face raw attempt/bbox/crop |
 
 Media được giữ theo cấu trúc:
 
@@ -175,8 +194,22 @@ media/
 └── face/<safe_trace_id>/
     ├── clip.mp4
     ├── trace.json
-    └── <evidence_id>/*.jpg
+    └── <evidence_id>/
+        ├── evidence.json
+        ├── *-recognition_attempt.jpg
+        ├── *-recognition_attempt_bbox.jpg
+        └── *-face_crop.jpg
 ```
+
+`recognition_attempt_bbox` do shared Face producer tạo trong chính model attempt. Validator kiểm
+tra hash, byte size, image shape, `object_box`, raw `detail_box` và `effective_crop_box`; validator
+không vẽ bbox thay thế và không tạo evidence ID/track ID giả.
+
+`report.md` chỉ giữ link và tổng số ảnh để không kéo dài bảng kết quả. `media/images.md` hiển thị
+toàn bộ ảnh trong các nhóm có thể thu gọn theo trace. Mỗi ảnh nằm trong timeline có sequence,
+source PTS, stage, evidence ID, decision/result, bbox/crop, byte size và SHA-256 để truy ngược
+failure. LPR lấy record từ `runtime-evidence.json`; Face lấy record từ producer
+`media/face/evidence.jsonl`, không suy diễn metadata từ tên file.
 
 Kho `recordings`, SQLite, snapshot/cache và enrollment phục vụ Frigate nằm trong workspace
 runtime tạm, không nằm trong cây report. Script đọc recording khi Frigate còn chạy và tải clip
@@ -195,6 +228,26 @@ lượng nhận dạng.
 và `runtime.lpr_evidence_trace_metrics` cho eligibility, plate detector, crop và OCR. Cả hai
 đều ghi `stage_counts` và `stage_calls_per_second`; dữ liệu chi tiết vẫn giữ nguyên trong raw
 trace/evidence để đối chiếu từng record.
+
+`report.md` cố ý không lặp raw JSON, throughput, provenance/hash hoặc diagnostic dump. Chi tiết
+đầy đủ vẫn thuộc các JSON authoritative. Markdown chỉ giữ một hàng canonical cho mỗi lineage;
+LPR và Face không dùng chung bảng kết quả.
+
+Riêng lineage LPR có kết quả `UNEXPECTED` hoặc `NO_OUTPUT` phải có `Lifecycle traces` ngay dưới
+khối LPR. Mỗi stage ghi số record, source PTS, status, final decision/result và render trực tiếp
+ảnh producer tương ứng; stage thiếu phải hiện `MISSING`, không được dựng ảnh thay thế.
+Face có outcome `recognized_unknown` hoặc `not_recognized` phải có lifecycle ngay dưới khối Face.
+`recognized_unknown` giữ nguyên nhãn terminal hợp lệ nhưng vẫn được review nhận dạng; không được
+  báo sai thành transport/pipeline failure. Mỗi attempt phải là đúng một hàng theo ba stage nghiệp
+  vụ source: `prepare_face_attempt → recognizer.classify → FaceEngine weighted vote / publish`.
+  `process_frame` guard, adapter/core cadence, evidence resolve, Event adapter và evidence writer
+  chỉ là boundary/side effect quanh pipeline. Các passage trace labels chỉ là observability
+  evidence, không phải tên stage production. Lifecycle Face dùng cùng kết cấu với LPR:
+  `Stage`, `Records`, `Source PTS`, `Status`, `Final result`, `Image`; mỗi production stage chỉ
+  render tối đa một ảnh producer. Các artifact còn lại vẫn nằm trong gallery để truy vết, không
+  được nhân thành hàng hoặc ảnh lifecycle riêng.
+Thumbnail dùng cùng chiều rộng `240px`, giữ nguyên tỷ lệ và lazy-load để không kéo vỡ bảng;
+click thumbnail phải mở file producer gốc ở độ phân giải đầy đủ.
 
 ## 8. Tổng hợp nhiều run
 
@@ -237,8 +290,15 @@ runtime replay và không được dùng để tuyên bố hệ thống nhận d
 
 ## 10. Bằng chứng hiện có
 
-Report evidence gần nhất nằm tại thư mục timestamp dưới `.tmp/platform-runtime/`. Mỗi thư mục
-là một invocation độc lập, chứa một lần replay nguồn LPR liên tục có 11 biển số audit và replay
-Face tương ứng. Số trace LPR là kết quả thực tế do detector/tracker tạo ra, không mặc định bằng
-11. Các kết quả nhận dạng, runtime và hardware phải đọc từ artifact raw tương ứng, không suy
-diễn từ fixture hoặc một cờ acceptance.
+Hai report runtime mới nhất dùng để review topology:
+
+| Run | Topology | Runtime evidence |
+| --- | --- | --- |
+| [`20260812-013537-853`](../../.tmp/platform-runtime/20260812-013537-853/report.md) | external | report complete; 4/4 Face lineage (`3 known + 1 unknown`), 11 raw LPR lineage, 20 producer bbox bundles, deadline/failure `0`, service healthy, local model load `0`, cleanup/pending/writer `0` |
+| [`20260812-013921-643`](../../.tmp/platform-runtime/20260812-013921-643/report.md) | local | report complete; 4/4 Face lineage (`3 known + 1 unknown`), 11 raw LPR lineage, deadline/failure `0`, cleanup/pending/writer `0` |
+
+Đây là hai invocation độc lập nên số attempt và raw LPR terminal output có thể khác theo tracker/
+wall-clock scheduling. Bit-exact decision parity chỉ được kết luận từ differential test khi đưa
+cùng ordered observations vào các topology. External run có `measurement_valid=false` do
+correlation/LPR quality diagnostics; vì vậy `report complete` không được diễn giải thành global
+acceptance hoặc kết luận accuracy production.

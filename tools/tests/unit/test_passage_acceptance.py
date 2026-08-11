@@ -35,7 +35,7 @@ from tools.runtime.validate_platform_runtime import (
     validate_runtime_lpr_evidence,
     wait_file_quiescent,
     wait_recognition_idle,
-    write_failure_only_report,
+    write_compact_runtime_report,
 )
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -186,7 +186,7 @@ def test_face_trace_outcome_counts_unknown_as_completed_recognition() -> None:
     assert face_trace_outcome([{"stage": "track_seen"}]) == "not_recognized"
 
 
-def test_report_lists_raw_trace_counts_and_failed_face_lifecycle(
+def test_compact_report_has_one_canonical_table_per_pipeline(
     tmp_path: Path,
 ) -> None:
     runtime_records = [
@@ -229,16 +229,39 @@ def test_report_lists_raw_trace_counts_and_failed_face_lifecycle(
         "face": {"passages": []},
     }
 
-    report = write_failure_only_report(tmp_path, summary).read_text(encoding="utf-8")
+    report = write_compact_runtime_report(tmp_path, summary).read_text(encoding="utf-8")
 
-    assert "## Raw trace inventory" in report
-    assert "| LPR | 1 | 1 | 0 | - | 1 | 0 | 0 |" in report
-    assert "| Face | 1 | 1 | 1 | 1 | 0 | 0 | 0 |" in report
-    assert "### Face recognition outcome index" in report
+    assert "## Run" in report
+    assert "## LPR result" in report
+    assert "## Face result" in report
+    assert report.count("## LPR result") == 1
+    assert report.count("## Face result") == 1
+    assert "| Clip | Outcome | Track | Eligible | Plate | OCR | Publish |" in report
+    assert (
+        "| Clip | Outcome | Prepare face | Recognition | Decision / publish |"
+        in report
+    )
+    assert "| Admission | Prepare | Classify | Vote | Publish |" not in report
+    assert "| Fixture | Expected | Runtime trace / clip |" not in report
+    assert "| Runtime trace / clip | BBox | Seen | Attempts |" not in report
     assert "recognized_unknown" in report
-    assert "### Not-recognized Face lifecycle index" in report
-    assert "face:face_camera:face-fail" in report
-    assert "### `Face` track_id `face:face_camera:face-fail`" not in report
+    assert "face-fail" in report
+    assert "Face recognition outcome index" not in report
+    assert report.count("### Lifecycle traces") == 2
+    assert "`face:face_camera:face-fail` — `recognized_unknown`" in report
+    assert (
+        report.count(
+            "| Stage | Records | Source PTS | Status | Final result | Image |"
+        )
+        == 2
+    )
+    assert "| Attempt | Source PTS | Prepare face |" not in report
+    assert "Throughput and source timing" not in report
+    assert "Provenance and artifacts" not in report
+    assert "Runtime diagnostics" not in report
+    assert "[0 LPR images](media/images.md#lpr)" in report
+    assert "[0 artifacts](media/images.md#face)" in report
+    assert (tmp_path / "media" / "images.md").is_file()
 
 
 def test_source_pts_completeness_ignores_non_frame_terminal_records() -> None:

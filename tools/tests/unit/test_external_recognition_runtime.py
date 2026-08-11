@@ -18,6 +18,7 @@ def test_topology_configuration_has_one_source_of_truth(monkeypatch, tmp_path):
         "runtime": "external",
         "endpoint": "recognition:50051",
         "deadline": 5,
+        "job_deadline": 30,
         "observation_capacity": 128,
         "control_capacity": 64,
         "outcome_capacity": 128,

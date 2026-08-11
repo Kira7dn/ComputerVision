@@ -83,6 +83,51 @@ frontend và Nginx hiện tại. Đây là build overlay có giới hạn cứng
 Full dependency image phải được đóng riêng trong pipeline release rồi chuyển tới máy deploy dưới
 dạng image đã kiểm duyệt. Không dùng `deploy/run.ps1` để full-build Frigate.
 
+## Recognition runtime
+
+`recognition.runtime` chọn đúng một topology:
+
+- `local`: Face/LPR model và synchronous `RecognitionCore` chạy trong `frigate`;
+  container `camera-recognition` không chạy.
+- `external`: Frigate chỉ chạy host adapter; model, core và session state chạy trong
+  container `camera-recognition` qua gRPC/mTLS. Không có local fallback.
+
+External mode yêu cầu `RECOGNITION_TLS_DIR` trỏ đến thư mục host chứa `ca.crt`,
+`server.crt`, `server.key`, `client.crt` và `client.key`. Client config dùng các path
+đã mount dưới `/run/recognition-tls`:
+
+```yaml
+recognition:
+  runtime: external
+  endpoint: recognition:50051
+  deadline: 5
+  job_deadline: 30
+  observation_capacity: 128
+  control_capacity: 64
+  outcome_capacity: 128
+  shutdown_drain: 10
+  tls:
+    ca: /run/recognition-tls/ca.crt
+    certificate: /run/recognition-tls/client.crt
+    key: /run/recognition-tls/client.key
+    server_name: recognition
+```
+
+Không có tham số CLI để bật external. Sau khi sửa `deploy/config.yaml`, dùng cùng
+entrypoint chuẩn:
+
+```powershell
+$env:RECOGNITION_TLS_DIR = 'D:\secure\camera-recognition-tls'
+.\deploy\run.ps1 doctor
+.\deploy\run.ps1 build
+.\deploy\run.ps1 start
+.\deploy\run.ps1 status
+```
+
+`build` tạo cả Frigate overlay và recognition overlay từ cùng source tree. External
+mode chỉ thay execution/transport boundary; detector, crop, bbox/evidence producer,
+LPR processing, voting và publication decision dùng chung code với local mode.
+
 ## Nhiều camera
 
 Mỗi camera phải có cùng một tên tại `go2rtc.streams` và `cameras`.

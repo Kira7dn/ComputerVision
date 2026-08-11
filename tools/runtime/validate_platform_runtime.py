@@ -529,6 +529,7 @@ def configure_recognition_topology(
         "runtime": "external",
         "endpoint": "recognition:50051",
         "deadline": 5,
+        "job_deadline": 30,
         "observation_capacity": 128,
         "control_capacity": 64,
         "outcome_capacity": 128,
@@ -2589,6 +2590,14 @@ def _md_table(headers: list[str], rows: list[list[Any]]) -> str:
     return "\n".join(lines) if rows else "_Không có dữ liệu._"
 
 
+def _md_thumbnail(relative: str, alt: str, width: int = 240) -> str:
+    """Render a bounded preview that links to the original producer artifact."""
+    return (
+        f'<a href="{relative}"><img src="{relative}" alt="{alt}" '
+        f'width="{width}" loading="lazy"></a>'
+    )
+
+
 def write_markdown_report(output: Path, summary: dict[str, Any]) -> Path:
     """Write a self-contained human-readable report for one runtime invocation."""
     runtime = summary.get("runtime", {})
@@ -3815,6 +3824,911 @@ def write_failure_only_report(output: Path, summary: dict[str, Any]) -> Path:
     return report_path
 
 
+def write_runtime_image_index(
+    output: Path,
+    lpr_records: list[dict[str, Any]],
+    face_records: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Index producer-owned images without creating or altering image evidence."""
+    media_root = output / "media"
+    media_root.mkdir(parents=True, exist_ok=True)
+    entries: dict[Path, dict[str, Any]] = {}
+    decisions: dict[tuple[str, str], list[dict[str, Any]]] = collections.defaultdict(
+        list
+    )
+
+    def result_value(record: dict[str, Any]) -> str:
+        parts = []
+        for key in (
+            "accepted",
+            "reason",
+            "plate",
+            "normalized_plate",
+            "raw_identity",
+            "identity",
+            "raw_score",
+            "score",
+        ):
+            if record.get(key) is not None:
+                parts.append(f"{key}={record[key]}")
+        return "; ".join(parts) or "observed"
+
+    def geometry_value(record: dict[str, Any]) -> str:
+        parts = []
+        for key in (
+            "object_box",
+            "plate_box",
+            "detail_box",
+            "effective_crop_box",
+            "text_box",
+        ):
+            if record.get(key) is not None:
+                parts.append(f"{key}={record[key]}")
+        return "; ".join(parts) or "—"
+
+    def add_image(
+        path: Path,
+        pipeline: str,
+        trace_id: str,
+        evidence_id: str,
+        record: dict[str, Any] | None = None,
+    ) -> None:
+        resolved = path.resolve()
+        if (
+            not resolved.is_relative_to(media_root.resolve())
+            or not resolved.is_file()
+            or resolved.suffix.lower() not in {".jpg", ".jpeg", ".png", ".webp"}
+        ):
+            return
+        record = record or {}
+        if resolved in entries and not record:
+            return
+        sequence_match = re.match(r"^(\d+)-", resolved.stem)
+        stage = str(record.get("stage") or re.sub(r"^\d+-", "", resolved.stem))
+        entries[resolved] = {
+            "pipeline": pipeline,
+            "trace_id": trace_id,
+            "evidence_id": evidence_id,
+            "stage": stage,
+            "sequence": record.get("sequence")
+            or (int(sequence_match.group(1)) if sequence_match else "—"),
+            "source_pts": record.get("source_pts", record.get("frame_time", "—")),
+            "result": result_value(record),
+            "geometry": geometry_value(record),
+            "sha256": record.get("artifact_sha256") or "—",
+            "bytes": record.get("artifact_bytes") or resolved.stat().st_size,
+        }
+
+    for record in lpr_records:
+        trace_id = str(record.get("trace_id") or record.get("track_id") or "unknown")
+        evidence_id = str(record.get("evidence_id") or "unknown")
+        if record.get("stage") in {
+            "eligibility_decision",
+            "plate_detector_result",
+            "ocr_candidate_result",
+            "ocr_result",
+        }:
+            decisions[("lpr", trace_id)].append(
+                {
+                    "sequence": record.get("sequence", "—"),
+                    "source_pts": record.get(
+                        "source_pts", record.get("frame_time", "—")
+                    ),
+                    "stage": record.get("stage", "unknown"),
+                    "evidence_id": evidence_id,
+                    "result": result_value(record),
+                    "geometry": geometry_value(record),
+                    "sha256": "—",
+                    "bytes": "—",
+                }
+            )
+        relative = record.get("artifact_path")
+        if not relative:
+            continue
+        add_image(
+            media_root / str(relative),
+            "lpr",
+            trace_id,
+            evidence_id,
+            record,
+        )
+
+    # Each annotated Face record identifies a producer-owned evidence directory.
+    # Its raw attempt, bbox image and crop are sibling artifacts written by the
+    # same model attempt; evidence.json prevents indexing unrelated files.
+    face_evidence_dirs: dict[Path, tuple[str, str]] = {}
+    for record in face_records:
+        relative = record.get("artifact_path") or record.get("annotated_artifact_path")
+        if not relative:
+            continue
+        add_image(
+            media_root / str(relative),
+            "face",
+            str(record.get("trace_id") or record.get("track_id") or "unknown"),
+            str(record.get("evidence_id") or "unknown"),
+            record,
+        )
+        directory = (media_root / str(relative)).parent
+        if not (directory / "evidence.json").is_file():
+            continue
+        face_evidence_dirs[directory] = (
+            str(record.get("trace_id") or record.get("track_id") or "unknown"),
+            str(record.get("evidence_id") or directory.name),
+        )
+    for directory, (trace_id, evidence_id) in sorted(face_evidence_dirs.items()):
+        for path in sorted(directory.iterdir()):
+            add_image(path, "face", trace_id, evidence_id)
+
+    grouped: dict[tuple[str, str], list[tuple[Path, dict[str, Any]]]] = (
+        collections.defaultdict(list)
+    )
+    stage_counts: dict[str, collections.Counter[str]] = collections.defaultdict(
+        collections.Counter
+    )
+    for path, metadata in sorted(entries.items()):
+        grouped[(metadata["pipeline"], metadata["trace_id"])].append((path, metadata))
+        stage_counts[metadata["pipeline"]][metadata["stage"]] += 1
+
+    lines = [
+        "# Producer-owned image evidence",
+        "",
+        "Gallery này chỉ lập chỉ mục artifact do pipeline ghi. Validator không vẽ, cắt, "
+        "sao chép hoặc tạo ảnh thay thế.",
+        "",
+        _md_table(
+            ["Pipeline", "Traces", "Images", "Stage counts"],
+            [
+                [
+                    pipeline.upper(),
+                    len(
+                        {
+                            trace
+                            for item_pipeline, trace in grouped
+                            if item_pipeline == pipeline
+                        }
+                    ),
+                    sum(stage_counts[pipeline].values()),
+                    "; ".join(
+                        f"{stage}={count}"
+                        for stage, count in sorted(stage_counts[pipeline].items())
+                    )
+                    or "none",
+                ]
+                for pipeline in ("lpr", "face")
+            ],
+        ),
+    ]
+    for pipeline in ("lpr", "face"):
+        lines.extend(["", f"## {pipeline.upper()}"])
+        pipeline_groups = [
+            (key, value) for key, value in grouped.items() if key[0] == pipeline
+        ]
+        for (_, trace_id), images in sorted(pipeline_groups):
+            anchor = "trace-" + re.sub(r"[^a-z0-9-]+", "-", trace_id.lower()).strip("-")
+            lines.extend(
+                [
+                    "",
+                    f'<a id="{anchor}"></a>',
+                    "",
+                    f"### `{trace_id}`",
+                    "",
+                    "<details>",
+                    f"<summary>{len(images)} producer images · "
+                    f"{len(decisions[(pipeline, trace_id)])} decision records</summary>",
+                    "",
+                ]
+            )
+            timeline_rows = []
+            timeline = [
+                *images,
+                *[(None, item) for item in decisions[(pipeline, trace_id)]],
+            ]
+            for path, metadata in sorted(
+                timeline,
+                key=lambda item: (
+                    int(item[1]["sequence"])
+                    if str(item[1]["sequence"]).isdigit()
+                    else 0
+                ),
+            ):
+                image = "—"
+                integrity = "—"
+                if path is not None:
+                    relative = path.relative_to(media_root).as_posix()
+                    image = _md_thumbnail(relative, str(metadata["stage"]))
+                    integrity = f"{metadata['bytes']} B<br>`{metadata['sha256']}`"
+                timeline_rows.append(
+                    [
+                        metadata["sequence"],
+                        metadata["source_pts"],
+                        metadata["stage"],
+                        metadata["evidence_id"],
+                        metadata["result"],
+                        metadata["geometry"],
+                        image,
+                        integrity,
+                    ]
+                )
+            lines.append(
+                _md_table(
+                    [
+                        "Seq",
+                        "Source PTS",
+                        "Stage",
+                        "Evidence",
+                        "Decision / result",
+                        "BBox / crop",
+                        "Producer image",
+                        "Integrity",
+                    ],
+                    timeline_rows,
+                )
+            )
+            lines.append("</details>")
+
+    index_path = media_root / "images.md"
+    index_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return {
+        "path": index_path,
+        "total": len(entries),
+        "lpr": sum(stage_counts["lpr"].values()),
+        "face": sum(stage_counts["face"].values()),
+        "traces": {trace_id for _, trace_id in grouped},
+    }
+
+
+def write_compact_runtime_report(output: Path, summary: dict[str, Any]) -> Path:
+    """Write one compact, non-duplicative runtime report from producer evidence."""
+    runtime = summary.get("runtime", {})
+    resources = runtime.get("resources", {})
+    gpu = resources.get("gpu", {})
+    timing = summary.get("timing", {})
+    measurement = summary.get("measurement", {})
+
+    def load_records(name: str) -> list[dict[str, Any]]:
+        path = output / name
+        if not path.is_file():
+            return []
+        return json.loads(path.read_text(encoding="utf-8")).get("records", [])
+
+    def load_jsonl_records(relative: str) -> list[dict[str, Any]]:
+        path = output / relative
+        if not path.is_file():
+            return []
+        return [
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+
+    face_evidence_records = load_jsonl_records("media/face/evidence.jsonl")
+    face_annotated_records = load_records("face-annotated-evidence.json")
+    records = [
+        *load_records("runtime-trace.json"),
+        *load_records("runtime-evidence.json"),
+        *(face_evidence_records or face_annotated_records),
+    ]
+    image_index = write_runtime_image_index(
+        output,
+        load_records("runtime-evidence.json"),
+        face_evidence_records or face_annotated_records,
+    )
+
+    def group_records(pipeline: str) -> dict[str, list[dict[str, Any]]]:
+        grouped: dict[str, list[dict[str, Any]]] = collections.defaultdict(list)
+        for record in records:
+            if record.get("pipeline") != pipeline:
+                continue
+            trace_id = str(record.get("trace_id") or record.get("track_id") or "")
+            if trace_id and not trace_id.startswith("detector:"):
+                grouped[trace_id].append(record)
+        return grouped
+
+    lpr_by_trace = group_records("lpr")
+    face_by_trace = group_records("face")
+
+    def ordered(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return sorted(
+            items,
+            key=lambda item: float(
+                item.get("source_pts", item.get("frame_time", 0)) or 0
+            ),
+        )
+
+    def clip_href(pipeline: str, trace_id: str) -> str | None:
+        safe_trace = re.sub(r"[^A-Za-z0-9_.-]+", "_", trace_id)
+        relative = Path("media") / pipeline / safe_trace / "clip.mp4"
+        return relative.as_posix() if (output / relative).is_file() else None
+
+    def compact_mapping(value: Any) -> str:
+        if not isinstance(value, dict):
+            return str(value if value not in (None, "") else "none")
+        return (
+            "; ".join(f"{key}={item}" for key, item in sorted(value.items())) or "none"
+        )
+
+    expected_rows = summary.get("lpr", {}).get("passages", [])
+    expected_by_plate = {
+        normalize_plate(row.get("expected_plate")): str(row.get("passage_id"))
+        for row in expected_rows
+        if normalize_plate(row.get("expected_plate"))
+    }
+    lpr_runtime: list[dict[str, Any]] = []
+    for index, (trace_id, trace_records) in enumerate(sorted(lpr_by_trace.items()), 1):
+        published = [
+            record
+            for record in ordered(trace_records)
+            if record.get("stage") == "event_published" and record.get("plate")
+        ]
+        final_plate = normalize_plate(published[-1].get("plate")) if published else ""
+        fixture_match = expected_by_plate.get(final_plate)
+        lpr_runtime.append(
+            {
+                "index": index,
+                "trace_id": trace_id,
+                "records": trace_records,
+                "plate": final_plate,
+                "fixture": fixture_match,
+                "outcome": "MATCH"
+                if fixture_match
+                else ("UNEXPECTED" if final_plate else "NO_OUTPUT"),
+            }
+        )
+
+    def lpr_clip_cell(row: dict[str, Any]) -> str:
+        href = clip_href("lpr", str(row["trace_id"]))
+        return f"[L{int(row['index']):02d}]({href})" if href else "—"
+
+    def lpr_stage_note(row: dict[str, Any], *preferred_stages: str) -> str:
+        stage_records: list[dict[str, Any]] = []
+        for stage in preferred_stages:
+            stage_records = [
+                record
+                for record in ordered(row["records"])
+                if record.get("stage") == stage
+            ]
+            if stage_records:
+                break
+        if not stage_records:
+            return "—"
+        final = stage_records[-1]
+        rejected = final.get("accepted") is False or final.get("status") in {
+            "failed",
+            "rejected",
+            "error",
+        }
+        note = ["✗" if rejected else "✓"]
+        if preferred_stages == ("track_seen",):
+            note.append(f"×{len(stage_records)}")
+        value = final.get("plate") or final.get("normalized_plate")
+        if value:
+            note.append(str(value))
+        if final.get("score") is not None:
+            note.append(f"{float(final['score']):.3f}")
+        reason = final.get("reason")
+        if reason:
+            note.append(str(reason))
+        return " · ".join(note)
+
+    lpr_rows = [
+        [
+            lpr_clip_cell(row),
+            row["outcome"],
+            lpr_stage_note(row, "track_seen"),
+            lpr_stage_note(row, "eligibility_decision", "lpr_eligible"),
+            lpr_stage_note(row, "plate_detector_result", "plate_detected"),
+            lpr_stage_note(row, "ocr_result"),
+            lpr_stage_note(row, "event_published"),
+        ]
+        for row in lpr_runtime
+    ]
+
+    def face_clip_cell(trace_id: str, index: int) -> str:
+        href = clip_href("face", trace_id)
+        return f"[F{index:02d}]({href})" if href else "—"
+
+    face_rows: list[list[Any]] = []
+    face_runtime: list[dict[str, Any]] = []
+    face_outcomes: list[str] = []
+    for index, (trace_id, trace_records) in enumerate(sorted(face_by_trace.items()), 1):
+        attempts = [
+            record for record in trace_records if record.get("stage") == "first_attempt"
+        ]
+        confirmed = [
+            record
+            for record in trace_records
+            if record.get("stage") == "confirmed_result"
+        ]
+        prepared = [
+            record for record in trace_records if record.get("stage") == "face_crop"
+        ]
+        observations = sum(
+            record.get("stage") == "track_seen" for record in trace_records
+        )
+        identities = sorted(
+            {
+                str(record.get("identity"))
+                for record in attempts
+                if record.get("identity")
+            }
+        )
+        published = sorted(
+            {
+                str(record.get("identity"))
+                for record in confirmed
+                if record.get("identity")
+            }
+        )
+        scores = [
+            float(record["score"])
+            for record in attempts
+            if record.get("score") is not None
+        ]
+        outcome = face_trace_outcome(trace_records)
+        face_outcomes.append(outcome)
+        identity_text = ", ".join(identities) or "none"
+        if scores:
+            identity_text += f" ({min(scores):.3f}..{max(scores):.3f})"
+        attempt_note = f"✓ · ×{len(attempts)} · {identity_text}" if attempts else "—"
+        vote_note = (
+            f"✓ · {', '.join(published)}"
+            if confirmed
+            else ("no aggregate · unknown excluded" if attempts else "—")
+        )
+        confirmed_note = (
+            f"✓ · ×{len(confirmed)} · {', '.join(published)}" if confirmed else "—"
+        )
+        face_rows.append(
+            [
+                face_clip_cell(trace_id, index),
+                outcome,
+                (
+                    f"×{len(prepared)} crops / {observations} input frames"
+                    if prepared
+                    else f"— / {observations} input frames"
+                ),
+                attempt_note,
+                f"{vote_note}; publish {confirmed_note}",
+            ]
+        )
+        face_runtime.append(
+            {
+                "index": index,
+                "trace_id": trace_id,
+                "records": trace_records,
+                "outcome": outcome,
+            }
+        )
+
+    lpr_match = sum(row["outcome"] == "MATCH" for row in lpr_runtime)
+    lpr_unexpected = sum(row["outcome"] == "UNEXPECTED" for row in lpr_runtime)
+    lpr_no_output = sum(row["outcome"] == "NO_OUTPUT" for row in lpr_runtime)
+    lpr_missing = max(0, len(expected_rows) - lpr_match)
+    face_known = sum(value == "recognized_known_published" for value in face_outcomes)
+    face_unknown = sum(value == "recognized_unknown" for value in face_outcomes)
+    face_failed = sum(value == "not_recognized" for value in face_outcomes)
+    recognition = runtime.get("recognition", {})
+    native_media = runtime.get("native_media", {})
+    recognition_service = runtime.get("recognition_service", {})
+    cleanup = (
+        "zero"
+        if recognition.get("cleanup_zero")
+        else (
+            f"sessions={recognition.get('sessions', '—')}; "
+            f"flight={recognition.get('in_flight', '—')}; "
+            f"leases={recognition.get('evidence_pinned', '—')}; "
+            f"queue={recognition.get('queue_depth', '—')}"
+        )
+    )
+
+    hardware_samples = runtime.get("hardware_samples", {})
+    cpu_samples = [float(value) for value in hardware_samples.get("cpu_percent", [])]
+    ram_samples = [float(value) for value in hardware_samples.get("ram_bytes", [])]
+    shm_samples = [float(value) for value in hardware_samples.get("shm_percent", [])]
+    gpu_samples = hardware_samples.get("gpu", [])
+
+    def average(values: list[float]) -> float | None:
+        return round(sum(values) / len(values), 2) if values else None
+
+    def gib(value: float | int | None) -> str:
+        return f"{float(value) / (1024**3):.2f} GiB" if value is not None else "—"
+
+    gpu_utilization = [
+        float(sample["utilization_percent"])
+        for sample in gpu_samples
+        if sample.get("utilization_percent") is not None
+    ]
+    gpu_memory = [
+        float(sample["memory_used_mib"])
+        for sample in gpu_samples
+        if sample.get("memory_used_mib") is not None
+    ]
+
+    def lifecycle_result(record: dict[str, Any] | None) -> str:
+        if record is None:
+            return "MISSING"
+        values = {
+            key: record.get(key)
+            for key in (
+                "accepted",
+                "reason",
+                "status",
+                "attempt",
+                "plate",
+                "normalized_plate",
+                "score",
+                "identity",
+                "raw_identity",
+                "raw_score",
+                "top1",
+                "top2",
+                "margin",
+            )
+            if record.get(key) is not None
+        }
+        return (
+            json.dumps(values, ensure_ascii=False, separators=(",", ":")) or "observed"
+        )
+
+    def lifecycle_image(trace_records: list[dict[str, Any]], stage: str) -> str:
+        image_stage_aliases = {
+            "track_seen": ("runtime_frame_object_box", "recognition_attempt_bbox"),
+            "lpr_eligible": ("car_crop", "runtime_frame_object_box"),
+            "plate_detector_result": ("plate_detector_input",),
+            "ocr_result": ("ocr_plate_input",),
+            "event_published": ("ocr_recognition_tensor", "ocr_text_crop"),
+            "first_qualified_face": ("recognition_attempt_bbox",),
+            "candidate_submitted": ("recognition_attempt",),
+            "first_attempt": ("recognition_attempt_bbox", "recognition_attempt"),
+            "confirmed_result": ("recognition_attempt_bbox",),
+        }
+        wanted = (stage, *image_stage_aliases.get(stage, ()))
+        selected: dict[str, Any] | None = None
+        for wanted_stage in wanted:
+            candidates = [
+                record
+                for record in ordered(trace_records)
+                if record.get("stage") == wanted_stage and record.get("artifact_path")
+            ]
+            if candidates:
+                selected = candidates[-1]
+                break
+        if selected is None:
+            return "—"
+        relative = str(selected["artifact_path"])
+        report_relative = f"media/{Path(relative).as_posix()}"
+        return (
+            _md_thumbnail(report_relative, stage)
+            if (output / "media" / relative).is_file()
+            else "—"
+        )
+
+    lpr_lifecycle_lines: list[str] = []
+    failed_runtime_lpr = [row for row in lpr_runtime if row["outcome"] != "MATCH"]
+    if failed_runtime_lpr:
+        lifecycle_stages = (
+            "track_seen",
+            "lpr_eligible",
+            "plate_detector_input",
+            "plate_detector_result",
+            "plate_crop",
+            "ocr_plate_input",
+            "ocr_result",
+            "ocr_text_crop",
+            "ocr_recognition_tensor",
+            "event_published",
+        )
+        lpr_lifecycle_lines.extend(["", "### Lifecycle traces", ""])
+        for row in failed_runtime_lpr:
+            by_stage: dict[str, list[dict[str, Any]]] = collections.defaultdict(list)
+            for record in ordered(row["records"]):
+                by_stage[str(record.get("stage"))].append(record)
+            by_stage["lpr_eligible"].extend(by_stage.get("eligibility_decision", []))
+            lifecycle_rows = []
+            for stage in lifecycle_stages:
+                stage_records = by_stage.get(stage, [])
+                final_record = stage_records[-1] if stage_records else None
+                lifecycle_rows.append(
+                    [
+                        stage,
+                        len(stage_records),
+                        (final_record or {}).get(
+                            "source_pts", (final_record or {}).get("frame_time", "—")
+                        ),
+                        "MISSING" if final_record is None else "observed",
+                        lifecycle_result(final_record),
+                        lifecycle_image(row["records"], stage)
+                        if final_record is not None
+                        else "—",
+                    ]
+                )
+            lpr_lifecycle_lines.extend(
+                [
+                    f"#### `{row['trace_id']}` — `{row['outcome']}`",
+                    "",
+                    _md_table(
+                        [
+                            "Stage",
+                            "Records",
+                            "Source PTS",
+                            "Status",
+                            "Final result",
+                            "Image",
+                        ],
+                        lifecycle_rows,
+                    ),
+                    "",
+                ]
+            )
+
+    face_lifecycle_lines: list[str] = []
+    review_face_traces = [
+        row
+        for row in face_runtime
+        if row["outcome"] in {"recognized_unknown", "not_recognized"}
+    ]
+    face_rendered_image_count = 0
+    if review_face_traces:
+        face_lifecycle_lines.extend(["", "### Lifecycle traces", ""])
+        for row in review_face_traces:
+            by_stage: dict[str, list[dict[str, Any]]] = collections.defaultdict(list)
+            for record in ordered(row["records"]):
+                by_stage[str(record.get("stage"))].append(record)
+
+            stage_specs = (
+                ("prepare_face_attempt", "face_crop", "recognition_attempt_bbox"),
+                ("recognizer.classify", "first_attempt", "face_crop"),
+                ("FaceEngine vote / publish", "first_attempt", "recognition_attempt"),
+            )
+            lifecycle_rows = []
+            for production_stage, record_stage, image_stage in stage_specs:
+                stage_records = by_stage.get(record_stage, [])
+                final_record = stage_records[-1] if stage_records else None
+                image_records = by_stage.get(image_stage, [])
+                image = "—"
+                if image_records:
+                    relative = image_records[-1].get("artifact_path")
+                    if relative and (output / "media" / str(relative)).is_file():
+                        image = _md_thumbnail(
+                            f"media/{Path(str(relative)).as_posix()}", production_stage
+                        )
+                        face_rendered_image_count += 1
+
+                final_result = lifecycle_result(final_record)
+                if production_stage == "FaceEngine vote / publish" and final_record:
+                    identity = final_record.get("identity")
+                    final_result = (
+                        "no aggregate; unknown excluded; sub_label not published"
+                        if identity == "unknown"
+                        else f"{final_result}; weighted vote evaluated"
+                    )
+                lifecycle_rows.append(
+                    [
+                        production_stage,
+                        len(stage_records),
+                        (final_record or {}).get(
+                            "source_pts", (final_record or {}).get("frame_time", "—")
+                        ),
+                        "MISSING" if final_record is None else "observed",
+                        final_result,
+                        image,
+                    ]
+                )
+            face_lifecycle_lines.extend(
+                [
+                    f"#### `{row['trace_id']}` — `{row['outcome']}`",
+                    "",
+                    _md_table(
+                        [
+                            "Stage",
+                            "Records",
+                            "Source PTS",
+                            "Status",
+                            "Final result",
+                            "Image",
+                        ],
+                        lifecycle_rows,
+                    ),
+                    "",
+                ]
+            )
+
+    lines = [
+        "# Runtime Test Report",
+        "",
+        "## Run",
+        "",
+        _md_table(
+            [
+                "Run",
+                "Topology",
+                "Report",
+                "Measurement",
+                "Service",
+                "Epoch",
+                "Local models",
+                "Source PTS",
+            ],
+            [
+                [
+                    output.name,
+                    summary.get("topology", "—"),
+                    summary.get("report", {}).get("status", "—"),
+                    measurement.get("measurement_valid", "—"),
+                    "in-process"
+                    if summary.get("topology") == "local"
+                    else recognition_service.get("healthy", "—"),
+                    recognition_service.get("service_epoch") or "n/a",
+                    "enabled" if summary.get("topology") == "local" else "disabled",
+                    measurement.get("source_pts_complete", "—"),
+                ]
+            ],
+        ),
+        "",
+        "## LPR result",
+        "",
+        _md_table(
+            [
+                "Match",
+                "Unexpected",
+                "No output",
+                "Expected missing",
+                "Raw traces",
+                "Clips",
+                "Debug images",
+            ],
+            [
+                [
+                    f"{lpr_match}/{len(expected_rows)}",
+                    lpr_unexpected,
+                    lpr_no_output,
+                    lpr_missing,
+                    len(lpr_runtime),
+                    sum(
+                        clip_href("lpr", row["trace_id"]) is not None
+                        for row in lpr_runtime
+                    ),
+                    f"[{image_index['lpr']} LPR images](media/images.md#lpr)",
+                ]
+            ],
+        ),
+        "",
+        "Bảng dưới đây chỉ dùng producer trace. Fixture chỉ tham gia tính KPI Match ở bảng tổng hợp.",
+        "",
+        _md_table(
+            ["Clip", "Outcome", "Track", "Eligible", "Plate", "OCR", "Publish"],
+            lpr_rows,
+        ),
+        *lpr_lifecycle_lines,
+        "",
+        "## Face result",
+        "",
+        _md_table(
+            [
+                "Known",
+                "Unknown",
+                "Failed",
+                "Raw traces",
+                "Attempts",
+                "Published",
+                "Clips",
+                "Rendered images",
+                "Artifact gallery",
+            ],
+            [
+                [
+                    face_known,
+                    face_unknown,
+                    face_failed,
+                    len(face_rows),
+                    sum(
+                        record.get("stage") == "first_attempt"
+                        for records_for_trace in face_by_trace.values()
+                        for record in records_for_trace
+                    ),
+                    summary.get("face", {}).get("recognition_publish_count", 0),
+                    sum(
+                        clip_href("face", trace_id) is not None
+                        for trace_id in face_by_trace
+                    ),
+                    face_rendered_image_count,
+                    f"[{image_index['face']} artifacts](media/images.md#face)",
+                ]
+            ],
+        ),
+        "",
+        "Face chỉ có ba stage nghiệp vụ production; input frame và producer evidence chỉ dùng để truy vết.",
+        "",
+        _md_table(
+            [
+                "Clip",
+                "Outcome",
+                "Prepare face",
+                "Recognition",
+                "Decision / publish",
+            ],
+            face_rows,
+        ),
+        *face_lifecycle_lines,
+        "",
+        "## Hardware and runtime health",
+        "",
+        _md_table(
+            [
+                "Samples",
+                "RAM avg / peak",
+                "CPU avg / peak",
+                "GPU avg / peak",
+                "VRAM avg / peak / total",
+                "SHM avg / peak",
+                "Skipped FPS",
+            ],
+            [
+                [
+                    max(
+                        len(cpu_samples),
+                        len(ram_samples),
+                        len(shm_samples),
+                        len(gpu_samples),
+                    ),
+                    f"{gib(average(ram_samples))} / {gib(max(ram_samples) if ram_samples else None)}",
+                    f"{average(cpu_samples) if cpu_samples else '—'}% / "
+                    f"{max(cpu_samples) if cpu_samples else '—'}% aggregate",
+                    f"{average(gpu_utilization) if gpu_utilization else '—'}% / "
+                    f"{max(gpu_utilization) if gpu_utilization else '—'}%",
+                    f"{average(gpu_memory) if gpu_memory else '—'} / "
+                    f"{max(gpu_memory) if gpu_memory else '—'} / "
+                    f"{gpu.get('memory_total_mib', '—')} MiB",
+                    f"{average(shm_samples) if shm_samples else '—'}% / "
+                    f"{max(shm_samples) if shm_samples else '—'}%",
+                    compact_mapping(resources.get("skipped_fps_max")),
+                ]
+            ],
+        ),
+        "",
+        _md_table(
+            [
+                "Duration total / replay / restore",
+                "Sessions",
+                "In-flight",
+                "Pinned leases",
+                "Queue / outcomes",
+                "Rejected",
+                "Writer depth / drop / error",
+                "Cleanup",
+                "Native clips",
+                "Sampler errors",
+            ],
+            [
+                [
+                    f"{timing.get('total_seconds', '—')} / "
+                    f"{timing.get('replay_seconds', '—')} / "
+                    f"{timing.get('restore_seconds', '—')} s",
+                    recognition.get("sessions", "—"),
+                    recognition.get("in_flight", "—"),
+                    recognition.get("evidence_pinned", "—"),
+                    f"{recognition.get('queue_depth', '—')} / "
+                    f"{recognition.get('outcome_depth', '—')}",
+                    recognition.get("rejected", 0),
+                    f"{recognition.get('writer_depth', '—')} / "
+                    f"{recognition.get('writer_drops', '—')} / "
+                    f"{recognition.get('writer_errors', '—')}",
+                    cleanup,
+                    f"{native_media.get('recorded_count', 0)} / "
+                    f"{native_media.get('trace_count', 0)}",
+                    "; ".join(runtime.get("hardware_sampler_errors", [])) or "none",
+                ]
+            ],
+        ),
+        "",
+        "CPU là tổng trên nhiều logical cores; cột hiển thị average/peak của toàn cửa sổ đo.",
+    ]
+
+    report_path = output / "report.md"
+    report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return report_path
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Run one Platform runtime evidence replay and create a timestamped report."
@@ -4532,7 +5446,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             os.environ["RECOGNITION_TLS_DIR"] = previous_recognition_tls
         write_json(output / "summary.json", summary)
-        report_path = write_failure_only_report(output, summary)
+        report_path = write_compact_runtime_report(output, summary)
         summary["report"]["artifacts"].append(
             {
                 "path": report_path.name,
