@@ -18,7 +18,7 @@ $env:ADAS_INPUT_FORMAT = if ($env:ADAS_INPUT_FORMAT) { $env:ADAS_INPUT_FORMAT } 
 $env:ADAS_DECODER_CODEC = if ($env:ADAS_DECODER_CODEC) { $env:ADAS_DECODER_CODEC } else { 'hevc_cuvid' }
 $env:ULTRALYTICS_DISABLE_TENSORRT = '0'
 $env:PUBLIC_HOST = if ($env:PUBLIC_HOST) { $env:PUBLIC_HOST } else { '127.0.0.1' }
-$python = Join-Path $PSScriptRoot '.venv\Scripts\python.exe'
+$python = Join-Path $PSScriptRoot '..\.venv\Scripts\python.exe'
 if (-not (Test-Path -LiteralPath $python)) { $python = (Get-Command python).Source }
 $env:PYTHONPATH = Join-Path $PSScriptRoot 'server'
 & $python -m camera_server.main

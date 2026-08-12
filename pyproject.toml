@@ -61,8 +61,29 @@ typecheck = [
 # embedded Frigate source tree.
 [tool.ty.environment]
 python-version = "3.11"
+python-platform = "all"
 root = [".", "server", "frigate/src"]
-extra-paths = ["typings"]
+extra-paths = ["server/typings"]
+
+[tool.ty.src]
+respect-ignore-files = false
+include = [
+    "*.py",
+    "server",
+    "frigate/src",
+    "tools",
+    "migrations",
+    "tests",
+    "scripts",
+]
+exclude = [
+    "**/.venv/**",
+    "**/node_modules/**",
+    "**/__pycache__/**",
+    "**/build/**",
+    "**/dist/**",
+    "server/vendor/**",
+]
 
 [tool.ruff]
 target-version = "py311"
@@ -72,8 +93,8 @@ ignore = ["E501", "E711", "E712", "UP031", "UP032", "UP042", "G004"]
 extend-select = ["I", "UP", "G", "ASYNC210", "B904"]
 
 [tool.ruff.lint.per-file-ignores]
-"frigate/src/camera_platform/tracker/service/v1/tracker_pb2.py" = ["ALL"]
-"frigate/src/camera_platform/tracker/service/v1/tracker_pb2_grpc.py" = ["ALL"]
+"frigate/src/extension/tracker/service/v1/tracker_pb2.py" = ["ALL"]
+"frigate/src/extension/tracker/service/v1/tracker_pb2_grpc.py" = ["ALL"]
 "server/camera_server/media/netsdk_source.py" = ["E402"]
 "server/camera_server/tools/probe_osd.py" = ["E402"]
 "server/test_real_live.py" = ["E402"]

@@ -16,7 +16,7 @@ if str(FRIGATE_ROOT) not in sys.path:
     sys.path.insert(0, str(FRIGATE_ROOT))
 
 from frigate.infrastructure.config import FrigateConfig  # noqa: E402
-from camera_platform.topology.compiler import (  # noqa: E402
+from extension.topology.compiler import (  # noqa: E402
     compile_topology,
     materialize_topology,
 )

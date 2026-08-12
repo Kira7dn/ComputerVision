@@ -8,7 +8,7 @@ param(
 
 Set-Location $PSScriptRoot
 
-$python = Join-Path $PSScriptRoot '.venv\Scripts\python.exe'
+$python = Join-Path $PSScriptRoot '..\.venv\Scripts\python.exe'
 $detector = Join-Path $PSScriptRoot 'DeepCamera\skills\detection\yolo-detection-2026\scripts\detect.py'
 $lib = Join-Path $PSScriptRoot 'DeepCamera\skills\lib'
 

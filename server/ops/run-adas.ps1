@@ -1,5 +1,5 @@
 $ErrorActionPreference = 'Stop'
-$projectRoot = Split-Path -Parent $PSScriptRoot
+$projectRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $serverRoot = Join-Path $projectRoot 'server'
 $python = Join-Path $projectRoot '.venv\Scripts\python.exe'
 $config = Join-Path $PSScriptRoot 'mediamtx.yml'
@@ -17,7 +17,7 @@ $env:ADAS_CHANNELS = '2'
 $env:ADAS_SUBTYPE = '0'
 $env:ADAS_INPUT_FORMAT = 'mpegts'
 $env:ADAS_DECODER_CODEC = 'hevc_cuvid'
-$env:ADAS_MODEL_PATH = if ($env:ADAS_MODEL_PATH) { $env:ADAS_MODEL_PATH } else { Join-Path $projectRoot 'server\models\yolov8n.pt' }
+$env:ADAS_MODEL_PATH = if ($env:ADAS_MODEL_PATH) { $env:ADAS_MODEL_PATH } else { Join-Path $projectRoot 'server\runtime\models\yolov8n.pt' }
 $env:ULTRALYTICS_DISABLE_TENSORRT = '1'  # disable TensorRT backend
 
 

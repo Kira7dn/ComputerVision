@@ -11,7 +11,7 @@ $ErrorActionPreference = 'Stop'
 if (-not $env:DAHUA_PASSWORD) {
     throw 'Set DAHUA_PASSWORD before starting the backup worker.'
 }
-$python = Join-Path $PSScriptRoot '..\.venv\Scripts\python.exe'
+$python = Join-Path $PSScriptRoot '..\..\.venv\Scripts\python.exe'
 if (-not (Test-Path -LiteralPath $python)) { $python = 'python' }
 $script = Join-Path $PSScriptRoot '..\server\camera_server\camera\hdd_downloader.py'
 $output = Join-Path $env:CAMERA_RUNTIME_DIR 'uploads\videos'
