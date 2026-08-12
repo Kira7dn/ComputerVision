@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, ClassVar
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 import cv2
 import numpy as np
@@ -424,7 +424,12 @@ def validate_external_recognition_evidence(
     }
 
 
-def run_deploy(command: str, config: Path | None = None, timeout: int = 45) -> None:
+def run_deploy(
+    command: str,
+    config: Path | None = None,
+    timeout: int = 45,
+    fault_scenario: str | None = None,
+) -> None:
     args = [
         "powershell",
         "-NoProfile",
@@ -436,6 +441,8 @@ def run_deploy(command: str, config: Path | None = None, timeout: int = 45) -> N
     ]
     if config is not None:
         args += ["-ConfigFile", str(config)]
+    if fault_scenario is not None:
+        args += ["-FaultScenario", fault_scenario]
     completed = subprocess.run(
         args,
         check=False,
@@ -454,6 +461,44 @@ def run_deploy(command: str, config: Path | None = None, timeout: int = 45) -> N
         raise RuntimeError(
             f"deploy/run.ps1 {command} failed ({completed.returncode}): {detail}"
         )
+
+
+class LauncherFaultInjector:
+    """Invoke runtime faults only through the shared launcher contract."""
+
+    def __init__(self, scenario: str, output: Path, config: Path) -> None:
+        self.scenario = scenario
+        self.output = output
+        self.config = config
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.error: str | None = None
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        self.thread.join(timeout=65)
+        if self.error:
+            raise RuntimeError(self.error)
+
+    def _run(self) -> None:
+        if self.stop_event.wait(3):
+            return
+        try:
+            run_deploy(
+                "acceptance-fault",
+                self.config,
+                timeout=60,
+                fault_scenario=self.scenario,
+            )
+            fault_path = Path(".tmp/runtime/fault.json")
+            if not fault_path.is_file():
+                raise RuntimeError("launcher fault artifact is missing")
+            shutil.copy2(fault_path, self.output / "fault-record.json")
+        except Exception as exc:
+            self.error = f"{type(exc).__name__}: {exc}"
 
 
 class DockerFaultInjector:
@@ -582,14 +627,16 @@ class DockerFaultInjector:
             self.records[-1]["restore"] = "docker network reconnect completed"
 
 
-def create_recognition_tls(directory: Path) -> None:
+def create_service_tls(
+    directory: Path, server_name: str, client_name: str = "frigate"
+) -> None:
     """Create a run-scoped CA and server/client identities for mTLS."""
     openssl = shutil.which("openssl")
     directory.mkdir(parents=True, exist_ok=True)
     server_ext = directory / "server.ext"
     client_ext = directory / "client.ext"
     server_ext.write_text(
-        "subjectAltName=DNS:recognition\nextendedKeyUsage=serverAuth\n",
+        f"subjectAltName=DNS:{server_name}\nextendedKeyUsage=serverAuth\n",
         encoding="utf-8",
     )
     client_ext.write_text("extendedKeyUsage=clientAuth\n", encoding="utf-8")
@@ -597,11 +644,11 @@ def create_recognition_tls(directory: Path) -> None:
         (
             "req", "-x509", "-newkey", "rsa:2048", "-nodes",
             "-keyout", "ca.key", "-out", "ca.crt", "-days", "1",
-            "-subj", "/CN=recognition-test-ca",
+            "-subj", f"/CN={server_name}-test-ca",
         ),
         (
             "req", "-newkey", "rsa:2048", "-nodes", "-keyout", "server.key",
-            "-out", "server.csr", "-subj", "/CN=recognition",
+            "-out", "server.csr", "-subj", f"/CN={server_name}",
         ),
         (
             "x509", "-req", "-in", "server.csr", "-CA", "ca.crt",
@@ -610,7 +657,7 @@ def create_recognition_tls(directory: Path) -> None:
         ),
         (
             "req", "-newkey", "rsa:2048", "-nodes", "-keyout", "client.key",
-            "-out", "client.csr", "-subj", "/CN=frigate",
+            "-out", "client.csr", "-subj", f"/CN={client_name}",
         ),
         (
             "x509", "-req", "-in", "client.csr", "-CA", "ca.crt",
@@ -647,7 +694,7 @@ def create_recognition_tls(directory: Path) -> None:
         )
         if completed.returncode != 0:
             raise RuntimeError(
-                f"Recognition TLS generation failed: {completed.stderr.strip()}"
+                f"{server_name} TLS generation failed: {completed.stderr.strip()}"
             )
         return
     for command in commands:
@@ -663,8 +710,13 @@ def create_recognition_tls(directory: Path) -> None:
         )
         if completed.returncode != 0:
             raise RuntimeError(
-                f"Recognition TLS generation failed: {completed.stderr.strip()}"
+                f"{server_name} TLS generation failed: {completed.stderr.strip()}"
             )
+
+
+def create_recognition_tls(directory: Path) -> None:
+    """Compatibility entrypoint for the existing recognition E2E contract."""
+    create_service_tls(directory, "recognition")
 
 
 def configure_recognition_topology(
@@ -690,6 +742,44 @@ def configure_recognition_topology(
             "key": "/run/recognition-tls/client.key",
             "server_name": "recognition",
         },
+    }
+    return tls_directory
+
+
+def configure_tracker_topology(
+    config: dict[str, Any], topology: str
+) -> Path | None:
+    if topology != "tracker":
+        config.pop("tracker", None)
+        return None
+    node_id = "edge-local"
+    server_name = "tracker-edge-local"
+    tls_directory = Path(".tmp/runtime/tracker-tls") / node_id
+    create_service_tls(tls_directory, server_name, "frigate-main")
+    config["tracker"] = {
+        node_id: {
+            "managed": True,
+            "endpoint": f"{server_name}:50052",
+            "cameras": ["face_camera", "car_camera"],
+            "deadline": 5,
+            "output_capacity": 256,
+            "control_capacity": 64,
+            "shutdown_drain": 10,
+            "evidence": {
+                "memory_bytes_per_camera": 32 * 1024 * 1024,
+                "ttl": 45,
+            },
+            "spool": {
+                "max_bytes": 256 * 1024 * 1024,
+                "retention": 24 * 60 * 60,
+            },
+            "tls": {
+                "ca": "/run/tracker-tls/ca.crt",
+                "certificate": "/run/tracker-tls/client.crt",
+                "key": "/run/tracker-tls/client.key",
+                "server_name": server_name,
+            },
+        }
     }
     return tls_directory
 
@@ -728,10 +818,16 @@ def capture_container_diagnostics(
 ) -> None:
     """Persist acceptance-container evidence before restore replaces it."""
     containers = ["frigate"]
-    if topology == "external":
+    if topology in ("external", "tracker"):
         containers.append("camera-recognition")
+    if topology == "tracker":
+        containers.append("camera-tracker-edge-local")
     for container in containers:
-        suffix = "" if container == "frigate" else "-recognition"
+        suffix = {
+            "frigate": "",
+            "camera-recognition": "-recognition",
+            "camera-tracker-edge-local": "-tracker-edge-local",
+        }[container]
         inspect = subprocess.run(
             ["docker", "inspect", container],
             check=False,
@@ -808,7 +904,11 @@ def latest_sample(camera: str) -> tuple[float, float] | None:
         return None
 
 
-def wait_acceptance_ready(expected_image: str | None, timeout: float = 32.0) -> None:
+def wait_acceptance_ready(
+    expected_image: str | None,
+    timeout: float = 32.0,
+    topology: str = "local",
+) -> None:
     deadline = time.monotonic() + timeout
     stable_since: float | None = None
     stable_required = float(os.environ.get("CAMERA_READY_STABLE_SECONDS", "2"))
@@ -829,17 +929,17 @@ def wait_acceptance_ready(expected_image: str | None, timeout: float = 32.0) -> 
                 }
                 for camera in CAMERAS.values()
             }
-            latest_ready = all(
+            latest_ready = topology == "tracker" or all(
                 latest_sample(camera) is not None for camera in CAMERAS.values()
             )
-            camera_ready = all(
+            camera_ready = topology == "tracker" or all(
                 status["camera_fps"] > 0 for status in camera_status.values()
             )
             detectors = stats.get("detectors", {})
-            detector_ready = bool(detectors) and all(
+            detector_ready = topology == "tracker" or (bool(detectors) and all(
                 float(value.get("inference_speed", 9999)) < 200
                 for value in detectors.values()
-            )
+            ))
             face_ready = (stats.get("embeddings") or {}).get(
                 "face_recognition"
             ) is not None
@@ -985,8 +1085,10 @@ def parse_bytes(value: str) -> int:
 class ResourceSampler:
     def __init__(self, topology: str = "local") -> None:
         self.containers = ["frigate"] + (
-            ["camera-recognition"] if topology == "external" else []
+            ["camera-recognition"] if topology in ("external", "tracker") else []
         )
+        if topology == "tracker":
+            self.containers.append("camera-tracker-edge-local")
         self.stop_event = threading.Event()
         self.memory_bytes: list[int] = []
         self.cpu_percent: list[float] = []
@@ -1122,7 +1224,7 @@ def finalize_finite_source_tracks(records: list[dict[str, Any]]) -> int:
         return 0
     code = """
 import json, sys, time
-from frigate.comms.events_updater import EventEndPublisher
+from frigate.infrastructure.comms.events_updater import EventEndPublisher
 
 publisher = EventEndPublisher()
 time.sleep(0.2)
@@ -2114,6 +2216,104 @@ def sqlite_events(ids: list[str], database_path: str) -> dict[str, dict[str, Any
     return json.loads(output or "{}")
 
 
+def audit_tracker_lifecycle_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Validate producer lifecycle order without inventing terminal events."""
+    errors: list[str] = []
+    sequence_keys: set[tuple[str, str, int]] = set()
+    identities: dict[tuple[str, str, str, str], str] = {}
+    lifecycles: dict[str, list[str]] = collections.defaultdict(list)
+    for row in rows:
+        sequence_key = (
+            str(row["node_id"]),
+            str(row["node_epoch"]),
+            int(row["journal_sequence"]),
+        )
+        if sequence_key in sequence_keys:
+            errors.append(f"duplicate_sequence:{sequence_key}")
+        sequence_keys.add(sequence_key)
+        identity = (
+            str(row["node_id"]),
+            str(row["camera_id"]),
+            str(row["stream_epoch"]),
+            str(row.get("track_id") or ""),
+        )
+        event_id = str(row["event_id"])
+        previous_event = identities.setdefault(identity, event_id)
+        if previous_event != event_id:
+            errors.append(f"identity_reused:{identity}")
+        lifecycles[event_id].append(str(row["operation"]).upper())
+
+    for event_id, operations in lifecycles.items():
+        if operations.count("START") != 1:
+            errors.append(f"start_count:{event_id}:{operations.count('START')}")
+        if operations.count("END") != 1:
+            errors.append(f"end_count:{event_id}:{operations.count('END')}")
+        if operations and operations[0] != "START":
+            errors.append(f"first_not_start:{event_id}")
+        if operations and operations[-1] != "END":
+            errors.append(f"last_not_end:{event_id}")
+
+    return {
+        "valid": bool(rows) and not errors,
+        "journal_entries": len(rows),
+        "event_count": len(lifecycles),
+        "active_count": sum(
+            bool(operations) and operations[-1] != "END"
+            for operations in lifecycles.values()
+        ),
+        "errors": errors,
+    }
+
+
+def tracker_lifecycle_audit(database_path: str) -> dict[str, Any]:
+    code = r"""
+import json, sqlite3, sys
+db = sqlite3.connect(sys.argv[1])
+rows = []
+for row in db.execute('''
+    select node_id,node_epoch,journal_sequence,camera_id,stream_epoch,
+           event_id,operation,payload
+    from tracker_journal_entry
+    order by node_id,journal_sequence
+'''):
+    payload = json.loads(row[7] or '{}')
+    rows.append({
+        'node_id': row[0], 'node_epoch': row[1], 'journal_sequence': row[2],
+        'camera_id': row[3], 'stream_epoch': row[4], 'event_id': row[5],
+        'operation': row[6], 'track_id': payload.get('track_id'),
+    })
+event_missing = db.execute('''
+    select count(*) from (
+        select distinct j.event_id from tracker_journal_entry j
+        left join event e on e.id=j.event_id
+        where j.operation='END' and e.id is null
+    )
+''').fetchone()[0]
+manifest_missing = db.execute('''
+    select count(*) from edge_media_manifest m
+    left join event e on e.id=m.event_id where e.id is null
+''').fetchone()[0]
+print(json.dumps({
+    'rows': rows,
+    'event_missing': event_missing,
+    'manifest_event_missing': manifest_missing,
+}))
+"""
+    output = docker_output(
+        "exec", "frigate", "python3", "-c", code, database_path, timeout=10
+    )
+    raw = json.loads(output)
+    result = audit_tracker_lifecycle_rows(raw["rows"])
+    result["event_missing"] = int(raw["event_missing"])
+    result["manifest_event_missing"] = int(raw["manifest_event_missing"])
+    result["valid"] = bool(
+        result["valid"]
+        and result["event_missing"] == 0
+        and result["manifest_event_missing"] == 0
+    )
+    return result
+
+
 def api_event(event_id: str) -> dict[str, Any] | None:
     try:
         with urlopen(
@@ -2414,6 +2614,7 @@ def collect_native_trace_clips(
     database_path: str,
     *,
     api_base: str = "http://127.0.0.1:5001",
+    edge_owned: bool = False,
 ) -> dict[str, Any]:
     """Download trace clips from Frigate's native recording API.
 
@@ -2572,7 +2773,16 @@ def collect_native_trace_clips(
                     "event_has_clip_sqlite": bool(source_event.get("has_clip")),
                 }
             )
-        if recordings:
+        media_url = None
+        if edge_owned and event is not None:
+            media_url = f"{api_base}/api/events/{quote(str(event['id']), safe='')}/clip.mp4"
+            metadata.update(
+                {
+                    "clip_basis": "edge_media_manifest",
+                    "clip_reason": None,
+                }
+            )
+        elif recordings:
             assert start_time is not None and end_time is not None
             coverage_start = min(float(row["start_time"]) for row in recordings)
             coverage_end = max(float(row["end_time"]) for row in recordings)
@@ -2594,13 +2804,14 @@ def collect_native_trace_clips(
             if request_end <= request_start:
                 metadata["clip_reason"] = "recording_coverage_missing"
                 recordings = []
-        if recordings:
-            url = (
+        if recordings and media_url is None:
+            media_url = (
                 f"{api_base}/api/{quote(camera, safe='')}/start/"
                 f"{request_start:.6f}/end/{request_end:.6f}/clip.mp4"
             )
+        if media_url is not None:
             try:
-                with urlopen(url, timeout=45) as response:
+                with urlopen(media_url, timeout=45) as response:
                     payload = response.read()
                     content_type = response.headers.get("Content-Type", "")
                 if not payload:
@@ -2621,6 +2832,37 @@ def collect_native_trace_clips(
                         "ffprobe": probe,
                     }
                 )
+                if edge_owned and event is not None:
+                    range_request = Request(
+                        media_url, headers={"Range": "bytes=0-1023"}
+                    )
+                    with urlopen(range_request, timeout=15) as response:
+                        range_payload = response.read()
+                        range_status = response.status
+                        content_range = response.headers.get("Content-Range", "")
+                    snapshot_url = (
+                        f"{api_base}/api/events/"
+                        f"{quote(str(event['id']), safe='')}/snapshot.jpg"
+                    )
+                    with urlopen(snapshot_url, timeout=15) as response:
+                        snapshot_payload = response.read()
+                        snapshot_type = response.headers.get("Content-Type", "")
+                    metadata.update(
+                        {
+                            "range_proxy_status": range_status,
+                            "range_proxy_bytes": len(range_payload),
+                            "range_proxy_content_range": content_range,
+                            "snapshot_proxy_bytes": len(snapshot_payload),
+                            "snapshot_proxy_content_type": snapshot_type,
+                            "media_proxy_complete": (
+                                range_status == 206
+                                and bool(range_payload)
+                                and content_range.startswith("bytes 0-")
+                                and bool(snapshot_payload)
+                                and snapshot_type.startswith("image/jpeg")
+                            ),
+                        }
+                    )
             except Exception as exc:
                 metadata["clip_reason"] = (
                     f"native_clip_error:{type(exc).__name__}:{exc}"
@@ -2635,6 +2877,11 @@ def collect_native_trace_clips(
         "missing_count": sum(item["clip_status"] != "recorded" for item in traces),
         "complete": bool(traces)
         and all(item["clip_status"] == "recorded" for item in traces),
+        "media_proxy_complete": not edge_owned
+        or (
+            bool(traces)
+            and all(item.get("media_proxy_complete") for item in traces)
+        ),
         "traces": traces,
     }
     write_json(output / "native-media.json", result)
@@ -4885,17 +5132,33 @@ def main(argv: list[str] | None = None) -> int:
         description="Run one Platform runtime evidence replay and create a timestamped report."
     )
     parser.add_argument(
-        "--topology", choices=("local", "external"), default="local"
+        "--topology", choices=("local", "external", "tracker"), default="local"
     )
     parser.add_argument(
         "--fault-scenario",
-        choices=("service_restart", "stream_disconnect", "client_disconnect"),
-        help="Inject one Docker fault during an external replay.",
+        choices=(
+            "service_restart",
+            "tracker_restart",
+            "stream_disconnect",
+            "client_disconnect",
+            "spool_replay",
+            "media_unavailable",
+        ),
+        help="Inject one launcher-owned fault during replay.",
     )
     args = parser.parse_args(argv)
     topology = str(args.topology)
-    if args.fault_scenario and topology != "external":
-        parser.error("--fault-scenario requires --topology external")
+    if args.fault_scenario and topology == "local":
+        parser.error("--fault-scenario requires an external topology")
+    if topology == "tracker" and args.fault_scenario == "service_restart":
+        parser.error("tracker topology uses --fault-scenario tracker_restart")
+    if topology == "external" and args.fault_scenario not in (
+        None,
+        "service_restart",
+        "stream_disconnect",
+        "client_disconnect",
+    ):
+        parser.error("tracker fault scenario requires --topology tracker")
     config = Path("deploy/config.yaml")
     manifest_path = Path("tools/fixtures/platform_passage_ground_truth.yaml")
     output_root = Path(".tmp/platform-runtime")
@@ -4933,7 +5196,7 @@ def main(argv: list[str] | None = None) -> int:
     previous_recognition_tls = os.environ.get("RECOGNITION_TLS_DIR")
     runtime_started = False
     sampler: ResourceSampler | None = None
-    fault_injector: DockerFaultInjector | None = None
+    fault_injector: DockerFaultInjector | LauncherFaultInjector | None = None
     isolated_start_wall: float | None = None
     exit_code = 1
     runtime_workspace = output / "test-assets"
@@ -4972,8 +5235,11 @@ def main(argv: list[str] | None = None) -> int:
         tls_directory = configure_recognition_topology(
             value, topology, runtime_workspace
         )
+        tracker_tls_directory = configure_tracker_topology(value, topology)
         if tls_directory is not None:
             os.environ["RECOGNITION_TLS_DIR"] = str(tls_directory.resolve())
+        if tracker_tls_directory is not None:
+            summary["tracker_tls_directory"] = str(tracker_tls_directory.resolve())
         isolated_config.write_text(
             yaml.safe_dump(value, sort_keys=False, allow_unicode=True), encoding="utf-8"
         )
@@ -4982,9 +5248,9 @@ def main(argv: list[str] | None = None) -> int:
         summary["fixture"] = fixture
         summary["fixture_contract"] = contract
         summary["timing"]["fixture_seconds"] = round(time.monotonic() - step_started, 3)
-        # Stop the current runtime before replacing its config and media mount.
+        # All topology mutations, including the pre-acceptance stop, are launcher-owned.
         runtime_started = True
-        docker_output("stop", "--time", "10", "frigate", timeout=15, check=False)
+        run_deploy("stop", config, timeout=30)
 
         isolated_start_wall = time.time()
         step_started = time.monotonic()
@@ -5018,15 +5284,25 @@ def main(argv: list[str] | None = None) -> int:
             run_deploy(
                 "acceptance-start",
                 Path(fixture["config"]),
-                timeout=90 if topology == "external" else 30,
+                timeout=90 if topology in ("external", "tracker") else 30,
             )
+            launcher_state_path = Path(".tmp/runtime/state.json")
+            if not launcher_state_path.is_file():
+                raise RuntimeError("launcher state artifact is missing")
+            launcher_state = json.loads(
+                launcher_state_path.read_text(encoding="utf-8")
+            )
+            write_json(output / "launcher-state.json", launcher_state)
+            summary["launcher_state"] = launcher_state
         finally:
             if previous_source_overlay is None:
                 os.environ.pop("CAMERA_SOURCE_OVERLAY", None)
             else:
                 os.environ["CAMERA_SOURCE_OVERLAY"] = previous_source_overlay
         source_started = wait_source_starts(source_start_dir, timeout=60)
-        wait_acceptance_ready(str(value["runtime"]["image"]), timeout=60)
+        wait_acceptance_ready(
+            str(value["runtime"]["image"]), timeout=60, topology=topology
+        )
         summary["timing"]["isolated_start_seconds"] = round(
             time.monotonic() - step_started, 3
         )
@@ -5035,7 +5311,9 @@ def main(argv: list[str] | None = None) -> int:
         sampler = ResourceSampler(topology)
         sampler.start()
         if args.fault_scenario:
-            fault_injector = DockerFaultInjector(args.fault_scenario, output, Path(fixture["config"]))
+            fault_injector = LauncherFaultInjector(
+                args.fault_scenario, output, Path(fixture["config"])
+            )
             fault_injector.start()
 
         replay_sources = value["runtime"]["direct"]["sources"]
@@ -5142,12 +5420,13 @@ def main(argv: list[str] | None = None) -> int:
         # runtime metrics; fixture association is a separate comparison view.
         runtime_records = records
         raw_lpr_trace_ids = pipeline_trace_ids(runtime_records, "lpr")
+        raw_face_trace_ids = pipeline_trace_ids(runtime_records, "face")
         all_media_evidence = media_evidence_records(output / "media")
         external_evidence = (
             validate_external_recognition_evidence(
                 output / "media", runtime_records, all_media_evidence
             )
-            if topology == "external"
+            if topology in ("external", "tracker")
             else {"valid": True, "errors": []}
         )
         if not external_evidence["valid"]:
@@ -5164,7 +5443,14 @@ def main(argv: list[str] | None = None) -> int:
             output,
             runtime_records + all_media_evidence,
             str(value["database"]["path"]),
+            edge_owned=topology == "tracker",
         )
+        tracker_lifecycle = (
+            tracker_lifecycle_audit(str(value["database"]["path"]))
+            if topology == "tracker"
+            else {"valid": True, "journal_entries": 0, "event_count": 0}
+        )
+        write_json(output / "tracker-lifecycle.json", tracker_lifecycle)
         comparison_records = assign_records(
             [dict(record) for record in runtime_records],
             anchors,
@@ -5227,9 +5513,16 @@ def main(argv: list[str] | None = None) -> int:
         correlation = correlation_mismatches(comparison_records)
         runtime_logs = docker_logs("frigate", observation_wall)
         model_logs = docker_logs("frigate", isolated_start_wall)
+        tracker_logs = (
+            docker_logs("camera-tracker-edge-local", isolated_start_wall)
+            if topology == "tracker"
+            else ""
+        )
+        if tracker_logs:
+            model_logs = f"{model_logs}\n{tracker_logs}"
         recognition_logs = (
             docker_logs("camera-recognition", isolated_start_wall)
-            if topology == "external"
+            if topology in ("external", "tracker")
             else ""
         )
         pending = parse_pending(runtime_logs)
@@ -5248,7 +5541,7 @@ def main(argv: list[str] | None = None) -> int:
                 r"reconnect|stall|no frames|ffmpeg.*(?:error|crash)", line, re.I
             )
         ]
-        if topology == "external":
+        if topology in ("external", "tracker"):
             bad_log_lines.extend(
                 line
                 for line in recognition_logs.splitlines()
@@ -5276,6 +5569,43 @@ def main(argv: list[str] | None = None) -> int:
         )
         recognition_service_started = topology == "local" or len(service_epochs) == 1
         local_models_disabled = topology == "local" or face_model_loads == 0
+        with urlopen("http://127.0.0.1:5001/api/stats", timeout=2) as response:
+            final_main_stats = json.loads(response.read().decode("utf-8"))
+        if topology == "tracker":
+            run_deploy("status", Path(fixture["config"]), timeout=30)
+            launcher_state = json.loads(
+                Path(".tmp/runtime/state.json").read_text(encoding="utf-8")
+            )
+            write_json(output / "launcher-state.json", launcher_state)
+            summary["launcher_state"] = launcher_state
+        main_camera_stats = final_main_stats.get("cameras", {})
+        main_edge_ownership_zero = topology != "tracker" or all(
+            not (main_camera_stats.get(camera) or {}).get("capture_pid")
+            and not (main_camera_stats.get(camera) or {}).get("pid")
+            for camera in CAMERAS.values()
+        ) and not final_main_stats.get("detectors")
+        launcher_tracker_nodes = summary.get("launcher_state", {}).get(
+            "tracker_nodes", []
+        )
+        tracker_cameras_ready = topology != "tracker" or (
+            len(launcher_tracker_nodes) == 1
+            and {
+                item.get("camera_id")
+                for item in launcher_tracker_nodes[0].get("cameras", [])
+                if item.get("ready")
+            }
+            == set(CAMERAS.values())
+        )
+        tracker_terminal_zero = topology != "tracker" or all(
+            node.get("health", {}).get("pending_ack") == 0
+            and node.get("health", {}).get("pinned_evidence") == 0
+            and node.get("health", {}).get("active_lifecycles") == 0
+            for node in launcher_tracker_nodes
+        )
+        tracker_not_degraded = topology != "tracker" or all(
+            not node.get("health", {}).get("degraded")
+            for node in launcher_tracker_nodes
+        )
 
         latency = {
             "face": {
@@ -5352,7 +5682,7 @@ def main(argv: list[str] | None = None) -> int:
                 "service_epoch": service_epochs[0] if len(service_epochs) == 1 else None,
                 "local_models_disabled": local_models_disabled,
                 "healthy": bool(recognition_stats.get("service_healthy", 0))
-                if topology == "external"
+                if topology in ("external", "tracker")
                 else None,
             },
             "resources": resources,
@@ -5379,6 +5709,14 @@ def main(argv: list[str] | None = None) -> int:
             "recordings_ready": recordings_ready,
             "recordings_available_through": recordings_through,
             "native_media": native_media,
+            "tracker": {
+                "nodes": launcher_tracker_nodes,
+                "main_edge_ownership_zero": main_edge_ownership_zero,
+                "cameras_ready": tracker_cameras_ready,
+                "terminal_zero": tracker_terminal_zero,
+                "not_degraded": tracker_not_degraded,
+                "lifecycle": tracker_lifecycle,
+            },
         }
         summary.update(
             {
@@ -5421,6 +5759,8 @@ def main(argv: list[str] | None = None) -> int:
             "lpr_recognition_recall": lpr["recall"] >= 2 / 3,
             "lpr_passage_precision": lpr["passage_precision"] == 1.0,
             "lpr_raw_trace_count_exact": len(raw_lpr_trace_ids) == len(lpr_passages),
+            "face_raw_trace_count_exact": len(raw_face_trace_ids)
+            == len(face_passages),
             "face_raw_tracks_present": face.get("trace_count", 0) > 0,
             "face_raw_attempts_present": face.get("attempt_count", 0) > 0,
             "face_recognition_trace_coverage_complete": face.get(
@@ -5457,6 +5797,13 @@ def main(argv: list[str] | None = None) -> int:
             "recognition_cleanup_zero": recognition["cleanup_zero"],
             "recognition_writer_drops_zero": recognition.get("writer_drops", 0) == 0,
             "recognition_writer_errors_zero": recognition.get("writer_errors", 0) == 0,
+            "tracker_cameras_ready": tracker_cameras_ready,
+            "main_edge_ownership_zero": main_edge_ownership_zero,
+            "tracker_terminal_zero": tracker_terminal_zero,
+            "tracker_not_degraded": tracker_not_degraded,
+            "tracker_media_proxy_complete": topology != "tracker"
+            or native_media.get("media_proxy_complete", False),
+            "tracker_lifecycle_valid": tracker_lifecycle.get("valid", False),
         }
         summary["gates"] = gates
     except Exception as exc:
@@ -5472,7 +5819,16 @@ def main(argv: list[str] | None = None) -> int:
         if sampler is not None:
             sampler.stop()
         if fault_injector is not None:
-            fault_injector.stop()
+            try:
+                fault_injector.stop()
+                summary.setdefault("gates", {})["fault_completed"] = (
+                    output / "fault-record.json"
+                ).is_file()
+            except Exception as exc:
+                summary.setdefault("fault_errors", []).append(
+                    f"{type(exc).__name__}: {exc}"
+                )
+                summary.setdefault("gates", {})["fault_completed"] = False
         step_started = time.monotonic()
         restore_ok = not runtime_started
         if runtime_started:
@@ -5491,12 +5847,42 @@ def main(argv: list[str] | None = None) -> int:
         )
         # The calculated gates remain diagnostic data and never decide the report.
         summary["diagnostic_gates"] = summary["gates"]
-        summary["acceptance"] = {
-            "mode": "evidence_only",
-            "status": "not_scored",
-            "criteria": [],
-        }
-        summary["accepted"] = None
+        if topology == "tracker":
+            diagnostic_names = {
+                "lpr_readable_denominator",
+                "lpr_exact_match_reported",
+                "lpr_accuracy",
+                "lpr_recognition_precision",
+                "lpr_recognition_recall",
+            }
+            required_gates = {
+                name: passed
+                for name, passed in summary["gates"].items()
+                if name not in diagnostic_names
+            }
+            failed_gates = sorted(
+                name for name, passed in required_gates.items() if not passed
+            )
+            summary["diagnostic_gates"] = {
+                name: summary["gates"][name]
+                for name in sorted(diagnostic_names)
+                if name in summary["gates"]
+            }
+            summary["accepted"] = not failed_gates
+            summary["acceptance"] = {
+                "mode": "phase8_hard_gate",
+                "status": "passed" if not failed_gates else "failed",
+                "criteria": sorted(required_gates),
+                "failed": failed_gates,
+                "diagnostic": sorted(diagnostic_names),
+            }
+        else:
+            summary["acceptance"] = {
+                "mode": "evidence_only",
+                "status": "not_scored",
+                "criteria": [],
+            }
+            summary["accepted"] = None
         summary["measurement"] = {
             "source_time": "source_pts",
             "assignment": "one_to_one_physical_passage_round",
@@ -5528,9 +5914,14 @@ def main(argv: list[str] | None = None) -> int:
             "lpr.json",
             "container-inspect.json",
             "container.log",
+            "launcher-state.json",
         ) + (
             ("container-inspect-recognition.json", "container-recognition.log")
-            if topology == "external"
+            if topology in ("external", "tracker")
+            else ()
+        ) + (
+            ("container-inspect-tracker-edge-local.json", "container-tracker-edge-local.log")
+            if topology == "tracker"
             else ()
         )
         artifacts_complete = all((output / name).is_file() for name in artifact_names)

@@ -61,7 +61,7 @@ typecheck = [
 # embedded Frigate source tree.
 [tool.ty.environment]
 python-version = "3.11"
-root = [".", "server", "frigate"]
+root = [".", "server", "frigate/src"]
 extra-paths = ["typings"]
 
 [tool.ruff]
@@ -72,13 +72,13 @@ ignore = ["E501", "E711", "E712", "UP031", "UP032", "UP042", "G004"]
 extend-select = ["I", "UP", "G", "ASYNC210", "B904"]
 
 [tool.ruff.lint.per-file-ignores]
-"frigate/frigate/tracker/service/v1/tracker_pb2.py" = ["ALL"]
-"frigate/frigate/tracker/service/v1/tracker_pb2_grpc.py" = ["ALL"]
+"frigate/src/camera_platform/tracker/service/v1/tracker_pb2.py" = ["ALL"]
+"frigate/src/camera_platform/tracker/service/v1/tracker_pb2_grpc.py" = ["ALL"]
 "server/camera_server/media/netsdk_source.py" = ["E402"]
 "server/camera_server/tools/probe_osd.py" = ["E402"]
 "server/test_real_live.py" = ["E402"]
 "server/test_sdk_api.py" = ["E402"]
 
 [tool.pytest.ini_options]
-pythonpath = [".", "server", "frigate"]
-testpaths = ["server/tests", "tools/tests", "frigate/frigate/test"]
+pythonpath = [".", "server", "frigate/src"]
+testpaths = ["server/tests", "tools/tests", "frigate/tests"]

@@ -133,7 +133,7 @@ Phase 6-0 xử lý theo thứ tự:
 
 ## Code và ranh giới kiến trúc
 
-- `frigate/frigate/data_processing/real_time/license_plate.py` khớp hoàn toàn với
+- `frigate/src/frigate/data_processing/real_time/license_plate.py` khớp hoàn toàn với
   `upstream/dev` commit `2599795ab0fb2c27f3dd7f9ff6f4a9eb857c4c43`; `git diff --numstat` cho
   file này không có output.
 - LPR vẫn là processor/model riêng. Event/API/SQLite schema và notification flow không đổi.

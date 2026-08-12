@@ -1,8 +1,10 @@
-"""Official Phase 8 fault entrypoint; faults must be implemented by run.ps1."""
-
-from __future__ import annotations
-
+"""Stable entrypoint for launcher-owned external tracker fault E2E."""
 import argparse
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+from tools.runtime.validate_platform_runtime import main as validate
 
 
 def main() -> int:
@@ -18,12 +20,10 @@ def main() -> int:
             "media_unavailable",
         ),
     )
-    parser.parse_args()
-    parser.error(
-        "Phase 8 fault actions are not enabled in deploy/run.ps1 yet; "
-        "no direct Docker fault injection is permitted"
+    args = parser.parse_args()
+    return validate(
+        ["--topology", "tracker", "--fault-scenario", args.scenario]
     )
-    return 2
 
 
 if __name__ == "__main__":

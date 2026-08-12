@@ -314,7 +314,7 @@ diagnostic, vì vậy `report complete` không được diễn giải thành k�
 
 Phase 8 hiện mới có bằng chứng source/unit cô lập, chưa có build/runtime acceptance:
 
-- `frigate/frigate/test/test_tracker_edge.py`: `18 passed` cho proto compatibility, mTLS identity,
+- `frigate/tests/test_tracker_edge.py`: `18 passed` cho proto compatibility, mTLS identity,
   ownership/mixed mode, producer parity, evidence TTL/checksum/pin, durable journal replay/ACK/
   restart/spool-full, canonical SQLite ingest, media manifest/range và no direct recognition import.
 - Root unit gate: `77 passed`; nhóm tracker/config/camera-maintainer/stationary/Event canonical:

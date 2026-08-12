@@ -49,7 +49,7 @@ def make_project(root: Path, name: str, files: tuple[str, ...], dependency: list
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(RECOGNITION / relative, target)
     (root / "pyproject.toml").write_text(
-        """[build-system]\nrequires = [\"setuptools>=68\", \"wheel\"]\nbuild-backend = \"setuptools.build_meta\"\n\n[project]\nname = \"%s\"\nversion = \"0.1.0\"\nrequires-python = \">=3.11,<3.12\"\ndependencies = %s\n\n[tool.setuptools]\npackage-dir = {\"\" = \"src\"}\n\n[tool.setuptools.packages.find]\nwhere = [\"src\"]\ninclude = [\"frigate.recognition*\"]\n\n[tool.setuptools.package-data]\n\"frigate.recognition\" = [\"service/v1/*.proto\"]\n""" % (name, json.dumps(dependency)),
+        """[build-system]\nrequires = [\"setuptools>=68\", \"wheel\"]\nbuild-backend = \"setuptools.build_meta\"\n\n[project]\nname = \"%s\"\nversion = \"0.1.0\"\nrequires-python = \">=3.11,<3.12\"\ndependencies = %s\n\n[tool.setuptools]\npackage-dir = {\"\" = \"src\"}\n\n[tool.setuptools.packages.find]\nwhere = [\"src\"]\ninclude = [\"frigate.application.recognition*\"]\n\n[tool.setuptools.package-data]\n\"frigate.application.recognition\" = [\"service/v1/*.proto\"]\n""" % (name, json.dumps(dependency)),
         encoding="utf-8",
     )
 

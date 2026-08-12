@@ -19,6 +19,7 @@ from tools.runtime.validate_platform_runtime import (
     annotate_face_evidence,
     api_sqlite_consistency,
     assign_records,
+    audit_tracker_lifecycle_rows,
     collect_native_trace_clips,
     correlation_mismatches,
     face_results,
@@ -32,15 +33,27 @@ from tools.runtime.validate_platform_runtime import (
     restore_mounts_verified,
     source_pts_metrics,
     trace_lifecycle_groups,
+    validate_external_recognition_evidence,
     validate_runtime_lpr_evidence,
     wait_file_quiescent,
     wait_recognition_idle,
     write_compact_runtime_report,
-    validate_external_recognition_evidence,
 )
 
 ROOT = Path(__file__).resolve().parents[3]
 MANIFEST = ROOT / "tools/fixtures/platform_passage_ground_truth.yaml"
+
+
+def test_tracker_topology_config_uses_direct_node_map(monkeypatch) -> None:
+    monkeypatch.setattr(passage_validator, "create_service_tls", lambda *args: None)
+    config: dict[str, object] = {}
+
+    passage_validator.configure_tracker_topology(config, "tracker")
+
+    tracker = config["tracker"]
+    assert isinstance(tracker, dict)
+    assert "edge-local" in tracker
+    assert "nodes" not in tracker
 
 
 def test_interrupted_face_attempt_accepts_typed_failure(tmp_path: Path) -> None:
@@ -575,6 +588,124 @@ def test_native_trace_clip_uses_recording_when_event_is_absent(
     assert metadata["clip_reason"] is None
     assert (trace_root / "clip.mp4").read_bytes() == b"native-recording-without-event"
     assert result["complete"] is True
+
+
+def test_edge_trace_media_uses_event_proxy_snapshot_and_range(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    records = [
+        {
+            "pipeline": "lpr",
+            "trace_id": "lpr:car_camera:event-1",
+            "camera": "car_camera",
+            "event_id": "event-1",
+            "stage": "track_seen",
+            "source_pts": 100.0,
+        }
+    ]
+
+    monkeypatch.setattr(
+        passage_validator,
+        "api_event",
+        lambda event_id: {
+            "id": event_id,
+            "camera": "car_camera",
+            "start_time": 99.0,
+            "end_time": 101.0,
+            "has_clip": True,
+        },
+    )
+    monkeypatch.setattr(
+        passage_validator, "sqlite_trace_media", lambda event_ids, path: {}
+    )
+    monkeypatch.setattr(
+        passage_validator,
+        "sqlite_recordings_for_trace_ranges",
+        lambda ranges, path: {},
+    )
+
+    class Response:
+        def __init__(self, payload: bytes, content_type: str, status: int = 200):
+            self._payload = payload
+            self.status = status
+            self.headers = {"Content-Type": content_type}
+            if status == 206:
+                self.headers["Content-Range"] = "bytes 0-1023/4096"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self):
+            return self._payload
+
+    def open_media(request, timeout):
+        url = request.full_url if hasattr(request, "full_url") else request
+        if url.endswith("snapshot.jpg"):
+            return Response(b"jpeg", "image/jpeg")
+        if hasattr(request, "headers") and request.headers.get("Range"):
+            return Response(b"range", "video/mp4", 206)
+        return Response(b"edge-clip", "video/mp4")
+
+    monkeypatch.setattr(passage_validator, "urlopen", open_media)
+    monkeypatch.setattr(
+        passage_validator,
+        "ffprobe_clip",
+        lambda path: {"valid": True, "format": {"duration": "2.0"}},
+    )
+
+    result = collect_native_trace_clips(
+        tmp_path, records, "runtime.db", edge_owned=True
+    )
+
+    trace = result["traces"][0]
+    assert trace["clip_basis"] == "edge_media_manifest"
+    assert trace["range_proxy_status"] == 206
+    assert trace["snapshot_proxy_content_type"] == "image/jpeg"
+    assert trace["media_proxy_complete"] is True
+    assert result["complete"] is True
+    assert result["media_proxy_complete"] is True
+
+
+def test_tracker_lifecycle_audit_accepts_one_ordered_producer_event() -> None:
+    common = {
+        "node_id": "edge-local",
+        "node_epoch": "epoch-1",
+        "camera_id": "car_camera",
+        "stream_epoch": "stream-1",
+        "event_id": "event-1",
+        "track_id": "raw-7",
+    }
+    result = audit_tracker_lifecycle_rows(
+        [
+            {**common, "journal_sequence": 1, "operation": "START"},
+            {**common, "journal_sequence": 2, "operation": "UPDATE"},
+            {**common, "journal_sequence": 3, "operation": "END"},
+        ]
+    )
+    assert result["valid"] is True
+    assert result["event_count"] == 1
+    assert result["active_count"] == 0
+
+
+def test_tracker_lifecycle_audit_rejects_duplicate_and_missing_end() -> None:
+    common = {
+        "node_id": "edge-local",
+        "node_epoch": "epoch-1",
+        "camera_id": "car_camera",
+        "stream_epoch": "stream-1",
+        "event_id": "event-1",
+        "track_id": "raw-7",
+        "operation": "START",
+        "journal_sequence": 1,
+    }
+    result = audit_tracker_lifecycle_rows([common, common])
+    assert result["valid"] is False
+    assert result["active_count"] == 1
+    assert any(error.startswith("duplicate_sequence") for error in result["errors"])
+    assert any(error.startswith("end_count") for error in result["errors"])
 
 
 def test_terminal_only_record_does_not_create_media_trace() -> None:

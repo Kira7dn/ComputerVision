@@ -1,29 +1,29 @@
 # Camera workspace instructions
 
-## Encoding
+## Test scope
 
-- Khi đọc file có tiếng Việt, luôn đọc bằng UTF-8.
-- Khi ghi hoặc sửa file có tiếng Việt, giữ UTF-8 và không làm hỏng dấu/cấu trúc hiện có.
-
-## Execution gates
-
-Mọi thay đổi runtime phải đi theo thứ tự bắt buộc sau:
-
-1. Review source và contract ở root cùng nested `frigate`.
-2. Chạy unit/regression test liên quan và toàn bộ test bắt buộc.
-3. Chạy `compileall`, Ruff trên Python files đã đổi và `git diff --check`.
-4. Chỉ build/package khi ba bước trên pass.
-5. Kiểm tra clean-install/import và reproducibility; lưu source commit, worktree hash,
-   artifact SHA-256 và byte size.
-6. Mọi build, healthy run và fault run của Camera phải đi qua launcher dùng chung
-   `deploy/run.ps1`; không gọi Docker Compose/container trực tiếp để thay thế launcher.
-7. Chỉ chạy healthy Docker acceptance sau khi build pass.
-8. Chỉ chạy fault scenarios sau khi healthy run pass.
-9. Chỉ đánh dấu `[DONE]` khi toàn bộ hard gate, cleanup và restore artifact đều pass.
-
-Nếu unit hoặc contract fail thì dừng, không build và không chạy Docker. Nếu build fail thì
-dừng, không chạy Docker. Nếu healthy run fail thì không chạy fault scenarios. Nếu
-`deploy/run.ps1` không được dùng hoặc launcher báo lỗi thì run không hợp lệ.
+- Baseline regression của nested `frigate` phải bám đúng contract CI của upstream/master:
+  chạy `python -m unittest` từ thư mục `frigate` (có thể dùng Python trong `.venv` của
+  workspace). Không tự biến toàn bộ `frigate/tests` thành một pytest gate mới.
+- Sau baseline, chỉ chạy test unit/contract trực tiếp bao phủ boundary bị thay đổi. Với Phase 8,
+  tập test chuẩn gồm:
+  - tracker contract, lifecycle, evidence, journal, media và ownership:
+    `frigate/tests/test_tracker_edge.py`;
+  - notification dùng edge media:
+    `frigate/tests/test_notification_media.py` và
+    `frigate/tests/test_notification_providers.py`;
+  - PTZ wrapper/runtime: `frigate/tests/test_ptz_autotrack.py`;
+  - launcher và acceptance validator:
+    `tools/tests/unit/test_external_tracker_launcher.py` cùng các test node liên quan trực tiếp
+    trong `tools/tests/unit/test_passage_acceptance.py`.
+- Khi một test fail, chẩn đoán và chạy lại đúng test file/test node bị fail. Không chạy lại suite
+  rộng nếu thay đổi sửa lỗi không tác động tới phần còn lại.
+- Chỉ mở rộng test ngoài danh sách trên khi diff thực sự chạm boundary khác, hoặc user/spec yêu
+  cầu rõ ràng; phải nêu chính xác lý do và test được thêm trước khi chạy.
+- Sau khi baseline và targeted architecture tests pass, mới build qua `deploy/run.ps1`, rồi chạy
+  healthy E2E chính thức; fault E2E chỉ chạy sau healthy pass.
+- Báo cáo riêng từng trạng thái: baseline regression, targeted architecture tests, build,
+  healthy E2E và fault E2E. Không dùng số test được collect làm bằng chứng pass.
 
 ## Launcher contract
 
@@ -42,29 +42,26 @@ dừng, không chạy Docker. Nếu healthy run fail thì không chạy fault sc
 - Fault E2E chính thức là:
   `tools/tests/e2e/run_external_recognition_fault_test.py` với các scenario
   `service_restart`, `stream_disconnect`, `client_disconnect`.
+- Healthy tracker-edge E2E entrypoint là:
+  `tools/tests/e2e/run_external_tracker_runtime_test.py`.
+- Fault tracker-edge E2E entrypoint là:
+  `tools/tests/e2e/run_external_tracker_fault_test.py` với các scenario
+  `tracker_restart`, `stream_disconnect`, `client_disconnect`, `spool_replay`,
+  `media_unavailable`.
+- Tracker entrypoint chỉ được báo `pass` khi healthy runner validate đủ tracker → Frigate main →
+  recognition → Event/API/SQLite/media và fault runner thực thi scenario qua action của
+  `deploy/run.ps1`. File scaffold hoặc chỉ gọi `acceptance-start` không phải bằng chứng E2E pass.
 - Không gọi `validate_platform_runtime.py` trực tiếp rồi gọi đó là entrypoint E2E chính thức;
   khi báo cáo hoặc chạy healthy E2E phải dùng file trong `tools/tests/e2e`.
 
-## Camera architecture constraints
+## Test diagnostics and process cleanup
 
-- Không thay model, OCR, threshold, độ phân giải hoặc recognition algorithm để ép accuracy,
-  trừ khi user mở rộng phạm vi rõ ràng.
-- Giữ kết quả LPR khó đọc dưới dạng diagnostic; không dùng accuracy diagnostic làm lý do sửa
-  pipeline hoặc đánh dấu giả là pass.
-- Camera embedded tiếp tục chạy nguyên pipeline Frigate. Với camera được gán edge,
-  tracker node sở hữu capture/detect/Norfair/PTZ/recording/live/media; không fork hoặc
-  viết lại logic hành vi gốc để tạo implementation thứ hai.
-- Frigate main tiếp tục là SOT duy nhất cho Event/API/SQLite/notification/publication,
-  nhận media manifest và proxy byte-range từ edge; main không tính lại tracker decision.
-- Recognition service sở hữu model, core và session state.
-- Không local fallback trong external topology.
-- Tracker không được giao tiếp trực tiếp với recognition.
-- Giữ canonical Event SOT, producer Event ID, idempotency và no-duplicate contract.
-- Mọi fault run phải ghi typed lifecycle outcome, service epoch, publication safety,
-  pending/in-flight/queue, cleanup và topology restore.
-
-## Verification reporting
-
-- Phân biệt rõ source change, unit pass, build pass, healthy runtime pass và fault pass.
-- Không kết luận pipeline hoàn tất chỉ từ unit test, build thành công hoặc một healthy run.
-- Giữ artifact mới có thể truy vết về source commit/worktree hash.
+- Mặc định mọi lần chạy pytest dùng verbose với log realtime:
+  `python -u -m pytest -vv -s --capture=tee-sys -o log_cli=true -o log_cli_level=DEBUG`.
+- Mặc định lưu toàn bộ output bằng PowerShell `Tee-Object`, ví dụ:
+  `... 2>&1 | Tee-Object .tmp\pytest-test.log`.
+- Các lần chạy sau interrupt bắt đầu bằng việc kiểm tra process `python.exe`/`pytest` của
+  Camera, dừng process stale và dọn `test.db`, `test.db-shm`, `test.db-wal` bằng Python.
+- Mỗi node hoặc file fail được chạy riêng với log đầy đủ; phạm vi rerun bám đúng failure.
+- Process thiếu CPU progress hoặc log trong thời gian bất thường được dừng lại; log lỗi được
+  giữ nguyên và node kế tiếp được cô lập để chẩn đoán.

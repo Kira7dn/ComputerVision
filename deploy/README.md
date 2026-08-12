@@ -46,7 +46,7 @@ Chạy từ `D:\BusinessAnalyze\Camera`:
 ## Development không build image
 
 Các lệnh development bind-mount trực tiếp package Python local vào container ở
-`/opt/frigate/frigate` theo chế độ read-only. Sửa source không cần build lại
+`/opt/frigate/src/frigate` theo chế độ read-only. Sửa source không cần build lại
 frontend hoặc Docker image; restart chỉ recreate service Frigate và giữ nguyên
 model/media/cache hiện có.
 
@@ -64,11 +64,11 @@ model/media/cache hiện có.
 .\deploy\run.ps1 dev-stop
 ```
 
-Mặc định source là `frigate/frigate`. Có thể chỉ định checkout khác bằng
+Mặc định source là `frigate/src/frigate`. Có thể chỉ định checkout khác bằng
 `-SourceDir`, nhưng thư mục đó phải là package Frigate có file `__init__.py`:
 
 ```powershell
-.\deploy\run.ps1 dev-start -SourceDir D:\path\to\frigate\frigate
+.\deploy\run.ps1 dev-start -SourceDir D:\path\to\frigate\src\frigate
 ```
 
 Dev mode không tự reload process Python. Sau khi sửa code phải chạy

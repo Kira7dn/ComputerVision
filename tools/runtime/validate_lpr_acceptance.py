@@ -135,7 +135,7 @@ def box_contains_plate(
 def database_events(started_epoch: float) -> list[dict[str, Any]]:
     script = """
 import json, sqlite3, sys
-connection = sqlite3.connect('/config/frigate.db')
+connection = sqlite3.connect('/config/frigate.infrastructure.db')
 rows = connection.execute(
     \"select id,camera,start_time,data from event where camera='car_camera' and start_time >= ?\",
     (float(sys.argv[1]),),
@@ -165,10 +165,10 @@ print(json.dumps(result))
 
 
 def runtime_lpr_source_contract() -> dict[str, Any]:
-    path = "/opt/frigate/frigate/data_processing/common/license_plate/mixin.py"
+    path = "/opt/frigate/src/frigate/data_processing/common/license_plate/mixin.py"
     script = """
 import hashlib, json
-path = '/opt/frigate/frigate/data_processing/common/license_plate/mixin.py'
+path = '/opt/frigate/src/frigate/data_processing/common/license_plate/mixin.py'
 source = open(path, encoding='utf-8').read()
 needles = [
     'car = rgb[top:bottom, left:right]',

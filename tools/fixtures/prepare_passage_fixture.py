@@ -250,7 +250,7 @@ def main() -> int:
     # configured record/snapshot features intact and suppress only external
     # notification delivery.
     config["notifications"]["enabled"] = False
-    config["database"] = {"path": "/media/frigate/passage/frigate.db"}
+    config["database"] = {"path": "/media/frigate/passage/frigate.infrastructure.db"}
     config["cameras"]["face_camera"]["face_recognition"]["min_area"] = 750
     # Match the fixed Face clip's native cadence so short tracks receive enough
     # synchronous recognition observations. Keep the missing-track lifetime at
