@@ -131,7 +131,7 @@ def main():
     parser.add_argument('--subtype', type=int, default=1)
     parser.add_argument('--duration', type=float, default=3)
     parser.add_argument('--rounds', type=int, default=20)
-    parser.add_argument('--output', default='artifacts/netsdk-probe')
+    parser.add_argument('--output', default='runtime/artifacts/netsdk-probe')
     args = parser.parse_args()
     if not args.password:
         parser.error('set DAHUA_PASSWORD or pass --password')

@@ -45,7 +45,7 @@ Không được dùng xung đột tài liệu này để âm thầm đổi speci
   ```
 
 - Có central topology compiler tại:
-  - `frigate/src/camera_platform/topology.py`
+  - `frigate/src/camera_platform/topology/compiler.py`
   - `tools/runtime/compile_platform_topology.py`
 - Topology plan hiện chịu trách nhiệm resolve recognition mode, tracker nodes, camera
   ownership, embedded camera view, per-node camera view, config revision và topology hash.
@@ -60,8 +60,8 @@ Không được dùng xung đột tài liệu này để âm thầm đổi speci
   - `service/`
   - protobuf `camera.tracker.v1`
 - Shared tracker lifecycle/policy đang nằm tại:
-  - `frigate/src/frigate/track/lifecycle.py`
-  - `frigate/src/frigate/track/policy.py`
+  - `frigate/src/frigate/domain/track/lifecycle.py`
+  - `frigate/src/frigate/domain/track/policy.py`
 - Launcher và tracker entrypoint hiện tham chiếu
   `python3 -u -m frigate.track.edge.service.app`.
 - API/media/notification source có các thay đổi để resolve edge media qua
@@ -96,7 +96,7 @@ Các hạng mục chức năng Phase 8 quan trọng vẫn chưa có bằng chứ
 
 - Shared producer core thực sự được cả embedded và edge gọi chung.
 - Differential fixture chạy cùng detector/frame sequence qua hai adapter.
-- Full camera process wrapper sử dụng capture/detector/Norfair/recorder/output/PTZ hiện hữu.
+- Full camera process wrapper sử dụng capture/detector/Norfair/recorder/runtime/output/PTZ hiện hữu.
 - Canonical Event transaction và ACK-after-commit hoàn chỉnh.
 - Recognition routing từ edge evidence qua Phase 7 adapter hiện hữu.
 - Durable journal/evidence/media ownership chạy thật trong container.
@@ -130,7 +130,7 @@ Outer repository đang có thay đổi ở các nhóm sau:
 - `docs/architecture/Platform.md`
 - tracker healthy/fault E2E, validator và launcher unit tests
 - `tools/runtime/compile_platform_topology.py` mới
-- ba file `test.db`, `test.db-shm`, `test.db-wal` đang hiện là deleted
+- ba file `runtime/db/test.db`, `runtime/db/test.db-shm`, `runtime/db/test.db-wal` đang hiện là deleted
 
 Nested Frigate repository đang có nhiều file API/app/camera/events/notification/PTZ/test bị
 modified; package cũ `frigate/tracker` hiện là deleted trong Git và source tương ứng nằm dưới

@@ -69,7 +69,7 @@ services:
       - frigate-config:/config
       - ${CAMERA_CONFIG_FILE:?run.ps1 must set CAMERA_CONFIG_FILE}:/config/config.yml
       - ${FRIGATE_MEDIA_DIR:-E:/Docker/Frigate/media}:/media/frigate
-      - ${CAMERA_MODEL_PATH:?run.ps1 must set CAMERA_MODEL_PATH}:/models/yolov9-t-320.onnx:ro
+      - ${CAMERA_MODEL_PATH:?run.ps1 must set CAMERA_MODEL_PATH}:/assets/models/yolov9-t-320.onnx:ro
       - ${RECOGNITION_TLS_DIR:-../../.tmp/runtime/recognition-tls}:/run/recognition-tls:ro
       - /etc/localtime:/etc/localtime:ro
 

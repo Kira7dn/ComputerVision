@@ -12,7 +12,7 @@ if callable(stderr_reconfigure):
     stderr_reconfigure(encoding='utf-8', errors='replace')
 
 # Add dahua_sdk to path before importing
-SDK_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), '..', 'dahua_sdk'))
+SDK_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), 'vendor', 'dahua_sdk'))
 sys.path.insert(0, SDK_DIR)
 
 from ctypes import sizeof

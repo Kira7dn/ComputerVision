@@ -301,9 +301,9 @@ thời gian bounded.
 `tracker` là boundary edge được suy ra từ pipeline hiện tại của Frigate, không phải một tracker
 mới với thuật toán mới. Mục tiêu là chuyển phần xử lý liên tục theo camera sang node edge để
 scale số camera bằng compute tại chỗ. Frigate giữ Event/persistence/publication và proxy media;
-tracker giữ media bytes/retention cho camera edge. Code tham chiếu hiện tại là `frigate/src/frigate/video/detect.py`,
-`frigate/src/frigate/video/ffmpeg.py`, `frigate/src/frigate/track/norfair_tracker.py`,
-`frigate/src/frigate/track/tracked_object.py` và `frigate/src/frigate/track/object_processing.py`.
+tracker giữ media bytes/retention cho camera edge. Code tham chiếu hiện tại là `frigate/src/frigate/domain/video/detect.py`,
+`frigate/src/frigate/domain/video/ffmpeg.py`, `frigate/src/frigate/domain/track/norfair_tracker.py`,
+`frigate/src/frigate/domain/track/tracked_object.py` và `frigate/src/frigate/domain/track/object_processing.py`.
 
 | Lane của tracker | Capability phải cung cấp | Output bắt buộc |
 | --- | --- | --- |
@@ -1060,7 +1060,7 @@ Các file sở hữu contract hiện hành:
 
 | Thành phần | Owner |
 | --- | --- |
-| Finite MP4 capture, FIFO và source-index timestamp | `frigate/src/frigate/video/ffmpeg.py`, `frigate/tests/test_video.py` |
+| Finite MP4 capture, FIFO và source-index timestamp | `frigate/src/frigate/domain/video/ffmpeg.py`, `frigate/tests/test_video.py` |
 | EOF/process synchronization, report và trace media | `tools/runtime/validate_platform_runtime.py` |
 | Raw tracker/Event/recording lifecycle | Frigate detect/track/Event pipeline hiện có; validator chỉ đọc kết quả |
 | Plate-only audit fixture | `tools/fixtures/platform_passage_ground_truth.yaml`, `tools/tests/unit/test_passage_acceptance.py` |
@@ -1143,7 +1143,7 @@ Mục tiêu là một package LPR/Face có thể import và test mà không kh�
 Event, SQLite, API, notification hoặc recording. Tách theo boundary sau tracker, vì voting cần
 track lifecycle ổn định; core không nhận raw detector batch và không tự tạo tracker.
 
-- Tạo package `frigate/src/frigate/recognition/` với các module `contracts.py`, `core.py`, `lpr.py`,
+- Tạo package `frigate/src/frigate/application/recognition/` với các module `contracts.py`, `core.py`, `lpr.py`,
   `face.py` và `ports.py`.
 - `TrackedObservation` chứa `camera_id`, `stream_epoch`, caller-owned `track_id`, task, `frame_time`,
   object/detail bbox, `observed_in_frame`, attributes và opaque `EvidenceRef`.
@@ -1455,29 +1455,29 @@ acceptance ở mục 13:
 
 | Trạng thái | Đường dẫn | Can thiệp |
 | --- | --- | --- |
-| `[DONE]` | `frigate/src/frigate/video/detect.py`, `frigate/src/frigate/data_processing/common/license_plate/mixin.py`, `frigate/src/frigate/util/passage_trace.py` | Instrument detector/track/eligibility/plate/OCR/Event funnel và sửa motion calibration, first-frame eligibility cùng crop context ở đúng tầng passage. |
-| `[DONE]` | `frigate/src/frigate/data_processing/real_time/face.py`, `frigate/src/frigate/util/face_snapshot.py` | Trace theo track generation, reset close-follow và giảm thời gian từ passage đến confirmed bằng cadence/selection hiện có; chưa thêm shared quality/top-K. |
+| `[DONE]` | `frigate/src/frigate/domain/video/detect.py`, `frigate/src/frigate/infrastructure/data_processing/common/license_plate/mixin.py`, `frigate/src/frigate/util/passage_trace.py` | Instrument detector/track/eligibility/plate/OCR/Event funnel và sửa motion calibration, first-frame eligibility cùng crop context ở đúng tầng passage. |
+| `[DONE]` | `frigate/src/frigate/infrastructure/data_processing/real_time/face.py`, `frigate/src/frigate/util/face_snapshot.py` | Trace theo track generation, reset close-follow và giảm thời gian từ passage đến confirmed bằng cadence/selection hiện có; chưa thêm shared quality/top-K. |
 | `[DONE]` | `tools/fixtures/platform_passage_ground_truth.yaml`, `tools/fixtures/prepare_passage_fixture.py`, `tools/runtime/validate_platform_runtime.py`, `tools/tests/unit/test_passage_acceptance.py` | MP4 gốc được đưa qua capture/detect/track Frigate; raw tracker tạo trace. Fixture chỉ đối chiếu terminal plate, không giữ time/bbox và không có tracker/passage registry riêng trong test. |
 
 ### 15.3 Phase 3 — LPR execution foundation
 
 | Trạng thái | Đường dẫn | Can thiệp |
 | --- | --- | --- |
-| `[DONE]` | `frigate/src/frigate/data_processing/common/license_plate/pipeline.py` | Typed track key, observation, prepared candidate và bounded track state được đặt trong module pipeline thực tế; không còn tham chiếu file `state.py` không tồn tại. |
-| `[DONE]` | `frigate/src/frigate/data_processing/common/license_plate/mixin.py` | Plate inference được tách khỏi Event publish; observation đi qua temporal decision trước commit. |
-| `[DONE]` | `frigate/src/frigate/data_processing/real_time/license_plate.py`, `frigate/src/frigate/data_processing/real_time/api.py` | Foundation worker/stale guard là artifact lịch sử Phase 3; production recognition decision phải theo master sau Phase 6-1. |
-| `[DONE]` | `frigate/src/frigate/embeddings/maintainer.py` | Foundation dispatch/drain là artifact lịch sử; không trao quyền decision owner trái master. |
+| `[DONE]` | `frigate/src/frigate/infrastructure/data_processing/common/license_plate/pipeline.py` | Typed track key, observation, prepared candidate và bounded track state được đặt trong module pipeline thực tế; không còn tham chiếu file `state.py` không tồn tại. |
+| `[DONE]` | `frigate/src/frigate/infrastructure/data_processing/common/license_plate/mixin.py` | Plate inference được tách khỏi Event publish; observation đi qua temporal decision trước commit. |
+| `[DONE]` | `frigate/src/frigate/infrastructure/data_processing/real_time/license_plate.py`, `frigate/src/frigate/infrastructure/data_processing/real_time/api.py` | Foundation worker/stale guard là artifact lịch sử Phase 3; production recognition decision phải theo master sau Phase 6-1. |
+| `[DONE]` | `frigate/src/frigate/application/embeddings/maintainer.py` | Foundation dispatch/drain là artifact lịch sử; không trao quyền decision owner trái master. |
 | `[DONE]` | `frigate/tests/test_lpr_track_state.py`, `frigate/tests/test_lpr_deferred_processor.py` | State lifecycle, unique-frame consensus, stale generation, queue replacement và one-decision/one-commit có regression test. |
 
 ### 15.4 Phase 4 — Camera quality, evidence và candidate contract
 
 | Trạng thái | Đường dẫn | Can thiệp |
 | --- | --- | --- |
-| `[DONE]` | `frigate/src/frigate/data_processing/common/evidence.py` | `FrameRef`, `EvidenceLease`, `EvidenceCandidate`, ownership/expiry contract và bounded ring buffer dùng chung. |
-| `[HISTORICAL]` | `frigate/src/frigate/data_processing/common/quality.py` | `QualitySelector`/top-K là artifact Phase 4; Phase 6-1 chỉ giữ diagnostic/evidence use, không giữ recognition decision behavior. |
-| `[DONE]` | `frigate/src/frigate/config/camera/quality.py`, `frigate/src/frigate/config/camera/camera.py`, `frigate/src/frigate/config/config.py` | Camera quality profile và validation source role, FPS, byte budget cùng detect resolution. |
-| `[HISTORICAL]` | `frigate/src/frigate/embeddings/maintainer.py` | Ring/selector lifecycle là artifact Phase 4; không được giữ quyền admission/decision cạnh tranh với master. |
-| `[HISTORICAL]` | `frigate/src/frigate/data_processing/real_time/face.py`, `frigate/src/frigate/data_processing/real_time/license_plate.py` | Adapter `EvidenceCandidate` chỉ được giữ nếu hoàn toàn side-channel và parity-neutral. |
+| `[DONE]` | `frigate/src/frigate/infrastructure/data_processing/common/evidence.py` | `FrameRef`, `EvidenceLease`, `EvidenceCandidate`, ownership/expiry contract và bounded ring buffer dùng chung. |
+| `[HISTORICAL]` | `frigate/src/frigate/infrastructure/data_processing/common/quality.py` | `QualitySelector`/top-K là artifact Phase 4; Phase 6-1 chỉ giữ diagnostic/evidence use, không giữ recognition decision behavior. |
+| `[DONE]` | `frigate/src/frigate/infrastructure/config/camera/quality.py`, `frigate/src/frigate/infrastructure/config/camera/camera.py`, `frigate/src/frigate/infrastructure/config/config.py` | Camera quality profile và validation source role, FPS, byte budget cùng detect resolution. |
+| `[HISTORICAL]` | `frigate/src/frigate/application/embeddings/maintainer.py` | Ring/selector lifecycle là artifact Phase 4; không được giữ quyền admission/decision cạnh tranh với master. |
+| `[HISTORICAL]` | `frigate/src/frigate/infrastructure/data_processing/real_time/face.py`, `frigate/src/frigate/infrastructure/data_processing/real_time/license_plate.py` | Adapter `EvidenceCandidate` chỉ được giữ nếu hoàn toàn side-channel và parity-neutral. |
 | `[DONE]` | `frigate/tests/test_evidence_quality.py`, các test Face/LPR deferred/state/snapshot | Kiểm tra ownership, bounds, replacement, stale generation và lineage; threshold accuracy thuộc product-profile calibration. |
 
 ### 15.5 Phase 5 — Custom recognition lifecycle [SUPERSEDED]
@@ -1492,16 +1492,16 @@ acceptance ở mục 13:
 
 | Trạng thái | Đường dẫn | Can thiệp |
 | --- | --- | --- |
-| `[DONE]` | `frigate/src/frigate/video/ffmpeg.py`, `frigate/tests/test_video.py` | Phase 6-0: finite MP4 dùng FIFO/backpressure và source-index timestamp; live/network source vẫn latest-only. Producer ghi start/EOF marker theo camera. |
+| `[DONE]` | `frigate/src/frigate/domain/video/ffmpeg.py`, `frigate/tests/test_video.py` | Phase 6-0: finite MP4 dùng FIFO/backpressure và source-index timestamp; live/network source vẫn latest-only. Producer ghi start/EOF marker theo camera. |
 | `[DONE]` | `tools/runtime/validate_platform_runtime.py`, `tools/tests/unit/test_passage_acceptance.py` | Phase 6-0: một invocation/một vòng; chờ cả producer EOF và processed final timestamp trước cutoff. LPR dùng raw tracker trace, fixture chỉ plate-only compare. |
 | `[DONE]` | `.tmp/platform-runtime/20260811-044205-810/` | Phase 6-0: report evidence-only hoàn tất trong 129,302 s; 11 raw LPR trace, 11/11 LPR clip, skipped FPS LPR bằng 0 và runtime được restore. |
-| `[DONE]` | `frigate/src/frigate/data_processing/common/license_plate/mixin.py`, `frigate/src/frigate/data_processing/real_time/license_plate.py` | Phase 6-1: exact master LPR variant window, Jaro cluster, `(size, max_conf)` winner và highest-conf representative. |
-| `[DONE]` | `frigate/src/frigate/data_processing/real_time/face.py`, `frigate/src/frigate/config/classification.py` | Phase 6-1: master `person_face_history`, weighted voting, active `min_faces`, count-tie rejection và attempt limits. |
+| `[DONE]` | `frigate/src/frigate/infrastructure/data_processing/common/license_plate/mixin.py`, `frigate/src/frigate/infrastructure/data_processing/real_time/license_plate.py` | Phase 6-1: exact master LPR variant window, Jaro cluster, `(size, max_conf)` winner và highest-conf representative. |
+| `[DONE]` | `frigate/src/frigate/infrastructure/data_processing/real_time/face.py`, `frigate/src/frigate/infrastructure/config/classification.py` | Phase 6-1: master `person_face_history`, weighted voting, active `min_faces`, count-tie rejection và attempt limits. |
 | `[DONE]` | Frozen master Face/LPR differential fixtures | Phase 6-1: function-level parity được khóa trước khi extract core. |
-| `[DONE]` | `frigate/src/frigate/recognition/contracts.py`, `core.py`, `ports.py` | Phase 6-2: typed tracked observation, explicit track lifecycle, evidence/model/observer ports và typed update; import độc lập detection/Event. |
-| `[DONE]` | `frigate/src/frigate/recognition/lpr.py`, `face.py` | Phase 6-2: synchronous master-compatible task engines và session state. |
-| `[DONE]` | `frigate/src/frigate/recognition/adapters/frigate.py` | Phase 6-3: map tracked-object/frame vào core và map update về Event metadata, không decision logic. |
-| `[DONE: SOURCE/DEV]` | `frigate/src/frigate/embeddings/maintainer.py`, Face/LPR realtime modules | Phase 6-3: orchestration/adapters duy nhất; custom reducer/pipeline/retry đã xóa khỏi production. |
+| `[DONE]` | `frigate/src/frigate/application/recognition/contracts.py`, `core.py`, `ports.py` | Phase 6-2: typed tracked observation, explicit track lifecycle, evidence/model/observer ports và typed update; import độc lập detection/Event. |
+| `[DONE]` | `frigate/src/frigate/application/recognition/lpr.py`, `face.py` | Phase 6-2: synchronous master-compatible task engines và session state. |
+| `[DONE]` | `frigate/src/frigate/application/recognition/adapters/frigate.py` | Phase 6-3: map tracked-object/frame vào core và map update về Event metadata, không decision logic. |
+| `[DONE: SOURCE/DEV]` | `frigate/src/frigate/application/embeddings/maintainer.py`, Face/LPR realtime modules | Phase 6-3: orchestration/adapters duy nhất; custom reducer/pipeline/retry đã xóa khỏi production. |
 | `[DONE]` | Face/LPR evidence ownership và raw bbox lineage | Runtime giữ raw trace ID, raw JPEG và native clip; ảnh bbox là artifact do chính producer tạo tại bước recognition, validator chỉ kiểm tra/copy và không dựng record giả hoặc vẽ lại media. |
 | `[DONE]` | Recognition ownership, `passage_trace.py`, acceptance evidence và stats | Phase 6-4: idempotent cleanup, bounded JSONL/JPEG writer và master-relevant metrics; run cuối đạt sessions/in-flight/pinned/writer depth bằng `0`. |
 | `[DONE]` | Core/differential/adapter tests, whole project và deployment | Phase 6-5: parity/import-isolation/single-owner tests đạt; run `20260811-201337-397` report complete, measurement valid, 4/4 Face raw traces recognized, 15/15 native clips, 22/22 bbox images và runtime healthy sau restore. |
@@ -1511,10 +1511,10 @@ acceptance ở mục 13:
 
 | Trạng thái | Đường dẫn | Can thiệp |
 | --- | --- | --- |
-| `[DONE: SOURCE/UNIT]` | `frigate/src/frigate/recognition/executor.py`, transport-neutral contracts | Bounded one-partition executor, ordered track lifecycle, typed receipt/outcome, deadline/cancel và terminal drain; không voting/winner/Event logic. |
-| `[DONE: SOURCE/UNIT]` | `frigate/src/frigate/recognition/service/`, protobuf schema | gRPC/mTLS stream, health/capabilities, config và Face control operations, service epoch, bounded dedupe và raw I420 validation đã có targeted test. |
-| `[DONE: SOURCE/UNIT]` | `frigate/src/frigate/data_processing/common/face_pipeline.py`, LPR mixin, `RecognitionCore` | Local và external dùng chung detector, crop, bbox/evidence producer, LPR processing, voting và publication decision; targeted differential/lifecycle tests đạt. |
-| `[DONE: SOURCE/UNIT]` | `frigate/src/frigate/embeddings/maintainer.py`, `external_recognition.py` | External client được chọn trực tiếp trong runtime; nhánh này không khởi tạo local Face/LPR model, guard epoch/sequence trước publication, giữ accepted outcome đến ordered END và không có fallback. |
+| `[DONE: SOURCE/UNIT]` | `frigate/src/frigate/application/recognition/executor.py`, transport-neutral contracts | Bounded one-partition executor, ordered track lifecycle, typed receipt/outcome, deadline/cancel và terminal drain; không voting/winner/Event logic. |
+| `[DONE: SOURCE/UNIT]` | `frigate/src/frigate/application/recognition/service/`, protobuf schema | gRPC/mTLS stream, health/capabilities, config và Face control operations, service epoch, bounded dedupe và raw I420 validation đã có targeted test. |
+| `[DONE: SOURCE/UNIT]` | `frigate/src/frigate/infrastructure/data_processing/common/face_pipeline.py`, LPR mixin, `RecognitionCore` | Local và external dùng chung detector, crop, bbox/evidence producer, LPR processing, voting và publication decision; targeted differential/lifecycle tests đạt. |
+| `[DONE: SOURCE/UNIT]` | `frigate/src/frigate/application/embeddings/maintainer.py`, `external_recognition.py` | External client được chọn trực tiếp trong runtime; nhánh này không khởi tạo local Face/LPR model, guard epoch/sequence trước publication, giữ accepted outcome đến ordered END và không có fallback. |
 | `[DONE]` | Recognition Docker image, Compose/deployment và integration tests | Healthy external run `20260812-141524-728` đạt `measurement_valid=true`, Face `4/4`, raw LPR `11/11`, API/SQLite consistency, correlation `0`, không reconnect/stall, service healthy, local model `0`, cleanup/pending/writer `0`, restore thành công; ba fault artifacts và reproducible wheel manifest đã pass. LPR exact `7/11` là diagnostic. |
 | `[DONE]` | Core/client wheel packaging | Hai wheel core/client đã được build sau runtime acceptance, clean-install/import và reproducibility pass; manifest ghi source/worktree hash, SHA-256 và byte size. |
 
@@ -1522,7 +1522,7 @@ acceptance ở mục 13:
 
 | Trạng thái | Đường dẫn | Phạm vi kế tiếp |
 | --- | --- | --- |
-| `[IN PROGRESS: SOURCE/UNIT]` | `frigate/src/frigate/track/edge/`, `frigate/src/frigate/video/`, `frigate/src/frigate/track/` | Typed contract, durable producer runtime và adapter dùng lại `CameraState`/`TrackedObject`/Norfair/PTZ gốc đã có unit cô lập; chưa có runtime parity |
+| `[IN PROGRESS: SOURCE/UNIT]` | `frigate/src/camera_platform/tracker/`, `frigate/src/frigate/domain/video/`, `frigate/src/frigate/domain/track/` | Typed contract, durable producer runtime và adapter dùng lại `CameraState`/`TrackedObject`/Norfair/PTZ gốc đã có unit cô lập; chưa có runtime parity |
 | `[IN PROGRESS: SOURCE/UNIT]` | Frigate tracked-object host adapter, config schema, migration 040 | Camera owner, epoch/sequence/idempotency, evidence lineage, canonical ingest record và edge media manifest đã có unit; recognition routing/media proxy chưa có E2E |
 | `[BLOCKED: FULL UNIT GATE]` | `deploy/run.ps1`, `deploy/config.yaml`, `deploy/reference/docker-compose.yml` | Chưa được build/start/restore tracker qua launcher do full regression fail ở default detector union |
 | `[PENDING]` | `tools/tests/e2e/`, `tools/runtime/validate_platform_runtime.py` | Chưa chạy detect/track parity, healthy/fault evidence, lifecycle/publication/cleanup/restore gates |

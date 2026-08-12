@@ -2,14 +2,14 @@ runtime:
   image: camera-frigate:current
   build_base_image: camera-frigate:0.18.0-33c00a27e-runtime3-tensorrt
   cpu_limit: 8
-  model_path: models/yolov9-t-320.onnx
+  model_path: assets/models/yolov9-t-320.onnx
   media_dir: E:/Docker/Frigate/media
   rtsp_transport: tcp
   replay:
     loop: true
     sources:
-      face_camera: mock_videos/face-recognition/segments/01_P1E_S1_C1.mp4
-      car_camera: "mock_videos/car-number-plate-video/cam-in/pexels-casey-whalen-6571483 (1024p).mp4"
+      face_camera: assets/fixtures/mock_videos/face-recognition/segments/01_P1E_S1_C1.mp4
+      car_camera: "assets/fixtures/mock_videos/car-number-plate-video/cam-in/pexels-casey-whalen-6571483 (1024p).mp4"
 mqtt:
   enabled: false
 
@@ -199,7 +199,7 @@ model:
   input_pixel_format: rgb
   input_dtype: float
   model_type: yolo-generic
-  path: /models/yolov9-t-320.onnx
+  path: /assets/models/yolov9-t-320.onnx
   labelmap_path: /labelmap/coco-80.txt
 
 record:

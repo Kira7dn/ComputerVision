@@ -403,7 +403,7 @@ Giả định MVP có quyền sử dụng hợp pháp dữ liệu khuôn mặt v
 
 ## 20. Cập nhật nghiệm thu runtime ngày 05/08/2026
 
-- [x] `gate_in_camera` loop 6 video trong `mock_videos/car-number-plate-video/cam-in`.
+- [x] `gate_in_camera` loop 6 video trong `assets/fixtures/mock_videos/car-number-plate-video/cam-in`.
 - [x] `gate_out_camera` đã được tạm tắt khỏi runtime mock.
 - [x] Chuẩn hóa video trước concat về `1280x720`, `15 FPS`, `H.264`, `yuv420p`, SAR cố định.
 - [x] Frigate healthy; `gate_in_camera` đạt khoảng `10 FPS` runtime.
@@ -512,7 +512,7 @@ Các kết luận trên là định hướng từ tài liệu, chưa thay thế 
 - Repo Git duy nhất của workspace là `D:\BusinessAnalyze\Camera`, branch chính `main`.
 - Thư mục `frigate/` là source clone local dùng để đọc tài liệu và kiểm tra kỹ thuật; thư mục này bị ignore trong repo Camera.
 - Metadata Git riêng của Frigate đã được vô hiệu hóa, vì vậy Frigate không còn branch hoặc remote độc lập trong workspace.
-- `mock_videos/` cũng bị ignore vì chỉ là dữ liệu runtime/local test.
+- `assets/fixtures/mock_videos/` cũng bị ignore vì chỉ là dữ liệu runtime/local test.
 - Runtime Frigate được mount từ `E:\Docker\Frigate\config` và `E:\Docker\Frigate\media`; source/config mẫu và script vận hành vẫn nằm trong workspace Camera.
 
 **Đầu ra:** môi trường chạy lặp lại được, có bằng chứng GPU và không lộ secret.
@@ -721,7 +721,7 @@ Ngày kiểm thử: 2026-08-05.
 Ngày kiểm thử: 2026-08-05.
 
 - Đã export `server/yolov8n.pt` thành ONNX FP32 và chuyển detector chính sang `onnx` trong image `stable-tensorrt`.
-- Frigate load model `/models/yolov8n.onnx`, detector inference khoảng 12–13 ms và RTX 3050 sử dụng thật khoảng 21% ở 5 FPS/camera.
+- Frigate load model `/assets/models/yolov8n.onnx`, detector inference khoảng 12–13 ms và RTX 3050 sử dụng thật khoảng 21% ở 5 FPS/camera.
 - Khi nâng lên 15 FPS/camera, GPU khoảng 53% nhưng process thực tế chỉ khoảng 4 FPS ở hai camera cổng; phần lớn frame bị skip.
 - Khi đặt `detect.fps: 10`, process đạt khoảng 8.1–8.4 FPS/camera, skipped khoảng 1.6–1.9 FPS/camera và GPU khoảng 52%.
 - Cấu hình đề xuất cho MVP/production demo: input mock 15 FPS, Frigate detect 10 FPS/camera.

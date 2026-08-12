@@ -14,7 +14,7 @@ from typing import Any
 # ADAS loaded lazily — only when ADAS_ENABLED=true and a matching channel is opened
 
 
-SDK_DIR = Path(__file__).resolve().parents[3] / 'dahua_sdk'
+SDK_DIR = Path(__file__).resolve().parents[2] / 'vendor' / 'dahua_sdk'
 sys.path.insert(0, str(SDK_DIR))
 
 from NetSDK.NetSDK import NetClient

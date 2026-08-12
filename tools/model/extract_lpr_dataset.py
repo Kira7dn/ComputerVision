@@ -10,7 +10,7 @@ import cv2
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_VIDEO = ROOT / "mock_videos/car-number-plate-video/cam-in/Traffic Control CCTV.mp4"
+DEFAULT_VIDEO = ROOT / "assets/fixtures/mock_videos/car-number-plate-video/cam-in/Traffic Control CCTV.mp4"
 
 
 def split_for_block(block: int) -> str:

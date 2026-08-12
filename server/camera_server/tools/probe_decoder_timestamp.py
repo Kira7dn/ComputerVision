@@ -13,7 +13,7 @@ import time
 from ctypes import POINTER, c_ubyte, cast, sizeof
 from pathlib import Path
 
-SDK_DIR = Path(__file__).resolve().parent.parent / 'dahua_sdk'
+SDK_DIR = Path(__file__).resolve().parents[2] / 'vendor' / 'dahua_sdk'
 sys.path.insert(0, str(SDK_DIR))
 
 from NetSDK.NetSDK import NetClient

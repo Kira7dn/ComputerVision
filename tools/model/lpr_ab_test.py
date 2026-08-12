@@ -19,10 +19,10 @@ import onnxruntime as ort
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_VIDEO = ROOT / "mock_videos/car-number-plate-video/cam-in/Traffic Control CCTV.mp4"
+DEFAULT_VIDEO = ROOT / "assets/fixtures/mock_videos/car-number-plate-video/cam-in/Traffic Control CCTV.mp4"
 DEFAULT_MODELS = [
-    ROOT / "models/roboflow-logistics-yolov8/best.onnx",
-    ROOT / "models/roboflow-logistics-yolov8/best-frigate.onnx",
+    ROOT / "assets/models/roboflow-logistics-yolov8/best.onnx",
+    ROOT / "assets/models/roboflow-logistics-yolov8/best-frigate.onnx",
 ]
 PLATE_CLASS = 9
 CAR_CLASS = 1

@@ -16,7 +16,7 @@ from ultralytics import YOLO
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATA = ROOT / ".tmp/lpr-dataset-v2"
-DEFAULT_OUTPUT = ROOT / ".tmp/models/native-lpr-finetuned"
+DEFAULT_OUTPUT = ROOT / ".tmp/assets/models/native-lpr-finetuned"
 
 
 def images(root: Path, split: str) -> list[Path]:

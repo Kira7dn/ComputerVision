@@ -145,7 +145,7 @@ function Get-Runtime($Config) {
     # Set from the compiled topology manifest before any runtime action.
     ExternalRecognition = $false
     CpuLimit = $cpu
-    ModelPath = Resolve-WorkspacePath ([string](Get-Value $runtime 'model_path' 'models/yolov9-t-320.onnx'))
+    ModelPath = Resolve-WorkspacePath ([string](Get-Value $runtime 'model_path' 'assets/models/yolov9-t-320.onnx'))
     MediaDir = Resolve-WorkspacePath ([string](Get-Value $runtime 'media_dir' 'E:/Docker/Frigate/media'))
     Transport = $transport
     ReplayLoop = [bool](Get-Value $runtime.replay 'loop' $true)
@@ -479,7 +479,7 @@ function New-ReplayOverride([object[]]$Sources, $Runtime, [bool]$NotificationsEn
   }
   foreach ($node in $TrackerNodes) {
     $configMount = (($node.ConfigPath.Replace('\','/') + ':/config/config.yml:ro') | ConvertTo-Json -Compress)
-    $modelMount = (($Runtime.ModelPath.Replace('\','/') + ':/models/yolov9-t-320.onnx:ro') | ConvertTo-Json -Compress)
+    $modelMount = (($Runtime.ModelPath.Replace('\','/') + ':/assets/models/yolov9-t-320.onnx:ro') | ConvertTo-Json -Compress)
     $tlsMount = (($node.TlsRoot.Replace('\','/') + ':/run/tracker-tls:ro') | ConvertTo-Json -Compress)
     $trackerVolumes = [Collections.Generic.List[string]]::new()
     $trackerVolumes.Add($configMount)
@@ -884,7 +884,7 @@ function Test-FrigateConfig($Runtime, [object[]]$Sources) {
       -e FRIGATE_ZALO_CHAT_ID `
       -e NGROK_URL `
       -v "${effectiveConfig}:/config/config.yml:ro" `
-      -v "$($Runtime.ModelPath):/models/yolov9-t-320.onnx:ro" `
+      -v "$($Runtime.ModelPath):/assets/models/yolov9-t-320.onnx:ro" `
       $Runtime.Image -c $validator 2>&1
     $exitCode = $LASTEXITCODE
   } finally {

@@ -989,7 +989,7 @@ def test_passage_manifest_contract() -> None:
     value = load_manifest(MANIFEST, ROOT)
     lpr = [p for p in value["lpr"]["passages"] if p.get("valid_passage", True)]
     assert value["face"]["source"] == (
-        "mock_videos/face-recognition/segments/01_P1E_S1_C1_5s-20s.mp4"
+        "assets/fixtures/mock_videos/face-recognition/segments/01_P1E_S1_C1_5s-20s.mp4"
     )
     assert "passages" not in value["face"]
     assert "close_follow" not in value["face"]

@@ -8,7 +8,7 @@ stdout_reconfigure = getattr(sys.stdout, 'reconfigure', None)
 if callable(stdout_reconfigure):
     stdout_reconfigure(encoding='utf-8', errors='replace')
 
-SDK_DIR = Path(__file__).resolve().parents[3] / 'dahua_sdk'
+SDK_DIR = Path(__file__).resolve().parents[2] / 'vendor' / 'dahua_sdk'
 sys.path.insert(0, str(SDK_DIR))
 from NetSDK.NetSDK import NetClient
 from NetSDK.SDK_Callback import fDisConnect, fHaveReConnect

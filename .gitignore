@@ -20,8 +20,22 @@ __pycache__/
 .vite/
 sdk/
 .secret/
+.tmp/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.playwright-cli/
+.coverage
+.coverage.*
+htmlcov/
+*.egg-info/
+__pycache__/
+*.py[cod]
 server/uploads/
 server/runtime/
+server/models/
+server/media/
+server/vendor/dahua_sdk/
 *.key
 *.crt
 *.sqlite3
@@ -38,11 +52,11 @@ camera_adas.egg-info/
 .tmp/
 
 # Local mock media and cloned upstream repositories
-mock_videos/
+assets/fixtures/mock_videos/
 frigate/
 .playwright-cli/
-output/
+runtime/output/
 /runtime/
 dahua_sdk/
-models/
-artifacts/
+assets/models/
+runtime/artifacts/

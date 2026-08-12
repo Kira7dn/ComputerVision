@@ -458,9 +458,9 @@ Việc thực hiện:
 Artifact:
 
 ```text
-artifacts/<run-id>/environment.json
-artifacts/<run-id>/camera-config.json
-artifacts/<run-id>/notes.md
+runtime/artifacts/<run-id>/environment.json
+runtime/artifacts/<run-id>/camera-config.json
+runtime/artifacts/<run-id>/notes.md
 ```
 
 Gate pass:
@@ -644,7 +644,7 @@ false_healthy_state_count = 0
 Mỗi run phải sinh artifact machine-readable:
 
 ```text
-artifacts/<run-id>/
+runtime/artifacts/<run-id>/
 ├── environment.json
 ├── camera-config.json
 ├── metrics.jsonl
@@ -753,7 +753,7 @@ policy, chưa phải phép đo false-negative của scenario ADAS.
 
 ### 18.1 Kết quả probe trên XVR thật
 
-Đã thêm [probe_netsdk_decoder_timestamp.py](D:/BusinessAnalyze/Letron/letron-leos/services/tbox/firmware-mini/tbox_esp32_gateway/docs/dahua_test/server/media/probe_netsdk_decoder_timestamp.py)
+Đã thêm [probe_netsdk_decoder_timestamp.py](D:/BusinessAnalyze/Letron/letron-leos/services/tbox/firmware-mini/tbox_esp32_gateway/docs/dahua_test/server/runtime/media/probe_netsdk_decoder_timestamp.py)
 và chạy bounded 5 giây trên channel 2/subtype 1. PLAYSDK nhận 124 callback/input thành
 công, nhưng kết quả là:
 

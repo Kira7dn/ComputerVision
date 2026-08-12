@@ -165,10 +165,10 @@ print(json.dumps(result))
 
 
 def runtime_lpr_source_contract() -> dict[str, Any]:
-    path = "/opt/frigate/src/frigate/data_processing/common/license_plate/mixin.py"
+    path = "/opt/frigate/src/frigate/infrastructure/data_processing/common/license_plate/mixin.py"
     script = """
 import hashlib, json
-path = '/opt/frigate/src/frigate/data_processing/common/license_plate/mixin.py'
+path = '/opt/frigate/src/frigate/infrastructure/data_processing/common/license_plate/mixin.py'
 source = open(path, encoding='utf-8').read()
 needles = [
     'car = rgb[top:bottom, left:right]',

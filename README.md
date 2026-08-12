@@ -79,7 +79,7 @@ Các biến cấu hình:
 ```text
 ADAS_ENABLED=true
 ADAS_CHANNELS=2
-ADAS_MODEL_PATH=<server>/models/yolov8n.engine
+ADAS_MODEL_PATH=<server>/assets/models/yolov8n.engine
 MEDIAMTX_PUBLISH_URL=rtsp://127.0.0.1:8554/adas-ch2
 MEDIAMTX_WEBRTC_BASE=http://192.168.100.108:8889
 ```
