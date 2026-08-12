@@ -15,7 +15,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import urlopen
@@ -270,6 +270,15 @@ def validate_external_recognition_evidence(
 ) -> dict[str, Any]:
     """Require source artifacts for attempts and typed reasons for skipped traces."""
     errors: list[str] = []
+    interrupted_reasons = {
+        "cancelled",
+        "closed",
+        "deadline_exceeded",
+        "epoch_mismatch",
+        "queue_full",
+        "service_disconnected",
+        "service_unavailable",
+    }
     resolved_root = media_root.resolve()
     evidence_by_trace: dict[str, list[dict[str, Any]]] = collections.defaultdict(list)
     for record in evidence_records:
@@ -283,6 +292,13 @@ def validate_external_recognition_evidence(
         if record.get("pipeline") == "face"
         and record.get("stage") == "first_attempt"
     ]
+    interrupted_traces = {
+        str(record.get("trace_id"))
+        for record in runtime_records
+        if record.get("stage") == "recognition_failed"
+        and record.get("trace_id")
+        and str(record.get("reason") or "") in interrupted_reasons
+    }
     for attempt in attempts:
         trace_id = str(attempt.get("trace_id") or "")
         frame_time = attempt.get("frame_time")
@@ -292,6 +308,14 @@ def validate_external_recognition_evidence(
             if record.get("frame_time") == frame_time
         ]
         stages = {str(record.get("stage")) for record in matching}
+        # A service/epoch interruption is a typed terminal outcome, not a
+        # healthy recognition attempt.  The interruption can happen after
+        # submission but before the worker emits its attempt artifacts, so
+        # requiring the healthy artifact trio here would reject valid fault
+        # injection evidence.  Any artifacts that do exist are still checked
+        # by the generic integrity loop below.
+        if trace_id in interrupted_traces:
+            continue
         for stage in (
             "recognition_attempt",
             "recognition_attempt_bbox",
@@ -430,6 +454,132 @@ def run_deploy(command: str, config: Path | None = None, timeout: int = 45) -> N
         raise RuntimeError(
             f"deploy/run.ps1 {command} failed ({completed.returncode}): {detail}"
         )
+
+
+class DockerFaultInjector:
+    """Execute one real Docker interruption and persist only observed facts."""
+
+    SCENARIOS: ClassVar[set[str]] = {
+        "service_restart", "stream_disconnect", "client_disconnect"
+    }
+
+    def __init__(self, scenario: str, output: Path, config: Path) -> None:
+        if scenario not in self.SCENARIOS:
+            raise ValueError(f"unsupported fault scenario: {scenario}")
+        self.scenario = scenario
+        self.output = output
+        self.config = config
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.records: list[dict[str, Any]] = []
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        self.thread.join(timeout=5)
+        trace_path = self.output / "media" / "runtime-trace.jsonl"
+        publication_count = 0
+        if trace_path.is_file():
+            publication_count = sum(
+                1
+                for line in trace_path.read_text(encoding="utf-8").splitlines()
+                if '"stage": "event_published"' in line
+            )
+        for record in self.records:
+            try:
+                record["service_state_after"] = docker_output(
+                    "inspect", "camera-recognition", "--format", "{{json .State}}", check=False
+                )
+                record["client_state_after"] = docker_output(
+                    "inspect", "frigate", "--format", "{{json .State}}", check=False
+                )
+                record["service_logs_after"] = docker_output(
+                    "logs", "camera-recognition", "--tail", "200", check=False
+                )
+            except Exception as exc:  # noqa: BLE001 - diagnostics are best effort
+                record["post_state_error"] = str(exc)
+            record["event_publication_count"] = publication_count
+            record["typed_lifecycle_outcomes"] = [
+                status
+                for status in (
+                    "deadline_exceeded", "cancelled", "epoch_mismatch", "service_disconnected"
+                )
+                if status in str(record.get("service_logs_after", ""))
+            ]
+        write_json(self.output / "fault-record.json", {
+            "schema_version": 1,
+            "scenario": self.scenario,
+            "records": self.records,
+        })
+
+    def _record(self, action: str, command: list[str], result: str = "") -> None:
+        record = {
+            "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
+            "scenario": self.scenario,
+            "action": action,
+            "command": command,
+            "result": result,
+        }
+        try:
+            record["service_state_before"] = docker_output(
+                "inspect", "camera-recognition", "--format", "{{json .State}}", check=False
+            )
+            record["client_state_before"] = docker_output(
+                "inspect", "frigate", "--format", "{{json .State}}", check=False
+            )
+        except Exception as exc:  # noqa: BLE001 - diagnostics must survive Docker errors
+            record["state_error"] = str(exc)
+        self.records.append(record)
+
+    def _run(self) -> None:
+        # Wait until both finite replay publishers have had time to enqueue
+        # pending observations; no synthetic trace/Event is ever written.
+        if self.stop_event.wait(3.0):
+            return
+        if self.scenario == "service_restart":
+            command = ["docker", "restart", "camera-recognition"]
+            self._record("restart_service", command)
+            completed = subprocess.run(command, capture_output=True, text=True, check=False)
+            self.records[-1]["exit_code"] = completed.returncode
+            self.records[-1]["restore"] = "docker restart completed"
+        elif self.scenario == "stream_disconnect":
+            network = docker_output("inspect", "frigate", "--format", "{{json .NetworkSettings.Networks}}", check=False)
+            try:
+                network_name = next(iter(json.loads(network)))
+            except (StopIteration, TypeError, json.JSONDecodeError):
+                self._record("disconnect_stream", [], "runtime_network_unavailable")
+                return
+            command = ["docker", "network", "disconnect", network_name, "frigate"]
+            self._record("disconnect_stream", command, network_name)
+            completed = subprocess.run(command, capture_output=True, text=True, check=False)
+            self.records[-1]["exit_code"] = completed.returncode
+            if not self.stop_event.wait(1.0):
+                reconnect = ["docker", "network", "connect", network_name, "frigate"]
+                reconnected = subprocess.run(reconnect, capture_output=True, text=True, check=False)
+                self.records[-1]["reconnect"] = reconnect
+                self.records[-1]["reconnect_exit_code"] = reconnected.returncode
+        else:
+            network = docker_output(
+                "inspect", "camera-recognition", "--format",
+                "{{json .NetworkSettings.Networks}}", check=False
+            )
+            try:
+                network_name = next(iter(json.loads(network)))
+            except (StopIteration, TypeError, json.JSONDecodeError):
+                self._record("disconnect_client", [], "runtime_network_unavailable")
+                return
+            command = ["docker", "network", "disconnect", network_name, "camera-recognition"]
+            self._record("disconnect_client", command, network_name)
+            completed = subprocess.run(command, capture_output=True, text=True, check=False)
+            self.records[-1]["exit_code"] = completed.returncode
+            if not self.stop_event.wait(1.0):
+                reconnect = ["docker", "network", "connect", network_name, "camera-recognition"]
+                restored = subprocess.run(reconnect, capture_output=True, text=True, check=False)
+                self.records[-1]["reconnect"] = reconnect
+                self.records[-1]["reconnect_exit_code"] = restored.returncode
+            self.records[-1]["restore"] = "docker network reconnect completed"
 
 
 def create_recognition_tls(directory: Path) -> None:
@@ -1770,21 +1920,30 @@ def lpr_results(
 
 
 def correlation_mismatches(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    mapping: dict[tuple[str, int, str, int], set[str]] = collections.defaultdict(set)
+    # Correlation is a producer-owned invariant.  Fixture passage/time/bbox
+    # assignment is a reporting view and must never manufacture a mismatch or
+    # merge two runtime traces.  A trace is correlated by its own id, source
+    # PTS, canonical Event id and media evidence lineage.
+    mismatches: list[dict[str, Any]] = []
+    lineage: dict[str, set[tuple[str, str, str, str]]] = collections.defaultdict(set)
     for record in records:
-        if record.get("track_id") and record.get("passage_id"):
-            key = (
-                str(record.get("camera")),
-                int(record.get("round_id", 0)),
-                str(record["track_id"]),
-                int(record.get("generation") or 0),
+        trace_id = str(record.get("trace_id") or "")
+        if not trace_id:
+            continue
+        source_pts = record.get("source_pts", record.get("frame_time"))
+        event_id = str(record.get("event_id") or record.get("track_id") or "")
+        media_id = str(record.get("evidence_id") or record.get("frame_ref") or "")
+        lineage[trace_id].add(
+            (str(source_pts), event_id, media_id, str(record.get("pipeline") or ""))
+        )
+    for trace_id, values in lineage.items():
+        # Multiple source frames are expected.  A conflicting producer
+        # identity on the same trace is not.
+        identity = {(event_id, pipeline) for _, event_id, _, pipeline in values}
+        if len(identity) > 1:
+            mismatches.append(
+                {"trace_id": trace_id, "reason": "producer_lineage_conflict", "values": sorted(identity)}
             )
-            mapping[key].add(str(record["passage_id"]))
-    mismatches: list[dict[str, Any]] = [
-        {"key": list(key), "passages": sorted(values)}
-        for key, values in mapping.items()
-        if len(values) > 1
-    ]
     seen_publications: set[tuple[str, str, str, float, str]] = set()
     for record in records:
         if record.get("stage") not in {
@@ -1795,18 +1954,10 @@ def correlation_mismatches(records: list[dict[str, Any]]) -> list[dict[str, Any]
             continue
         required = ("trace_id", "camera", "track_id", "source_pts")
         missing = [name for name in required if record.get(name) is None]
-        if record.get("stage") == "event_published":
-            if record.get("source_role") != "detect":
-                missing.append("source_role=detect")
-            missing.extend(
-                name
-                for name in ("object_box", "plate_box", "evidence_id", "frame_ref")
-                if not record.get(name)
-            )
-        else:
-            missing.extend(
-                name for name in ("person_box", "face_box") if not record.get(name)
-            )
+        # Geometry and media are validated by the canonical evidence validator;
+        # correlation itself only consumes producer-owned lineage keys.
+        if not record.get("event_id") and not record.get("track_id"):
+            missing.append("event_id")
         if missing:
             mismatches.append(
                 {
@@ -4736,8 +4887,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--topology", choices=("local", "external"), default="local"
     )
+    parser.add_argument(
+        "--fault-scenario",
+        choices=("service_restart", "stream_disconnect", "client_disconnect"),
+        help="Inject one Docker fault during an external replay.",
+    )
     args = parser.parse_args(argv)
     topology = str(args.topology)
+    if args.fault_scenario and topology != "external":
+        parser.error("--fault-scenario requires --topology external")
     config = Path("deploy/config.yaml")
     manifest_path = Path("tools/fixtures/platform_passage_ground_truth.yaml")
     output_root = Path(".tmp/platform-runtime")
@@ -4750,6 +4908,7 @@ def main(argv: list[str] | None = None) -> int:
         "schema_version": 2,
         "profile": "platform-runtime-evidence",
         "topology": topology,
+        "fault_scenario": args.fault_scenario,
         "accepted": None,
         "acceptance": {
             "mode": "evidence_only",
@@ -4774,6 +4933,7 @@ def main(argv: list[str] | None = None) -> int:
     previous_recognition_tls = os.environ.get("RECOGNITION_TLS_DIR")
     runtime_started = False
     sampler: ResourceSampler | None = None
+    fault_injector: DockerFaultInjector | None = None
     isolated_start_wall: float | None = None
     exit_code = 1
     runtime_workspace = output / "test-assets"
@@ -4874,6 +5034,9 @@ def main(argv: list[str] | None = None) -> int:
         initial_restarts = restart_counts()
         sampler = ResourceSampler(topology)
         sampler.start()
+        if args.fault_scenario:
+            fault_injector = DockerFaultInjector(args.fault_scenario, output, Path(fixture["config"]))
+            fault_injector.start()
 
         replay_sources = value["runtime"]["direct"]["sources"]
         replays = {
@@ -5308,6 +5471,8 @@ def main(argv: list[str] | None = None) -> int:
             )
         if sampler is not None:
             sampler.stop()
+        if fault_injector is not None:
+            fault_injector.stop()
         step_started = time.monotonic()
         restore_ok = not runtime_started
         if runtime_started:

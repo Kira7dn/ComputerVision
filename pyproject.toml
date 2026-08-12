@@ -72,6 +72,8 @@ ignore = ["E501", "E711", "E712", "UP031", "UP032", "UP042", "G004"]
 extend-select = ["I", "UP", "G", "ASYNC210", "B904"]
 
 [tool.ruff.lint.per-file-ignores]
+"frigate/frigate/tracker/service/v1/tracker_pb2.py" = ["ALL"]
+"frigate/frigate/tracker/service/v1/tracker_pb2_grpc.py" = ["ALL"]
 "server/camera_server/media/netsdk_source.py" = ["E402"]
 "server/camera_server/tools/probe_osd.py" = ["E402"]
 "server/test_real_live.py" = ["E402"]

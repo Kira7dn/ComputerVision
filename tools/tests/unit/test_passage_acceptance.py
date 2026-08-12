@@ -36,10 +36,44 @@ from tools.runtime.validate_platform_runtime import (
     wait_file_quiescent,
     wait_recognition_idle,
     write_compact_runtime_report,
+    validate_external_recognition_evidence,
 )
 
 ROOT = Path(__file__).resolve().parents[3]
 MANIFEST = ROOT / "tools/fixtures/platform_passage_ground_truth.yaml"
+
+
+def test_interrupted_face_attempt_accepts_typed_failure(tmp_path: Path) -> None:
+    trace_id = "face:face_camera:1.0-track"
+    records = [
+        {"pipeline": "face", "stage": "track_seen", "trace_id": trace_id},
+        {"pipeline": "face", "stage": "first_attempt", "trace_id": trace_id, "frame_time": 1.0},
+        {
+            "pipeline": "face",
+            "stage": "recognition_failed",
+            "trace_id": trace_id,
+            "reason": "service_disconnected",
+        },
+    ]
+
+    result = validate_external_recognition_evidence(tmp_path, records, [])
+
+    assert result["valid"] is True
+    assert result["attempt_count"] == 1
+    assert result["errors"] == []
+
+
+def test_face_attempt_without_typed_failure_still_requires_artifacts(tmp_path: Path) -> None:
+    trace_id = "face:face_camera:2.0-track"
+    records = [
+        {"pipeline": "face", "stage": "track_seen", "trace_id": trace_id},
+        {"pipeline": "face", "stage": "first_attempt", "trace_id": trace_id, "frame_time": 2.0},
+    ]
+
+    result = validate_external_recognition_evidence(tmp_path, records, [])
+
+    assert result["valid"] is False
+    assert any("missing stage: recognition_attempt" in error for error in result["errors"])
 
 
 def test_wait_file_quiescent_requires_stable_manifest(tmp_path: Path) -> None:
@@ -1248,7 +1282,8 @@ def test_close_follow_rejects_old_generation_correlation() -> None:
             "passage_id": "unknown",
         },
     ]
-    assert correlation_mismatches(records)
+    # Fixture passage labels are a reporting view, not producer correlation.
+    assert not correlation_mismatches(records)
     records[1]["generation"] = 2
     assert not correlation_mismatches(records)
 

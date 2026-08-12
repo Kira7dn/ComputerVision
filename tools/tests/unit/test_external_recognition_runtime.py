@@ -50,3 +50,11 @@ def test_deployment_starts_service_before_frigate():
     frigate_start = deploy.index("'--no-deps','frigate'", health_wait)
     assert recognition_start < health_wait < frigate_start
     assert "--profile','external-recognition'" in deploy
+
+
+def test_replay_topology_is_ready_before_frigate_start():
+    deploy = Path("deploy/run.ps1").read_text(encoding="utf-8")
+    replay_ready = deploy.index("Wait-ReplayReady $replaySources")
+    frigate_start = deploy.index("'--no-deps','frigate'", replay_ready)
+    assert replay_ready < frigate_start
+    assert "camera-mediamtx running=" in deploy

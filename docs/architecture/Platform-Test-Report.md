@@ -288,17 +288,40 @@ python -m pytest tools/tests/unit -q
 Regression test chỉ xác nhận tính đúng của chương trình đo và schema/report; không thay thế
 runtime replay và không được dùng để tuyên bố hệ thống nhận dạng đạt chất lượng production.
 
+Execution gate và yêu cầu dùng `deploy/run.ps1` được quản lý tập trung tại
+[AGENTS.md](../../AGENTS.md); report này chỉ ghi evidence của các bước đã chạy.
+
 ## 10. Bằng chứng hiện có
 
-Hai report runtime mới nhất dùng để review topology:
+Các report runtime gần nhất dùng để review topology:
 
 | Run | Topology | Runtime evidence |
 | --- | --- | --- |
+| [`20260812-141524-728`](../../.tmp/platform-runtime/20260812-141524-728/report.md) | external | report complete; `measurement_valid=true`, Face `4/4` coverage `1.0`, `38` track-seen, raw LPR `11/11`, LPR exact `7/11` diagnostic, API/SQLite consistency, correlation mismatch `0`, không reconnect/stall, service healthy, local model `0`, cleanup/pending/writer `0`, runtime restored |
+| [`20260812-130708-272`](../../.tmp/platform-runtime/20260812-130708-272/report.md) | external fault: stream_disconnect | artifact completed; network disconnect/reconnect recorded, topology restored |
+| [`20260812-132857-884`](../../.tmp/platform-runtime/20260812-132857-884/report.md) | external fault: client_disconnect | artifact complete; typed lifecycle failure, publication safety, cleanup zero and topology restore recorded |
+| [`20260812-135955-917`](../../.tmp/platform-runtime/20260812-135955-917/report.md) | external fault: service_restart | artifact complete; service epoch interruption, typed lifecycle failure, publication safety, cleanup zero and topology restore recorded |
 | [`20260812-013537-853`](../../.tmp/platform-runtime/20260812-013537-853/report.md) | external | report complete; 4/4 Face lineage (`3 known + 1 unknown`), 11 raw LPR lineage, 20 producer bbox bundles, deadline/failure `0`, service healthy, local model load `0`, cleanup/pending/writer `0` |
 | [`20260812-013921-643`](../../.tmp/platform-runtime/20260812-013921-643/report.md) | local | report complete; 4/4 Face lineage (`3 known + 1 unknown`), 11 raw LPR lineage, deadline/failure `0`, cleanup/pending/writer `0` |
 
-Đây là hai invocation độc lập nên số attempt và raw LPR terminal output có thể khác theo tracker/
+Đây là các invocation độc lập nên số attempt và raw LPR terminal output có thể khác theo tracker/
 wall-clock scheduling. Bit-exact decision parity chỉ được kết luận từ differential test khi đưa
-cùng ordered observations vào các topology. External run có `measurement_valid=false` do
-correlation/LPR quality diagnostics; vì vậy `report complete` không được diễn giải thành global
-acceptance hoặc kết luận accuracy production.
+cùng ordered observations vào các topology. Run healthy mới đã có correlation/measurement/API/SQLite/
+reconnect-stall hợp lệ; ba fault scenarios và packaging đã có artifact pass. LPR accuracy vẫn là
+diagnostic, vì vậy `report complete` không được diễn giải thành kết luận accuracy production.
+
+## 11. Phase 8 tracker edge — source gate ngày 2026-08-12
+
+Phase 8 hiện mới có bằng chứng source/unit cô lập, chưa có build/runtime acceptance:
+
+- `frigate/frigate/test/test_tracker_edge.py`: `18 passed` cho proto compatibility, mTLS identity,
+  ownership/mixed mode, producer parity, evidence TTL/checksum/pin, durable journal replay/ACK/
+  restart/spool-full, canonical SQLite ingest, media manifest/range và no direct recognition import.
+- Root unit gate: `77 passed`; nhóm tracker/config/camera-maintainer/stationary/Event canonical:
+  `96 passed`; `compileall`, Ruff, PowerShell parser và `git diff --check` pass.
+- Full Frigate gate collect đủ `976` test nhưng dừng tại
+  `TestHttpApp.test_recordings_storage_requires_admin`: fixture dùng `os.path.join` trên Windows tạo
+  key `/media/frigate\\recordings`, khác runtime constant POSIX `/media/frigate/recordings`. Đây là
+  hard-gate failure ngoài Phase 8; không chỉnh fixture/report để biến thành pass.
+- Theo execution gate, chưa chạy build `camera-tracker`, healthy E2E, fault E2E hoặc restore.
+  Không được diễn giải source/unit pass thành Phase 8 `[DONE]`.

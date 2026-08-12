@@ -11,6 +11,11 @@ deploy/config.yaml   # toàn bộ cấu hình runtime và Frigate
 Các file Compose nội bộ nằm trong `deploy/reference/`; người vận hành
 không cần sửa chúng.
 
+> Phase 8 tracker edge đang ở source gate, chưa phải deployment được hỗ trợ. Source đã có
+> `reference/Dockerfile.tracker`, nhưng `run.ps1` chưa được phép build/start image này vì full
+> regression gate ngày 2026-08-12 còn fail. Không chạy Dockerfile hoặc Compose tracker trực tiếp
+> để thay launcher; chỉ mở rollout khi launcher/readiness/restore và E2E chính thức đã pass.
+
 ## Yêu cầu
 
 - Windows PowerShell 5.1 trở lên.
@@ -85,12 +90,48 @@ dạng image đã kiểm duyệt. Không dùng `deploy/run.ps1` để full-build
 
 ## Recognition runtime
 
+### Ranh giới service
+
+`frigate` là service lõi và luôn giữ các quyền sở hữu sau:
+
+- capture, detect và tracker;
+- Face/LPR input adapter và evidence ownership;
+- EventAggregator, Event/API/SQLite và media publication;
+- notification outbox từ Event đã commit.
+
+`camera-recognition` là deployment riêng của **tập con Face/LPR recognition thuộc Frigate**,
+chỉ xuất hiện ở topology `external`:
+
+- model Face/LPR, `RecognitionCore` và session state;
+- nhận job qua gRPC/mTLS và trả typed outcome;
+- không đọc SQLite/media của Frigate, không sở hữu tracker/Event và không publish trực tiếp.
+
+`camera-mediamtx` chỉ là replay/RTSP gateway; `camera-ngrok` chỉ là HTTP tunnel. Hai container
+này không tham gia recognition decision hoặc Event commit.
+
 `recognition.runtime` chọn đúng một topology:
 
 - `local`: Face/LPR model và synchronous `RecognitionCore` chạy trong `frigate`;
   container `camera-recognition` không chạy.
 - `external`: Frigate chỉ chạy host adapter; model, core và session state chạy trong
   container `camera-recognition` qua gRPC/mTLS. Không có local fallback.
+
+### Chọn local runtime
+
+Dùng khi muốn chạy toàn bộ recognition trong container Frigate:
+
+```yaml
+recognition:
+  runtime: local
+```
+
+Ở topology này không cần `endpoint` hoặc TLS cho recognition; container
+`camera-recognition` không được khởi động. Face/LPR model chạy trong Frigate và vẫn dùng
+`RecognitionCore`/publication path chung.
+
+### Chọn external runtime
+
+Dùng khi muốn tách model/core/session state sang container `camera-recognition`:
 
 External mode yêu cầu `RECOGNITION_TLS_DIR` trỏ đến thư mục host chứa `ca.crt`,
 `server.crt`, `server.key`, `client.crt` và `client.key`. Client config dùng các path
@@ -123,6 +164,15 @@ $env:RECOGNITION_TLS_DIR = 'D:\secure\camera-recognition-tls'
 .\deploy\run.ps1 start
 .\deploy\run.ps1 status
 ```
+
+`deploy/run.ps1` là entrypoint duy nhất: không sửa `deploy/reference/*.yml` và không gọi
+Docker Compose/container trực tiếp để bật topology. Với acceptance/replay, dùng entrypoint
+E2E trong `tools/tests/e2e`; launcher sẽ tạo/mount config và TLS runtime cần thiết. Sau khi
+đổi topology, kiểm tra `status` và log health trước khi đọc kết quả recognition.
+
+Khi chuyển từ `external` về `local`, đổi `runtime` thành `local`, bỏ hoặc giữ nguyên block
+endpoint/TLS không dùng, rồi chạy lại `doctor` và `start` qua launcher. Không được dùng local
+fallback để che lỗi external; external không healthy phải là typed failure.
 
 `build` tạo cả Frigate overlay và recognition overlay từ cùng source tree. External
 mode chỉ thay execution/transport boundary; detector, crop, bbox/evidence producer,
@@ -304,5 +354,7 @@ deploy/
 ├── README.md
 └── reference/
     ├── docker-compose.yml
+    ├── Dockerfile.tracker
+    ├── tracker-run
     ├── mediamtx.replay.yml
 ```

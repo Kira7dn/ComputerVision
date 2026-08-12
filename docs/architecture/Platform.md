@@ -4,9 +4,9 @@ Ngày cập nhật: 12/08/2026
 
 ## 1. Mục tiêu
 
-Tài liệu này định nghĩa cách tối ưu pipeline Computer Vision của runtime hai camera và boundary
-để recognition có thể chạy trong một container độc lập mà không chuyển tracker, Event, media hoặc
-notification ra khỏi Frigate.
+Tài liệu này định nghĩa kiến trúc pipeline Computer Vision nhiều camera với các boundary rõ ràng:
+`tracker` xử lý edge, `frigate` main là system of record và `camera-recognition` xử lý Face/LPR.
+Tracker giao tiếp với Frigate main; không giao tiếp trực tiếp với recognition.
 
 Mục tiêu kinh doanh ưu tiên là **Gate Intelligence cho nhà máy, kho vận, depot và
 bãi xe đang có camera RTSP nhiều hãng**. Sản phẩm không cạnh tranh trực diện với
@@ -22,7 +22,8 @@ camera ANPR/face chuyên dụng bằng một model đơn lẻ; lợi thế chín
 
 Các thành phần đã có và được giữ làm nền tảng:
 
-- Frigate đã sở hữu capture, detection, tracking, LPR, face recognition và Event.
+- Frigate hiện vẫn chạy toàn bộ pipeline trong một container; kiến trúc đích tách lane
+  capture/detection/tracking thành `tracker` edge và giữ Event/publication trong Frigate main.
 - `deploy/config.yaml` là cấu hình runtime hiện hành.
 - Hai pipeline đang chạy là `car_camera` cho LPR và `face_camera` cho face recognition.
 
@@ -44,8 +45,7 @@ Các bằng chứng hiện có được phân loại như sau; `pass` unit test 
 | --- | --- | --- |
 | Hai-camera stream health | Replay giữ camera/process FPS ổn định | Diagnostic pass; không phải passage recognition acceptance |
 | LPR hai camera | Baseline passage recall 60%; Phase 2 đã tăng lên 100% trên fixture replay | Passage bottleneck Phase 2 đã đạt; recognition tiếp tục được cải thiện |
-| Face sáu/bảy camera | Các report gần nhất `accepted=false`, enrichment latency/pending vượt gate | Không có approved capacity sáu/bảy camera |
-| Recognition runtime boundary | Local vẫn là mặc định; external là opt-in | Core nhận typed observation; external gRPC/mTLS container đã chạy mà tracker/Event/media vẫn ở Frigate |
+| Recognition runtime boundary | Face/LPR đang chạy trong Frigate; boundary service đã có | Frigate main gửi job và nhận outcome từ `camera-recognition`; Event/media vẫn ở Frigate |
 
 ## 3. Khoảng trống cần giải quyết
 
@@ -75,34 +75,40 @@ Các bằng chứng hiện có được phân loại như sau; `pass` unit test 
 8. Recognition chỉ phụ thuộc typed tracked-observation/evidence contract; detection, Event và
    transport cụ thể nằm trong adapter.
 9. Trace là side-channel bounded, không phải source of truth và không được block critical path.
-10. Mỗi deployment chỉ chọn một recognition runtime. External mode lỗi phải fail closed và trả
-    typed failure; không được chạy lại job bằng local runtime hoặc một model khác.
+10. `tracker` chỉ gửi tracked-object result stream cho Frigate main. Frigate main là integration
+    boundary duy nhất giữa tracker và recognition; tracker không gọi trực tiếp recognition.
 11. Nhãn `Phase N` chỉ dùng trong roadmap/tài liệu/acceptance artifact; production code, config,
     public API, metric và test name dùng tên chức năng, không mang phase label.
 
-### 4.1 Phạm vi đơn giản hóa cho external runtime
+### 4.1 Boundary deployment hiện hành
 
-Runtime hiện hỗ trợ hai topology chọn độc quyền bằng `recognition.runtime`: `local` chạy đồng bộ
-trong `EmbeddingProcess`; `external` chuyển model adapters, `RecognitionCore` và session state sang
-container `camera-recognition`. External production chỉ dùng gRPC/mTLS; không có ZeroMQ production
-path, generic SDK hoặc content-addressed resolver. Local là topology độc lập để vận hành/parity,
-không phải fallback khi external lỗi. Wheel packaging chỉ thực hiện sau fault-injection acceptance.
+`frigate` là runtime đang chạy và hiện chứa cả các lane tracker lẫn Event/recognition. Kiến trúc
+đích giữ Frigate main làm Event/publication SOT nhưng chuyển camera ownership theo topology:
+`tracker` phát detection/track result, giữ evidence và media bytes cho camera edge; `frigate` main
+validate stream/manifest, route candidate/evidence, sở hữu Event/API/SQLite/notification/publication,
+proxy media và gọi `camera-recognition`. `camera-recognition` chỉ xử lý Face/LPR và trả outcome.
 
 ## 5. Kiến trúc đích
 
-Sơ đồ dưới đây là external topology đã triển khai. Khi chọn external, Frigate chỉ khởi tạo host
-client; Face/LPR model và core chỉ chạy trong `camera-recognition`. Khi chọn local, container này
-không chạy. Không topology nào chạy hai recognition decision path song song.
+Sơ đồ dưới đây là kiến trúc service chuẩn. Hiện tại các lane `tracker` vẫn nằm trong container
+`frigate`; khi tách edge, chỉ thay producer của tracked-object stream, không thay Event SOT.
 
 ```mermaid
 flowchart LR
-    subgraph Frigate[Frigate container]
-        Camera[Capture / detect / track]
-        Client[ExternalRecognitionClient]
+    subgraph Tracker[tracker edge boundary]
+        Camera[Camera ingest / FFmpeg / decode]
+        Detect[Object detection]
+        Track[Association / track lifecycle]
+        EdgeMedia[Evidence ring / recording / live / clip]
+    end
+
+    subgraph Frigate[frigate main]
+        Client[TrackedObject input + validation]
+        Candidate[Candidate / crop / bbox / evidence]
         Guard[Epoch / sequence / idempotency guard]
         EventAdapter[FrigateEventAdapter]
         Event[EventAggregator]
-        Media[Media / trace writer]
+        Media[Authenticated media proxy / trace writer]
         Database[API / SQLite / notification outbox]
     end
 
@@ -115,19 +121,81 @@ flowchart LR
         Health[Health / capabilities / service_epoch]
     end
 
-    Camera --> Client
+    Camera --> Detect --> Track --> Client
+    Track --> EdgeMedia
+    EdgeMedia -->|Evidence / MediaManifest / byte range| Client
+    Client --> Candidate --> Guard
     Client -->|RecognitionJob + raw I420 evidence| Grpc
     Grpc -->|JobReceipt / RecognitionOutcome| Client
     Grpc --> Queue --> Models --> Core
     Core -->|RecognitionOutcome| Grpc
-    Client --> Guard --> EventAdapter --> Event --> Database
+    Guard --> EventAdapter --> Event --> Database
     Guard --> Media
-    Camera --> Event
     Client -. configure / Face operations .-> Control
     Health -. readiness .-> Client
 ```
 
 ### 5.1 Runtime lanes và ownership
+
+Ranh giới deployment được cố định như sau:
+
+| Container/service | Ownership chính | Không được sở hữu |
+| --- | --- | --- |
+| `frigate` | Embedded camera chạy pipeline hiện hành; edge camera dùng host adapter. Luôn giữ EventAggregator, API/SQLite, notification/publication và authenticated media proxy | Không chạy lại camera logic hoặc giữ media bytes cho camera edge; không bypass Event SOT |
+| `tracker` | Với camera được gán: ingest, go2rtc/FFmpeg, detection, Norfair/`TrackedObject`, zone/speed/path, PTZ, evidence, recording/live/clip và durable spool | Face/LPR decision, Event/API/canonical SQLite, notification/publication hoặc gọi trực tiếp `camera-recognition` |
+| `camera-recognition` | Face/LPR candidate processing, crop/bbox/evidence artifact, model, `RecognitionCore`, history/session và outcome | Tracker, Event/API/SQLite, media, notification hoặc tự publish |
+| `camera-mediamtx` | Replay/RTSP gateway | Recognition decision và Event commit |
+| `camera-ngrok` | HTTP tunnel vào Frigate | Camera inference, recognition và database |
+
+`camera-recognition` là **tập con recognition của Frigate về chức năng và code** (candidate,
+crop/bbox/evidence processing, model, `RecognitionCore`, history/session), được đóng gói thành
+deployment service riêng. Nó không phải một hệ thống nghiệp vụ độc lập và không bao gồm toàn bộ
+Frigate. `tracker` là boundary edge riêng cho detection/tracking, nhưng chỉ giao tiếp với Frigate
+main.
+`camera-mediamtx` và `camera-ngrok` mới là infrastructure services bên ngoài Frigate core.
+
+Ma trận capability theo ownership kiến trúc. `✅` nghĩa là service/boundary có hoặc sẽ sở hữu
+capability; `—` nghĩa là không sở hữu capability đó. Cột `frigate` là runtime hiện tại;
+`camera-recognition` là boundary có thể tách cho toàn bộ Face/LPR recognition; `tracker` là
+boundary edge có thể tách cho ingest/detection/tracking. Hai boundary sau chưa phải Docker
+container riêng đang chạy.
+
+| Capability/tính năng | `frigate` | `camera-recognition` | `tracker` | `camera-ngrok` |
+| --- | :---: | :---: | :---: | :---: |
+| Camera ingest, FFmpeg và decode | ✅ | — | ✅ | — |
+| Object detection | ✅ | — | ✅ | — |
+| Track association và track lifecycle | ✅ | — | ✅ | — |
+| Detection/Track result stream | ✅ | — | ✅ | — |
+| Frame/track lineage (`camera_id`, `frame_seq`, `source_pts`, `edge_epoch`) | ✅ | — | ✅ | — |
+| Face/LPR candidate | ✅ | ✅ | — | — |
+| Face/LPR crop | ✅ | ✅ | — | — |
+| Face/plate bbox | ✅ | ✅ | — | — |
+| Face/LPR evidence | ✅ | ✅ | — | — |
+| Recognition job admission, sequence và epoch guard | ✅ | — | — | — |
+| Face/LPR model inference | ✅ | ✅ | — | — |
+| Face/LPR history, voting và `RecognitionCore` | ✅ | ✅ | — | — |
+| Recognition outcome | ✅ | ✅ | — | — |
+| Recognition outcome: nhận/validate/publication | ✅ | — | — | — |
+| Event metadata mapping và publication guard | ✅ | — | — | — |
+| Canonical Event commit và correlation | ✅ | — | — | — |
+| API và SQLite | ✅ | — | — | — |
+| Media, recording và review | ✅ | — | — | — |
+| Notification outbox/worker | ✅ | — | — | — |
+| Bounded queue, backpressure và stale-drop | ✅ | — | ✅ | — |
+| Health/readiness, reconnect và typed failure | ✅ | ✅ | ✅ | ✅ |
+| gRPC/mTLS, node identity và certificate lifecycle | ✅ | ✅ | ✅ | — |
+| Model/config/schema version và hash | ✅ | ✅ | ✅ | — |
+| Runtime metrics, trace và resource telemetry | ✅ | ✅ | ✅ | ✅ |
+| HTTP tunnel / public access | — | — | — | ✅ |
+
+Chú thích: `frigate` là runtime đang chạy và hiện sở hữu toàn bộ capability của pipeline. Các dấu
+`✅` trong cột `camera-recognition` và `tracker` mô tả ownership boundary khi tách service, không
+khẳng định các container đó đang chạy. `camera-recognition` bao gồm candidate, crop, bbox, evidence,
+model inference, history/voting và `RecognitionCore`; `frigate` vẫn giữ Event, API, SQLite, media,
+notification và publication. `tracker` sẽ cung cấp ingest/detection/tracking/result stream; hiện
+những capability đó vẫn nằm trong `frigate` cho đến khi edge runtime được triển khai và acceptance.
+`camera-ngrok` chỉ cung cấp HTTP tunnel/public access, không tham gia camera processing,
+recognition hoặc Event commit.
 
 | Lane | Owner | Được phép làm | Không được làm |
 | --- | --- | --- | --- |
@@ -139,9 +207,10 @@ flowchart LR
 | Notification | Durable outbox/worker | Gửi từ committed Event, retry/idempotency | Nhận lệnh trực tiếp từ recognition worker |
 | Trace | Một bounded queue + writer thread | Persist JSONL/metrics best-effort | Block detection/recognition/Event hoặc sở hữu evidence |
 
-Detector/tracker vẫn cập nhật base Event path trực tiếp. Frigate là owner duy nhất của track
-lifecycle, Event và media; recognition container là owner duy nhất của model, Face/LPR history và
-decision state. Cùng chuỗi observation phải tạo đúng update sequence như synchronous core.
+Trong deployment hiện tại, detector/tracker trong `frigate` cập nhật base Event path. Trong kiến
+trúc đích, `tracker` phát `track_start/update/end` cho Frigate main; Frigate là owner duy nhất của
+Event, API/SQLite, media và publication, còn recognition service là owner của model, Face/LPR
+history và decision state. Recognition không bao giờ nhận stream trực tiếp từ tracker.
 
 ### 5.2 Recognition input/output boundary
 
@@ -226,6 +295,79 @@ bytes và không giữ evidence lease. Khi queue đầy, production drop record 
 `trace_dropped_total`; không block critical path. Report phải ghi nguyên drop count để biết evidence
 quan sát có đầy đủ hay không. Writer là thread duy nhất mở/ghi JSONL và shutdown chỉ flush trong
 thời gian bounded.
+
+### 5.6 Thiết kế boundary `tracker` edge
+
+`tracker` là boundary edge được suy ra từ pipeline hiện tại của Frigate, không phải một tracker
+mới với thuật toán mới. Mục tiêu là chuyển phần xử lý liên tục theo camera sang node edge để
+scale số camera bằng compute tại chỗ. Frigate giữ Event/persistence/publication và proxy media;
+tracker giữ media bytes/retention cho camera edge. Code tham chiếu hiện tại là `frigate/frigate/video/detect.py`,
+`frigate/frigate/video/ffmpeg.py`, `frigate/frigate/track/norfair_tracker.py`,
+`frigate/frigate/track/tracked_object.py` và `frigate/frigate/track/object_processing.py`.
+
+| Lane của tracker | Capability phải cung cấp | Output bắt buộc |
+| --- | --- | --- |
+| Capture | Camera stream, FFmpeg/decode, source PTS và bounded latest-frame queue | `camera_id`, `stream_epoch`, `frame_seq`, `source_pts`, frame contract |
+| Detection | Detector hiện hành theo camera config, label/score/box và detect timestamp | Detection list gắn đúng frame lineage |
+| Association | Norfair/centroid-compatible association, track ID, matched detection và track state | Ordered `TrackedObjectUpdate` |
+| Lifecycle | Tạo, update, mất, kết thúc track; end-of-stream và epoch change | `track_start`, `track_update`, `track_end` typed events |
+| Quality/evidence reference | Frame reference và bbox hợp lệ cho downstream recognition | Evidence ID/reference có TTL, không gửi path tùy ý |
+| Transport | Bounded result queue, backpressure, stale-drop và reconnect state | Result stream có sequence/epoch và typed failure |
+
+#### 5.6.1 Input/output contract
+
+Input của tracker là camera source và cấu hình detector/tracking theo camera. Output không được
+là raw track ID đơn lẻ. Mỗi update phải chứa tối thiểu:
+
+```text
+camera_id
+stream_epoch
+frame_seq
+source_pts
+track_id
+label
+score
+object_bbox
+frame_time
+observed_in_frame
+lineage/schema/config hash
+```
+
+`track_id` chỉ có ý nghĩa trong một cặp `(camera_id, stream_epoch)`; không được nối history qua
+epoch mới. `source_pts` và `frame_seq` là căn cứ chọn evidence và đối chiếu passage. `track_end`
+phải được phát khi object timeout, stream disconnect, shutdown hoặc epoch đổi; không chờ recognition
+service trả kết quả.
+
+#### 5.6.2 Ownership và giới hạn
+
+Tracker sở hữu capture, detection, association, track lifecycle và result stream. Tracker không
+được sở hữu:
+
+- Face/LPR history, voting hoặc `RecognitionCore`;
+- canonical Event, API, SQLite, media recording hoặc notification;
+- recognition retry, winner selection hoặc publication;
+- đọc/ghi evidence bằng filesystem path không có TTL và lineage.
+
+Frigate nhận `TrackedObjectUpdate`, kiểm tra `(camera_id, stream_epoch, frame_seq, track_id)`,
+sau đó cập nhật base Event path và chuyển candidate/evidence sang recognition boundary. Khi edge
+chưa được triển khai, chính các lane này vẫn chạy trong Frigate main với cùng contract.
+
+#### 5.6.3 Failure và backpressure contract
+
+Tracker phải fail closed theo từng camera/epoch: queue đầy thì stale-drop theo policy đã cấu hình,
+không phát lại frame cũ và không tạo track giả. Khi capture mất frame, tracker phát health/failure
+và `track_end`; khi stream phục hồi, tạo `stream_epoch` mới và bắt đầu track mới. Reconnect không
+được nối history cũ hoặc tái sử dụng sequence cũ.
+
+Các hard gate trước khi tracker trở thành runtime riêng:
+
+1. Không có `No frames received`, capture lag hoặc queue backlog vượt bound.
+2. Detection/track result giữ đúng frame, PTS, bbox và camera/epoch lineage.
+3. Không mất hoặc nhân đôi `track_start`, `track_update`, `track_end` trong replay.
+4. Recognition candidate/evidence từ edge tương đương contract Frigate main hiện tại.
+5. Event/API/SQLite/media vẫn chỉ được commit bởi Frigate; không có Event duplicate.
+6. Stream disconnect/reconnect tạo typed failure, cleanup về `0`, rồi phục hồi serving.
+7. CPU/GPU/queue/resource telemetry đủ để scale camera theo node edge.
 
 ## 6. Quality contract theo camera
 
@@ -371,8 +513,6 @@ Kết luận kiến trúc:
    nhưng quality gate làm nó chạy ít hơn.
 3. Object detection là chi phí nền quyết định số camera tối đa: inference đơn lẻ nhẹ
    nhất nhưng phải chạy liên tục trên mọi luồng.
-4. Không được dùng snapshot này để tuyên bố capacity 4/8 camera. Nó chưa phải benchmark
-   passage có ground truth, burst đồng thời hoặc repeated-cycle stability test.
 
 ### 11.2 Compute control không đổi recognition
 
@@ -383,70 +523,6 @@ early-stop, best-result winner hoặc terminal recognition state trong kiến tr
 Metric bắt buộc gồm calls/s, P95 latency, queue age/depth, CPU, GPU, VRAM và compute-time theo raw
 track. Khi quá tải, runtime phải báo degraded state; không được âm thầm thay cadence/voting để đạt
 capacity.
-
-### 11.3 Projection lên tám camera [STALE UNTIL MASTER PARITY]
-
-Projection dùng workload mix 4 camera xe + LPR và 4 camera người + face, cùng resolution
-1280 × 720, detect 5 FPS và mật độ passage tương tự hai replay hiện tại. Đây là phép
-ngoại suy tuyến tính để xác định rủi ro, chưa phải capacity đã được chứng minh.
-
-Nhịp inference ước tính:
-
-| Stage | 2 camera hiện tại | 8 camera chưa tối ưu | Sau master parity |
-| --- | ---: | ---: | ---: |
-| Object detect input | 10 FPS | 40 FPS | 40 FPS; không giảm ngầm |
-| Plate detection | 5,5 lần/s | khoảng 22 lần/s | mục tiêu 6–11 lần/s với ROI/quality gate |
-| Plate OCR | 2,6 lần/s | khoảng 10,4 lần/s | Chưa có claim; đo lại theo master variant cadence |
-| Face recognition | 0,5 lần/s | khoảng 2,0 lần/s | Chưa có claim; đo lại theo master attempt limits 12/6 |
-
-Các tỷ lệ tiết kiệm dựa trên top-3/early-stop đã bị rút khỏi active roadmap. Phải đo lại
-calls/trace, master Face attempt cadence, LPR variant cadence và worst-run queue sau Phase 6-1 trước
-khi cập nhật projection tám camera.
-
-Projection tải chuẩn hóa:
-
-| Kịch bản 8 camera | GPU demand ngoại suy | CPU Frigate ngoại suy | Đánh giá |
-| --- | ---: | ---: | --- |
-| Giữ logic hiện tại | khoảng 132–136% | khoảng 71–77% | Không khả thi; GPU sẽ bão hòa và queue tăng |
-| Chỉ conditional retry OCR + face | khoảng 92–116% | khoảng 50–65% | Vẫn thiếu headroom, không được approve |
-| Full cascade | khoảng 79–102% | khoảng 43–58% | Có thể chạy workload thưa nhưng vẫn sát giới hạn |
-
-`GPU demand` trên 100% biểu diễn lượng compute được yêu cầu so với một GPU, không phải
-metric utilization có thể hiển thị vượt 100%. Khi demand vượt khả năng, hệ quả là queue
-age, skipped/stale candidate và P95 latency tăng.
-
-VRAM không giảm tỷ lệ thuận với số inference vì model vẫn resident. Ngược lại, frame,
-ROI và queue tăng theo số camera; vì vậy projection không tự suy ra VRAM từ 44,6% × 4.
-Acceptance tám camera yêu cầu đo peak VRAM thực và giữ queue bounded.
-
-Kết luận provisional: confidence-gated retry là cần thiết nhưng chưa đủ để cam kết tám
-camera trên RTX 3050 4 GB. Ngay cả biên tốt của full cascade còn cần thêm khoảng 15–32%
-hiệu quả để đạt mục tiêu steady-state GPU ≤70%. Nguồn cải thiện tiếp theo gồm TensorRT/
-FP16 cho stage phù hợp, batching có giới hạn, tránh copy CPU↔GPU và shared model instance.
-Nếu 3 FPS vẫn giữ passage recall, cấu hình 3 FPS có thể dùng để tăng headroom; không tự
-hạ từ 5 xuống 3 FPS khi chưa benchmark.
-
-Acceptance tám camera tối thiểu:
-
-- Chạy đồng thời 4 LPR + 4 face camera ít nhất 24 giờ.
-- Steady GPU ≤70%, burst P95 ≤85%, VRAM peak ≤80%; không OOM hoặc model reload.
-- Queue age/depth bounded và trở về baseline sau burst; không tích lũy stale candidate.
-- Báo cáo passage recall/recognition không giảm so với baseline hai camera đã duyệt.
-- P95 capture-to-recognition và end-to-end latency đạt SLA cho từng product profile.
-- Burst đồng thời trên cả tám camera vẫn giữ queue/latency bounded; nếu không đạt thì
-  giảm số camera theo capacity profile đã benchmark.
-
-### 11.4 Capacity theo benchmark
-
-Mỗi benchmark ghi hardware, model/config version, resolution/FPS, workload mix, số camera,
-GPU/CPU/VRAM, queue P95 và passage result. Số camera tối đa của một hardware/pipeline mode
-là mức cao nhất đã đạt acceptance; deployment không cấu hình vượt mức này.
-
-Khi overload đột biến:
-
-1. Drop stale detect/evidence candidate chưa persist.
-2. Tạm ngừng enrichment ưu tiên thấp.
-3. Ghi metric overload cùng số liệu queue/latency.
 
 ## 12. Passage-level SLA và observability
 
@@ -534,9 +610,10 @@ tick chỉ vì code đã tồn tại.
 module hoặc deployment topology được nêu rõ; unit test, replay và benchmark chỉ là bằng chứng
 để đóng phase, không phải work package thay thế cho phần triển khai. Phase 1–4 đã hoàn tất;
 Phase 5 là thử nghiệm `[SUPERSEDED]`; Phase 6 đã `[DONE]` với recognition core đồng bộ và Frigate
-adapters; Phase 7 đang `[IN PROGRESS]`: external container/runtime đã chạy cùng shared decision
-code và đạt runtime/E2E invariants, còn correlation audit, restart/disconnect fault injection và
-wheel packaging. Acceptance tổng thể được đánh giá riêng sau khi hoàn thành toàn bộ roadmap,
+adapters; Phase 7 đã `[DONE]`: external container/runtime đã chạy cùng shared decision
+code và E2E mới đã đạt `measurement_valid=true`, correlation `0` cùng cleanup/restore; fault
+injection và wheel packaging đã có artifact. Acceptance tổng thể được đánh giá riêng sau
+khi hoàn thành toàn bộ roadmap,
 không dùng để đổi trạng thái từng
 phase đã hoàn tất.
 
@@ -546,15 +623,17 @@ phase đã hoàn tất.
 | --- | --- | --- | --- |
 | 1. Mục tiêu | On-premise Camera AI với recognition runtime độc lập và Event output ổn định | Phase 4–7 | Recognition container không sở hữu tracker/Event/media; adapter không đổi decision contract |
 | 2. Baseline | Giữ Frigate capture/detect/track/Face/LPR/Event làm nền tảng | Phase 1–2 | Baseline và passage remediation có artifact `[DONE]` |
-| 3. Khoảng trống | Passage, quality, evidence, recognition core, transport và trace có owner riêng | Phase 2–7 | Frigate host và recognition service có boundary rõ; không thêm parallel decision path |
+| 3. Khoảng trống | Passage, quality, evidence, recognition core, transport và trace có owner riêng | Phase 2–7 | Tracker → Frigate main → recognition có boundary rõ; không thêm parallel decision path |
 | 4. Nguyên tắc | Lineage, explicit lifecycle, bounded admission, no fallback và single-writer ownership | Phase 3–7 | Overload/restart trả typed failure; không silent drop, retry chéo runtime hoặc duplicate publish |
-| 5. Kiến trúc đích | `RecognitionJob → gRPC service → RecognitionOutcome`; Frigate giữ publication | Phase 6–7 | Docker service độc lập; core semantics không đổi và Event/media không rời Frigate |
+| 5. Kiến trúc đích | `tracker → TrackedObjectUpdate/MediaManifest → frigate → RecognitionJob → camera-recognition → RecognitionOutcome → frigate` | Phase 6–9 | Tracker không gọi recognition trực tiếp; Frigate giữ Event/publication và proxy media edge |
 | 6. Quality contract | Camera profile và reject reasons có schema/runtime owner | Phase 4 | Config validate được và selector xuất quality/reject reason |
 | 7. Detect/evidence stream | Live detect dùng latest-frame; finite MP4 dùng FIFO/backpressure; evidence/record bounded riêng | Phase 4, 6-0 | Source role, frame ownership, source timeline và byte/time bound được triển khai |
 | 8. Frame reference | Observation/result/evidence giữ cùng camera, track, epoch, frame và bbox | Phase 3–7 | External V1 dùng bounded raw I420 evidence, length/shape/layout validation và TTL |
 | 9. Quality/evidence observability | Face/LPR có cùng lineage và diagnostic metric | Phase 4, 6-1 | Selector không gate observation hoặc tham gia recognition decision |
 | 10. Recognition/result selection | Khôi phục nguyên vẹn LPR clustering và Face weighted voting từ Frigate master | Phase 6-1 | Khóa master commit, restore decision semantics và chứng minh parity |
 | 11. Compute control | Core đồng bộ khóa parity trước; service dùng bounded ordered executor | Phase 6–7 | Queue full reject ngay; service không thay cadence, order hoặc recognition output của core |
+| 12. Edge tracker runtime | Tách capture/detection/tracking thành edge service, chỉ phát `TrackedObjectUpdate` về Frigate main | Phase 8 | Parity detect/track, ordered lifecycle, lineage, fault cleanup và single-owner Event contract được kiểm chứng |
+| 13. Remote distributed runtime | Frigate main kết nối cả tracker và recognition chạy trên máy khác qua private network và mTLS | Phase 9 | Remote topology, node/camera ownership, certificate, epoch, publication safety và fault recovery được kiểm chứng |
 
 Dependency bắt buộc:
 
@@ -565,9 +644,107 @@ baseline/passage [DONE]
 → finite-source timeline + raw trace + native media [DONE: Phase 6-0]
 → Frigate master voting/consensus parity [DONE: Phase 6-1]
 → standalone synchronous recognition core + Frigate adapters [DONE: Phase 6]
-→ external gRPC recognition container + Frigate host adapter [DONE: RUNTIME/E2E]
-→ restart/disconnect fault injection + wheel packaging [NEXT]
+→ external gRPC recognition container + Frigate host adapter [DONE: HEALTHY E2E]
+→ restart/disconnect fault injection + wheel packaging [DONE: Phase 7]
+→ edge tracker runtime + Frigate tracked-object adapter [IN PROGRESS: Phase 8]
+→ remote tracker + remote recognition distributed deployment [PLANNED: Phase 9]
 ```
+
+### Phase 8 — Edge tracker runtime [IN PROGRESS — SOURCE GATE BLOCKED]
+
+Phase 8 tách lane xử lý liên tục theo camera khỏi Frigate main thành `tracker` edge runtime. Tracker
+nhận camera stream, decode và chạy lại chính các component Frigate hiện hành cho object detection,
+Norfair association, `CameraState`/`TrackedObject`, zone/speed/path, PTZ và recording; không có
+implementation thuật toán thứ hai. Với camera đã gán edge, tracker là media authority và phát
+ordered typed update, evidence reference cùng media manifest về Frigate main. Frigate main
+validate/idempotent ingest, giữ Event/API/SQLite/notification/publication SOT, route recognition và
+proxy media; main không tính lại tracker decision. Tracker không giao tiếp trực tiếp với recognition.
+
+Trạng thái source ngày 2026-08-12: contract/config ownership, protobuf gRPC/mTLS, shared producer,
+`CameraState` edge adapter, bounded I420 evidence, durable SQLite journal, canonical ingest record,
+media manifest/range primitives, managed node runtime và launcher-managed image/config/readiness đã
+có unit cô lập. Chưa build hoặc chạy Docker: full Frigate gate collect đủ `976` test nhưng dừng ở
+HTTP storage fixture do `os.path.join` Windows tạo key khác runtime POSIX constant. Vì vậy Phase 8
+chưa được đánh dấu `[DONE]`; healthy/fault/restore chưa có bằng chứng hợp lệ.
+
+Phạm vi triển khai:
+
+- **Phase 8-1 — Typed tracker contract:** định nghĩa `TrackedObjectUpdate` gồm `camera_id`,
+  `stream_epoch`, `frame_seq`, `source_pts`, `track_id`, operation `track_start/update/end`, label,
+  score, bbox, `frame_time`, `observed_in_frame`, schema/config hash và typed failure.
+- **Phase 8-2 — Edge processing runtime:** đóng gói capture/FFmpeg, detector hiện hành và
+  Norfair-compatible association/lifecycle thành container `tracker`; không đổi model, threshold,
+  resolution hoặc tracking algorithm để ép acceptance.
+- **Phase 8-3 — Frigate host adapter:** nhận và validate node/camera ownership, epoch, sequence,
+  frame lineage và idempotency trước khi cập nhật base Event path; late, duplicate và old-epoch
+  update bị loại trước Event/recognition publication.
+- **Phase 8-4 — Evidence boundary:** chuyển frame/evidence reference bounded có TTL và đúng
+  camera/epoch/frame/bbox lineage về Frigate; Frigate tiếp tục tạo recognition job và giữ evidence
+  đến terminal acknowledgement/expiry.
+- **Phase 8-5 — Runtime control:** health/readiness, bounded queue, backpressure, stale-drop,
+  reconnect, explicit `track_end`, config/schema compatibility và CPU/GPU/queue telemetry theo node.
+- **Phase 8-6 — Deployment:** thêm Docker image/service và launcher contract cho một hoặc nhiều
+  edge node; mỗi camera tại một thời điểm chỉ có đúng một tracker owner và restore được topology
+  Frigate-contained hiện hành.
+- **Phase 8-7 — Acceptance:** chạy parity replay, healthy E2E và các fault scenario tracker restart,
+  stream disconnect, Frigate client disconnect; artifact phải ghi topology, node/camera ownership,
+  source/worktree hash, epoch, lifecycle count, queue/resource state, cleanup và restore.
+
+Tiêu chí đóng Phase 8:
+
+- Detection/tracking trên cùng replay tương đương pipeline Frigate hiện hành; raw lineage vẫn đủ
+  4 Face passage và 11 car passage. Face/LPR exact accuracy tiếp tục là diagnostic.
+- Không mất hoặc nhân đôi `track_start`, `track_update`, `track_end`; không nối track/history qua
+  `stream_epoch` mới và không nhận late/old-epoch result.
+- Tracker không gọi trực tiếp `camera-recognition`, không sở hữu Event/API/canonical SQLite/
+  notification/publication và không tạo publication path thứ hai. Tracker là media authority cho
+  camera edge; Frigate chỉ lưu manifest/reference và proxy authenticated range request.
+- Frigate main tiếp tục chạy khi một tracker unavailable; disconnect/restart trả typed failure,
+  đóng lifecycle cũ, phục hồi bằng epoch mới và không reconnect loop.
+- Queue/in-flight/evidence/writer/session terminal về `0`, không backlog unbounded, không duplicate
+  Event và runtime restore thành công.
+- Unit/contract, compile/Ruff/diff-check pass trước build; healthy/fault E2E chạy qua launcher chuẩn
+  và mọi artifact truy vết được source commit/worktree hash.
+
+### Phase 9 — Remote distributed runtime [PLANNED]
+
+Phase 9 triển khai cả `tracker` và `camera-recognition` trên máy khác với Frigate main. Phase này
+chỉ bắt đầu sau khi Phase 8 khóa `TrackedObjectUpdate`, evidence và lifecycle contract. Frigate main
+vẫn là system of record và integration hub: remote tracker chỉ gửi tracked-object stream về Frigate;
+Frigate mới gửi recognition job tới remote recognition. Hai remote service không gọi trực tiếp nhau.
+
+Phạm vi đã khóa:
+
+- Thêm remote endpoint DNS/IP và deployment mode độc lập cho từng `tracker` node và
+  `camera-recognition`; launcher Frigate không start/inspect container remote như container local.
+- Giữ transport production qua gRPC/mTLS trên private LAN/VPN; preflight kiểm tra DNS, TCP,
+  certificate SAN, CA/client certificate, server name, expiry, capabilities và schema/config hash
+  cho cả hai service.
+- Cấu hình ánh xạ mỗi camera tới đúng một tracker node; artifact ghi endpoint đã redacted,
+  node/camera ownership, tracker `stream_epoch`, recognition `service_epoch`, topology hash,
+  readiness và restore result.
+- Remote healthy E2E phải đi xuyên `remote tracker → Frigate → remote recognition → Frigate`, giữ
+  raw passage lineage, canonical Event publication, API/SQLite consistency, bounded queue và cleanup
+  zero.
+- Fault acceptance chạy độc lập cho tracker restart, recognition restart, network partition trên
+  từng link và Frigate client disconnect; late/duplicate/old-epoch update hoặc outcome phải bị loại
+  trước publication.
+- Frigate main phải tiếp tục phục vụ Event/API/media khi một remote service unavailable; tracker
+  failure không được gọi recognition trực tiếp hoặc nối track history cũ, recognition failure không
+  được kích hoạt local fallback.
+- Bổ sung observability cho health transition, end-to-end latency, queue/in-flight, stale result,
+  per-node resource và certificate expiry. HA/failover và tự động chuyển camera sang node khác là
+  scope riêng, chưa thuộc Phase 9.
+
+Tiêu chí đóng Phase 9:
+
+- Unit/contract, compile/Ruff/diff-check và launcher/preflight tests pass trước build/deploy.
+- Remote healthy E2E và toàn bộ fault E2E chạy qua entrypoint/launcher chuẩn, có artifact mới cùng
+  source commit/worktree hash và topology hash.
+- Không direct tracker-to-recognition path, local fallback, duplicate Event, stale/old-epoch
+  publication, reconnect loop hoặc nối history qua node/epoch mới.
+- Runtime restore thành công; tracker/recognition queue, pending, in-flight, evidence, session và
+  writer terminal đều về `0`; TLS/network failure trả typed failure đúng service boundary.
 
 ### Phase 1 — Đo baseline hai camera [DONE]
 
@@ -671,7 +848,6 @@ Phase 2 đã được khắc phục so với baseline.
 | --- | --- | --- | --- |
 | Chất lượng LPR recognition chưa ổn định | Exact-match đạt 1/3 passage có biển đọc được; `lpr-01` và `lpr-02` chưa tạo kết quả OCR hợp lệ. Hệ thống đã bắt được passage nhưng chưa đọc tin cậy mọi biển trong tập thử. | Phase 3 sửa execution architecture và temporal decision hiện có. Nếu raw OCR không có thông tin hữu ích thì dừng ở ranh giới model, không tiếp tục vá pipeline. | [lpr.json](../../.tmp/platform-phase2/lpr.json), [evidence lpr-01](../../.tmp/platform-phase2/mismatches/lpr-01.jpg), [evidence lpr-02](../../.tmp/platform-phase2/mismatches/lpr-02.jpg) |
 | Dữ liệu replay còn nhỏ | Kết quả hiện tại đủ xác nhận regression của Phase 2 nhưng chưa đủ để công bố accuracy tổng quát cho nhiều người, biển số và điều kiện hình ảnh. | Đây là đầu vào cho fine-tune/certification sau này, không phải work package triển khai của Phase 3. | [manifest](../../tools/fixtures/platform_passage_ground_truth.yaml) |
-| Chưa đo capacity và điều kiện triển khai rộng hơn | Replay mới chạy đồng thời một camera Face và một camera LPR ở 720p; chưa có kết quả 4/8 camera hoặc nhiều điều kiện lắp đặt. | Không thuộc phạm vi đã chốt của Phase 2; hạn chế này phải có phase owner riêng nếu được đưa vào roadmap. | [summary.json](../../.tmp/platform-phase2/summary.json) |
 
 ### Phase 3 — LPR execution foundation [DONE]
 
@@ -842,7 +1018,7 @@ recognition. Code custom còn tồn tại không được hiểu là kiến trú
 | Phase 6-0 runtime/trace/media | `[DONE]` | 11 raw LPR traces, 11/11 clips và report đã xác minh |
 | Phase 6-1 master parity | `[DONE]` | Exact LPR clustering và Face weighted voting đã có differential test |
 | Phase 6 recognition core/adapters | `[DONE]` | Production adapter/core duy nhất đã test; finite-source caller phát explicit end sau EOF và runtime cleanup đạt zero |
-| Phase 7 external recognition runtime | `[IN PROGRESS]` | Docker/gRPC/mTLS service, host integration, shared logic và local/external E2E đã đạt; còn restart/disconnect fault injection và wheel packaging |
+| Phase 7 external recognition runtime | `[DONE]` | Docker/gRPC/mTLS service, host integration, shared logic, healthy E2E, ba fault scenarios và reproducible wheel packaging đã có artifact; LPR accuracy giữ ở diagnostic |
 
 ### Phase 6 — Master-compatible standalone recognition core [DONE]
 
@@ -1026,6 +1202,9 @@ track lifecycle ổn định; core không nhận raw detector batch và không t
   track ID, frame/bbox/evidence và không duplicate publication.
 - Chạy static/unit/integration, Ruff, `compileall`, `git diff --check`; sau đó build đúng một immutable
   image, lưu image digest cùng source/worktree hash.
+
+Execution gate, thứ tự build/run và yêu cầu dùng `deploy/run.ps1` được quản lý tập trung tại
+[AGENTS.md](../../AGENTS.md); tài liệu này chỉ ghi kết quả và artifact, không lặp lại rule.
 - Runtime entrypoint chạy một vòng, giữ full report/summary/log/media/hardware metrics và master/core
   voting history. Báo cáo evidence-only, không dùng accuracy threshold để đổi kết quả; mọi giá trị
   PASS/MISSING/raw value được giữ nguyên.
@@ -1161,11 +1340,12 @@ cleanup cuối đạt `sessions=0`, `in_flight=0`, `evidence_pinned=0`, `writer_
 `complete`, `measurement_valid=true`, `runtime_restored=true`; Docker sau restore được kiểm tra
 `running healthy`, restart `0`.
 
-### Phase 7 — External recognition runtime [IN PROGRESS]
+### Phase 7 — External recognition runtime [DONE]
 
-Phase 7 chuyển model inference, `RecognitionCore` và toàn bộ Face/LPR session state khỏi
-`EmbeddingProcess` sang một recognition container. Frigate giữ tracker, evidence ownership,
-Event/media publication và không có local fallback khi deployment chọn external runtime.
+Phase 7 triển khai recognition boundary: model inference, `RecognitionCore` và Face/LPR session
+state có thể chạy trong `camera-recognition`, còn Frigate giữ host integration, evidence contract,
+Event/media publication. Tracker vẫn nằm trong Frigate ở runtime hiện tại; việc tách tracker thành
+edge boundary là kiến trúc đích tiếp theo và không cho phép tracker gọi recognition trực tiếp.
 
 #### Phase 7-1 — Ordered executor và transport-neutral contract [DONE: SOURCE/UNIT]
 
@@ -1197,7 +1377,7 @@ Event/media publication và không có local fallback khi deployment chọn exte
   fail khi endpoint/TLS/config sai; runtime disconnect trả unhealthy/typed failure và không fallback,
   tự retry job hoặc nối session qua epoch.
 
-#### Phase 7-4 — Docker acceptance và packaging [PARTIAL]
+#### Phase 7-4 — Docker acceptance và packaging [DONE]
 
 - `deploy/run.ps1 build` đã tạo Frigate overlay và recognition overlay riêng từ cùng source tree;
   service có GPU/resource/health policy, private network, Face library và certificate mount.
@@ -1205,13 +1385,24 @@ Event/media publication và không có local fallback khi deployment chọn exte
   synchronous core và executor/transport khi healthy. Hai E2E độc lập cùng đọc 4 Face lineage
   (`3 known + 1 unknown`) và 11 raw LPR lineage; attempt count có thể khác do tracker scheduling,
   không được dùng hai wall-clock replay độc lập làm bit-exact differential.
-- External run `20260812-013537-853` complete với 20 producer-owned Face bbox bundles,
-  deadline/failure bằng `0`, service healthy, local model load bằng `0`, cleanup/pending/writer về
-  `0`. Local run `20260812-013921-643` cũng complete với cùng Face terminal identities và cleanup.
-- Không ghi hai run này là global acceptance: external `measurement_valid=false` do correlation/
-  LPR quality diagnostics; restart/disconnect fault injection chưa chạy. Đây là các gate còn mở.
-- Sau runtime acceptance mới đóng gói core/executor và client/schema thành hai wheel; packaging không
-  được tạo namespace hay semantics song song với code đã chạy trong hai image.
+- External healthy run mới `20260812-141524-728` complete với `measurement_valid=true`, Face
+  lineage `4/4` (coverage `1.0`, `38` track-seen), raw LPR `11/11`, API/SQLite consistency,
+  correlation mismatch `0`, không reconnect/stall, service healthy, external không load local model,
+  cleanup/pending/writer về `0` và restore thành công. LPR exact `7/11` được giữ nguyên là
+  diagnostic, không phải hard gate.
+- Validator hiện tương quan bằng producer-owned `trace_id`, source PTS, Event id và media lineage;
+  fixture passage/time/bbox chỉ là comparison view. External trace writer đã bổ sung lineage/geometry
+  cho update từ service. `measurement_valid` vẫn tách khỏi Face/LPR accuracy.
+- Đã thêm `tools/tests/e2e/run_external_recognition_fault_test.py --scenario ...` cho ba fault
+  scenario và `tools/package_recognition_wheels.py`. Hai wheel được build reproducible trong
+  `.tmp/recognition-wheels`, có source commit/worktree hash và SHA-256; clean Python 3.11
+  install/import đã pass. Lần build thứ hai trong `.tmp/recognition-wheels-rebuild` khớp
+  SHA-256 và byte size.
+- Diagnostic LPR accuracy vẫn giữ nguyên kết quả khó đọc và không chặn phase. Ba fault artifact
+  đều hoàn tất qua validator: `stream_disconnect` (`20260812-130708-272`), `client_disconnect`
+  (`20260812-132857-884`) và `service_restart` (`20260812-135955-917`). Typed interruption
+  không còn bị validator đánh nhầm là healthy attempt; cleanup/restore và publication safety là
+  hard gate. Vì vậy Phase 7-4 và Phase 7 được đóng `[DONE]`.
 
 Phase 6-0 hoàn tất riêng không đồng nghĩa recognition core đã hoàn tất. Hiện Phase 6-1…6-5 đều đã
 hoàn thành và Phase 6 đã đóng `[DONE]`. Phase 7 được đánh giá độc lập sau đó; `Acceptance tổng thể`
@@ -1316,7 +1507,7 @@ acceptance ở mục 13:
 | `[DONE]` | Core/differential/adapter tests, whole project và deployment | Phase 6-5: parity/import-isolation/single-owner tests đạt; run `20260811-201337-397` report complete, measurement valid, 4/4 Face raw traces recognized, 15/15 native clips, 22/22 bbox images và runtime healthy sau restore. |
 | `[CURRENT]` | `tools/runtime/validate_platform_runtime.py`, `tools/reporting/summarize_platform_runtime.py`, Phase artifacts | Runtime test xuyên roadmap, full evidence report và diagnostic summary; không kết luận pass/fail bằng threshold. |
 
-### 15.7 Phase 7 — External recognition runtime [IN PROGRESS]
+### 15.7 Phase 7 — External recognition runtime [DONE]
 
 | Trạng thái | Đường dẫn | Can thiệp |
 | --- | --- | --- |
@@ -1324,10 +1515,28 @@ acceptance ở mục 13:
 | `[DONE: SOURCE/UNIT]` | `frigate/frigate/recognition/service/`, protobuf schema | gRPC/mTLS stream, health/capabilities, config và Face control operations, service epoch, bounded dedupe và raw I420 validation đã có targeted test. |
 | `[DONE: SOURCE/UNIT]` | `frigate/frigate/data_processing/common/face_pipeline.py`, LPR mixin, `RecognitionCore` | Local và external dùng chung detector, crop, bbox/evidence producer, LPR processing, voting và publication decision; targeted differential/lifecycle tests đạt. |
 | `[DONE: SOURCE/UNIT]` | `frigate/frigate/embeddings/maintainer.py`, `external_recognition.py` | External client được chọn trực tiếp trong runtime; nhánh này không khởi tạo local Face/LPR model, guard epoch/sequence trước publication, giữ accepted outcome đến ordered END và không có fallback. |
-| `[PARTIAL]` | Recognition Docker image, Compose/deployment và integration tests | Build `deploy/run.ps1` tạo hai overlay image. External run `20260812-013537-853` và local run `20260812-013921-643` đều complete: 4/4 Face lineage (`3 known + 1 unknown`), 11 raw LPR lineage, bbox/evidence hợp lệ, deadline/failure bằng `0`, cleanup/pending/writer về `0`; còn restart/disconnect fault injection trước khi đóng phase. |
-| `[PLANNED]` | Core/client wheel packaging | Chỉ tách hai wheel sau runtime acceptance; wheel phải đóng gói code đã chạy, không tạo implementation song song. |
+| `[DONE]` | Recognition Docker image, Compose/deployment và integration tests | Healthy external run `20260812-141524-728` đạt `measurement_valid=true`, Face `4/4`, raw LPR `11/11`, API/SQLite consistency, correlation `0`, không reconnect/stall, service healthy, local model `0`, cleanup/pending/writer `0`, restore thành công; ba fault artifacts và reproducible wheel manifest đã pass. LPR exact `7/11` là diagnostic. |
+| `[DONE]` | Core/client wheel packaging | Hai wheel core/client đã được build sau runtime acceptance, clean-install/import và reproducibility pass; manifest ghi source/worktree hash, SHA-256 và byte size. |
 
-### 15.8 Profile nguồn LPR 1024p hiện tại
+### 15.8 Phase 8 — Edge tracker runtime [IN PROGRESS — SOURCE GATE BLOCKED]
+
+| Trạng thái | Đường dẫn | Phạm vi kế tiếp |
+| --- | --- | --- |
+| `[IN PROGRESS: SOURCE/UNIT]` | `frigate/frigate/tracker/`, `frigate/frigate/video/`, `frigate/frigate/track/` | Typed contract, durable producer runtime và adapter dùng lại `CameraState`/`TrackedObject`/Norfair/PTZ gốc đã có unit cô lập; chưa có runtime parity |
+| `[IN PROGRESS: SOURCE/UNIT]` | Frigate tracked-object host adapter, config schema, migration 040 | Camera owner, epoch/sequence/idempotency, evidence lineage, canonical ingest record và edge media manifest đã có unit; recognition routing/media proxy chưa có E2E |
+| `[BLOCKED: FULL UNIT GATE]` | `deploy/run.ps1`, `deploy/config.yaml`, `deploy/reference/docker-compose.yml` | Chưa được build/start/restore tracker qua launcher do full regression fail ở default detector union |
+| `[PENDING]` | `tools/tests/e2e/`, `tools/runtime/validate_platform_runtime.py` | Chưa chạy detect/track parity, healthy/fault evidence, lifecycle/publication/cleanup/restore gates |
+
+### 15.9 Phase 9 — Remote distributed runtime [PLANNED]
+
+| Trạng thái | Đường dẫn | Phạm vi sau Phase 8 |
+| --- | --- | --- |
+| `[PLANNED]` | `deploy/run.ps1`, `deploy/config.yaml`, deployment manifests | Remote endpoint/topology cho cả tracker và recognition; không quản lý container remote như local |
+| `[PLANNED]` | Tracker/recognition transport, config và host adapters | gRPC/mTLS preflight, node/camera ownership, schema/config hash, tracker epoch và recognition epoch |
+| `[PLANNED]` | `tools/tests/e2e/`, `tools/runtime/validate_platform_runtime.py` | Remote end-to-end healthy/fault evidence trên cả hai link, publication safety, cleanup và restore |
+| `[PLANNED]` | `docs/architecture/Platform-Test-Report.md` | Report remote topology, certificate/network evidence, per-node resource và source/topology hash |
+
+### 15.10 Profile nguồn LPR 1024p hiện tại
 
 `car_camera` dùng file nguồn đã chuẩn hóa `1820×1024`, detect `1820×1024/5 FPS`;
 `face_camera` là `1280×720/15 FPS` với `max_disappeared=15` để giữ lifetime tracker đúng một giây. Fixture builder không còn dùng một hằng số
@@ -1348,3 +1557,24 @@ trước khi vượt ngân sách. Số frame giữ lại không mang semantics t
 - [Use case và so sánh chi phí Dahua/Hikvision/LS CV](../CameraUseCase.md)
 - [Kiến trúc ADAS Level 0](ADAS.md)
 - [Dahua IPC HTTP API](../references/DahuaHTTPAPI.pdf)
+
+## 17. Báo cáo hiện trạng runtime — 12/08/2026
+
+Artifact xác nhận: [external E2E `20260812-141524-728`](../../.tmp/platform-runtime/20260812-141524-728/summary.json).
+
+| Nhóm | Kết quả |
+| --- | --- |
+| Healthy external E2E | `measurement_valid=true`; runtime hoàn tất và restore thành công |
+| Face | `4/4` lineage, coverage `1.0`, `38` track-seen, `32` attempts |
+| Car/LPR | `11/11` raw trace, `8` publication; exact `7/11` giữ nguyên là diagnostic |
+| Data correctness | API/SQLite pass; correlation mismatch `0` |
+| Runtime stability | Không reconnect/stall; queue/outcome/writer cuối run `0`; rejected `0` |
+| Resource peak | GPU `39%`; VRAM `1367/4096 MiB` (`33,4%`); shared memory `20%` |
+| CPU | Peak tổng hai container `1131,55%` trong startup/warm-up; các mẫu steady-state sau đó khoảng `35–41%` |
+| E2E elapsed | `158,19 giây`, trong đó replay `39,13 giây` |
+
+Diễn giải CPU: phần trăm là Docker CPU cộng theo hai container, nên `100%` xấp xỉ một logical
+core. Peak startup không đại diện tải duy trì; artifact không cho thấy queue tích lũy, stall hoặc
+OOM trong healthy run. Phase 8 edge tracker đang `[IN PROGRESS — SOURCE GATE BLOCKED]`; Phase 9 remote distributed runtime
+cho cả tracker và recognition là `[PLANNED]` sau Phase 8. LPR exact thấp tiếp tục được giữ nguyên
+dưới dạng diagnostic.

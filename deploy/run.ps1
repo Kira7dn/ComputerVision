@@ -139,6 +139,7 @@ function Get-Runtime($Config) {
     ConfiguredImage = $configuredImage
     BuildBaseImage = [string](Get-Value $runtime 'build_base_image' 'camera-frigate:0.18.0-33c00a27e-runtime3-tensorrt')
     RecognitionImage = if ($manifest -and $manifest.recognition_image) { [string]$manifest.recognition_image } else { 'camera-recognition:current' }
+    TrackerImage = if ($manifest -and $manifest.tracker_image) { [string]$manifest.tracker_image } else { 'camera-tracker:current' }
     ExternalRecognition = $null -ne $Config.recognition -and [string](Get-Value $Config.recognition 'runtime' 'local') -eq 'external'
     CpuLimit = $cpu
     ModelPath = Resolve-WorkspacePath ([string](Get-Value $runtime 'model_path' 'models/yolov9-t-320.onnx'))
@@ -148,6 +149,84 @@ function Get-Runtime($Config) {
     ReplaySources = Get-Value $runtime.replay 'sources' ([pscustomobject]@{})
     DirectSources = Get-Value $runtime.direct 'sources' ([pscustomobject]@{})
   }
+}
+
+function Get-TrackerNodes($Config) {
+  if ($null -eq $Config.tracker -or $null -eq $Config.tracker.nodes) { return @() }
+  $owners = @{}
+  $nodes = @()
+  foreach ($property in $Config.tracker.nodes.PSObject.Properties) {
+    $nodeId = [string]$property.Name
+    $node = $property.Value
+    if ($nodeId -notmatch '^[A-Za-z0-9_-]+$') { throw "Invalid tracker node id '$nodeId'." }
+    if (-not [bool](Get-Value $node 'managed' $true)) {
+      throw "Phase 8 supports managed same-host tracker nodes only: $nodeId"
+    }
+    $service = 'tracker-' + $nodeId.ToLowerInvariant().Replace('_','-')
+    $expectedEndpoint = "${service}:50052"
+    if ([string](Get-Value $node 'endpoint' '') -ne $expectedEndpoint) {
+      throw "tracker.nodes.$nodeId.endpoint must be '$expectedEndpoint' for managed same-host deployment."
+    }
+    $cameras = @($node.cameras | ForEach-Object { [string]$_ })
+    if ($cameras.Count -eq 0) { throw "tracker.nodes.$nodeId.cameras must not be empty." }
+    foreach ($camera in $cameras) {
+      if ($Config.cameras.PSObject.Properties.Name -notcontains $camera) {
+        throw "tracker node '$nodeId' references unknown camera '$camera'."
+      }
+      if ($owners.ContainsKey($camera)) {
+        throw "camera '$camera' belongs to tracker nodes '$($owners[$camera])' and '$nodeId'."
+      }
+      $owners[$camera] = $nodeId
+    }
+    $tlsRoot = Join-Path $runtimeDir ("tracker-tls\" + $nodeId)
+    $nodes += [pscustomobject]@{
+      Id = $nodeId
+      Service = $service
+      Container = 'camera-tracker-' + $nodeId.ToLowerInvariant().Replace('_','-')
+      Cameras = $cameras
+      TlsRoot = $tlsRoot
+      ServerName = [string]$node.tls.server_name
+      ConfigPath = Join-Path $runtimeDir ("config.tracker.$nodeId.yml")
+    }
+  }
+  return $nodes
+}
+
+function New-TrackerRuntimeConfigs($Config, [object[]]$TrackerNodes) {
+  if ($TrackerNodes.Count -eq 0) {
+    $env:CAMERA_CONFIG_FILE = $configFile.Replace('\','/')
+    return
+  }
+  $workspacePython = Join-Path $workspace '.venv\Scripts\python.exe'
+  if (-not (Test-Path -LiteralPath $workspacePython -PathType Leaf)) { throw 'Workspace Python is required to generate tracker runtime configs.' }
+  $mainConfig = Join-Path $runtimeDir 'config.main.yml'
+  $mapping = [ordered]@{ main=$mainConfig; nodes=@() }
+  foreach ($node in $TrackerNodes) {
+    $mapping.nodes += [ordered]@{ id=$node.Id; cameras=$node.Cameras; path=$node.ConfigPath }
+  }
+  $mappingPath = Join-Path $runtimeDir 'tracker-topology.json'
+  Write-AtomicUtf8 $mappingPath (($mapping | ConvertTo-Json -Depth 6) + "`n")
+  $script = @'
+import copy, json, pathlib, sys, yaml
+source = pathlib.Path(sys.argv[1])
+mapping = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
+config = yaml.safe_load(source.read_text(encoding="utf-8"))
+assigned = {camera for node in mapping["nodes"] for camera in node["cameras"]}
+main = copy.deepcopy(config)
+streams = main.setdefault("go2rtc", {}).setdefault("streams", {})
+main["go2rtc"]["streams"] = {key: value for key, value in streams.items() if key not in assigned}
+pathlib.Path(mapping["main"]).write_text(yaml.safe_dump(main, sort_keys=False, allow_unicode=True), encoding="utf-8")
+for node in mapping["nodes"]:
+    edge = copy.deepcopy(config)
+    wanted = set(node["cameras"])
+    edge["cameras"] = {key: value for key, value in edge.get("cameras", {}).items() if key in wanted}
+    edge_streams = edge.setdefault("go2rtc", {}).setdefault("streams", {})
+    edge["go2rtc"]["streams"] = {key: value for key, value in edge_streams.items() if key in wanted}
+    pathlib.Path(node["path"]).write_text(yaml.safe_dump(edge, sort_keys=False, allow_unicode=True), encoding="utf-8")
+'@
+  $output = & $workspacePython -c $script $configFile $mappingPath 2>&1
+  if ($LASTEXITCODE -ne 0) { throw "Unable to generate tracker runtime configs: $($output -join ' ')" }
+  $env:CAMERA_CONFIG_FILE = $mainConfig.Replace('\','/')
 }
 
 function Get-FirstStream($Streams, [string]$Name) {
@@ -298,8 +377,8 @@ function Set-ComposeEnvironment($Runtime) {
   New-Item -ItemType Directory -Force -Path $Runtime.MediaDir | Out-Null
   $env:FRIGATE_IMAGE = $Runtime.Image
   $env:RECOGNITION_IMAGE = $Runtime.RecognitionImage
+  $env:TRACKER_IMAGE = $Runtime.TrackerImage
   $env:FRIGATE_CPU_LIMIT = [string]$Runtime.CpuLimit
-  $env:CAMERA_CONFIG_FILE = $configFile.Replace('\','/')
   $env:CAMERA_MODEL_PATH = $Runtime.ModelPath.Replace('\','/')
   $env:FRIGATE_MEDIA_DIR = $Runtime.MediaDir.Replace('\','/')
   if ([string]::IsNullOrWhiteSpace($env:RECOGNITION_TLS_DIR)) {
@@ -376,7 +455,7 @@ function Wait-NgrokReady([string]$ExpectedUrl) {
   return $false
 }
 
-function New-ReplayOverride([object[]]$Sources, $Runtime, [bool]$NotificationsEnabled) {
+function New-ReplayOverride([object[]]$Sources, $Runtime, [bool]$NotificationsEnabled, [object[]]$TrackerNodes) {
   $lines = [Collections.Generic.List[string]]::new()
   $lines.Add('services:')
   $frigateVolumes = [Collections.Generic.List[string]]::new()
@@ -436,6 +515,41 @@ function New-ReplayOverride([object[]]$Sources, $Runtime, [bool]$NotificationsEn
     $command = $commandArgs | ConvertTo-Json -Compress
     $lines.Add("    command: $command")
   }
+  foreach ($node in $TrackerNodes) {
+    $configMount = (($node.ConfigPath.Replace('\','/') + ':/config/config.yml:ro') | ConvertTo-Json -Compress)
+    $modelMount = (($Runtime.ModelPath.Replace('\','/') + ':/models/yolov9-t-320.onnx:ro') | ConvertTo-Json -Compress)
+    $tlsMount = (($node.TlsRoot.Replace('\','/') + ':/run/tracker-tls:ro') | ConvertTo-Json -Compress)
+    $trackerVolumes = [Collections.Generic.List[string]]::new()
+    $trackerVolumes.Add($configMount)
+    $trackerVolumes.Add($modelMount)
+    $trackerVolumes.Add($tlsMount)
+    if (-not [string]::IsNullOrWhiteSpace($env:CAMERA_SOURCE_OVERLAY)) {
+      $trackerVolumes.Add((($sourceOverlay.Replace('\','/') + ':/opt/frigate/frigate:ro') | ConvertTo-Json -Compress))
+    }
+    foreach ($source in @($Sources | Where-Object { $_.Mode -eq 'direct' -and $node.Cameras -contains $_.Name })) {
+      $trackerVolumes.Add((($source.Path.Replace('\','/') + ":$($source.ContainerPath):ro") | ConvertTo-Json -Compress))
+    }
+    $volumeList = @($trackerVolumes) -join ', '
+    $mediaVolume = 'camera-tracker-' + $node.Id.ToLowerInvariant().Replace('_','-') + '-media'
+    $spoolVolume = 'camera-tracker-' + $node.Id.ToLowerInvariant().Replace('_','-') + '-spool'
+    $lines.Add("  $($node.Service):")
+    $lines.Add('    image: ${TRACKER_IMAGE}')
+    $lines.Add("    container_name: $($node.Container)")
+    $lines.Add('    profiles: ["external-tracker"]')
+    $lines.Add('    restart: unless-stopped')
+    $lines.Add('    shm_size: "1gb"')
+    $lines.Add('    gpus: all')
+    $lines.Add("    environment: { TRACKER_NODE_ID: $($node.Id) }")
+    $lines.Add("    volumes: [$volumeList, ${mediaVolume}:/media/tracker, ${spoolVolume}:/var/lib/camera-tracker/spool]")
+  }
+  if ($TrackerNodes.Count -gt 0) {
+    $lines.Add('volumes:')
+    foreach ($node in $TrackerNodes) {
+      $suffix = $node.Id.ToLowerInvariant().Replace('_','-')
+      $lines.Add("  camera-tracker-${suffix}-media: {}")
+      $lines.Add("  camera-tracker-${suffix}-spool: {}")
+    }
+  }
   Write-AtomicUtf8 $composeOverride (($lines -join "`n") + "`n")
 
   $mediaLines = [Collections.Generic.List[string]]::new()
@@ -467,11 +581,12 @@ function New-ReplayOverride([object[]]$Sources, $Runtime, [bool]$NotificationsEn
   Write-AtomicUtf8 $mediaMtxReplayConfig (($mediaLines -join "`n") + "`n")
 }
 
-function Get-ComposePrefix([bool]$Replay, [bool]$ExternalRecognition) {
+function Get-ComposePrefix([bool]$Replay, [bool]$ExternalRecognition, [bool]$ExternalTracker) {
   if (-not (Test-Path -LiteralPath $envFile -PathType Leaf)) { throw "Missing required secrets file: $envFile" }
   $args = @('compose','-f',$composeFile,'-f',$composeOverride,'--env-file',$envFile)
   if ($Replay) { $args += @('--profile','replay') }
   if ($ExternalRecognition) { $args += @('--profile','external-recognition') }
+  if ($ExternalTracker) { $args += @('--profile','external-tracker') }
   return $args
 }
 
@@ -487,6 +602,40 @@ function Invoke-Compose([string[]]$Prefix, [string[]]$Arguments) {
     $ErrorActionPreference = $savedErrorActionPreference
   }
   if ($composeExitCode -ne 0) { throw "Docker Compose failed with exit code $composeExitCode." }
+}
+
+function Wait-ReplayReady([object[]]$ReplaySources, [int]$TimeoutSeconds = 30) {
+  if ($ReplaySources.Count -eq 0) { return }
+  $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+  $lastReason = ''
+  while ([DateTime]::UtcNow -lt $deadline) {
+    $mediaRunning = ((& docker inspect camera-mediamtx --format '{{.State.Running}}' 2>$null) -join '').Trim()
+    if ($mediaRunning -ne 'true') {
+      $lastReason = "camera-mediamtx running=$mediaRunning"
+      Start-Sleep -Milliseconds 250
+      continue
+    }
+    $allPublishersReady = $true
+    foreach ($source in $ReplaySources) {
+      $container = 'camera-replay-' + $source.Name.ToLowerInvariant().Replace('_','-')
+      $running = ((& docker inspect $container --format '{{.State.Running}}' 2>$null) -join '').Trim()
+      if ($running -ne 'true') {
+        $allPublishersReady = $false
+        $lastReason = "$container running=$running"
+        break
+      }
+    }
+    if ($allPublishersReady) {
+      # Docker's embedded DNS only advertises a usable service while the
+      # target container is attached/running.  Verify that condition before
+      # Frigate opens go2rtc/FFmpeg readers.
+      $network = ((& docker inspect camera-mediamtx --format '{{json .NetworkSettings.Networks}}' 2>$null) -join '').Trim()
+      if ($network -and $network -ne '{}') { return }
+      $lastReason = 'camera-mediamtx has no attached Docker network'
+    }
+    Start-Sleep -Milliseconds 250
+  }
+  throw "Replay topology did not become ready before Frigate startup: $lastReason"
 }
 
 function Test-RuntimeDependencies($Runtime) {
@@ -507,6 +656,18 @@ function Test-RuntimeDependencies($Runtime) {
     }
   }
   if (-not (Test-Path -LiteralPath $Runtime.ModelPath -PathType Leaf)) { throw "Missing model: $($Runtime.ModelPath)" }
+}
+
+function Test-TrackerDependencies($Runtime, [object[]]$TrackerNodes) {
+  if ($TrackerNodes.Count -eq 0) { return }
+  & docker image inspect $Runtime.TrackerImage *> $null
+  if ($LASTEXITCODE -ne 0) { throw "Missing tracker image: $($Runtime.TrackerImage)" }
+  foreach ($node in $TrackerNodes) {
+    foreach ($name in @('ca.crt','server.crt','server.key','client.crt','client.key')) {
+      $path = Join-Path $node.TlsRoot $name
+      if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Missing tracker TLS file: $path" }
+    }
+  }
 }
 
 function Wait-RecognitionReady([int]$TimeoutSeconds = 60) {
@@ -552,6 +713,46 @@ raise SystemExit(0 if response.status == health_pb2.HealthCheckResponse.SERVING 
   }
   $logs = (& docker logs --tail 80 camera-recognition 2>&1) -join "`n"
   throw "Recognition service did not become healthy: $logs"
+}
+
+function Wait-TrackerReady([object[]]$TrackerNodes, [int]$TimeoutSeconds = 90) {
+  if ($TrackerNodes.Count -eq 0) { return }
+  foreach ($node in $TrackerNodes) {
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    $cameraJson = ConvertTo-Json -InputObject @($node.Cameras) -Compress
+    $probe = @"
+import grpc, json
+from pathlib import Path
+from frigate.tracker.service.v1 import tracker_pb2 as pb, tracker_pb2_grpc as rpc
+root = Path('/run/tracker-tls')
+credentials = grpc.ssl_channel_credentials(
+    root_certificates=(root / 'ca.crt').read_bytes(),
+    private_key=(root / 'client.key').read_bytes(),
+    certificate_chain=(root / 'client.crt').read_bytes(),
+)
+channel = grpc.secure_channel(
+    '127.0.0.1:50052', credentials,
+    options=(('grpc.ssl_target_name_override', '$($node.ServerName)'),),
+)
+response = rpc.TrackerServiceStub(channel).GetCapabilities(pb.CapabilitiesRequest(), timeout=2)
+expected = set(json.loads('$cameraJson'))
+actual = {item.camera_id for item in response.cameras if item.ready}
+raise SystemExit(0 if response.node_id == '$($node.Id)' and response.schema_version == '1.0.0' and response.mtls_required and expected == actual else 1)
+"@
+    $ready = $false
+    do {
+      $running = ((& docker inspect $node.Container --format '{{.State.Running}}' 2>$null) -join '').Trim()
+      if ($running -eq 'true') {
+        & docker exec $node.Container python3 -c $probe *> $null
+        if ($LASTEXITCODE -eq 0) { $ready = $true; break }
+      }
+      Start-Sleep -Milliseconds 500
+    } while ([DateTime]::UtcNow -lt $deadline)
+    if (-not $ready) {
+      $logs = (& docker logs --tail 100 $node.Container 2>&1) -join "`n"
+      throw "Tracker node '$($node.Id)' did not reach camera readiness: $logs"
+    }
+  }
 }
 
 function Ensure-FrigateConfigVolume {
@@ -607,16 +808,39 @@ function Build-RuntimeImage($Runtime) {
   $recognitionImage = "camera-recognition:overlay-$($recognitionId.Substring(7,12))"
   & docker tag $recognitionCurrent $recognitionImage
   if ($LASTEXITCODE -ne 0) { throw 'Unable to create immutable runtime image tag.' }
+
+  $trackerDockerfile = Join-Path $referenceDir 'Dockerfile.tracker'
+  $trackerCurrent = 'camera-tracker:current'
+  $trackerArgs = @('buildx','build','--load','--pull=false','--file',$trackerDockerfile,'--build-context',"trackerfiles=$referenceDir",'--build-arg',"BASE_IMAGE=$immutableImage",'--tag',$trackerCurrent,$sourceDir)
+  Invoke-BuildStep 'tracker overlay' $dockerPath $trackerArgs $stopwatch
+  $trackerId = (& docker image inspect --format '{{.Id}}' $trackerCurrent).Trim()
+  if (-not $trackerId.StartsWith('sha256:')) { throw "Invalid tracker image id: $trackerId" }
+  $trackerImage = "camera-tracker:overlay-$($trackerId.Substring(7,12))"
+  & docker tag $trackerCurrent $trackerImage
+  if ($LASTEXITCODE -ne 0) { throw 'Unable to create immutable tracker image tag.' }
+  $runtimeSize = [int64]((& docker image inspect --format '{{.Size}}' $immutableImage).Trim())
+  $recognitionSize = [int64]((& docker image inspect --format '{{.Size}}' $recognitionImage).Trim())
+  $trackerSize = [int64]((& docker image inspect --format '{{.Size}}' $trackerImage).Trim())
+  $sourceCommit = (& git -C (Join-Path $workspace 'frigate') rev-parse HEAD).Trim()
+  $worktreeHash = ((& git -C (Join-Path $workspace 'frigate') diff --binary HEAD | git hash-object --stdin) -join '').Trim()
   $manifest = [ordered]@{
     source_image = $Runtime.ConfiguredImage
     image = $immutableImage
     recognition_image = $recognitionImage
+    tracker_image = $trackerImage
     digest = $imageId
+    runtime_bytes = $runtimeSize
+    recognition_digest = $recognitionId
+    recognition_bytes = $recognitionSize
+    tracker_digest = $trackerId
+    tracker_bytes = $trackerSize
+    source_commit = $sourceCommit
+    worktree_hash = $worktreeHash
     built_at = [DateTime]::UtcNow.ToString('o')
   }
   Write-AtomicUtf8 $imageManifestFile (($manifest | ConvertTo-Json) + "`n")
   $stopwatch.Stop()
-  Write-Host ("Built runtime images: {0}, {1} in {2:n1}s (overlay only; full dependency build disabled)." -f $immutableImage,$recognitionImage,$stopwatch.Elapsed.TotalSeconds)
+  Write-Host ("Built runtime images: {0}, {1}, {2} in {3:n1}s (all via run.ps1 overlay build)." -f $immutableImage,$recognitionImage,$trackerImage,$stopwatch.Elapsed.TotalSeconds)
 }
 
 function Test-FrigateConfig($Runtime, [object[]]$Sources) {
@@ -756,17 +980,22 @@ try {
   }
   $config = Get-CameraConfig
   $runtime = Get-Runtime $config
+  $trackerNodes = @(Get-TrackerNodes $config)
   $notificationsEnabled = $null -ne $config.notifications -and [bool](Get-Value $config.notifications 'enabled' $false)
   if ($Command -eq 'build') { Build-RuntimeImage $runtime; exit 0 }
   $sources = @(Resolve-CameraSources $config $runtime)
   $hasReplay = @($sources | Where-Object Mode -eq 'replay').Count -gt 0
   Set-ComposeEnvironment $runtime
-  New-ReplayOverride $sources $runtime $notificationsEnabled
-  $prefix = Get-ComposePrefix $hasReplay $runtime.ExternalRecognition
+  New-TrackerRuntimeConfigs $config $trackerNodes
+  New-ReplayOverride $sources $runtime $notificationsEnabled $trackerNodes
+  $prefix = Get-ComposePrefix $hasReplay $runtime.ExternalRecognition ($trackerNodes.Count -gt 0)
+  $edgeCameras = @($trackerNodes | ForEach-Object { $_.Cameras })
+  $mainSources = @($sources | Where-Object { $edgeCameras -notcontains $_.Name })
 
   switch ($effectiveCommand) {
     'doctor' {
       Test-RuntimeDependencies $runtime
+      Test-TrackerDependencies $runtime $trackerNodes
       $ngrokUrl = if ($notificationsEnabled) { Test-NgrokConfiguration $config } else { '' }
       $probes = @(Test-Sources $sources $runtime.Transport)
       Test-FrigateConfig $runtime $sources
@@ -785,6 +1014,7 @@ try {
     }
     'start' {
       Test-RuntimeDependencies $runtime
+      Test-TrackerDependencies $runtime $trackerNodes
       $ngrokUrl = if ($notificationsEnabled) { Test-NgrokConfiguration $config } else { '' }
       if (-not $notificationsEnabled -and ((& docker ps -a --format '{{.Names}}') -contains 'camera-ngrok')) {
         & docker rm -f camera-ngrok *> $null
@@ -793,25 +1023,40 @@ try {
       Test-FrigateConfig $runtime $sources
       Ensure-FrigateConfigVolume
       Invoke-Compose $prefix @('config','--quiet')
+      $replaySources = @($sources | Where-Object Mode -eq 'replay')
+      if ($replaySources.Count -gt 0) {
+        Invoke-Compose $prefix @('up','-d','--no-build','mediamtx')
+        $replayServices = @($replaySources | ForEach-Object { 'replay-' + $_.Name.ToLowerInvariant().Replace('_','-') })
+        Invoke-Compose $prefix (@('up','-d','--no-build','--force-recreate','--no-deps') + $replayServices)
+        Wait-ReplayReady $replaySources
+      }
       if ($runtime.ExternalRecognition) {
         Invoke-Compose $prefix @('up','-d','--no-build','--force-recreate','--no-deps','recognition')
         Wait-RecognitionReady
-        Invoke-Compose $prefix @('up','-d','--no-build','--remove-orphans','--force-recreate','--no-deps','frigate')
-        Invoke-Compose $prefix @('up','-d','--no-build')
-      } else {
+      } elseif ((& docker ps -a --format '{{.Names}}') -contains 'camera-recognition') {
+        & docker rm -f camera-recognition *> $null
+      }
+      if ($trackerNodes.Count -gt 0) {
+        Invoke-Compose $prefix (@('up','-d','--no-build','--force-recreate','--no-deps') + @($trackerNodes.Service))
+        Wait-TrackerReady $trackerNodes
+      }
+      if (-not $runtime.ExternalRecognition) {
         if ((& docker ps -a --format '{{.Names}}') -contains 'camera-recognition') {
           & docker rm -f camera-recognition *> $null
         }
-        Invoke-Compose $prefix @('up','-d','--no-build','--remove-orphans','--force-recreate')
       }
+      Invoke-Compose $prefix @('up','-d','--no-build','--remove-orphans','--force-recreate','--no-deps','frigate')
+      Invoke-Compose $prefix @('up','-d','--no-build')
       if ($env:CAMERA_SKIP_READY_WAIT -ne '1') {
-        Wait-RuntimeReady $sources $config
+        Wait-RuntimeReady $mainSources $config
+        Wait-TrackerReady $trackerNodes
       }
       $ngrokReady = if ($notificationsEnabled) { Wait-NgrokReady $ngrokUrl } else { $false }
       $state = [ordered]@{
         started_at=[DateTime]::UtcNow.ToString('o')
         development=($null -ne $devSourcePath)
         source_overlay=$devSourcePath
+        tracker_nodes=@($trackerNodes | ForEach-Object { [ordered]@{ node_id=$_.Id; cameras=$_.Cameras; container=$_.Container } })
         cameras=@()
       }
       foreach ($source in $sources) { $state.cameras += [ordered]@{ name=$source.Name; mode=$source.Mode; source=$source.Redacted } }
@@ -871,6 +1116,11 @@ try {
           $running = (& docker inspect $container --format '{{.State.Running}}' 2>$null).Trim()
           if ($running -ne 'true') { throw "Replay publisher '$($source.Name)' did not start." }
         }
+        Wait-ReplayReady $replaySources
+      }
+      if ($trackerNodes.Count -gt 0) {
+        Invoke-Compose $prefix (@('up','-d','--no-build','--force-recreate','--no-deps') + @($trackerNodes.Service))
+        Wait-TrackerReady $trackerNodes
       }
       Invoke-Compose $prefix @('up','-d','--no-build','--force-recreate','--no-deps','frigate')
       $state = [ordered]@{ started_at=[DateTime]::UtcNow.ToString('o'); cameras=@() }
@@ -885,6 +1135,10 @@ try {
       Ensure-FrigateConfigVolume
       Invoke-Compose $prefix @('config','--quiet')
       Invoke-Compose $prefix @('stop','--timeout','10','frigate')
+      if ($trackerNodes.Count -gt 0) {
+        Invoke-Compose $prefix (@('up','-d','--no-build','--force-recreate','--no-deps') + @($trackerNodes.Service))
+        Wait-TrackerReady $trackerNodes
+      }
       Invoke-Compose $prefix @('up','-d','--no-build','--force-recreate','--no-deps','frigate')
       if (-not $runtime.ExternalRecognition -and ((& docker ps -a --format '{{.Names}}') -contains 'camera-recognition')) {
         & docker rm -f camera-recognition *> $null
