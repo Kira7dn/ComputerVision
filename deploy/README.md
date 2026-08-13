@@ -100,7 +100,7 @@ dạng image đã kiểm duyệt. Không dùng `deploy/run.ps1` để full-build
 - notification outbox từ Event đã commit.
 
 `camera-recognition` là deployment riêng của **tập con Face/LPR recognition thuộc Frigate**,
-chỉ xuất hiện ở topology `external`:
+chỉ xuất hiện ở topology `recognition` hoặc `tracker`:
 
 - model Face/LPR, `RecognitionCore` và session state;
 - nhận job qua gRPC/mTLS và trả typed outcome;

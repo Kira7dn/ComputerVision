@@ -263,7 +263,7 @@ def validate_runtime_lpr_evidence(
     return records, summary
 
 
-def validate_external_recognition_evidence(
+def validate_recognition_evidence(
     media_root: Path,
     runtime_records: list[dict[str, Any]],
     evidence_records: list[dict[str, Any]],
@@ -424,6 +424,10 @@ def validate_external_recognition_evidence(
     }
 
 
+# Backward-compatible import name for existing acceptance tests.
+validate_external_recognition_evidence = validate_recognition_evidence
+
+
 def run_deploy(
     command: str,
     config: Path | None = None,
@@ -443,15 +447,24 @@ def run_deploy(
         args += ["-ConfigFile", str(config)]
     if fault_scenario is not None:
         args += ["-FaultScenario", fault_scenario]
-    completed = subprocess.run(
-        args,
-        check=False,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=timeout,
-    )
+    try:
+        completed = subprocess.run(
+            args,
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout.decode("utf-8", "replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+        stderr = exc.stderr.decode("utf-8", "replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+        detail = "\n".join(part.strip() for part in (stdout, stderr) if part.strip())
+        raise TimeoutError(
+            f"deploy/run.ps1 {command} timed out after {timeout} seconds"
+            + (f":\n{detail}" if detail else "")
+        ) from exc
     if completed.returncode != 0:
         detail = "\n".join(
             part.strip()
@@ -722,6 +735,7 @@ def create_recognition_tls(directory: Path) -> None:
 def configure_recognition_topology(
     config: dict[str, Any], topology: str, workspace: Path
 ) -> Path | None:
+    """Build the E2E fixture overlay; deployment remains the topology compiler."""
     if topology == "local":
         config["recognition"] = {"runtime": "local"}
         return None
@@ -749,6 +763,7 @@ def configure_recognition_topology(
 def configure_tracker_topology(
     config: dict[str, Any], topology: str
 ) -> Path | None:
+    """Build the E2E tracker fixture overlay; launcher compiles its runtime views."""
     if topology != "tracker":
         config.pop("tracker", None)
         return None
@@ -817,8 +832,11 @@ def capture_container_diagnostics(
     output: Path, since: float | None, topology: str = "local"
 ) -> None:
     """Persist acceptance-container evidence before restore replaces it."""
+    launcher_steps = Path(".tmp/runtime/launcher-steps.jsonl")
+    if launcher_steps.is_file():
+        shutil.copy2(launcher_steps, output / "launcher-steps.jsonl")
     containers = ["frigate"]
-    if topology in ("external", "tracker"):
+    if topology in ("recognition", "tracker"):
         containers.append("camera-recognition")
     if topology == "tracker":
         containers.append("camera-tracker-edge-local")
@@ -998,6 +1016,45 @@ def wait_source_starts(directory: Path, timeout: float = 60.0) -> dict[str, floa
     raise TimeoutError("direct MP4 sources did not emit their first frame")
 
 
+def wait_tracker_ready(
+    state_path: Path,
+    expected_cameras: set[str],
+    timeout: float = 15.0,
+    require_cameras: bool = True,
+) -> dict[str, Any]:
+    """Require tracker service readiness, optionally including camera workers."""
+    deadline = time.monotonic() + timeout
+    last_reason = "tracker state unavailable"
+    while time.monotonic() < deadline:
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            nodes = state.get("tracker_nodes", [])
+            ready_cameras = {
+                camera.get("camera_id")
+                for node in nodes
+                for camera in node.get("cameras", [])
+                if camera.get("ready")
+            }
+            healthy = all(
+                node.get("health", {}).get("ready")
+                and not node.get("health", {}).get("degraded")
+                for node in nodes
+            )
+            if nodes and healthy and (
+                not require_cameras or ready_cameras == expected_cameras
+            ):
+                return state
+            last_reason = (
+                f"nodes={len(nodes)}, healthy={healthy}, "
+                f"ready_cameras={sorted(ready_cameras)}, "
+                f"expected={sorted(expected_cameras)}"
+            )
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            last_reason = str(exc)
+        time.sleep(0.25)
+    raise TimeoutError(f"tracker runtime not ready: {last_reason}")
+
+
 def wait_source_ends(directory: Path, deadline: float) -> dict[str, float]:
     """Wait for each finite detect input to enqueue its final source frame."""
     while time.monotonic() < deadline:
@@ -1033,12 +1090,18 @@ def wait_latest_through(source_ended: dict[str, float], deadline: float) -> None
 
 
 def restore_mounts_verified(config: Path) -> bool:
-    expected = str(config.resolve()).replace("\\", "/").lower()
-    expected_suffix = (
-        expected[0] + expected[2:]
-        if len(expected) > 2 and expected[1] == ":"
-        else expected
-    )
+    expected_paths = {
+        str(config.resolve()).replace("\\", "/").lower(),
+        str(Path(".tmp/runtime/config.main.yml").resolve())
+        .replace("\\", "/")
+        .lower(),
+    }
+    expected_suffixes = {
+        value[0] + value[2:]
+        if len(value) > 2 and value[1] == ":"
+        else value
+        for value in expected_paths
+    }
     try:
         if (
             docker_output("inspect", "frigate", "--format", "{{.State.Running}}")
@@ -1058,7 +1121,8 @@ def restore_mounts_verified(config: Path) -> bool:
         )
         actual = str((config_mount or {}).get("Source", "")).replace("\\", "/").lower()
         return bool(config_mount) and (
-            actual == expected or actual.endswith(expected_suffix)
+            actual in expected_paths
+            or any(actual.endswith(suffix) for suffix in expected_suffixes)
         )
     except Exception:
         return False
@@ -1085,7 +1149,7 @@ def parse_bytes(value: str) -> int:
 class ResourceSampler:
     def __init__(self, topology: str = "local") -> None:
         self.containers = ["frigate"] + (
-            ["camera-recognition"] if topology in ("external", "tracker") else []
+            ["camera-recognition"] if topology in ("recognition", "tracker") else []
         )
         if topology == "tracker":
             self.containers.append("camera-tracker-edge-local")
@@ -4499,16 +4563,22 @@ def write_compact_runtime_report(output: Path, summary: dict[str, Any]) -> Path:
             if line.strip()
         ]
 
+    runtime_records = load_records("runtime-trace.json")
+    if not runtime_records:
+        runtime_records = load_jsonl_records("media/runtime-trace.jsonl")
+    lpr_evidence_records = load_records("runtime-evidence.json")
+    if not lpr_evidence_records:
+        lpr_evidence_records = load_jsonl_records("media/lpr/evidence.jsonl")
     face_evidence_records = load_jsonl_records("media/face/evidence.jsonl")
     face_annotated_records = load_records("face-annotated-evidence.json")
     records = [
-        *load_records("runtime-trace.json"),
-        *load_records("runtime-evidence.json"),
+        *runtime_records,
+        *lpr_evidence_records,
         *(face_evidence_records or face_annotated_records),
     ]
     image_index = write_runtime_image_index(
         output,
-        load_records("runtime-evidence.json"),
+        lpr_evidence_records,
         face_evidence_records or face_annotated_records,
     )
 
@@ -4934,6 +5004,15 @@ def write_compact_runtime_report(output: Path, summary: dict[str, Any]) -> Path:
     lines = [
         "# Runtime Test Report",
         "",
+        *(
+            [
+                "> **Incomplete run:** Partial producer evidence recovered before "
+                f"failure: `{summary['error']}`",
+                "",
+            ]
+            if summary.get("error")
+            else []
+        ),
         "## Run",
         "",
         _md_table(
@@ -5132,7 +5211,7 @@ def main(argv: list[str] | None = None) -> int:
         description="Run one Platform runtime evidence replay and create a timestamped report."
     )
     parser.add_argument(
-        "--topology", choices=("local", "external", "tracker"), default="local"
+        "--topology", choices=("local", "recognition", "tracker"), default="local"
     )
     parser.add_argument(
         "--fault-scenario",
@@ -5149,10 +5228,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     topology = str(args.topology)
     if args.fault_scenario and topology == "local":
-        parser.error("--fault-scenario requires an external topology")
+        parser.error("--fault-scenario requires a recognition or tracker topology")
     if topology == "tracker" and args.fault_scenario == "service_restart":
         parser.error("tracker topology uses --fault-scenario tracker_restart")
-    if topology == "external" and args.fault_scenario not in (
+    if topology == "recognition" and args.fault_scenario not in (
         None,
         "service_restart",
         "stream_disconnect",
@@ -5250,7 +5329,11 @@ def main(argv: list[str] | None = None) -> int:
         summary["timing"]["fixture_seconds"] = round(time.monotonic() - step_started, 3)
         # All topology mutations, including the pre-acceptance stop, are launcher-owned.
         runtime_started = True
-        run_deploy("stop", config, timeout=30)
+        run_deploy(
+            "stop",
+            config,
+            timeout=90 if topology in ("recognition", "tracker") else 30,
+        )
 
         isolated_start_wall = time.time()
         step_started = time.monotonic()
@@ -5284,7 +5367,7 @@ def main(argv: list[str] | None = None) -> int:
             run_deploy(
                 "acceptance-start",
                 Path(fixture["config"]),
-                timeout=90 if topology in ("external", "tracker") else 30,
+                timeout=180 if topology in ("recognition", "tracker") else 30,
             )
             launcher_state_path = Path(".tmp/runtime/state.json")
             if not launcher_state_path.is_file():
@@ -5300,6 +5383,13 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 os.environ["CAMERA_SOURCE_OVERLAY"] = previous_source_overlay
         source_started = wait_source_starts(source_start_dir, timeout=60)
+        if topology == "tracker":
+            tracker_state = wait_tracker_ready(
+                Path(".tmp/runtime/state.json"),
+                set(CAMERAS.values()),
+                require_cameras=False,
+            )
+            summary["tracker_readiness"] = tracker_state.get("tracker_nodes", [])
         wait_acceptance_ready(
             str(value["runtime"]["image"]), timeout=60, topology=topology
         )
@@ -5422,19 +5512,19 @@ def main(argv: list[str] | None = None) -> int:
         raw_lpr_trace_ids = pipeline_trace_ids(runtime_records, "lpr")
         raw_face_trace_ids = pipeline_trace_ids(runtime_records, "face")
         all_media_evidence = media_evidence_records(output / "media")
-        external_evidence = (
-            validate_external_recognition_evidence(
+        recognition_evidence = (
+            validate_recognition_evidence(
                 output / "media", runtime_records, all_media_evidence
             )
-            if topology in ("external", "tracker")
+            if topology in ("recognition", "tracker")
             else {"valid": True, "errors": []}
         )
-        if not external_evidence["valid"]:
+        if not recognition_evidence["valid"]:
             raise RuntimeError(
-                "External recognition evidence is invalid: "
-                + "; ".join(external_evidence.get("errors", ()))
+                "Recognition evidence is invalid: "
+                + "; ".join(recognition_evidence.get("errors", ()))
             )
-        write_json(output / "external-recognition-evidence.json", external_evidence)
+        write_json(output / "recognition-evidence.json", recognition_evidence)
         face_annotated_evidence = annotate_face_evidence(
             output / "media", all_media_evidence
         )
@@ -5522,7 +5612,7 @@ def main(argv: list[str] | None = None) -> int:
             model_logs = f"{model_logs}\n{tracker_logs}"
         recognition_logs = (
             docker_logs("camera-recognition", isolated_start_wall)
-            if topology in ("external", "tracker")
+            if topology in ("recognition", "tracker")
             else ""
         )
         pending = parse_pending(runtime_logs)
@@ -5541,7 +5631,7 @@ def main(argv: list[str] | None = None) -> int:
                 r"reconnect|stall|no frames|ffmpeg.*(?:error|crash)", line, re.I
             )
         ]
-        if topology in ("external", "tracker"):
+        if topology in ("recognition", "tracker"):
             bad_log_lines.extend(
                 line
                 for line in recognition_logs.splitlines()
@@ -5682,7 +5772,7 @@ def main(argv: list[str] | None = None) -> int:
                 "service_epoch": service_epochs[0] if len(service_epochs) == 1 else None,
                 "local_models_disabled": local_models_disabled,
                 "healthy": bool(recognition_stats.get("service_healthy", 0))
-                if topology in ("external", "tracker")
+                if topology in ("recognition", "tracker")
                 else None,
             },
             "resources": resources,
@@ -5698,7 +5788,7 @@ def main(argv: list[str] | None = None) -> int:
             "source_pts": observed_source_pts,
             "recognition_metrics": {"samples": sampler.recognition},
             "lpr_evidence": runtime_lpr_evidence,
-            "external_recognition_evidence": external_evidence,
+            "recognition_evidence": recognition_evidence,
             "face_annotated_evidence": {
                 key: value
                 for key, value in face_annotated_evidence.items()
@@ -5833,6 +5923,10 @@ def main(argv: list[str] | None = None) -> int:
         restore_ok = not runtime_started
         if runtime_started:
             try:
+                if previous_recognition_tls is None:
+                    os.environ.pop("RECOGNITION_TLS_DIR", None)
+                else:
+                    os.environ["RECOGNITION_TLS_DIR"] = previous_recognition_tls
                 run_deploy("acceptance-restore", config, timeout=30)
                 restore_ok = restore_mounts_verified(config)
             except Exception as exc:
@@ -5917,7 +6011,7 @@ def main(argv: list[str] | None = None) -> int:
             "launcher-state.json",
         ) + (
             ("container-inspect-recognition.json", "container-recognition.log")
-            if topology in ("external", "tracker")
+            if topology in ("recognition", "tracker")
             else ()
         ) + (
             ("container-inspect-tracker-edge-local.json", "container-tracker-edge-local.log")

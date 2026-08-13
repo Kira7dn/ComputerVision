@@ -152,6 +152,8 @@ def test_finalize_finite_source_tracks_uses_raw_ids_once(
     [
         "D:/BusinessAnalyze/Camera/deploy/config.yaml",
         "/run/desktop/mnt/host/d/BusinessAnalyze/Camera/deploy/config.yaml",
+        "D:/BusinessAnalyze/Camera/.tmp/runtime/config.main.yml",
+        "/run/desktop/mnt/host/d/BusinessAnalyze/Camera/.tmp/runtime/config.main.yml",
     ],
 )
 def test_restore_mount_verification_accepts_windows_docker_path_forms(
@@ -309,6 +311,61 @@ def test_compact_report_has_one_canonical_table_per_pipeline(
     assert "[0 LPR images](media/images.md#lpr)" in report
     assert "[0 artifacts](media/images.md#face)" in report
     assert (tmp_path / "media" / "images.md").is_file()
+
+
+def test_incomplete_report_recovers_partial_jsonl_evidence(tmp_path: Path) -> None:
+    media = tmp_path / "media"
+    (media / "lpr").mkdir(parents=True)
+    records = [
+        {
+            "pipeline": "lpr",
+            "trace_id": "lpr:car_camera:track-1",
+            "stage": "track_seen",
+            "source_pts": 1.0,
+        },
+        {
+            "pipeline": "lpr",
+            "trace_id": "lpr:car_camera:track-1",
+            "stage": "event_published",
+            "plate": "ABC123",
+            "source_pts": 1.1,
+        },
+        {
+            "pipeline": "face",
+            "trace_id": "face:face_camera:track-2",
+            "stage": "track_seen",
+            "source_pts": 2.0,
+        },
+        {
+            "pipeline": "face",
+            "trace_id": "face:face_camera:track-2",
+            "stage": "recognition_skipped",
+            "reason": "no_recognition_result",
+            "source_pts": 2.1,
+        },
+    ]
+    (media / "runtime-trace.jsonl").write_text(
+        "".join(json.dumps(record) + "\n" for record in records),
+        encoding="utf-8",
+    )
+    (media / "lpr" / "evidence.jsonl").write_text("", encoding="utf-8")
+    summary = {
+        "error": "RuntimeError: face evidence missing",
+        "topology": "recognition",
+        "report": {"status": "incomplete"},
+        "measurement": {"measurement_valid": False},
+        "runtime": {"recognition": {}, "resources": {}, "source_pts": {}},
+        "lpr": {"passages": [{"passage_id": "L01", "expected_plate": "ABC123"}]},
+        "face": {"passages": []},
+    }
+
+    report = write_compact_runtime_report(tmp_path, summary).read_text(encoding="utf-8")
+
+    assert "Incomplete run" in report
+    assert "Partial producer evidence recovered" in report
+    assert "| 1/1 | 0 | 0 | 0 | 1 |" in report
+    assert "face:face_camera:track-2" in report
+    assert "0/0" not in report
 
 
 def test_source_pts_completeness_ignores_non_frame_terminal_records() -> None:

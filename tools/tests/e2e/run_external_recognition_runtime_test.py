@@ -1,4 +1,4 @@
-"""Stable entrypoint for the external recognition runtime evidence test."""
+"""Stable entrypoint for the recognition topology runtime evidence test."""
 # ruff: noqa: E402, I001
 
 import sys
@@ -9,4 +9,4 @@ from tools.runtime.validate_platform_runtime import main
 
 
 if __name__ == "__main__":
-    raise SystemExit(main(["--topology", "external"]))
+    raise SystemExit(main(["--topology", "recognition"]))

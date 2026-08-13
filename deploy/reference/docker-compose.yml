@@ -22,6 +22,7 @@ services:
     volumes:
       - frigate-config:/config:ro
       - ${CAMERA_CONFIG_FILE:?run.ps1 must set CAMERA_CONFIG_FILE}:/config/config.yml:ro
+      - ${CAMERA_MODEL_CACHE_PATH:?run.ps1 must set CAMERA_MODEL_CACHE_PATH}:/config/model_cache:ro
       - ${FRIGATE_MEDIA_DIR:-E:/Docker/Frigate/media}:/media/frigate
       - ${RECOGNITION_TLS_DIR:-../../.tmp/runtime/recognition-tls}:/run/recognition-tls:ro
       - /etc/localtime:/etc/localtime:ro
@@ -68,6 +69,7 @@ services:
     volumes:
       - frigate-config:/config
       - ${CAMERA_CONFIG_FILE:?run.ps1 must set CAMERA_CONFIG_FILE}:/config/config.yml
+      - ${CAMERA_MODEL_CACHE_PATH:?run.ps1 must set CAMERA_MODEL_CACHE_PATH}:/config/model_cache
       - ${FRIGATE_MEDIA_DIR:-E:/Docker/Frigate/media}:/media/frigate
       - ${CAMERA_MODEL_PATH:?run.ps1 must set CAMERA_MODEL_PATH}:/assets/models/yolov9-t-320.onnx:ro
       - ${RECOGNITION_TLS_DIR:-../../.tmp/runtime/recognition-tls}:/run/recognition-tls:ro

@@ -1,4 +1,4 @@
-"""Thin entrypoint for one real Docker external-recognition fault scenario."""
+"""Thin entrypoint for one real Docker recognition fault scenario."""
 # ruff: noqa: I001
 
 import argparse
@@ -15,4 +15,4 @@ if __name__ == "__main__":
         "service_restart", "stream_disconnect", "client_disconnect"
     ))
     args = parser.parse_args()
-    raise SystemExit(main(["--topology", "external", "--fault-scenario", args.scenario]))
+    raise SystemExit(main(["--topology", "recognition", "--fault-scenario", args.scenario]))

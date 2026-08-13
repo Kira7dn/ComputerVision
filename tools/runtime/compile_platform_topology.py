@@ -3,13 +3,10 @@
 from __future__ import annotations
 
 import argparse
-import copy
 import json
 import os
 import sys
 from pathlib import Path
-
-import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 FRIGATE_SRC = ROOT / "frigate" / "src"
@@ -41,23 +38,18 @@ def main() -> int:
     args = parser.parse_args()
 
     _load_env_file(args.env_file)
-    from frigate.infrastructure.config import FrigateConfig
     from extension.topology.compiler import compile_topology, materialize_topology
+    from extension.topology.loader import PlatformConfigLoader
 
-    raw = yaml.safe_load(args.config.read_text(encoding="utf-8"))
-    if not isinstance(raw, dict):
-        raise ValueError("config.yaml must contain a YAML mapping")
-    validation_raw = copy.deepcopy(raw)
-    model = validation_raw.get("model")
-    if isinstance(model, dict) and model.get("labelmap_path") == "/labelmap/coco-80.txt":
-        model["labelmap_path"] = str(
+    source = PlatformConfigLoader.load_source(
+        args.config,
+        host_labelmap_path=(
             ROOT / "frigate" / "docker" / "main" / "rootfs" / "labelmap" / "coco-80.txt"
-        )
-    config = FrigateConfig.model_validate(validation_raw)
-    if config.runtime.topology_role != "source":
-        raise ValueError("launcher input must be a source topology config")
+        ),
+    )
+    config = source.config
     plan = compile_topology(config)
-    manifest = materialize_topology(raw, plan, args.output_dir)
+    manifest = materialize_topology(source.raw, plan, args.output_dir)
     print(json.dumps(manifest, ensure_ascii=False, sort_keys=True))
     return 0
 

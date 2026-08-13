@@ -22,15 +22,43 @@ def test_tracker_build_is_owned_by_launcher() -> None:
 def test_tracker_entrypoint_uses_frigate_package_root() -> None:
     tracker_run = _tracker_run()
     assert "cd /opt/frigate" in tracker_run
-    assert "python3 -u -m extension.tracker.service.app" in tracker_run
+    assert "python3 -u -m extension.tracker.app" in tracker_run
 
 
-def test_tracker_camera_readiness_precedes_frigate() -> None:
+def test_tracker_service_readiness_precedes_frigate_without_camera_gate() -> None:
     launcher = _launcher()
-    tracker_start = launcher.index("@($trackerNodes.Service)")
+    acceptance = launcher.index("    'acceptance-start'")
+    tracker_start = launcher.index("@($trackerNodes.Service)", acceptance)
     tracker_ready = launcher.index("Wait-TrackerReady $trackerNodes", tracker_start)
     frigate_start = launcher.index("'--no-deps','frigate'", tracker_ready)
     assert tracker_start < tracker_ready < frigate_start
+    assert "-RequireCameras:$false" in launcher[tracker_ready:frigate_start]
+
+
+def test_acceptance_timeouts_are_nested_and_launcher_steps_are_durable() -> None:
+    launcher = _launcher()
+    validator = Path("tools/runtime/validate_platform_runtime.py").read_text(
+        encoding="utf-8"
+    )
+    acceptance = launcher[launcher.index("    'acceptance-start'") :]
+    assert "Wait-TrackerReady $trackerNodes 30 -RequireCameras:$false" in acceptance
+    assert "timeout=180 if topology" in validator
+    assert 'timeout=90 if topology in ("recognition", "tracker") else 30' in validator
+    assert "Write-LauncherStep 'recognition-readiness' 'starting'" in acceptance
+    assert "Write-LauncherStep 'tracker-service-readiness' 'starting'" in acceptance
+    assert "Write-LauncherStep 'frigate-create' 'starting'" in acceptance
+
+
+def test_acceptance_validates_storage_and_restores_recognition_lifecycle() -> None:
+    launcher = _launcher()
+    acceptance = launcher[launcher.index("    'acceptance-start'") :]
+    restore = launcher[launcher.index("    'acceptance-restore'") :]
+    assert "Test-RuntimeStorage $runtime $config" in acceptance
+    assert "Test-RuntimeStorage $runtime $config" in restore
+    recognition_start = restore.index("'--no-deps','recognition'")
+    recognition_ready = restore.index("Wait-RecognitionReady", recognition_start)
+    frigate_start = restore.index("'--no-deps','frigate'", recognition_ready)
+    assert recognition_start < recognition_ready < frigate_start
 
 
 def test_tracker_readiness_treats_startup_connection_errors_as_failed_polls() -> None:
@@ -50,7 +78,11 @@ def test_tracker_runtime_uses_private_state_and_mtls() -> None:
     assert ":/var/lib/camera-tracker/spool" in launcher
     assert ":/run/tracker-tls:ro" in launcher
     assert "grpc.secure_channel" in launcher
-    assert "response.mtls_required" in launcher
+    assert "grpc.ssl_channel_credentials" in launcher
+    assert "root_certificates=" in launcher
+    assert "private_key=" in launcher
+    assert "certificate_chain=" in launcher
+    assert "response['schema_version'] == 1" in launcher
 
 
 def test_tracker_receives_the_same_config_environment_as_frigate() -> None:

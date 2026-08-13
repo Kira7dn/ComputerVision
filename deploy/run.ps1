@@ -23,6 +23,7 @@ $runtimeDir = Join-Path $workspace '.tmp\runtime'
 $composeOverride = Join-Path $runtimeDir 'compose.replay.yml'
 $mediaMtxReplayConfig = Join-Path $runtimeDir 'mediamtx.replay.yml'
 $stateFile = Join-Path $runtimeDir 'state.json'
+$launcherStepFile = Join-Path $runtimeDir 'launcher-steps.jsonl'
 $imageManifestFile = Join-Path $runtimeDir 'image.json'
 $defaultImage = 'camera-frigate:0.18.0-33c00a27e-runtime3-reviewfix1-tensorrt'
 $buildTimeLimitSeconds = 300
@@ -37,6 +38,23 @@ function Write-AtomicUtf8([string]$Path, [string]$Content) {
   } finally {
     if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force }
   }
+}
+
+function Write-LauncherStep([string]$Step, [string]$Status, [hashtable]$Detail = @{}) {
+  $record = [ordered]@{
+    timestamp=[DateTime]::UtcNow.ToString('o')
+    step=$Step
+    status=$Status
+  }
+  foreach ($key in $Detail.Keys) { $record[$key] = $Detail[$key] }
+  $directory = Split-Path -Parent $launcherStepFile
+  New-Item -ItemType Directory -Force -Path $directory | Out-Null
+  [IO.File]::AppendAllText(
+    $launcherStepFile,
+    (($record | ConvertTo-Json -Compress -Depth 6) + "`n"),
+    [Text.UTF8Encoding]::new($false)
+  )
+  Write-Host ("[{0}] {1}: {2}" -f $record.timestamp,$Step,$Status)
 }
 
 function Protect-Source([string]$Value) {
@@ -161,7 +179,13 @@ function Initialize-PlatformTopology {
   }
   $compiler = Join-Path $workspace 'tools\runtime\compile_platform_topology.py'
   $topologyManifestPath = Join-Path $runtimeDir 'platform-topology.json'
-  $output = & $workspacePython $compiler --config $configFile --output-dir $runtimeDir --env-file $envFile 2>&1
+  $previousErrorActionPreference = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try {
+    $output = & $workspacePython $compiler --config $configFile --output-dir $runtimeDir --env-file $envFile 2>&1
+  } finally {
+    $ErrorActionPreference = $previousErrorActionPreference
+  }
   if ($LASTEXITCODE -ne 0) {
     throw "Unable to compile platform topology: $($output -join ' ')"
   }
@@ -337,6 +361,11 @@ function Set-ComposeEnvironment($Runtime) {
   $env:TRACKER_IMAGE = $Runtime.TrackerImage
   $env:FRIGATE_CPU_LIMIT = [string]$Runtime.CpuLimit
   $env:CAMERA_MODEL_PATH = $Runtime.ModelPath.Replace('\','/')
+  $modelCachePath = Join-Path $workspace 'frigate\config\model_cache'
+  if (-not (Test-Path -LiteralPath $modelCachePath -PathType Container)) {
+    throw "Missing Frigate model cache: $modelCachePath"
+  }
+  $env:CAMERA_MODEL_CACHE_PATH = $modelCachePath.Replace('\','/')
   $env:FRIGATE_MEDIA_DIR = $Runtime.MediaDir.Replace('\','/')
   if ([string]::IsNullOrWhiteSpace($env:RECOGNITION_TLS_DIR)) {
     $env:RECOGNITION_TLS_DIR = (Join-Path $runtimeDir 'recognition-tls').Replace('\','/')
@@ -354,6 +383,30 @@ function Set-ComposeEnvironment($Runtime) {
       if (-not [string]::IsNullOrWhiteSpace($legacy)) {
         [Environment]::SetEnvironmentVariable($mapping[0], $legacy)
       }
+    }
+  }
+}
+
+function Test-RuntimeStorage($Runtime, $Config) {
+  if (-not (Test-Path -LiteralPath $Runtime.MediaDir -PathType Container)) {
+    throw "Runtime media directory is missing: $($Runtime.MediaDir)"
+  }
+  $databasePath = [string](Get-Value $Config.database 'path' '')
+  if ([string]::IsNullOrWhiteSpace($databasePath)) { return }
+  $containerPrefix = '/media/frigate/'
+  if (-not $databasePath.StartsWith($containerPrefix, [StringComparison]::Ordinal)) {
+    return
+  }
+  $relative = $databasePath.Substring($containerPrefix.Length).Replace('/', [IO.Path]::DirectorySeparatorChar)
+  $hostDatabase = Join-Path $Runtime.MediaDir $relative
+  $parent = Split-Path -Parent $hostDatabase
+  New-Item -ItemType Directory -Force -Path $parent | Out-Null
+  $probe = Join-Path $parent ('.camera-write-probe-' + [IO.Path]::GetRandomFileName())
+  try {
+    [IO.File]::WriteAllBytes($probe, [byte[]]@(0))
+  } finally {
+    if (Test-Path -LiteralPath $probe -PathType Leaf) {
+      Remove-Item -LiteralPath $probe -Force
     }
   }
 }
@@ -655,7 +708,7 @@ function Wait-RecognitionReady([int]$TimeoutSeconds = 60) {
   $probe = @'
 import grpc
 from pathlib import Path
-from frigate.recognition.service import health_pb2, health_pb2_grpc
+from extension.recognition import health_pb2, health_pb2_grpc
 root = Path('/run/recognition-tls')
 credentials = grpc.ssl_channel_credentials(
     root_certificates=(root / 'ca.crt').read_bytes(),
@@ -696,7 +749,7 @@ raise SystemExit(0 if response.status == health_pb2.HealthCheckResponse.SERVING 
   throw "Recognition service did not become healthy: $logs"
 }
 
-function Wait-TrackerReady([object[]]$TrackerNodes, [int]$TimeoutSeconds = 90) {
+function Wait-TrackerReady([object[]]$TrackerNodes, [int]$TimeoutSeconds = 45, [switch]$RequireCameras) {
   if ($TrackerNodes.Count -eq 0) { return @() }
   $states = @()
   $savedErrorActionPreference = $ErrorActionPreference
@@ -707,10 +760,10 @@ function Wait-TrackerReady([object[]]$TrackerNodes, [int]$TimeoutSeconds = 90) {
     foreach ($node in $TrackerNodes) {
       $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
       $cameraJson = ConvertTo-Json -InputObject @($node.Cameras) -Compress
+      $requireCamerasValue = if ($RequireCameras) { 'True' } else { 'False' }
       $probe = @"
 import grpc, json
 from pathlib import Path
-from extension.tracker.service.v1 import tracker_pb2 as pb, tracker_pb2_grpc as rpc
 root = Path('/run/tracker-tls')
 credentials = grpc.ssl_channel_credentials(
     root_certificates=(root / 'ca.crt').read_bytes(),
@@ -721,36 +774,20 @@ channel = grpc.secure_channel(
     '127.0.0.1:50052', credentials,
     options=(('grpc.ssl_target_name_override', '$($node.ServerName)'),),
 )
-response = rpc.TrackerServiceStub(channel).GetCapabilities(pb.CapabilitiesRequest(), timeout=2)
+call = channel.unary_unary(
+    '/camera.tracker.v1.TrackerService/GetCapabilities',
+    request_serializer=lambda value: value,
+    response_deserializer=lambda value: value,
+)
+response = json.loads(call(b'{}', timeout=2))
 expected = set(json.loads('$cameraJson'))
-actual = {item.camera_id for item in response.cameras if item.ready}
-valid = response.node_id == '$($node.Id)' and response.schema_version == '1.0.0' and response.mtls_required and expected == actual
+actual = {item['camera_id'] for item in response['cameras'] if item['ready']}
+identity_ready = response['node_id'] == '$($node.Id)' and response['schema_version'] == 1 and response['health']['ready'] and not response['health']['degraded']
+valid = identity_ready and ((not $requireCamerasValue) or expected == actual)
 if valid:
     print(json.dumps({
-        'node_id': response.node_id,
-        'node_epoch': response.node_epoch,
-        'schema_version': response.schema_version,
-        'config_hash': response.config_hash,
-        'mtls_required': response.mtls_required,
-        'health': {
-            'ready': response.health.ready,
-            'degraded': response.health.degraded,
-            'pending_ack': response.health.pending_ack,
-            'spool_bytes': response.health.spool_bytes,
-            'pinned_evidence': response.health.pinned_evidence,
-            'active_lifecycles': response.health.active_lifecycles,
-        },
-        'cameras': [
-            {
-                'camera_id': item.camera_id,
-                'ready': item.ready,
-                'camera_fps': item.camera_fps,
-                'process_fps': item.process_fps,
-                'capture_pid': item.capture_pid,
-                'process_pid': item.process_pid,
-            }
-            for item in response.cameras
-        ],
+        **response,
+        'mtls_required': True,
     }, sort_keys=True))
 raise SystemExit(0 if valid else 1)
 "@
@@ -1117,14 +1154,23 @@ try {
       # The passage acceptance validator already performs strict fixture/config checks and
       # owns readiness/stability gates. Keep this switch bounded to compose
       # recreation so startup and rollback remain inside its 119-second budget.
+      if (Test-Path -LiteralPath $launcherStepFile -PathType Leaf) {
+        Remove-Item -LiteralPath $launcherStepFile -Force
+      }
+      Write-LauncherStep 'acceptance-start' 'started' @{ config=$configFile }
+      Test-RuntimeDependencies $runtime
+      Test-TrackerDependencies $runtime $trackerNodes
+      Test-RuntimeStorage $runtime $config
       Ensure-FrigateConfigVolume
       Invoke-Compose $prefix @('config','--quiet')
       # SQLite must finish WAL/checkpoint work before Compose replaces the
       # container or an acceptance timeout can surface as a disk I/O failure.
       Invoke-Compose $prefix @('stop','--timeout','10','frigate')
       if ($runtime.ExternalRecognition) {
+        Write-LauncherStep 'recognition-readiness' 'starting'
         Invoke-Compose $prefix @('up','-d','--no-build','--force-recreate','--no-deps','recognition')
         Wait-RecognitionReady
+        Write-LauncherStep 'recognition-readiness' 'ready'
       } elseif ((& docker ps -a --format '{{.Names}}') -contains 'camera-recognition') {
         & docker rm -f camera-recognition *> $null
       }
@@ -1150,10 +1196,17 @@ try {
       }
       $trackerReadiness = @()
       if ($trackerNodes.Count -gt 0) {
+        Write-LauncherStep 'tracker-service-readiness' 'starting'
         Invoke-Compose $prefix (@('up','-d','--no-build','--force-recreate','--no-deps') + @($trackerNodes.Service))
-        $trackerReadiness = @(Wait-TrackerReady $trackerNodes)
+        # acceptance-start only gates on the tracker service. Camera FPS is
+        # established after Frigate main attaches to the direct source and is
+        # validated by the acceptance runner, not during topology startup.
+        $trackerReadiness = @(Wait-TrackerReady $trackerNodes 30 -RequireCameras:$false)
+        Write-LauncherStep 'tracker-service-readiness' 'ready' @{ nodes=$trackerReadiness.Count }
       }
+      Write-LauncherStep 'frigate-create' 'starting'
       Invoke-Compose $prefix @('up','-d','--no-build','--force-recreate','--no-deps','frigate')
+      Write-LauncherStep 'frigate-create' 'created'
       $sourceCommit = ((& git -C (Join-Path $workspace 'frigate') rev-parse HEAD) -join '').Trim()
       $worktreeHash = ((& git -C (Join-Path $workspace 'frigate') diff --binary HEAD | git hash-object --stdin) -join '').Trim()
       $imageManifest = if (Test-Path -LiteralPath $imageManifestFile) {
@@ -1172,6 +1225,7 @@ try {
       }
       foreach ($source in $sources) { $state.cameras += [ordered]@{ name=$source.Name; mode=$source.Mode; source=$source.Redacted } }
       Write-AtomicUtf8 $stateFile (($state | ConvertTo-Json -Depth 5) + "`n")
+      Write-LauncherStep 'acceptance-start' 'complete'
       Write-Host "Acceptance runtime containers recreated for $($sources.Count) camera(s)."
     }
     'acceptance-fault' {
@@ -1239,16 +1293,22 @@ try {
       # them alive during rollback and replace only Frigate, which is the sole
       # service that must remount deploy/config.yaml.
       Ensure-FrigateConfigVolume
+      Test-RuntimeDependencies $runtime
+      Test-TrackerDependencies $runtime $trackerNodes
+      Test-RuntimeStorage $runtime $config
       Invoke-Compose $prefix @('config','--quiet')
       Invoke-Compose $prefix @('stop','--timeout','10','frigate')
-      if ($trackerNodes.Count -gt 0) {
-        Invoke-Compose $prefix (@('up','-d','--no-build','--force-recreate','--no-deps') + @($trackerNodes.Service))
-        Wait-TrackerReady $trackerNodes
-      }
-      Invoke-Compose $prefix @('up','-d','--no-build','--force-recreate','--no-deps','frigate')
-      if (-not $runtime.ExternalRecognition -and ((& docker ps -a --format '{{.Names}}') -contains 'camera-recognition')) {
+      if ($runtime.ExternalRecognition) {
+        Invoke-Compose $prefix @('up','-d','--no-build','--force-recreate','--no-deps','recognition')
+        Wait-RecognitionReady
+      } elseif ((& docker ps -a --format '{{.Names}}') -contains 'camera-recognition') {
         & docker rm -f camera-recognition *> $null
       }
+      if ($trackerNodes.Count -gt 0) {
+        Invoke-Compose $prefix (@('up','-d','--no-build','--force-recreate','--no-deps') + @($trackerNodes.Service))
+        Wait-TrackerReady $trackerNodes 30 -RequireCameras:$false
+      }
+      Invoke-Compose $prefix @('up','-d','--no-build','--force-recreate','--no-deps','frigate')
       $state = [ordered]@{ started_at=[DateTime]::UtcNow.ToString('o'); cameras=@() }
       foreach ($source in $sources) { $state.cameras += [ordered]@{ name=$source.Name; mode=$source.Mode; source=$source.Redacted } }
       Write-AtomicUtf8 $stateFile (($state | ConvertTo-Json -Depth 5) + "`n")

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from extension.topology.fingerprint import canonical_json, fingerprint
+
 import tools.runtime.validate_platform_runtime as runtime
 
 
@@ -11,7 +13,7 @@ def test_topology_configuration_has_one_source_of_truth(monkeypatch, tmp_path):
         runtime, "create_recognition_tls", lambda path: created.append(path)
     )
     config = {}
-    tls = runtime.configure_recognition_topology(config, "external", tmp_path)
+    tls = runtime.configure_recognition_topology(config, "recognition", tmp_path)
     assert tls == tmp_path / "recognition-tls"
     assert created == [tls]
     assert config["recognition"] == {
@@ -39,7 +41,7 @@ def test_external_wrapper_reuses_runtime_validator():
     wrapper = Path(
         "tools/tests/e2e/run_external_recognition_runtime_test.py"
     ).read_text(encoding="utf-8")
-    assert 'main(["--topology", "external"])' in wrapper
+    assert 'main(["--topology", "recognition"])' in wrapper
     assert "validate_platform_runtime import main" in wrapper
 
 
@@ -52,9 +54,47 @@ def test_deployment_starts_service_before_frigate():
     assert "--profile','external-recognition'" in deploy
 
 
+def test_recognition_service_uses_an_in_memory_noncanonical_database() -> None:
+    source = Path("frigate/src/extension/recognition/app.py").read_text(
+        encoding="utf-8"
+    )
+    assert 'config.database.path = ":memory:"' in source
+
+
+def test_restore_switches_from_run_scoped_tls_before_launcher_call() -> None:
+    validator = Path("tools/runtime/validate_platform_runtime.py").read_text(
+        encoding="utf-8"
+    )
+    restore = validator[validator.index("restore_ok = not runtime_started") :]
+    reset = restore.index('os.environ.pop("RECOGNITION_TLS_DIR", None)')
+    call = restore.index('run_deploy("acceptance-restore"', reset)
+    assert reset < call
+
+
 def test_replay_topology_is_ready_before_frigate_start():
     deploy = Path("deploy/run.ps1").read_text(encoding="utf-8")
     replay_ready = deploy.index("Wait-ReplayReady $replaySources")
     frigate_start = deploy.index("'--no-deps','frigate'", replay_ready)
     assert replay_ready < frigate_start
     assert "camera-mediamtx running=" in deploy
+
+
+def test_runtime_fingerprint_is_deterministic_and_utf8():
+    first = canonical_json({"z": "á", "a": 1})
+    second = canonical_json({"a": 1, "z": "á"})
+    assert first == second
+    assert fingerprint(first) == fingerprint(second)
+
+
+def test_tracker_readiness_requires_all_expected_cameras(tmp_path):
+    state = tmp_path / "state.json"
+    state.write_text(
+        '{"tracker_nodes":[{"health":{"ready":true,"degraded":false},'
+        '"cameras":[{"camera_id":"face_camera","ready":true},'
+        '{"camera_id":"car_camera","ready":true}]}]}',
+        encoding="utf-8",
+    )
+    result = runtime.wait_tracker_ready(
+        state, {"face_camera", "car_camera"}, timeout=0.1
+    )
+    assert result["tracker_nodes"][0]["health"]["ready"] is True

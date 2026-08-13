@@ -177,9 +177,9 @@ Mỗi lần chạy phải lưu tối thiểu:
 | `lpr.json` | Bảng car passage × round, funnel và raw plate result |
 | `container-inspect.json` | Docker container configuration/state |
 | `container.log` | Log runtime trong cửa sổ test |
-| `container-inspect-recognition.json` | External service state; chỉ bắt buộc ở external topology |
-| `container-recognition.log` | External service log; chỉ bắt buộc ở external topology |
-| `external-recognition-evidence.json` | Hash/shape/bbox/stage audit của producer-owned artifacts |
+| `container-inspect-recognition.json` | Recognition service state; chỉ bắt buộc ở recognition/tracker topology |
+| `container-recognition.log` | Recognition service log; chỉ bắt buộc ở recognition/tracker topology |
+| `recognition-evidence.json` | Hash/shape/bbox/stage audit của producer-owned artifacts |
 | `media/images.md` | Gallery đầy đủ theo producer trace/evidence; gồm mọi LPR artifact và bộ Face raw attempt/bbox/crop |
 
 Media được giữ theo cấu trúc:
