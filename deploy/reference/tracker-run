@@ -3,7 +3,7 @@ set -eu
 
 cd /opt/frigate
 
-exec python3 -u -m camera_platform.tracker.service.app \
+exec python3 -u -m extension.tracker.service.app \
   --config /config/config.yml \
   --node-id "${TRACKER_NODE_ID:?TRACKER_NODE_ID is required}" \
   --bind 0.0.0.0:50052 \

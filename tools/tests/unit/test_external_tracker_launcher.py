@@ -22,7 +22,7 @@ def test_tracker_build_is_owned_by_launcher() -> None:
 def test_tracker_entrypoint_uses_frigate_package_root() -> None:
     tracker_run = _tracker_run()
     assert "cd /opt/frigate" in tracker_run
-    assert "python3 -u -m camera_platform.tracker.service.app" in tracker_run
+    assert "python3 -u -m extension.tracker.service.app" in tracker_run
 
 
 def test_tracker_camera_readiness_precedes_frigate() -> None:
@@ -65,7 +65,7 @@ def test_tracker_receives_the_same_config_environment_as_frigate() -> None:
 
 def test_each_tracker_runtime_config_contains_only_its_node() -> None:
     launcher = _launcher()
-    compiler = Path("frigate/src/camera_platform/topology/compiler.py").read_text(encoding="utf-8")
+    compiler = Path("frigate/src/extension/topology/compiler.py").read_text(encoding="utf-8")
     topology_launcher = launcher[
         launcher.index("function Initialize-PlatformTopology") : launcher.index(
             "function Get-FirstStream"
@@ -80,7 +80,7 @@ def test_each_tracker_runtime_config_contains_only_its_node() -> None:
 
 def test_main_live_streams_proxy_private_edge_go2rtc() -> None:
     launcher = _launcher()
-    compiler = Path("frigate/src/camera_platform/topology/compiler.py").read_text(encoding="utf-8")
+    compiler = Path("frigate/src/extension/topology/compiler.py").read_text(encoding="utf-8")
     assert 'streams[camera] = f"rtsp://{node.service}:8554/{camera}"' in compiler
     assert "if name in wanted" in compiler
     assert "Initialize-PlatformTopology" in launcher

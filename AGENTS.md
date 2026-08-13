@@ -57,9 +57,9 @@
 ## Nested Frigate development standards
 
 - Nested Frigate production code lives under `frigate/src`; the workspace extension lives under
-  `frigate/src/camera_platform`.
+  `frigate/src/extension`.
 - The embedded Frigate tracking core lives under `frigate/src/frigate/domain/track`; edge tracker
-  transport, ownership, journal, media, and topology live under `frigate/src/camera_platform/tracker`.
+  transport, ownership, journal, media, and topology live under `frigate/src/extension/tracker`.
 - API routes remain under `frigate/src/frigate/api`; application orchestration remains under
   `frigate/src/frigate/application`; system adapters remain under `frigate/src/frigate/infrastructure`.
 - Use the shared root environment `D:\BusinessAnalyze\Camera\.venv` for both workspace and nested
@@ -85,10 +85,10 @@
 ## Nested Frigate development standards
 
 - Nested Frigate production code lives under `frigate/src`; the workspace extension lives under
-  `frigate/src/camera_platform`.
+  `frigate/src/extension`.
 - Embedded Frigate tracking core lives under `frigate/src/frigate/domain/track`.
   Edge tracker transport, ownership, journal, media, and topology live under
-  `frigate/src/camera_platform/tracker`.
+  `frigate/src/extension/tracker`.
 - API routes live under `frigate/src/frigate/api`.
 - Application orchestration lives under `frigate/src/frigate/application`.
 - Domain behavior lives under `frigate/src/frigate/domain`.

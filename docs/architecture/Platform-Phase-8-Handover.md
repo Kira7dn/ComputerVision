@@ -45,7 +45,7 @@ Không được dùng xung đột tài liệu này để âm thầm đổi speci
   ```
 
 - Có central topology compiler tại:
-  - `frigate/src/camera_platform/topology/compiler.py`
+  - `frigate/src/extension/topology/compiler.py`
   - `tools/runtime/compile_platform_topology.py`
 - Topology plan hiện chịu trách nhiệm resolve recognition mode, tracker nodes, camera
   ownership, embedded camera view, per-node camera view, config revision và topology hash.
@@ -79,7 +79,7 @@ Không được dùng xung đột tài liệu này để âm thầm đổi speci
 frigate/
   src/
     frigate/                    # upstream Frigate package
-    camera_platform/            # topology + recognition + tracker extensions
+    extension/            # topology + recognition + tracker extensions
       config/
       topology/
       recognition/
@@ -88,7 +88,7 @@ frigate/
 ```
 
 Không có file/package nào đã được chuyển sang `frigate/src` hoặc
-`frigate/src/camera_platform` trong lượt restructure cuối. Vì vậy không được giả định rằng
+`frigate/src/extension` trong lượt restructure cuối. Vì vậy không được giả định rằng
 pyproject, Dockerfile, launcher overlay, module entrypoint hoặc test import đã hỗ trợ `src`
 layout.
 
@@ -162,7 +162,7 @@ Các thay đổi ngoài Phase 8 có thể cùng tồn tại trong working tree. 
 ### A. Chốt source boundary trước khi restructure vật lý
 
 Giữ import namespace upstream là `frigate.*`. Tách extension thành
-`camera_platform.{config,topology,recognition,tracker}` chỉ khi đã lập mapping đầy đủ cho:
+`extension.{config,topology,recognition,tracker}` chỉ khi đã lập mapping đầy đủ cho:
 
 - Python packaging/import root.
 - Docker/runtime COPY và `PYTHONPATH`.
@@ -176,7 +176,7 @@ Không đổi behavior API của upstream chỉ để đạt folder đẹp.
 
 1. Chụp inventory và diff của cả outer/nested repository.
 2. Hoàn tất và review central topology/config boundary.
-3. Chuyển riêng platform extensions sang `camera_platform` và sửa import/entrypoint.
+3. Chuyển riêng platform extensions sang `extension` và sửa import/entrypoint.
 4. Chạy targeted import/config tests; nếu fail thì sửa ngay tại lát đó.
 5. Chỉ sau khi extension boundary ổn mới cân nhắc chuyển upstream package sang `src/frigate`.
 6. Sau source gate, chạy đúng thứ tự: targeted/unit → compile/Ruff/diff → launcher build →

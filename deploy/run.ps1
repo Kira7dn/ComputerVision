@@ -710,7 +710,7 @@ function Wait-TrackerReady([object[]]$TrackerNodes, [int]$TimeoutSeconds = 90) {
       $probe = @"
 import grpc, json
 from pathlib import Path
-from camera_platform.tracker.service.v1 import tracker_pb2 as pb, tracker_pb2_grpc as rpc
+from extension.tracker.service.v1 import tracker_pb2 as pb, tracker_pb2_grpc as rpc
 root = Path('/run/tracker-tls')
 credentials = grpc.ssl_channel_credentials(
     root_certificates=(root / 'ca.crt').read_bytes(),
@@ -845,7 +845,7 @@ function Build-RuntimeImage($Runtime) {
   $recognitionSize = [int64]((& docker image inspect --format '{{.Size}}' $recognitionImage).Trim())
   $trackerSize = [int64]((& docker image inspect --format '{{.Size}}' $trackerImage).Trim())
   $sourceCommit = (& git -C (Join-Path $workspace 'frigate') rev-parse HEAD).Trim()
-  $worktreeHash = ((& git -C (Join-Path $workspace 'frigate') diff --binary HEAD | git hash-object --stdin) -join '').Trim()
+  $worktreeHash = ((& git -c core.autocrlf=false -C (Join-Path $workspace 'frigate') diff --binary HEAD | git hash-object --stdin) -join '').Trim()
   $manifest = [ordered]@{
     source_image = $Runtime.ConfiguredImage
     image = $immutableImage

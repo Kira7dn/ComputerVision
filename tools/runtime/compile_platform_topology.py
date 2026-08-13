@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import sys
@@ -11,19 +12,15 @@ from pathlib import Path
 import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
-FRIGATE_ROOT = ROOT / "frigate"
-if str(FRIGATE_ROOT) not in sys.path:
-    sys.path.insert(0, str(FRIGATE_ROOT))
-
-from frigate.infrastructure.config import FrigateConfig  # noqa: E402
-from extension.topology.compiler import (  # noqa: E402
-    compile_topology,
-    materialize_topology,
-)
-
+FRIGATE_SRC = ROOT / "frigate" / "src"
+if str(FRIGATE_SRC) not in sys.path:
+    sys.path.insert(0, str(FRIGATE_SRC))
 
 def _load_env_file(path: Path | None) -> None:
-    if path is None or not path.is_file():
+    if path is None:
+        return
+    path = path.resolve()
+    if not path.is_file():
         return
     for raw_line in path.read_text(encoding="utf-8").splitlines():
         line = raw_line.strip()
@@ -44,10 +41,19 @@ def main() -> int:
     args = parser.parse_args()
 
     _load_env_file(args.env_file)
+    from frigate.infrastructure.config import FrigateConfig
+    from extension.topology.compiler import compile_topology, materialize_topology
+
     raw = yaml.safe_load(args.config.read_text(encoding="utf-8"))
     if not isinstance(raw, dict):
         raise ValueError("config.yaml must contain a YAML mapping")
-    config = FrigateConfig.model_validate(raw)
+    validation_raw = copy.deepcopy(raw)
+    model = validation_raw.get("model")
+    if isinstance(model, dict) and model.get("labelmap_path") == "/labelmap/coco-80.txt":
+        model["labelmap_path"] = str(
+            ROOT / "frigate" / "docker" / "main" / "rootfs" / "labelmap" / "coco-80.txt"
+        )
+    config = FrigateConfig.model_validate(validation_raw)
     if config.runtime.topology_role != "source":
         raise ValueError("launcher input must be a source topology config")
     plan = compile_topology(config)

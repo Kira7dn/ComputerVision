@@ -1522,7 +1522,7 @@ acceptance ở mục 13:
 
 | Trạng thái | Đường dẫn | Phạm vi kế tiếp |
 | --- | --- | --- |
-| `[IN PROGRESS: SOURCE/UNIT]` | `frigate/src/camera_platform/tracker/`, `frigate/src/frigate/domain/video/`, `frigate/src/frigate/domain/track/` | Typed contract, durable producer runtime và adapter dùng lại `CameraState`/`TrackedObject`/Norfair/PTZ gốc đã có unit cô lập; chưa có runtime parity |
+| `[IN PROGRESS: SOURCE/UNIT]` | `frigate/src/extension/tracker/`, `frigate/src/frigate/domain/video/`, `frigate/src/frigate/domain/track/` | Typed contract, durable producer runtime và adapter dùng lại `CameraState`/`TrackedObject`/Norfair/PTZ gốc đã có unit cô lập; chưa có runtime parity |
 | `[IN PROGRESS: SOURCE/UNIT]` | Frigate tracked-object host adapter, config schema, migration 040 | Camera owner, epoch/sequence/idempotency, evidence lineage, canonical ingest record và edge media manifest đã có unit; recognition routing/media proxy chưa có E2E |
 | `[BLOCKED: FULL UNIT GATE]` | `deploy/run.ps1`, `deploy/config.yaml`, `deploy/reference/docker-compose.yml` | Chưa được build/start/restore tracker qua launcher do full regression fail ở default detector union |
 | `[PENDING]` | `tools/tests/e2e/`, `tools/runtime/validate_platform_runtime.py` | Chưa chạy detect/track parity, healthy/fault evidence, lifecycle/publication/cleanup/restore gates |
