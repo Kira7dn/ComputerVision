@@ -61,7 +61,8 @@ def test_default_runtime_uses_an_isolated_lifecycle() -> None:
     )
     assert "--preserve-runtime" not in validator
     assert "CAMERA_REUSE_SERVICES" not in validator
-    assert 'run_deploy(\n            "stop",' in validator
+    assert 'run_deploy(\n            "stop",' not in validator
+    assert "acceptance-start force-recreates every test service" in validator
     assert 'run_deploy("acceptance-restore", config' in validator
     assert "configure_recognition_topology(value, topology, tls_workspace)" in validator
     assert "configure_tracker_topology(value, topology)" in validator
@@ -76,6 +77,23 @@ def test_default_runtime_keeps_evidence_in_the_timestamped_report() -> None:
     assert "PASSAGE_SESSION_FILE" not in validator
     assert 'run_deploy("acceptance-park"' not in validator
     assert 'run_deploy("acceptance-restore", config' in validator
+    assert 'topology != "tracker" or summary["accepted"] is True' in validator
+    assert "finalize_report_assets(output)" in validator
+    assert "preserve_failed_run_staging" in validator
+    assert "Producer-owned clips and traces were materialized" in validator
+    for redundant in (
+        "fixture-comparison.json",
+        "recognition-evidence.json",
+        "tracker-lifecycle.json",
+        "face-annotated-evidence.json",
+        "runtime-evidence.json",
+        "runtime-trace.json\"",
+        "native-media.json",
+        "face.json",
+        "lpr.json",
+        "launcher-state.json",
+    ):
+        assert redundant not in validator
 
 
 def test_deployment_starts_service_before_frigate():

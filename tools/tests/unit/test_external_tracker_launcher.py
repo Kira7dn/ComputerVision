@@ -11,10 +11,6 @@ def _tracker_run() -> str:
     return Path("deploy/reference/tracker-run").read_text(encoding="utf-8")
 
 
-def _tracker_dev_reload() -> str:
-    return Path("deploy/reference/tracker-dev-reload.py").read_text(encoding="utf-8")
-
-
 def test_tracker_build_is_owned_by_launcher() -> None:
     launcher = _launcher()
     assert "Dockerfile.tracker" in launcher
@@ -31,23 +27,38 @@ def test_tracker_entrypoint_uses_frigate_package_root() -> None:
     assert 'ENTRYPOINT ["/bin/sh", "/tracker-run"]' in dockerfile
 
 
-def test_tracker_dev_hot_reload_uses_host_source_without_build() -> None:
+def test_python_service_hot_reload_uses_compose_watch_without_build() -> None:
     launcher = _launcher()
-    dev_reload = _tracker_dev_reload()
     assert "CAMERA_HOT_RELOAD = '1'" in launcher
     assert ":/opt/frigate/frigate:ro" in launcher
     assert ":/opt/frigate/extension:ro" in launcher
     assert ":/usr/local/go2rtc/create_config.py:ro" in launcher
     assert "$lines.Add('    image: ${FRIGATE_IMAGE}')" in launcher
-    assert 'entrypoint: [\"python3\", \"-u\", \"/tracker-dev-reload.py\"]' in launcher
     assert 'entrypoint: [\"/bin/sh\", \"/tracker-run\"]' in launcher
-    assert "from watchfiles import PythonFilter, watch" in dev_reload
-    assert "extension.tracker.app" in dev_reload
-    assert "/opt/frigate/frigate" in dev_reload
-    assert "/opt/frigate/extension" in dev_reload
-    assert "return 75" in dev_reload
+    assert "$lines.Add('  recognition:')" in launcher
+    assert "$lines.Add('    develop:')" in launcher
+    assert "$lines.Add('          action: restart')" in launcher
+    assert "':/media/frigate/edge-media'" in launcher
+    assert "@('watch','--no-up')" in launcher
+    assert "Start-DevWatch $prefix" in launcher
+    assert "Get-DevWatchServices" in launcher
     dev_start = launcher[launcher.index("    'start' {") : launcher.index("    'dev-restart' {")]
     assert "--no-build" in dev_start
+
+
+def test_acceptance_script_creates_missing_services_and_waits_for_readiness() -> None:
+    launcher = _launcher()
+    acceptance = launcher[
+        launcher.index("    'acceptance-start'") : launcher.index(
+            "    'acceptance-park'"
+        )
+    ]
+    assert "Test-RuntimeDependencies $runtime" in acceptance
+    assert "Invoke-Compose $prefix @('config','--quiet')" in acceptance
+    assert acceptance.count("@('up','-d','--no-build'") >= 3
+    assert "Wait-RecognitionReady" in acceptance
+    assert "Wait-TrackerReady" in acceptance
+    assert "Get-FrigateInternalStats" in acceptance
 
 
 def test_go2rtc_dev_overlay_uses_current_config_package() -> None:
@@ -101,7 +112,8 @@ def test_stop_removes_launcher_owned_containers_left_by_another_profile() -> Non
     launcher = _launcher()
     stop = launcher[launcher.index("    'stop' {") :]
     assert "$_ -eq 'frigate' -or $_ -like 'camera-*'" in stop
-    assert "docker rm -f @remaining" in stop
+    assert "docker rm -f $remaining" in stop
+    assert "docker rm -f @remaining" not in stop
     assert stop.count("@('down','--remove-orphans')") == 2
 
 
@@ -113,7 +125,7 @@ def test_acceptance_timeouts_are_nested_and_launcher_steps_are_durable() -> None
     acceptance = launcher[launcher.index("    'acceptance-start'") :]
     assert "Wait-TrackerReady $trackerNodes 30 -RequireCameras:$false" in acceptance
     assert "timeout=180 if topology" in validator
-    assert 'timeout=90 if topology in ("recognition", "tracker") else 30' in validator
+    assert 'run_deploy(\n            "stop",' not in validator
     assert "Write-LauncherStep 'recognition-readiness' 'starting'" in acceptance
     assert "Write-LauncherStep 'tracker-service-readiness' 'starting'" in acceptance
     assert "Write-LauncherStep 'frigate-create' 'starting'" in acceptance

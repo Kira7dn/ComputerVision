@@ -32,9 +32,19 @@ python tools/tests/e2e/run_external_recognition_runtime_test.py
 `tools/runtime/validate_platform_runtime.py` là implementation tham số hóa duy nhất. Các wrapper
 không copy scorer, fixture, media writer hoặc report logic.
 
-Entrypoint mặc định dùng isolated lifecycle: dừng runtime acceptance cũ, khởi động đúng topology
-tracker, chạy replay hữu hạn, thu artifact rồi gọi `acceptance-restore`. Source hiện tại được
-bind-mount vào Frigate và tracker nên healthy E2E không yêu cầu build image trong development.
+Entrypoint mặc định dùng isolated lifecycle: force-recreate đúng các service test bằng config,
+database, TLS và evidence directory riêng của run, chạy replay hữu hạn, thu artifact rồi gọi
+`acceptance-restore`. Không teardown Compose network trước khi tạo lại cùng các service. Source hiện tại được
+bind-mount vào Frigate, recognition và tracker nên healthy E2E không yêu cầu build image trong
+development. `deploy/run.ps1 dev-start` dùng Docker Compose watch để tự restart các Python
+service khi source thay đổi; MediaMTX và replay publisher không chứa source ứng dụng nên không
+tham gia watch.
+
+Run retention `20260814-213819-309` hoàn tất với `accepted=true`, đủ 15 trace/clip và
+`runtime_restored=true`. Tracker ghi `edge-media` trực tiếp vào report bind mount; sau khi clip,
+trace và ảnh debug cuối đã được xác nhận, runner xóa transport staging, test TLS và SQLite
+WAL/SHM. Artifact giảm còn `145.496 MiB`; root chỉ còn `summary.json` và ba Docker inspect JSON;
+failed run vẫn giữ staging nguyên vẹn để chẩn đoán.
 
 Mỗi invocation tự tạo một thư mục timestamp:
 
@@ -173,18 +183,18 @@ Mỗi lần chạy phải lưu tối thiểu:
 | Artifact | Nội dung |
 | --- | --- |
 | `report.md` | Run header; khối LPR và Face tách riêng; hardware/runtime health rõ đơn vị; link gallery evidence thật |
-| `summary.json` | Report tổng hợp, measurement, runtime và diagnostic data |
-| `runtime-trace.json` | Trace detector/track/Event/Face/LPR theo source PTS |
-| `runtime-evidence.json` | LPR invocation, crop, plate detector và OCR evidence |
-| `native-media.json` | Quan hệ `trace_id → Event.id → recording segments → clip.mp4`, hash và ffprobe |
-| `face.json` | Bảng Face passage × round và latency |
-| `lpr.json` | Bảng car passage × round, funnel và raw plate result |
+| `summary.json` | JSON canonical duy nhất: fixture, launcher state, Face/LPR result, native media, lifecycle, measurement và diagnostics |
+| `media/runtime-trace.jsonl` | Raw detector/track/Event/Face/LPR trace theo source PTS |
+| `media/lpr/evidence.jsonl` | Raw LPR invocation, crop, plate detector và OCR evidence |
+| `media/face/evidence.jsonl` | Raw Face attempt/bbox/crop evidence |
 | `container-inspect.json` | Docker container configuration/state |
 | `container.log` | Log runtime trong cửa sổ test |
 | `container-inspect-recognition.json` | Recognition service state; chỉ bắt buộc ở recognition/tracker topology |
 | `container-recognition.log` | Recognition service log; chỉ bắt buộc ở recognition/tracker topology |
-| `recognition-evidence.json` | Hash/shape/bbox/stage audit của producer-owned artifacts |
 | `media/images.md` | Gallery đầy đủ theo producer trace/evidence; gồm mọi LPR artifact và bộ Face raw attempt/bbox/crop |
+
+Runner không tạo các JSON root lặp lại `summary.json` hoặc JSONL media. Fixture metadata và
+launcher state được truyền trong memory rồi nhúng trực tiếp vào `summary.json`.
 
 Media được giữ theo cấu trúc:
 
@@ -192,7 +202,7 @@ Media được giữ theo cấu trúc:
 media/
 ├── runtime-trace.jsonl          # raw trace của đúng run_id hiện tại
 ├── lpr/<safe_trace_id>/
-│   ├── clip.mp4                # tải từ native recording API
+│   ├── clip.mp4                # materialize trực tiếp từ edge tracker media
 │   ├── trace.json
 │   └── <evidence_id>/*.jpg
 └── face/<safe_trace_id>/
@@ -212,7 +222,7 @@ không vẽ bbox thay thế và không tạo evidence ID/track ID giả.
 `report.md` chỉ giữ link và tổng số ảnh để không kéo dài bảng kết quả. `media/images.md` hiển thị
 toàn bộ ảnh trong các nhóm có thể thu gọn theo trace. Mỗi ảnh nằm trong timeline có sequence,
 source PTS, stage, evidence ID, decision/result, bbox/crop, byte size và SHA-256 để truy ngược
-failure. LPR lấy record từ `runtime-evidence.json`; Face lấy record từ producer
+failure. LPR lấy record từ producer `media/lpr/evidence.jsonl`; Face lấy record từ producer
 `media/face/evidence.jsonl`, không suy diễn metadata từ tên file.
 
 Kho `recordings`, SQLite, snapshot/cache và enrollment phục vụ Frigate nằm trong workspace

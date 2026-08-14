@@ -283,9 +283,6 @@ def main() -> int:
         "config_sha256": file_hash(config_path),
         "elapsed_seconds": round(time.monotonic() - started, 3),
     }
-    (output / "fixture.json").write_text(
-        json.dumps(result, indent=2) + "\n", encoding="utf-8"
-    )
     print(json.dumps(result))
     return 0
 

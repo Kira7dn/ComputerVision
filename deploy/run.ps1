@@ -2,7 +2,7 @@
 param(
   [Parameter(Position = 0)]
   [ValidateSet('help', 'start', 'dev-start', 'dev-restart', 'dev-logs', 'dev-stop', 'acceptance-start', 'acceptance-park', 'acceptance-fault', 'acceptance-restore', 'status', 'logs', 'doctor', 'stop', 'build')]
-  [string]$Command = 'help',
+  [string]$Command = 'dev-start',
   [string]$ConfigFile = '',
   [string]$SourceDir = '',
   [ValidateSet('service_restart', 'tracker_restart', 'stream_disconnect', 'client_disconnect', 'spool_replay', 'media_unavailable')]
@@ -25,6 +25,9 @@ $mediaMtxReplayConfig = Join-Path $runtimeDir 'mediamtx.replay.yml'
 $stateFile = Join-Path $runtimeDir 'state.json'
 $launcherStepFile = Join-Path $runtimeDir 'launcher-steps.jsonl'
 $imageManifestFile = Join-Path $runtimeDir 'image.json'
+$devWatchPidFile = Join-Path $runtimeDir 'dev-watch.pid'
+$devWatchOutput = Join-Path $runtimeDir 'dev-watch.log'
+$devWatchError = Join-Path $runtimeDir 'dev-watch.error.log'
 $defaultImage = 'camera-frigate:0.18.0-33c00a27e-runtime3-reviewfix1-tensorrt'
 $buildTimeLimitSeconds = 300
 
@@ -508,6 +511,28 @@ function New-ReplayOverride([object[]]$Sources, $Runtime, [bool]$NotificationsEn
     $mounts = @($frigateVolumes | ForEach-Object { $_ | ConvertTo-Json -Compress }) -join ', '
     $lines.Add('  frigate:')
     $lines.Add("    volumes: [$mounts]")
+    if ($env:CAMERA_HOT_RELOAD -eq '1') {
+      $watchPath = $sourceOverlay.Replace('\','/') | ConvertTo-Json -Compress
+      $lines.Add('    develop:')
+      $lines.Add('      watch:')
+      $lines.Add("        - path: $watchPath")
+      $lines.Add('          action: restart')
+    }
+  }
+  if ($null -ne $frigateSourceOverlay -and $Runtime.ExternalRecognition) {
+    $recognitionMounts = @(
+      ($frigateSourceOverlay.Replace('\','/') + ':/opt/frigate/frigate:ro') | ConvertTo-Json -Compress
+      ($extensionSourceOverlay.Replace('\','/') + ':/opt/frigate/extension:ro') | ConvertTo-Json -Compress
+    ) -join ', '
+    $lines.Add('  recognition:')
+    $lines.Add("    volumes: [$recognitionMounts]")
+    if ($env:CAMERA_HOT_RELOAD -eq '1') {
+      $watchPath = $sourceOverlay.Replace('\','/') | ConvertTo-Json -Compress
+      $lines.Add('    develop:')
+      $lines.Add('      watch:')
+      $lines.Add("        - path: $watchPath")
+      $lines.Add('          action: restart')
+    }
   }
   if (-not $NotificationsEnabled) {
     $lines.Add('  ngrok:')
@@ -553,20 +578,17 @@ function New-ReplayOverride([object[]]$Sources, $Runtime, [bool]$NotificationsEn
     if (-not [string]::IsNullOrWhiteSpace($env:CAMERA_SOURCE_OVERLAY)) {
       $trackerVolumes.Add((($frigateSourceOverlay.Replace('\','/') + ':/opt/frigate/frigate:ro') | ConvertTo-Json -Compress))
       $trackerVolumes.Add((($extensionSourceOverlay.Replace('\','/') + ':/opt/frigate/extension:ro') | ConvertTo-Json -Compress))
-      if ($env:CAMERA_HOT_RELOAD -ne '1') {
-        $trackerRunner = Join-Path $referenceDir 'tracker-run'
-        $trackerVolumes.Add((($trackerRunner.Replace('\','/') + ':/tracker-run:ro') | ConvertTo-Json -Compress))
-      }
-    }
-    if ($env:CAMERA_HOT_RELOAD -eq '1') {
-      $devRunner = Join-Path $referenceDir 'tracker-dev-reload.py'
-      $trackerVolumes.Add((($devRunner.Replace('\','/') + ':/tracker-dev-reload.py:ro') | ConvertTo-Json -Compress))
+      $trackerRunner = Join-Path $referenceDir 'tracker-run'
+      $trackerVolumes.Add((($trackerRunner.Replace('\','/') + ':/tracker-run:ro') | ConvertTo-Json -Compress))
     }
     foreach ($source in @($Sources | Where-Object { $_.Mode -eq 'direct' -and $node.Cameras -contains $_.Name })) {
       $trackerVolumes.Add((($source.Path.Replace('\','/') + ":$($source.ContainerPath):ro") | ConvertTo-Json -Compress))
     }
     if (-not [string]::IsNullOrWhiteSpace($env:CAMERA_REPORT_MEDIA_DIR)) {
       $trackerVolumes.Add((($reportMedia.Replace('\','/') + ':/runtime-evidence') | ConvertTo-Json -Compress))
+      $edgeReportMedia = Join-Path $reportMedia 'edge-media'
+      New-Item -ItemType Directory -Force -Path $edgeReportMedia | Out-Null
+      $trackerVolumes.Add((($edgeReportMedia.Replace('\','/') + ':/media/frigate/edge-media') | ConvertTo-Json -Compress))
     }
     $volumeList = @($trackerVolumes) -join ', '
     $mediaVolume = 'camera-tracker-' + $node.Id.ToLowerInvariant().Replace('_','-') + '-media'
@@ -599,12 +621,17 @@ function New-ReplayOverride([object[]]$Sources, $Runtime, [bool]$NotificationsEn
     $lines.Add('      PASSAGE_CAPTURE_CUTOFF_PATH: ${PASSAGE_CAPTURE_CUTOFF_PATH:-}')
     $lines.Add('      PASSAGE_RUN_ID: ${PASSAGE_RUN_ID:-}')
     $lines.Add('      PASSAGE_SOURCE_START_DIR: ${PASSAGE_SOURCE_START_DIR:-}')
-    if ($env:CAMERA_HOT_RELOAD -eq '1') {
-      $lines.Add('    entrypoint: ["python3", "-u", "/tracker-dev-reload.py"]')
-    } elseif (-not [string]::IsNullOrWhiteSpace($env:CAMERA_SOURCE_OVERLAY)) {
+    if (-not [string]::IsNullOrWhiteSpace($env:CAMERA_SOURCE_OVERLAY)) {
       $lines.Add('    entrypoint: ["/bin/sh", "/tracker-run"]')
     }
     $lines.Add("    volumes: [$volumeList, ${mediaVolume}:/media/frigate, ${spoolVolume}:/var/lib/camera-tracker/spool]")
+    if ($env:CAMERA_HOT_RELOAD -eq '1') {
+      $watchPath = $sourceOverlay.Replace('\','/') | ConvertTo-Json -Compress
+      $lines.Add('    develop:')
+      $lines.Add('      watch:')
+      $lines.Add("        - path: $watchPath")
+      $lines.Add('          action: restart')
+    }
   }
   if ($TrackerNodes.Count -gt 0) {
     $lines.Add('volumes:')
@@ -666,6 +693,51 @@ function Invoke-Compose([string[]]$Prefix, [string[]]$Arguments) {
     $ErrorActionPreference = $savedErrorActionPreference
   }
   if ($composeExitCode -ne 0) { throw "Docker Compose failed with exit code $composeExitCode." }
+}
+
+function Stop-DevWatch {
+  if (-not (Test-Path -LiteralPath $devWatchPidFile -PathType Leaf)) { return }
+  try {
+    $processId = [int]([IO.File]::ReadAllText($devWatchPidFile).Trim())
+    $process = Get-Process -Id $processId -ErrorAction SilentlyContinue
+    if ($null -ne $process) { Stop-NativeProcessTree $process }
+  } finally {
+    Remove-Item -LiteralPath $devWatchPidFile -Force -ErrorAction SilentlyContinue
+  }
+}
+
+function Start-DevWatch([string[]]$Prefix, [string[]]$Services) {
+  Stop-DevWatch
+  if ($Services.Count -eq 0) { throw 'Development watch requires at least one service.' }
+  New-Item -ItemType Directory -Force -Path $runtimeDir | Out-Null
+  Remove-Item -LiteralPath $devWatchOutput,$devWatchError -Force -ErrorAction SilentlyContinue
+  $dockerExecutable = (Get-Command docker -ErrorAction Stop).Source
+  $arguments = @($Prefix) + @('watch','--no-up') + @($Services)
+  $process = Start-Process -FilePath $dockerExecutable -ArgumentList $arguments `
+    -WindowStyle Hidden -RedirectStandardOutput $devWatchOutput `
+    -RedirectStandardError $devWatchError -PassThru
+  [IO.File]::WriteAllText(
+    $devWatchPidFile,
+    [string]$process.Id,
+    [Text.UTF8Encoding]::new($false)
+  )
+  Start-Sleep -Milliseconds 750
+  if ($process.HasExited) {
+    $detail = if (Test-Path -LiteralPath $devWatchError -PathType Leaf) {
+      Get-Content -LiteralPath $devWatchError -Encoding utf8 -Raw
+    } else { '' }
+    Stop-DevWatch
+    throw "Docker Compose watch exited during startup: $detail"
+  }
+  Write-Host "Development watch ready for: $($Services -join ', ')"
+}
+
+function Get-DevWatchServices([bool]$ExternalRecognition, [object[]]$TrackerNodes) {
+  $services = [Collections.Generic.List[string]]::new()
+  $services.Add('frigate')
+  if ($ExternalRecognition) { $services.Add('recognition') }
+  foreach ($node in $TrackerNodes) { $services.Add([string]$node.Service) }
+  return @($services)
 }
 
 function Wait-ReplayReady([object[]]$ReplaySources, [int]$TimeoutSeconds = 30) {
@@ -1067,7 +1139,7 @@ Camera runtime
 
 Use -ConfigFile to select an isolated config; the default is .\deploy\config.yaml.
 Development commands bind-mount -SourceDir read-only; the default is .\frigate\src.
-Tracker development watches Python files and reloads automatically without an image build.
+Docker Compose watches Frigate, recognition and tracker source and restarts changed services without a build.
 '@ | Write-Host
 }
 
@@ -1166,6 +1238,9 @@ try {
         Wait-TrackerReady $trackerNodes
       }
       $ngrokReady = if ($notificationsEnabled) { Wait-NgrokReady $ngrokUrl } else { $false }
+      if ($Command -eq 'dev-start') {
+        Start-DevWatch $prefix @(Get-DevWatchServices $runtime.ExternalRecognition $trackerNodes)
+      }
       $state = [ordered]@{
         started_at=[DateTime]::UtcNow.ToString('o')
         development=($null -ne $devSourcePath)
@@ -1192,6 +1267,7 @@ try {
       if ($env:CAMERA_SKIP_READY_WAIT -ne '1') {
         Wait-RuntimeReady $sources $config
       }
+      Start-DevWatch $prefix @(Get-DevWatchServices $runtime.ExternalRecognition $trackerNodes)
       $state = [ordered]@{
         started_at=[DateTime]::UtcNow.ToString('o')
         development=$true
@@ -1453,12 +1529,13 @@ try {
       if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     }
     'stop' {
+      Stop-DevWatch
       Invoke-Compose $prefix @('down','--remove-orphans')
       $remaining = @(& docker ps --format '{{.Names}}') | Where-Object { $_ -eq 'frigate' -or $_ -like 'camera-*' }
       if ($remaining) {
         # A container created under a different dev profile can keep this
         # Compose network alive even though it is still launcher-owned.
-        & docker rm -f @remaining *> $null
+        & docker rm -f $remaining *> $null
         if ($LASTEXITCODE -ne 0) { throw "Unable to remove runtime containers: $($remaining -join ', ')" }
         Invoke-Compose $prefix @('down','--remove-orphans')
       }

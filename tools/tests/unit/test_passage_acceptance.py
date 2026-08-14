@@ -1,4 +1,5 @@
 import json
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -55,6 +56,65 @@ def test_tracker_topology_config_uses_direct_node_map(monkeypatch) -> None:
     assert isinstance(tracker, dict)
     assert "edge-local" in tracker
     assert "nodes" not in tracker
+
+
+def test_tracker_topology_disables_unconsumed_recording_and_snapshots(monkeypatch) -> None:
+    monkeypatch.setattr(passage_validator, "create_service_tls", lambda *args: None)
+    config = {
+        "record": {"enabled": True},
+        "cameras": {
+            "car_camera": {
+                "snapshots": {"enabled": True},
+                "ffmpeg": {
+                    "inputs": [
+                        {"path": "input.mp4", "roles": ["detect"]},
+                        {"path": "input.mp4", "roles": ["record"]},
+                    ]
+                },
+            }
+        },
+    }
+
+    passage_validator.configure_tracker_topology(config, "tracker")
+
+    assert config["record"]["enabled"] is False
+    camera = config["cameras"]["car_camera"]
+    assert camera["snapshots"]["enabled"] is False
+    assert camera["ffmpeg"]["inputs"] == [
+        {"path": "input.mp4", "roles": ["detect"]}
+    ]
+
+
+def test_report_asset_finalization_removes_transport_staging(tmp_path: Path) -> None:
+    edge_clip = tmp_path / "media/edge-media/clips/event-1/clip.mp4"
+    edge_clip.parent.mkdir(parents=True)
+    edge_clip.write_bytes(b"clip")
+    retained_clip = tmp_path / "media/lpr/event-1/clip.mp4"
+    retained_clip.parent.mkdir(parents=True)
+    retained_clip.hardlink_to(edge_clip)
+    recognition_frame = tmp_path / "media/edge-media/recognition/frame.i420"
+    recognition_frame.parent.mkdir(parents=True)
+    recognition_frame.write_bytes(b"frame")
+    tls = tmp_path / "test-assets/recognition-tls/server.key"
+    tls.parent.mkdir(parents=True)
+    tls.write_text("test", encoding="utf-8")
+    database = (
+        tmp_path
+        / "test-assets/media/passage/frigate.infrastructure.db"
+    )
+    database.parent.mkdir(parents=True)
+    with sqlite3.connect(database) as connection:
+        connection.execute("create table evidence (id integer primary key)")
+        connection.execute("insert into evidence default values")
+
+    result = passage_validator.finalize_report_assets(tmp_path)
+
+    assert result["policy"] == "report_assets_and_debug_logs"
+    assert result["sqlite_compacted"] is True
+    assert not (tmp_path / "media/edge-media").exists()
+    assert not (tmp_path / "test-assets/recognition-tls").exists()
+    assert retained_clip.read_bytes() == b"clip"
+    assert database.is_file()
 
 
 def test_acceptance_readiness_fails_fast_when_frigate_restarts(monkeypatch) -> None:
@@ -306,8 +366,11 @@ def test_compact_report_has_one_canonical_table_per_pipeline(
             "source_pts": 2.1,
         },
     ]
-    (tmp_path / "runtime-trace.json").write_text(
-        json.dumps({"records": runtime_records}), encoding="utf-8"
+    media = tmp_path / "media"
+    media.mkdir()
+    (media / "runtime-trace.jsonl").write_text(
+        "".join(json.dumps(record) + "\n" for record in runtime_records),
+        encoding="utf-8",
     )
     summary = {
         "report": {"status": "complete"},
@@ -763,7 +826,10 @@ def test_tracker_report_recovery_filters_current_node_epoch(
             self.stderr = ""
             self.returncode = returncode
 
+    calls = []
+
     def run(args, **_kwargs):
+        calls.append(args)
         target = Path(args[-1])
         kind = "traces" if "/traces/." in args[2] else "clips"
         for event_id, epoch in (("current", "epoch-current"), ("stale", "epoch-stale")):
@@ -787,15 +853,54 @@ def test_tracker_report_recovery_filters_current_node_epoch(
     monkeypatch.setattr(passage_validator.subprocess, "run", run)
 
     result = passage_validator.copy_tracker_report_artifacts(
-        tmp_path, "epoch-current"
+        tmp_path, "epoch-current", ["current"]
     )
 
     target = tmp_path / "media/lpr/lpr_car_camera_current"
     assert result == {"copied": 1, "events": ["current"]}
+    assert len(calls) == 2
     assert (target / "clip.mp4").read_bytes() == b"current"
     assert json.loads((target / "trace.json").read_text(encoding="utf-8"))[
         "node_epoch"
     ] == "epoch-current"
+
+
+def test_tracker_report_recovery_uses_direct_report_mount(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    edge_media = tmp_path / "media" / "edge-media"
+    trace_dir = edge_media / "traces" / "current"
+    clip_dir = edge_media / "clips" / "current"
+    trace_dir.mkdir(parents=True)
+    clip_dir.mkdir(parents=True)
+    (trace_dir / "trace.json").write_text(
+        json.dumps(
+            {
+                "event_id": "current",
+                "camera_id": "car_camera",
+                "node_epoch": "epoch-current",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (clip_dir / "clip.mp4").write_bytes(b"direct-edge-clip")
+
+    def unexpected_run(*_args, **_kwargs):
+        raise AssertionError("direct report mount must not call docker cp")
+
+    monkeypatch.setattr(passage_validator.subprocess, "run", unexpected_run)
+
+    result = passage_validator.copy_tracker_report_artifacts(
+        tmp_path, "epoch-current", ["current"]
+    )
+
+    target = tmp_path / "media/lpr/lpr_car_camera_current"
+    assert result == {
+        "copied": 1,
+        "events": ["current"],
+        "source": "bind_mount",
+    }
+    assert (target / "clip.mp4").read_bytes() == b"direct-edge-clip"
 
 
 def test_tracker_lifecycle_audit_accepts_one_ordered_producer_event() -> None:
@@ -1226,6 +1331,7 @@ def test_fixture_closes_missing_face_track_before_later_person() -> None:
     assert (
         'config["cameras"]["face_camera"]["detect"]["max_disappeared"] = 15' in builder
     )
+    assert 'output / "fixture.json"' not in builder
 
 
 def test_time_and_bbox_distinguish_simultaneous_vehicles() -> None:
