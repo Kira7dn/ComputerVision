@@ -52,6 +52,7 @@ services:
       PASSAGE_CAPTURE_CUTOFF_PATH: ${PASSAGE_CAPTURE_CUTOFF_PATH:-}
       PASSAGE_CAPTURE_CUTOFF_DIR: ${PASSAGE_CAPTURE_CUTOFF_DIR:-}
       PASSAGE_RUN_ID: ${PASSAGE_RUN_ID:-}
+      PASSAGE_SESSION_FILE: ${PASSAGE_SESSION_FILE:-}
       PASSAGE_SOURCE_START_DIR: ${PASSAGE_SOURCE_START_DIR:-}
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:5000/api/stats >/dev/null && test -w /config && test -w /config/config.yml && test -w /media/frigate"]

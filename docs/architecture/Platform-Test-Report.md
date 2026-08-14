@@ -22,15 +22,19 @@ report và diagnostic data, không phải một cờ pass/fail.
 Entrypoint chuẩn dùng xuyên suốt:
 
 ```powershell
-# Local synchronous topology (default)
+# Tracker -> Frigate -> recognition topology (default healthy E2E)
 python tools/tests/e2e/run_platform_runtime_test.py
 
-# External gRPC/mTLS topology; cùng implementation, chỉ khóa topology=external
+# Recognition-only compatibility topology
 python tools/tests/e2e/run_external_recognition_runtime_test.py
 ```
 
-`tools/runtime/validate_platform_runtime.py` là implementation tham số hóa duy nhất. Wrapper
-external không copy scorer, fixture, media writer hoặc report logic.
+`tools/runtime/validate_platform_runtime.py` là implementation tham số hóa duy nhất. Các wrapper
+không copy scorer, fixture, media writer hoặc report logic.
+
+Entrypoint mặc định dùng isolated lifecycle: dừng runtime acceptance cũ, khởi động đúng topology
+tracker, chạy replay hữu hạn, thu artifact rồi gọi `acceptance-restore`. Source hiện tại được
+bind-mount vào Frigate và tracker nên healthy E2E không yêu cầu build image trong development.
 
 Mỗi invocation tự tạo một thư mục timestamp:
 

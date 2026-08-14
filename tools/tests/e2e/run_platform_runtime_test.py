@@ -1,4 +1,4 @@
-"""Stable, roadmap-independent entrypoint for the Platform runtime evidence test."""
+"""Default healthy E2E for tracker + Frigate + recognition."""
 # ruff: noqa: E402, I001
 
 import sys
@@ -9,4 +9,4 @@ from tools.runtime.validate_platform_runtime import main
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(["--topology", "tracker"]))

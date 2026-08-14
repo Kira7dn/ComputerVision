@@ -37,6 +37,7 @@ from tools.runtime.validate_platform_runtime import (
     validate_runtime_lpr_evidence,
     wait_file_quiescent,
     wait_recognition_idle,
+    wait_tracker_session_complete,
     write_compact_runtime_report,
 )
 
@@ -54,6 +55,23 @@ def test_tracker_topology_config_uses_direct_node_map(monkeypatch) -> None:
     assert isinstance(tracker, dict)
     assert "edge-local" in tracker
     assert "nodes" not in tracker
+
+
+def test_acceptance_readiness_fails_fast_when_frigate_restarts(monkeypatch) -> None:
+    outputs = iter(("0", "restarting|1"))
+    times = iter((0.0, 0.0))
+    monkeypatch.setattr(
+        passage_validator, "docker_output", lambda *_args, **_kwargs: next(outputs)
+    )
+    monkeypatch.setattr(
+        passage_validator,
+        "urlopen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("connection closed")),
+    )
+    monkeypatch.setattr(passage_validator.time, "monotonic", lambda: next(times))
+
+    with pytest.raises(RuntimeError, match="Frigate failed during readiness"):
+        passage_validator.wait_acceptance_ready(None, timeout=60, topology="tracker")
 
 
 def test_interrupted_face_attempt_accepts_typed_failure(tmp_path: Path) -> None:
@@ -100,6 +118,27 @@ def test_wait_file_quiescent_requires_stable_manifest(tmp_path: Path) -> None:
         )
         is False
     )
+
+
+def test_wait_tracker_session_complete_requires_epoch_and_all_cameras(
+    tmp_path: Path,
+) -> None:
+    marker = tmp_path / "tracker-session-complete.json"
+    marker.write_text(
+        json.dumps(
+            {
+                "node_epoch": "epoch-current",
+                "cameras": ["face_camera", "car_camera"],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = wait_tracker_session_complete(
+        tmp_path, "epoch-current", timeout=0.05
+    )
+
+    assert result["node_epoch"] == "epoch-current"
 
 
 def test_finalize_finite_source_tracks_uses_raw_ids_once(
@@ -366,6 +405,38 @@ def test_incomplete_report_recovers_partial_jsonl_evidence(tmp_path: Path) -> No
     assert "| 1/1 | 0 | 0 | 0 | 1 |" in report
     assert "face:face_camera:track-2" in report
     assert "0/0" not in report
+
+
+def test_incomplete_report_counts_recovered_tracker_clips(tmp_path: Path) -> None:
+    for pipeline, camera, event_id in (
+        ("lpr", "car_camera", "event-lpr"),
+        ("face", "face_camera", "event-face"),
+    ):
+        directory = tmp_path / "media" / pipeline / f"{pipeline}_{camera}_{event_id}"
+        directory.mkdir(parents=True)
+        (directory / "clip.mp4").write_bytes(b"mp4")
+        (directory / "trace.json").write_text(
+            json.dumps({"event_id": event_id, "camera_id": camera}),
+            encoding="utf-8",
+        )
+    summary = {
+        "error": "TimeoutError: trace did not become quiescent",
+        "topology": "tracker",
+        "report": {"status": "incomplete"},
+        "measurement": {"measurement_valid": False},
+        "runtime": {"recognition": {}, "resources": {}, "source_pts": {}},
+        "lpr": {"passages": []},
+        "face": {"passages": []},
+    }
+
+    report = write_compact_runtime_report(tmp_path, summary).read_text(encoding="utf-8")
+
+    assert "## Recovered tracker media" in report
+    assert "[clip.mp4](media/lpr/lpr_car_camera_event-lpr/clip.mp4)" in report
+    assert "[clip.mp4](media/face/face_face_camera_event-face/clip.mp4)" in report
+    assert "| 0/0 | 0 | 0 | 0 | 0 | 1 |" in report
+    assert "| 0 | 0 | 0 | 0 | 0 | 0 | 1 |" in report
+    assert "| 2 / 2 |" in report
 
 
 def test_source_pts_completeness_ignores_non_frame_terminal_records() -> None:
@@ -647,7 +718,7 @@ def test_native_trace_clip_uses_recording_when_event_is_absent(
     assert result["complete"] is True
 
 
-def test_edge_trace_media_uses_event_proxy_snapshot_and_range(
+def test_edge_trace_media_copies_tracker_volume_directly(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     records = [
@@ -661,52 +732,12 @@ def test_edge_trace_media_uses_event_proxy_snapshot_and_range(
         }
     ]
 
-    monkeypatch.setattr(
-        passage_validator,
-        "api_event",
-        lambda event_id: {
-            "id": event_id,
-            "camera": "car_camera",
-            "start_time": 99.0,
-            "end_time": 101.0,
-            "has_clip": True,
-        },
-    )
-    monkeypatch.setattr(
-        passage_validator, "sqlite_trace_media", lambda event_ids, path: {}
-    )
-    monkeypatch.setattr(
-        passage_validator,
-        "sqlite_recordings_for_trace_ranges",
-        lambda ranges, path: {},
-    )
+    def copy_clip(event_id: str, target: Path) -> bool:
+        assert event_id == "event-1"
+        target.write_bytes(b"edge-clip")
+        return True
 
-    class Response:
-        def __init__(self, payload: bytes, content_type: str, status: int = 200):
-            self._payload = payload
-            self.status = status
-            self.headers = {"Content-Type": content_type}
-            if status == 206:
-                self.headers["Content-Range"] = "bytes 0-1023/4096"
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            return None
-
-        def read(self):
-            return self._payload
-
-    def open_media(request, timeout):
-        url = request.full_url if hasattr(request, "full_url") else request
-        if url.endswith("snapshot.jpg"):
-            return Response(b"jpeg", "image/jpeg")
-        if hasattr(request, "headers") and request.headers.get("Range"):
-            return Response(b"range", "video/mp4", 206)
-        return Response(b"edge-clip", "video/mp4")
-
-    monkeypatch.setattr(passage_validator, "urlopen", open_media)
+    monkeypatch.setattr(passage_validator, "copy_tracker_clip", copy_clip)
     monkeypatch.setattr(
         passage_validator,
         "ffprobe_clip",
@@ -718,12 +749,53 @@ def test_edge_trace_media_uses_event_proxy_snapshot_and_range(
     )
 
     trace = result["traces"][0]
-    assert trace["clip_basis"] == "edge_media_manifest"
-    assert trace["range_proxy_status"] == 206
-    assert trace["snapshot_proxy_content_type"] == "image/jpeg"
-    assert trace["media_proxy_complete"] is True
+    assert trace["clip_basis"] == "tracker_volume"
+    assert (tmp_path / trace["clip_path"]).read_bytes() == b"edge-clip"
     assert result["complete"] is True
-    assert result["media_proxy_complete"] is True
+
+
+def test_tracker_report_recovery_filters_current_node_epoch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class Result:
+        def __init__(self, stdout: str = "", returncode: int = 0):
+            self.stdout = stdout
+            self.stderr = ""
+            self.returncode = returncode
+
+    def run(args, **_kwargs):
+        target = Path(args[-1])
+        kind = "traces" if "/traces/." in args[2] else "clips"
+        for event_id, epoch in (("current", "epoch-current"), ("stale", "epoch-stale")):
+            event_dir = target / event_id
+            event_dir.mkdir(parents=True, exist_ok=True)
+            if kind == "traces":
+                (event_dir / "trace.json").write_text(
+                    json.dumps(
+                        {
+                            "event_id": event_id,
+                            "camera_id": "car_camera",
+                            "node_epoch": epoch,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+            else:
+                (event_dir / "clip.mp4").write_bytes(event_id.encode())
+        return Result()
+
+    monkeypatch.setattr(passage_validator.subprocess, "run", run)
+
+    result = passage_validator.copy_tracker_report_artifacts(
+        tmp_path, "epoch-current"
+    )
+
+    target = tmp_path / "media/lpr/lpr_car_camera_current"
+    assert result == {"copied": 1, "events": ["current"]}
+    assert (target / "clip.mp4").read_bytes() == b"current"
+    assert json.loads((target / "trace.json").read_text(encoding="utf-8"))[
+        "node_epoch"
+    ] == "epoch-current"
 
 
 def test_tracker_lifecycle_audit_accepts_one_ordered_producer_event() -> None:
@@ -1008,7 +1080,7 @@ def test_wait_recognition_idle_reads_lifecycle_and_evidence(monkeypatch) -> None
     monkeypatch.setattr(
         passage_validator, "urlopen", lambda *_args, **_kwargs: Response()
     )
-    assert wait_recognition_idle(0.01)
+    assert wait_recognition_idle(0.05, stable_seconds=0)
 
 
 @pytest.mark.parametrize(
@@ -1860,3 +1932,12 @@ def test_recognition_lifecycle_summary_detects_attempts_duplicates_and_early_sto
     records[1]["candidate_id"] = records[0]["candidate_id"]
     summary = recognition_lifecycle_summary(records, {})
     assert summary["duplicate_inference"]
+
+
+def test_tracker_acceptance_keeps_unlabelled_quality_metrics_diagnostic() -> None:
+    source = Path("tools/runtime/validate_platform_runtime.py").read_text(encoding="utf-8")
+    diagnostic_block = source.split("diagnostic_names = {", 1)[1].split("}", 1)[0]
+
+    assert '"lpr_recall"' in diagnostic_block
+    assert '"lpr_passage_precision"' in diagnostic_block
+    assert '"face_raw_trace_count_exact": not face_passages' in source

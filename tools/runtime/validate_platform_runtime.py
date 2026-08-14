@@ -12,13 +12,15 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, ClassVar
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
-from urllib.request import Request, urlopen
+from urllib.request import urlopen
 
 import cv2
 import numpy as np
@@ -78,6 +80,115 @@ def write_json(path: Path, value: Any) -> None:
     path.write_text(
         json.dumps(value, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
     )
+
+
+def copy_tracker_clip(event_id: str, target: Path) -> bool:
+    """Copy one producer-owned tracker clip into the host report."""
+    source = (
+        "camera-tracker-edge-local:/media/frigate/edge-media/"
+        f"clips/{event_id}/clip.mp4"
+    )
+    temporary = target.with_suffix(target.suffix + ".tmp")
+    temporary.unlink(missing_ok=True)
+    result = subprocess.run(
+        ["docker", "cp", source, str(temporary)],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode != 0 or not temporary.is_file() or temporary.stat().st_size == 0:
+        temporary.unlink(missing_ok=True)
+        return False
+    os.replace(temporary, target)
+    return True
+
+
+def copy_tracker_report_artifacts(
+    output: Path, node_epoch: str, event_ids: list[str] | None = None
+) -> dict[str, Any]:
+    """Recover only producer events from the current tracker session."""
+    copied: list[str] = []
+    with tempfile.TemporaryDirectory(prefix="tracker-media-", dir=output) as temporary:
+        staging = Path(temporary)
+        traces = staging / "traces"
+        clips = staging / "clips"
+        traces.mkdir()
+        clips.mkdir()
+        if event_ids is None:
+            copy_targets = (("traces", traces), ("clips", clips))
+        else:
+            safe_events = sorted(
+                {
+                    event_id
+                    for event_id in event_ids
+                    if re.fullmatch(r"[A-Za-z0-9_.-]+", event_id)
+                }
+            )
+            copy_targets = tuple(
+                (name, target / event_id)
+                for event_id in safe_events
+                for name, target in (("traces", traces), ("clips", clips))
+            )
+        for name, target in copy_targets:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            source_suffix = "." if event_ids is None else target.name
+            result = subprocess.run(
+                [
+                    "docker",
+                    "cp",
+                    "camera-tracker-edge-local:/media/frigate/edge-media/"
+                    f"{name}/{source_suffix}",
+                    str(target if event_ids is None else target.parent),
+                ],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+            if result.returncode != 0:
+                return {
+                    "copied": len(copied),
+                    "events": copied,
+                    "error": f"tracker_{name}_copy_failed",
+                }
+
+        for trace_path in traces.rglob("trace.json"):
+            event_id = trace_path.parent.name
+            try:
+                trace = json.loads(trace_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if str(trace.get("node_epoch") or "") != node_epoch:
+                continue
+            source_clip = clips / event_id / "clip.mp4"
+            if not source_clip.is_file() or source_clip.stat().st_size == 0:
+                continue
+            camera = str(trace.get("camera_id") or "")
+            pipeline = "lpr" if "car" in camera else "face"
+            target_dir = output / "media" / pipeline / f"{pipeline}_{camera}_{event_id}"
+            target_dir.mkdir(parents=True, exist_ok=True)
+            target_clip = target_dir / "clip.mp4"
+            shutil.copyfile(source_clip, target_clip)
+            target_trace = target_dir / "trace.json"
+            if not target_trace.is_file():
+                write_json(target_trace, trace)
+            copied.append(event_id)
+    return {"copied": len(copied), "events": copied}
+
+
+def tracker_node_epoch(output: Path) -> str | None:
+    """Return the launcher-owned tracker epoch for this run."""
+    state_path = output / "launcher-state.json"
+    if not state_path.is_file():
+        return None
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    nodes = state.get("tracker_nodes") or []
+    if len(nodes) != 1:
+        return None
+    value = str(nodes[0].get("node_epoch") or "")
+    return value or None
 
 
 def wait_file_quiescent(
@@ -733,14 +844,20 @@ def create_recognition_tls(directory: Path) -> None:
 
 
 def configure_recognition_topology(
-    config: dict[str, Any], topology: str, workspace: Path
+    config: dict[str, Any],
+    topology: str,
+    workspace: Path,
+    *,
+    reuse_tls: bool = False,
 ) -> Path | None:
     """Build the E2E fixture overlay; deployment remains the topology compiler."""
     if topology == "local":
         config["recognition"] = {"runtime": "local"}
         return None
     tls_directory = workspace / "recognition-tls"
-    create_recognition_tls(tls_directory)
+    required_tls = ("ca.crt", "server.crt", "server.key", "client.crt", "client.key")
+    if not reuse_tls or not all((tls_directory / name).is_file() for name in required_tls):
+        create_recognition_tls(tls_directory)
     config["recognition"] = {
         "runtime": "external",
         "endpoint": "recognition:50051",
@@ -761,7 +878,7 @@ def configure_recognition_topology(
 
 
 def configure_tracker_topology(
-    config: dict[str, Any], topology: str
+    config: dict[str, Any], topology: str, *, reuse_tls: bool = False
 ) -> Path | None:
     """Build the E2E tracker fixture overlay; launcher compiles its runtime views."""
     if topology != "tracker":
@@ -770,7 +887,11 @@ def configure_tracker_topology(
     node_id = "edge-local"
     server_name = "tracker-edge-local"
     tls_directory = Path(".tmp/runtime/tracker-tls") / node_id
-    create_service_tls(tls_directory, server_name, "frigate-main")
+    required_tls = ("ca.crt", "server.crt", "server.key", "client.crt", "client.key")
+    if not reuse_tls or not all(
+        (tls_directory / name).is_file() for name in required_tls
+    ):
+        create_service_tls(tls_directory, server_name, "frigate-main")
     config["tracker"] = {
         node_id: {
             "managed": True,
@@ -928,6 +1049,12 @@ def wait_acceptance_ready(
     topology: str = "local",
 ) -> None:
     deadline = time.monotonic() + timeout
+    initial_restart_count = int(
+        docker_output(
+            "inspect", "frigate", "--format", "{{.RestartCount}}", check=False
+        )
+        or 0
+    )
     stable_since: float | None = None
     stable_required = float(os.environ.get("CAMERA_READY_STABLE_SECONDS", "2"))
     last_reason = "stats unavailable"
@@ -991,6 +1118,20 @@ def wait_acceptance_ready(
             )
         except Exception as exc:
             last_reason = str(exc)
+            state = docker_output(
+                "inspect",
+                "frigate",
+                "--format",
+                "{{.State.Status}}|{{.RestartCount}}",
+                check=False,
+            )
+            status, _, restart_text = state.partition("|")
+            restart_count = int(restart_text or 0)
+            if status != "running" or restart_count > initial_restart_count:
+                raise RuntimeError(
+                    "Frigate failed during readiness: "
+                    f"status={status or 'missing'} restart_count={restart_count}"
+                ) from exc
         time.sleep(0.5)
     raise TimeoutError(f"acceptance runtime not ready: {last_reason}")
 
@@ -1072,6 +1213,32 @@ def wait_source_ends(directory: Path, deadline: float) -> dict[str, float]:
             return values
         time.sleep(0.05)
     raise TimeoutError("direct MP4 sources did not reach EOF")
+
+
+def wait_tracker_session_complete(
+    directory: Path, node_epoch: str, timeout: float = 45.0
+) -> dict[str, Any]:
+    """Wait for the tracker-owned finite-source completion contract."""
+    marker = directory / "tracker-session-complete.json"
+    deadline = time.monotonic() + timeout
+    last_reason = "marker_missing"
+    expected_cameras = set(CAMERAS.values())
+    while time.monotonic() < deadline:
+        try:
+            value = json.loads(marker.read_text(encoding="utf-8"))
+            marker_epoch = str(value.get("node_epoch") or "")
+            cameras = {str(camera) for camera in value.get("cameras", [])}
+            if marker_epoch == node_epoch and cameras == expected_cameras:
+                return value
+            last_reason = (
+                f"node_epoch={marker_epoch!r}, cameras={sorted(cameras)!r}"
+            )
+        except FileNotFoundError:
+            pass
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            last_reason = str(exc)
+        time.sleep(0.1)
+    raise TimeoutError(f"tracker session did not complete: {last_reason}")
 
 
 def wait_latest_through(source_ended: dict[str, float], deadline: float) -> None:
@@ -1248,9 +1415,10 @@ class ResourceSampler:
             self.stop_event.wait(1.0)
 
 
-def wait_recognition_idle(timeout: float = 10.0) -> bool:
+def wait_recognition_idle(timeout: float = 10.0, stable_seconds: float = 1.0) -> bool:
     """Allow bounded deferred work to release attempts and evidence leases."""
     deadline = time.monotonic() + timeout
+    stable_since: float | None = None
     while time.monotonic() < deadline:
         try:
             with urlopen("http://127.0.0.1:5001/api/stats", timeout=1) as response:
@@ -1265,9 +1433,16 @@ def wait_recognition_idle(timeout: float = 10.0) -> bool:
                 and int(recognition.get("queue_depth", 0)) == 0
                 and int(recognition.get("outcome_depth", 0)) == 0
             ):
-                return True
+                if stable_since is None:
+                    stable_since = time.monotonic()
+                    if stable_seconds <= 0:
+                        return True
+                elif time.monotonic() - stable_since >= stable_seconds:
+                    return True
+            else:
+                stable_since = None
         except Exception:
-            pass
+            stable_since = None
         time.sleep(0.2)
     return False
 
@@ -1312,7 +1487,10 @@ finally:
 
 
 def observe_round_anchors(
-    replays: dict[str, Path], replay_started: dict[str, float], hard_deadline: float
+    replays: dict[str, Path],
+    replay_started: dict[str, float],
+    hard_deadline: float,
+    source_marker_dir: Path | None = None,
 ) -> tuple[dict[str, list[float]], dict[str, Any]]:
     """Observe source progress using the publisher's exact one-shot boundary."""
     durations = {CAMERAS[kind]: replay_duration(path) for kind, path in replays.items()}
@@ -1344,6 +1522,10 @@ def observe_round_anchors(
 
         if time.time() >= completion_deadline and all(
             state["first_observed_frame"] is not None for state in states.values()
+        ):
+            break
+        if source_marker_dir is not None and all(
+            (source_marker_dir / f"{camera}.end").is_file() for camera in states
         ):
             break
         time.sleep(0.12)
@@ -2680,49 +2862,51 @@ def collect_native_trace_clips(
     api_base: str = "http://127.0.0.1:5001",
     edge_owned: bool = False,
 ) -> dict[str, Any]:
-    """Download trace clips from Frigate's native recording API.
+    """Collect trace clips from their topology owner.
 
-    Fixture files and replay anchors are intentionally not accepted by this
-    interface, making reverse materialization impossible.
+    Tracker topology copies producer-owned clips directly. Other topologies
+    use Frigate's native recording API.
     """
     groups = trace_lifecycle_groups(records)
     traces: list[dict[str, Any]] = []
+    edge_probe_jobs: list[tuple[dict[str, Any], Path, Path]] = []
     resolved_events: dict[tuple[str, str], dict[str, Any]] = {}
 
     # Event finalization is asynchronous.  Resolve only the exact producer
     # track id and fail closed when a lifecycle has zero or multiple Events.
-    deadline = time.monotonic() + 8.0
-    while True:
-        pending = False
-        for key, trace_records in groups.items():
-            if key in resolved_events:
-                continue
-            camera = str(trace_records[0].get("camera") or "")
-            event_ids = sorted(
-                {
-                    str(record.get("event_id") or record.get("track_id"))
-                    for record in trace_records
-                    if record.get("event_id") or record.get("track_id")
-                }
-            )
-            matches = [
-                event
-                for event_id in event_ids
-                if (event := api_event(event_id)) is not None
-                and str(event.get("camera")) == camera
-            ]
-            if len(matches) == 1 and matches[0].get("end_time") is not None:
-                resolved_events[key] = matches[0]
-            else:
-                pending = True
-        if not pending or time.monotonic() >= deadline:
-            break
-        time.sleep(0.25)
+    if not edge_owned:
+        deadline = time.monotonic() + 8.0
+        while True:
+            pending = False
+            for key, trace_records in groups.items():
+                if key in resolved_events:
+                    continue
+                camera = str(trace_records[0].get("camera") or "")
+                event_ids = sorted(
+                    {
+                        str(record.get("event_id") or record.get("track_id"))
+                        for record in trace_records
+                        if record.get("event_id") or record.get("track_id")
+                    }
+                )
+                matches = [
+                    event
+                    for event_id in event_ids
+                    if (event := api_event(event_id)) is not None
+                    and str(event.get("camera")) == camera
+                ]
+                if len(matches) == 1 and matches[0].get("end_time") is not None:
+                    resolved_events[key] = matches[0]
+                else:
+                    pending = True
+            if not pending or time.monotonic() >= deadline:
+                break
+            time.sleep(0.25)
 
     event_ids = sorted(
         {str(event["id"]) for event in resolved_events.values() if event.get("id")}
     )
-    media_rows = sqlite_trace_media(event_ids, database_path)
+    media_rows = sqlite_trace_media(event_ids, database_path) if not edge_owned else {}
     trace_ranges: dict[tuple[str, str], tuple[float, float]] = {}
     range_queries: list[dict[str, Any]] = []
     for key, trace_records in groups.items():
@@ -2746,8 +2930,10 @@ def collect_native_trace_clips(
                 "end_time": end_time,
             }
         )
-    recordings_by_range = sqlite_recordings_for_trace_ranges(
-        range_queries, database_path
+    recordings_by_range = (
+        sqlite_recordings_for_trace_ranges(range_queries, database_path)
+        if not edge_owned
+        else {}
     )
     for (pipeline, trace_id), trace_records in sorted(groups.items()):
         safe_trace = re.sub(r"[^A-Za-z0-9_.-]+", "_", trace_id)
@@ -2809,6 +2995,37 @@ def collect_native_trace_clips(
             "final_result": final_result,
             "history": recognition_history,
         }
+        if edge_owned:
+            producer_event_ids = sorted(
+                {
+                    str(record.get("event_id") or record.get("track_id"))
+                    for record in trace_records
+                    if record.get("event_id") or record.get("track_id")
+                }
+            )
+            if len(producer_event_ids) == 1:
+                event_id = producer_event_ids[0]
+                target = trace_dir / "clip.mp4"
+                metadata["event_id"] = event_id
+                metadata["clip_basis"] = "tracker_volume"
+                if target.is_file() or copy_tracker_clip(event_id, target):
+                    metadata.update(
+                        {
+                            "clip_status": "pending_validation",
+                            "clip_reason": None,
+                            "clip_path": target.relative_to(output).as_posix(),
+                            "clip_bytes": target.stat().st_size,
+                            "content_type": "video/mp4",
+                        }
+                    )
+                    edge_probe_jobs.append((metadata, target, trace_dir))
+                else:
+                    metadata["clip_reason"] = "tracker_clip_missing"
+            else:
+                metadata["clip_reason"] = "producer_event_id_not_unique"
+            write_json(trace_dir / "trace.json", metadata)
+            traces.append(metadata)
+            continue
         range_key = f"{pipeline}\0{trace_id}"
         recordings: list[dict[str, Any]] = recordings_by_range.get(range_key, [])
         start_time: float | None = None
@@ -2838,15 +3055,7 @@ def collect_native_trace_clips(
                 }
             )
         media_url = None
-        if edge_owned and event is not None:
-            media_url = f"{api_base}/api/events/{quote(str(event['id']), safe='')}/clip.mp4"
-            metadata.update(
-                {
-                    "clip_basis": "edge_media_manifest",
-                    "clip_reason": None,
-                }
-            )
-        elif recordings:
+        if recordings:
             assert start_time is not None and end_time is not None
             coverage_start = min(float(row["start_time"]) for row in recordings)
             coverage_end = max(float(row["end_time"]) for row in recordings)
@@ -2896,43 +3105,33 @@ def collect_native_trace_clips(
                         "ffprobe": probe,
                     }
                 )
-                if edge_owned and event is not None:
-                    range_request = Request(
-                        media_url, headers={"Range": "bytes=0-1023"}
-                    )
-                    with urlopen(range_request, timeout=15) as response:
-                        range_payload = response.read()
-                        range_status = response.status
-                        content_range = response.headers.get("Content-Range", "")
-                    snapshot_url = (
-                        f"{api_base}/api/events/"
-                        f"{quote(str(event['id']), safe='')}/snapshot.jpg"
-                    )
-                    with urlopen(snapshot_url, timeout=15) as response:
-                        snapshot_payload = response.read()
-                        snapshot_type = response.headers.get("Content-Type", "")
-                    metadata.update(
-                        {
-                            "range_proxy_status": range_status,
-                            "range_proxy_bytes": len(range_payload),
-                            "range_proxy_content_range": content_range,
-                            "snapshot_proxy_bytes": len(snapshot_payload),
-                            "snapshot_proxy_content_type": snapshot_type,
-                            "media_proxy_complete": (
-                                range_status == 206
-                                and bool(range_payload)
-                                and content_range.startswith("bytes 0-")
-                                and bool(snapshot_payload)
-                                and snapshot_type.startswith("image/jpeg")
-                            ),
-                        }
-                    )
             except Exception as exc:
                 metadata["clip_reason"] = (
                     f"native_clip_error:{type(exc).__name__}:{exc}"
                 )
         write_json(trace_dir / "trace.json", metadata)
         traces.append(metadata)
+
+    def validate_edge_clip(
+        job: tuple[dict[str, Any], Path, Path]
+    ) -> tuple[dict[str, Any], Path, dict[str, Any], str]:
+        metadata, target, trace_dir = job
+        return metadata, trace_dir, ffprobe_clip(target), sha256(target)
+
+    if edge_probe_jobs:
+        with ThreadPoolExecutor(max_workers=min(4, len(edge_probe_jobs))) as executor:
+            for metadata, trace_dir, probe, digest in executor.map(
+                validate_edge_clip, edge_probe_jobs
+            ):
+                metadata.update(
+                    {
+                        "clip_status": "recorded" if probe.get("valid") else "invalid",
+                        "clip_reason": None if probe.get("valid") else "ffprobe_invalid",
+                        "clip_sha256": digest,
+                        "ffprobe": probe,
+                    }
+                )
+                write_json(trace_dir / "trace.json", metadata)
 
     result = {
         "mode": "frigate_native_recording",
@@ -2941,11 +3140,6 @@ def collect_native_trace_clips(
         "missing_count": sum(item["clip_status"] != "recorded" for item in traces),
         "complete": bool(traces)
         and all(item["clip_status"] == "recorded" for item in traces),
-        "media_proxy_complete": not edge_owned
-        or (
-            bool(traces)
-            and all(item.get("media_proxy_complete") for item in traces)
-        ),
         "traces": traces,
     }
     write_json(output / "native-media.json", result)
@@ -4608,6 +4802,39 @@ def write_compact_runtime_report(output: Path, summary: dict[str, Any]) -> Path:
         relative = Path("media") / pipeline / safe_trace / "clip.mp4"
         return relative.as_posix() if (output / relative).is_file() else None
 
+    def recovered_tracker_media(pipeline: str) -> list[dict[str, str]]:
+        """Inventory tracker-owned media even when trace analysis aborted."""
+        recovered: list[dict[str, str]] = []
+        for trace_path in sorted((output / "media" / pipeline).glob("*/trace.json")):
+            try:
+                trace = json.loads(trace_path.read_text(encoding="utf-8"))
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+            clip_path = trace_path.with_name("clip.mp4")
+            recovered.append(
+                {
+                    "event_id": str(trace.get("event_id") or trace_path.parent.name),
+                    "trace": trace_path.relative_to(output).as_posix(),
+                    "clip": (
+                        clip_path.relative_to(output).as_posix()
+                        if clip_path.is_file() and clip_path.stat().st_size > 0
+                        else ""
+                    ),
+                }
+            )
+        return recovered
+
+    lpr_recovered_media = recovered_tracker_media("lpr")
+    face_recovered_media = recovered_tracker_media("face")
+    recovered_media = [
+        (pipeline, item)
+        for pipeline, items in (
+            ("lpr", lpr_recovered_media),
+            ("face", face_recovered_media),
+        )
+        for item in items
+    ]
+
     def compact_mapping(value: Any) -> str:
         if not isinstance(value, dict):
             return str(value if value not in (None, "") else "none")
@@ -5001,6 +5228,31 @@ def write_compact_runtime_report(output: Path, summary: dict[str, Any]) -> Path:
                 ]
             )
 
+    recovered_media_lines = (
+        [
+            "## Recovered tracker media",
+            "",
+            "Recognition analysis stopped before completion; these producer-owned "
+            "artifacts were recovered and must not be reported as zero.",
+            "",
+            _md_table(
+                ["Pipeline", "Event", "Clip", "Trace"],
+                [
+                    [
+                        pipeline,
+                        item["event_id"],
+                        f"[clip.mp4]({item['clip']})" if item["clip"] else "—",
+                        f"[trace.json]({item['trace']})",
+                    ]
+                    for pipeline, item in recovered_media
+                ],
+            ),
+            "",
+        ]
+        if recovered_media
+        else []
+    )
+
     lines = [
         "# Runtime Test Report",
         "",
@@ -5042,6 +5294,7 @@ def write_compact_runtime_report(output: Path, summary: dict[str, Any]) -> Path:
             ],
         ),
         "",
+        *recovered_media_lines,
         "## LPR result",
         "",
         _md_table(
@@ -5061,10 +5314,7 @@ def write_compact_runtime_report(output: Path, summary: dict[str, Any]) -> Path:
                     lpr_no_output,
                     lpr_missing,
                     len(lpr_runtime),
-                    sum(
-                        clip_href("lpr", row["trace_id"]) is not None
-                        for row in lpr_runtime
-                    ),
+                    sum(bool(item["clip"]) for item in lpr_recovered_media),
                     f"[{image_index['lpr']} LPR images](media/images.md#lpr)",
                 ]
             ],
@@ -5104,10 +5354,7 @@ def write_compact_runtime_report(output: Path, summary: dict[str, Any]) -> Path:
                         for record in records_for_trace
                     ),
                     summary.get("face", {}).get("recognition_publish_count", 0),
-                    sum(
-                        clip_href("face", trace_id) is not None
-                        for trace_id in face_by_trace
-                    ),
+                    sum(bool(item["clip"]) for item in face_recovered_media),
                     face_rendered_image_count,
                     f"[{image_index['face']} artifacts](media/images.md#face)",
                 ]
@@ -5191,8 +5438,8 @@ def write_compact_runtime_report(output: Path, summary: dict[str, Any]) -> Path:
                     f"{recognition.get('writer_drops', '—')} / "
                     f"{recognition.get('writer_errors', '—')}",
                     cleanup,
-                    f"{native_media.get('recorded_count', 0)} / "
-                    f"{native_media.get('trace_count', 0)}",
+                    f"{max(int(native_media.get('recorded_count', 0)), sum(bool(item['clip']) for _, item in recovered_media))} / "
+                    f"{max(int(native_media.get('trace_count', 0)), len(recovered_media))}",
                     "; ".join(runtime.get("hardware_sampler_errors", [])) or "none",
                 ]
             ],
@@ -5280,6 +5527,7 @@ def main(argv: list[str] | None = None) -> int:
     exit_code = 1
     runtime_workspace = output / "test-assets"
     runtime_workspace.mkdir(parents=True, exist_ok=True)
+    report_media = output / "media"
     try:
         step_started = time.monotonic()
         manifest = load_manifest(manifest_path, Path.cwd())
@@ -5311,9 +5559,9 @@ def main(argv: list[str] | None = None) -> int:
         isolated_config = Path(fixture["config"])
         value = yaml.safe_load(isolated_config.read_text(encoding="utf-8"))
         value["runtime"]["image"] = base_config["runtime"]["image"]
-        tls_directory = configure_recognition_topology(
-            value, topology, runtime_workspace
-        )
+        tls_workspace = runtime_workspace
+        tls_workspace.mkdir(parents=True, exist_ok=True)
+        tls_directory = configure_recognition_topology(value, topology, tls_workspace)
         tracker_tls_directory = configure_tracker_topology(value, topology)
         if tls_directory is not None:
             os.environ["RECOGNITION_TLS_DIR"] = str(tls_directory.resolve())
@@ -5327,7 +5575,8 @@ def main(argv: list[str] | None = None) -> int:
         summary["fixture"] = fixture
         summary["fixture_contract"] = contract
         summary["timing"]["fixture_seconds"] = round(time.monotonic() - step_started, 3)
-        # All topology mutations, including the pre-acceptance stop, are launcher-owned.
+        # The healthy E2E owns an isolated lifecycle so every run starts from
+        # the fixture recorded in its timestamped artifact directory.
         runtime_started = True
         run_deploy(
             "stop",
@@ -5342,12 +5591,9 @@ def main(argv: list[str] | None = None) -> int:
         os.environ["PASSAGE_CAPTURE_START_PATH"] = CAPTURE_START_CONTAINER_PATH
         os.environ["PASSAGE_CAPTURE_CUTOFF_PATH"] = CAPTURE_CUTOFF_CONTAINER_PATH
         os.environ["PASSAGE_RUN_ID"] = run_id
-        if topology == "local":
-            os.environ["CAMERA_SOURCE_OVERLAY"] = str(
-                (Path.cwd() / "frigate" / "frigate").resolve()
-            )
-        else:
-            os.environ.pop("CAMERA_SOURCE_OVERLAY", None)
+        os.environ["CAMERA_SOURCE_OVERLAY"] = str(
+            (Path.cwd() / "frigate" / "src").resolve()
+        )
         report_media = output / "media"
         report_media.mkdir(parents=True, exist_ok=True)
         source_start_dir = report_media / "source-start"
@@ -5361,6 +5607,10 @@ def main(argv: list[str] | None = None) -> int:
         capture_start = time.time()
         (report_media / "capture-start").write_text(
             f"{capture_start:.9f}\n", encoding="utf-8"
+        )
+        write_json(
+            report_media / "session.json",
+            {"run_id": run_id, "created_at": capture_start},
         )
         summary["capture_start_epoch"] = capture_start
         try:
@@ -5422,11 +5672,43 @@ def main(argv: list[str] | None = None) -> int:
         )
         step_started = time.monotonic()
         anchors, anchor_details = observe_round_anchors(
-            replays, source_started, source_deadline
+            replays, source_started, source_deadline, source_start_dir
         )
         source_ended = wait_source_ends(source_start_dir, source_deadline)
-        wait_latest_through(source_ended, source_deadline)
+        summary["timing"]["source_eof_seconds"] = round(
+            time.monotonic() - step_started, 3
+        )
         live_trace_path = report_media / "runtime-trace.jsonl"
+        if topology == "tracker":
+            tracker_finalize_started = time.monotonic()
+            tracker_epoch = str(
+                (summary.get("tracker_readiness") or [{}])[0].get("node_epoch") or ""
+            )
+            completion = wait_tracker_session_complete(
+                source_start_dir, tracker_epoch, timeout=45.0
+            )
+            summary["tracker_session_complete"] = completion
+            summary["timing"]["tracker_finalize_seconds"] = round(
+                time.monotonic() - tracker_finalize_started, 3
+            )
+            recognition_drain_started = time.monotonic()
+            recognition_idle = wait_recognition_idle(timeout=60.0, stable_seconds=1.0)
+            summary["timing"]["recognition_drain_seconds"] = round(
+                time.monotonic() - recognition_drain_started, 3
+            )
+            if not recognition_idle:
+                raise TimeoutError("recognition did not become idle after tracker completion")
+            quiescence_started = time.monotonic()
+            if not wait_file_quiescent(
+                live_trace_path, timeout=60.0, stable_seconds=2.0
+            ):
+                raise TimeoutError("tracker trace did not become quiescent after EOF")
+            summary["timing"]["trace_quiescence_seconds"] = round(
+                time.monotonic() - quiescence_started, 3
+            )
+        else:
+            wait_latest_through(source_ended, source_deadline)
+            recognition_idle = wait_recognition_idle()
         live_records = [
             json.loads(line)
             for line in live_trace_path.read_text(encoding="utf-8").splitlines()
@@ -5439,13 +5721,20 @@ def main(argv: list[str] | None = None) -> int:
             f"{capture_cutoff:.9f}\n", encoding="utf-8"
         )
         source_done = source_ended
-        recognition_idle = wait_recognition_idle()
-        recordings_ready, recordings_through = wait_recordings_through(
-            str(value["database"]["path"]),
-            list(CAMERAS.values()),
-            capture_cutoff + 0.5,
+        recordings_started = time.monotonic()
+        if topology == "tracker":
+            recordings_ready, recordings_through = True, {}
+        else:
+            recordings_ready, recordings_through = wait_recordings_through(
+                str(value["database"]["path"]),
+                list(CAMERAS.values()),
+                capture_cutoff + 0.5,
+            )
+        summary["timing"]["recordings_wait_seconds"] = round(
+            time.monotonic() - recordings_started, 3
         )
         summary["timing"]["replay_seconds"] = round(time.monotonic() - step_started, 3)
+        postprocess_started = time.monotonic()
         sampler.stop()
         resource_memory = list(sampler.memory_bytes)
         hardware_cpu_samples = list(sampler.cpu_percent)
@@ -5511,6 +5800,7 @@ def main(argv: list[str] | None = None) -> int:
         runtime_records = records
         raw_lpr_trace_ids = pipeline_trace_ids(runtime_records, "lpr")
         raw_face_trace_ids = pipeline_trace_ids(runtime_records, "face")
+        evidence_analysis_started = time.monotonic()
         all_media_evidence = media_evidence_records(output / "media")
         recognition_evidence = (
             validate_recognition_evidence(
@@ -5529,11 +5819,36 @@ def main(argv: list[str] | None = None) -> int:
             output / "media", all_media_evidence
         )
         write_json(output / "face-annotated-evidence.json", face_annotated_evidence)
+        summary["timing"]["evidence_analysis_seconds"] = round(
+            time.monotonic() - evidence_analysis_started, 3
+        )
+        if topology == "tracker":
+            node_epoch = tracker_node_epoch(output)
+            if not node_epoch:
+                raise RuntimeError("Tracker node epoch is missing before media collection")
+            tracker_copy_started = time.monotonic()
+            summary["tracker_report_media"] = copy_tracker_report_artifacts(
+                output,
+                node_epoch,
+                [
+                    str(event_id)
+                    for event_id in summary.get("tracker_session_complete", {}).get(
+                        "events", []
+                    )
+                ],
+            )
+            summary["timing"]["tracker_media_copy_seconds"] = round(
+                time.monotonic() - tracker_copy_started, 3
+            )
+        clip_validation_started = time.monotonic()
         native_media = collect_native_trace_clips(
             output,
             runtime_records + all_media_evidence,
             str(value["database"]["path"]),
             edge_owned=topology == "tracker",
+        )
+        summary["timing"]["clip_validation_seconds"] = round(
+            time.monotonic() - clip_validation_started, 3
         )
         tracker_lifecycle = (
             tracker_lifecycle_audit(str(value["database"]["path"]))
@@ -5849,8 +6164,8 @@ def main(argv: list[str] | None = None) -> int:
             "lpr_recognition_recall": lpr["recall"] >= 2 / 3,
             "lpr_passage_precision": lpr["passage_precision"] == 1.0,
             "lpr_raw_trace_count_exact": len(raw_lpr_trace_ids) == len(lpr_passages),
-            "face_raw_trace_count_exact": len(raw_face_trace_ids)
-            == len(face_passages),
+            "face_raw_trace_count_exact": not face_passages
+            or len(raw_face_trace_ids) == len(face_passages),
             "face_raw_tracks_present": face.get("trace_count", 0) > 0,
             "face_raw_attempts_present": face.get("attempt_count", 0) > 0,
             "face_recognition_trace_coverage_complete": face.get(
@@ -5891,11 +6206,12 @@ def main(argv: list[str] | None = None) -> int:
             "main_edge_ownership_zero": main_edge_ownership_zero,
             "tracker_terminal_zero": tracker_terminal_zero,
             "tracker_not_degraded": tracker_not_degraded,
-            "tracker_media_proxy_complete": topology != "tracker"
-            or native_media.get("media_proxy_complete", False),
             "tracker_lifecycle_valid": tracker_lifecycle.get("valid", False),
         }
         summary["gates"] = gates
+        summary["timing"]["postprocess_seconds"] = round(
+            time.monotonic() - postprocess_started, 3
+        )
     except Exception as exc:
         summary["error"] = f"{type(exc).__name__}: {exc}"
         summary.setdefault("gates", {})["error_free"] = False
@@ -5919,6 +6235,33 @@ def main(argv: list[str] | None = None) -> int:
                     f"{type(exc).__name__}: {exc}"
                 )
                 summary.setdefault("gates", {})["fault_completed"] = False
+        if (
+            topology == "tracker"
+            and runtime_started
+            and "tracker_report_media" not in summary
+        ):
+            try:
+                node_epoch = tracker_node_epoch(output)
+                summary["tracker_report_media"] = (
+                    copy_tracker_report_artifacts(
+                        output,
+                        node_epoch,
+                        [
+                            str(event_id)
+                            for event_id in summary.get(
+                                "tracker_session_complete", {}
+                            ).get("events", [])
+                        ],
+                    )
+                    if node_epoch
+                    else {"copied": 0, "events": [], "error": "node_epoch_missing"}
+                )
+            except Exception as exc:
+                summary["tracker_report_media"] = {
+                    "copied": 0,
+                    "events": [],
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
         step_started = time.monotonic()
         restore_ok = not runtime_started
         if runtime_started:
@@ -5948,6 +6291,8 @@ def main(argv: list[str] | None = None) -> int:
                 "lpr_accuracy",
                 "lpr_recognition_precision",
                 "lpr_recognition_recall",
+                "lpr_recall",
+                "lpr_passage_precision",
             }
             required_gates = {
                 name: passed

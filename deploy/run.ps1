@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
   [Parameter(Position = 0)]
-  [ValidateSet('help', 'start', 'dev-start', 'dev-restart', 'dev-logs', 'dev-stop', 'acceptance-start', 'acceptance-fault', 'acceptance-restore', 'status', 'logs', 'doctor', 'stop', 'build')]
+  [ValidateSet('help', 'start', 'dev-start', 'dev-restart', 'dev-logs', 'dev-stop', 'acceptance-start', 'acceptance-park', 'acceptance-fault', 'acceptance-restore', 'status', 'logs', 'doctor', 'stop', 'build')]
   [string]$Command = 'help',
   [string]$ConfigFile = '',
   [string]$SourceDir = '',
@@ -469,13 +469,25 @@ function New-ReplayOverride([object[]]$Sources, $Runtime, [bool]$NotificationsEn
   $lines = [Collections.Generic.List[string]]::new()
   $lines.Add('services:')
   $frigateVolumes = [Collections.Generic.List[string]]::new()
+  $frigateSourceOverlay = $null
+  $extensionSourceOverlay = $null
   if (-not [string]::IsNullOrWhiteSpace($env:CAMERA_SOURCE_OVERLAY)) {
     $sourceOverlay = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($env:CAMERA_SOURCE_OVERLAY)
     if (-not (Test-Path -LiteralPath $sourceOverlay -PathType Container)) {
       throw "Missing CAMERA_SOURCE_OVERLAY directory: $sourceOverlay"
     }
-    $sourceMount = $sourceOverlay.Replace('\','/') + ':/opt/frigate/src/frigate:ro'
-    $frigateVolumes.Add($sourceMount)
+    $frigateSourceOverlay = Join-Path $sourceOverlay 'frigate'
+    $extensionSourceOverlay = Join-Path $sourceOverlay 'extension'
+    if (-not (Test-Path -LiteralPath $frigateSourceOverlay -PathType Container)) {
+      throw "Missing Frigate package in source overlay: $frigateSourceOverlay"
+    }
+    if (-not (Test-Path -LiteralPath $extensionSourceOverlay -PathType Container)) {
+      throw "Missing extension package in source overlay: $extensionSourceOverlay"
+    }
+    $frigateVolumes.Add($frigateSourceOverlay.Replace('\','/') + ':/opt/frigate/frigate:ro')
+    $frigateVolumes.Add($extensionSourceOverlay.Replace('\','/') + ':/opt/frigate/extension:ro')
+    $go2rtcConfigScript = Join-Path $workspace 'frigate\docker\main\rootfs\usr\local\go2rtc\create_config.py'
+    $frigateVolumes.Add($go2rtcConfigScript.Replace('\','/') + ':/usr/local/go2rtc/create_config.py:ro')
   }
   if (-not [string]::IsNullOrWhiteSpace($env:CAMERA_REPORT_MEDIA_DIR)) {
     $reportMedia = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($env:CAMERA_REPORT_MEDIA_DIR)
@@ -539,7 +551,16 @@ function New-ReplayOverride([object[]]$Sources, $Runtime, [bool]$NotificationsEn
     $trackerVolumes.Add($modelMount)
     $trackerVolumes.Add($tlsMount)
     if (-not [string]::IsNullOrWhiteSpace($env:CAMERA_SOURCE_OVERLAY)) {
-      $trackerVolumes.Add((($sourceOverlay.Replace('\','/') + ':/opt/frigate/src/frigate:ro') | ConvertTo-Json -Compress))
+      $trackerVolumes.Add((($frigateSourceOverlay.Replace('\','/') + ':/opt/frigate/frigate:ro') | ConvertTo-Json -Compress))
+      $trackerVolumes.Add((($extensionSourceOverlay.Replace('\','/') + ':/opt/frigate/extension:ro') | ConvertTo-Json -Compress))
+      if ($env:CAMERA_HOT_RELOAD -ne '1') {
+        $trackerRunner = Join-Path $referenceDir 'tracker-run'
+        $trackerVolumes.Add((($trackerRunner.Replace('\','/') + ':/tracker-run:ro') | ConvertTo-Json -Compress))
+      }
+    }
+    if ($env:CAMERA_HOT_RELOAD -eq '1') {
+      $devRunner = Join-Path $referenceDir 'tracker-dev-reload.py'
+      $trackerVolumes.Add((($devRunner.Replace('\','/') + ':/tracker-dev-reload.py:ro') | ConvertTo-Json -Compress))
     }
     foreach ($source in @($Sources | Where-Object { $_.Mode -eq 'direct' -and $node.Cameras -contains $_.Name })) {
       $trackerVolumes.Add((($source.Path.Replace('\','/') + ":$($source.ContainerPath):ro") | ConvertTo-Json -Compress))
@@ -551,7 +572,11 @@ function New-ReplayOverride([object[]]$Sources, $Runtime, [bool]$NotificationsEn
     $mediaVolume = 'camera-tracker-' + $node.Id.ToLowerInvariant().Replace('_','-') + '-media'
     $spoolVolume = 'camera-tracker-' + $node.Id.ToLowerInvariant().Replace('_','-') + '-spool'
     $lines.Add("  $($node.Service):")
-    $lines.Add('    image: ${TRACKER_IMAGE}')
+    if ($env:CAMERA_HOT_RELOAD -eq '1') {
+      $lines.Add('    image: ${FRIGATE_IMAGE}')
+    } else {
+      $lines.Add('    image: ${TRACKER_IMAGE}')
+    }
     $lines.Add("    container_name: $($node.Container)")
     $lines.Add('    profiles: ["external-tracker"]')
     $lines.Add('    restart: unless-stopped')
@@ -574,6 +599,11 @@ function New-ReplayOverride([object[]]$Sources, $Runtime, [bool]$NotificationsEn
     $lines.Add('      PASSAGE_CAPTURE_CUTOFF_PATH: ${PASSAGE_CAPTURE_CUTOFF_PATH:-}')
     $lines.Add('      PASSAGE_RUN_ID: ${PASSAGE_RUN_ID:-}')
     $lines.Add('      PASSAGE_SOURCE_START_DIR: ${PASSAGE_SOURCE_START_DIR:-}')
+    if ($env:CAMERA_HOT_RELOAD -eq '1') {
+      $lines.Add('    entrypoint: ["python3", "-u", "/tracker-dev-reload.py"]')
+    } elseif (-not [string]::IsNullOrWhiteSpace($env:CAMERA_SOURCE_OVERLAY)) {
+      $lines.Add('    entrypoint: ["/bin/sh", "/tracker-run"]')
+    }
     $lines.Add("    volumes: [$volumeList, ${mediaVolume}:/media/frigate, ${spoolVolume}:/var/lib/camera-tracker/spool]")
   }
   if ($TrackerNodes.Count -gt 0) {
@@ -904,7 +934,7 @@ function Build-RuntimeImage($Runtime) {
 }
 
 function Test-FrigateConfig($Runtime, [object[]]$Sources) {
-  $validator = "from frigate.config import FrigateConfig; f=open('/config/config.yml',encoding='utf-8'); FrigateConfig.parse(f); f.close(); print('Frigate config: OK')"
+  $validator = "from importlib import import_module; from importlib.util import find_spec; module=import_module('frigate.infrastructure.config' if find_spec('frigate.infrastructure.config') else 'frigate.config'); FrigateConfig=module.FrigateConfig; f=open('/config/config.yml',encoding='utf-8'); FrigateConfig.parse(f); f.close(); print('Frigate config: OK')"
   $effectiveConfig = if ([string]::IsNullOrWhiteSpace($env:CAMERA_CONFIG_FILE)) {
     $configFile
   } else {
@@ -913,16 +943,26 @@ function Test-FrigateConfig($Runtime, [object[]]$Sources) {
   $oldPreference = $ErrorActionPreference
   try {
     $ErrorActionPreference = 'Continue'
-    $output = & docker run --rm --entrypoint python3 `
-      -e CONFIG_FILE=/config/config.yml `
-      -e FRIGATE_TELEGRAM_BOT_TOKEN `
-      -e FRIGATE_TELEGRAM_CHAT_ID `
-      -e FRIGATE_ZALO_BOT_TOKEN `
-      -e FRIGATE_ZALO_CHAT_ID `
-      -e NGROK_URL `
-      -v "${effectiveConfig}:/config/config.yml:ro" `
-      -v "$($Runtime.ModelPath):/assets/models/yolov9-t-320.onnx:ro" `
-      $Runtime.Image -c $validator 2>&1
+    $dockerArgs = @(
+      'run','--rm','--entrypoint','python3',
+      '-e','CONFIG_FILE=/config/config.yml',
+      '-e','FRIGATE_TELEGRAM_BOT_TOKEN',
+      '-e','FRIGATE_TELEGRAM_CHAT_ID',
+      '-e','FRIGATE_ZALO_BOT_TOKEN',
+      '-e','FRIGATE_ZALO_CHAT_ID',
+      '-e','NGROK_URL',
+      '-v',"${effectiveConfig}:/config/config.yml:ro",
+      '-v',"$($Runtime.ModelPath):/assets/models/yolov9-t-320.onnx:ro"
+    )
+    if (-not [string]::IsNullOrWhiteSpace($env:CAMERA_SOURCE_OVERLAY)) {
+      $overlayRoot = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($env:CAMERA_SOURCE_OVERLAY)
+      $dockerArgs += @(
+        '-v',((Join-Path $overlayRoot 'frigate').Replace('\','/') + ':/opt/frigate/frigate:ro'),
+        '-v',((Join-Path $overlayRoot 'extension').Replace('\','/') + ':/opt/frigate/extension:ro')
+      )
+    }
+    $dockerArgs += @($Runtime.Image,'-c',$validator)
+    $output = & docker @dockerArgs 2>&1
     $exitCode = $LASTEXITCODE
   } finally {
     $ErrorActionPreference = $oldPreference
@@ -1026,7 +1066,8 @@ Camera runtime
   .\deploy\run.ps1 build
 
 Use -ConfigFile to select an isolated config; the default is .\deploy\config.yaml.
-Development commands bind-mount -SourceDir read-only; the default is .\frigate\src\frigate.
+Development commands bind-mount -SourceDir read-only; the default is .\frigate\src.
+Tracker development watches Python files and reloads automatically without an image build.
 '@ | Write-Host
 }
 
@@ -1036,6 +1077,7 @@ try {
   if ($Command -in @('dev-start','dev-restart','dev-logs','dev-stop')) {
     $devSourcePath = Resolve-DevSourcePath $SourceDir
     $env:CAMERA_SOURCE_OVERLAY = $devSourcePath
+    $env:CAMERA_HOT_RELOAD = '1'
   }
   $effectiveCommand = switch ($Command) {
     'dev-start' { 'start' }
@@ -1089,6 +1131,11 @@ try {
       Test-FrigateConfig $runtime $sources
       Ensure-FrigateConfigVolume
       Invoke-Compose $prefix @('config','--quiet')
+      if ($trackerNodes.Count -gt 0) {
+        # Stop the dependent first so replacing a tracker never creates a
+        # startup disconnect in an older Frigate process.
+        Invoke-Compose $prefix @('stop','--timeout','10','frigate')
+      }
       $replaySources = @($sources | Where-Object Mode -eq 'replay')
       if ($replaySources.Count -gt 0) {
         Invoke-Compose $prefix @('up','-d','--no-build','mediamtx')
@@ -1122,6 +1169,7 @@ try {
       $state = [ordered]@{
         started_at=[DateTime]::UtcNow.ToString('o')
         development=($null -ne $devSourcePath)
+        hot_reload=($env:CAMERA_HOT_RELOAD -eq '1')
         source_overlay=$devSourcePath
         tracker_nodes=@($trackerNodes | ForEach-Object { [ordered]@{ node_id=$_.Id; cameras=$_.Cameras; container=$_.Container } })
         cameras=@()
@@ -1135,6 +1183,11 @@ try {
       Test-RuntimeDependencies $runtime
       Ensure-FrigateConfigVolume
       Invoke-Compose $prefix @('config','--quiet')
+      if ($trackerNodes.Count -gt 0) {
+        Invoke-Compose $prefix @('stop','--timeout','10','frigate')
+        Invoke-Compose $prefix (@('up','-d','--no-build','--force-recreate','--no-deps') + @($trackerNodes.Service))
+        Wait-TrackerReady $trackerNodes
+      }
       Invoke-Compose $prefix @('up','-d','--no-build','--force-recreate','--no-deps','frigate')
       if ($env:CAMERA_SKIP_READY_WAIT -ne '1') {
         Wait-RuntimeReady $sources $config
@@ -1142,6 +1195,7 @@ try {
       $state = [ordered]@{
         started_at=[DateTime]::UtcNow.ToString('o')
         development=$true
+        hot_reload=$true
         source_overlay=$devSourcePath
         cameras=@()
       }
@@ -1163,9 +1217,6 @@ try {
       Test-RuntimeStorage $runtime $config
       Ensure-FrigateConfigVolume
       Invoke-Compose $prefix @('config','--quiet')
-      # SQLite must finish WAL/checkpoint work before Compose replaces the
-      # container or an acceptance timeout can surface as a disk I/O failure.
-      Invoke-Compose $prefix @('stop','--timeout','10','frigate')
       if ($runtime.ExternalRecognition) {
         Write-LauncherStep 'recognition-readiness' 'starting'
         Invoke-Compose $prefix @('up','-d','--no-build','--force-recreate','--no-deps','recognition')
@@ -1174,26 +1225,7 @@ try {
       } elseif ((& docker ps -a --format '{{.Names}}') -contains 'camera-recognition') {
         & docker rm -f camera-recognition *> $null
       }
-      $acceptanceServices = [Collections.Generic.List[string]]::new()
       $replaySources = @($sources | Where-Object Mode -eq 'replay')
-      if ($replaySources.Count -gt 0) {
-        Invoke-Compose $prefix @('up','-d','--no-build','mediamtx')
-        foreach ($source in $replaySources) {
-          $acceptanceServices.Add(('replay-' + $source.Name.ToLowerInvariant().Replace('_','-')))
-        }
-        # Bring the RTSP paths online before Frigate opens them. Starting all
-        # services in one Compose transaction races Frigate capture against
-        # MediaMTX publication and can leave both cameras at 0 FPS for the
-        # validator's entire startup budget.
-        Invoke-Compose $prefix (@('up','-d','--no-build','--force-recreate','--no-deps') + @($acceptanceServices))
-        Start-Sleep -Milliseconds 1200
-        foreach ($source in $replaySources) {
-          $container = 'camera-replay-' + $source.Name.ToLowerInvariant().Replace('_','-')
-          $running = (& docker inspect $container --format '{{.State.Running}}' 2>$null).Trim()
-          if ($running -ne 'true') { throw "Replay publisher '$($source.Name)' did not start." }
-        }
-        Wait-ReplayReady $replaySources
-      }
       $trackerReadiness = @()
       if ($trackerNodes.Count -gt 0) {
         Write-LauncherStep 'tracker-service-readiness' 'starting'
@@ -1206,7 +1238,38 @@ try {
       }
       Write-LauncherStep 'frigate-create' 'starting'
       Invoke-Compose $prefix @('up','-d','--no-build','--force-recreate','--no-deps','frigate')
+      $frigateServiceReady = $false
+      $frigateReadyDeadline = [DateTime]::UtcNow.AddSeconds(90)
+      do {
+        try {
+          Get-FrigateInternalStats *> $null
+          $frigateServiceReady = $true
+          break
+        } catch {
+          Start-Sleep -Milliseconds 500
+        }
+      } while ([DateTime]::UtcNow -lt $frigateReadyDeadline)
+      if (-not $frigateServiceReady) {
+        throw 'Frigate service did not become healthy before acceptance input started.'
+      }
       Write-LauncherStep 'frigate-create' 'created'
+      # Test input is the final activation step. Matching healthy services are
+      # reused above; only replay publishers are recreated for a fresh stream.
+      if ($replaySources.Count -gt 0) {
+        $acceptanceServices = [Collections.Generic.List[string]]::new()
+        Invoke-Compose $prefix @('up','-d','--no-build','mediamtx')
+        foreach ($source in $replaySources) {
+          $acceptanceServices.Add(('replay-' + $source.Name.ToLowerInvariant().Replace('_','-')))
+        }
+        Invoke-Compose $prefix (@('up','-d','--no-build','--force-recreate','--no-deps') + @($acceptanceServices))
+        Start-Sleep -Milliseconds 1200
+        foreach ($source in $replaySources) {
+          $container = 'camera-replay-' + $source.Name.ToLowerInvariant().Replace('_','-')
+          $running = (& docker inspect $container --format '{{.State.Running}}' 2>$null).Trim()
+          if ($running -ne 'true') { throw "Replay publisher '$($source.Name)' did not start." }
+        }
+        Wait-ReplayReady $replaySources
+      }
       $sourceCommit = ((& git -C (Join-Path $workspace 'frigate') rev-parse HEAD) -join '').Trim()
       $worktreeHash = ((& git -C (Join-Path $workspace 'frigate') diff --binary HEAD | git hash-object --stdin) -join '').Trim()
       $imageManifest = if (Test-Path -LiteralPath $imageManifestFile) {
@@ -1226,7 +1289,63 @@ try {
       foreach ($source in $sources) { $state.cameras += [ordered]@{ name=$source.Name; mode=$source.Mode; source=$source.Redacted } }
       Write-AtomicUtf8 $stateFile (($state | ConvertTo-Json -Depth 5) + "`n")
       Write-LauncherStep 'acceptance-start' 'complete'
-      Write-Host "Acceptance runtime containers recreated for $($sources.Count) camera(s)."
+      Write-Host "Acceptance runtime started from prepared containers for $($sources.Count) camera(s)."
+    }
+    'acceptance-park' {
+      # Parking removes test input, not the runtime. Long-lived services stay
+      # healthy so the next E2E run can reuse the matching topology directly.
+      $replayServices = @($sources | Where-Object Mode -eq 'replay' | ForEach-Object {
+        'replay-' + $_.Name.ToLowerInvariant().Replace('_','-')
+      })
+      if ($replayServices.Count -gt 0) {
+        Invoke-Compose $prefix (@('stop','--timeout','2') + $replayServices)
+        Invoke-Compose $prefix @('up','-d','--no-build','mediamtx')
+      }
+      if (-not [string]::IsNullOrWhiteSpace($env:CAMERA_REPORT_MEDIA_DIR)) {
+        $sessionFile = Join-Path $env:CAMERA_REPORT_MEDIA_DIR 'session.json'
+        Write-AtomicUtf8 $sessionFile (([ordered]@{
+          state='idle'
+          updated_at=[DateTime]::UtcNow.ToString('o')
+        } | ConvertTo-Json -Compress) + "`n")
+      }
+      if ($runtime.ExternalRecognition) {
+        $recognitionRunning = ((& docker inspect camera-recognition --format '{{.State.Running}}' 2>$null) -join '').Trim() -eq 'true'
+        if (-not $recognitionRunning) {
+          & docker start camera-recognition *> $null
+          if ($LASTEXITCODE -ne 0) { throw 'Unable to keep recognition ready while idle.' }
+        }
+        Wait-RecognitionReady
+      }
+      foreach ($node in $trackerNodes) {
+        $trackerRunning = Test-ContainerRunning $node.Container
+        if (-not $trackerRunning) {
+          & docker start $node.Container *> $null
+          if ($LASTEXITCODE -ne 0) { throw "Unable to keep tracker '$($node.Id)' ready while idle." }
+        }
+      }
+      if ($trackerNodes.Count -gt 0) {
+        Wait-TrackerReady $trackerNodes 30 -RequireCameras:$false *> $null
+      }
+      $frigateRunning = ((& docker inspect frigate --format '{{.State.Running}}' 2>$null) -join '').Trim() -eq 'true'
+      if (-not $frigateRunning) {
+        & docker start frigate *> $null
+        if ($LASTEXITCODE -ne 0) { throw 'Unable to keep Frigate ready while idle.' }
+      }
+      $frigateIdleReady = $false
+      $frigateIdleDeadline = [DateTime]::UtcNow.AddSeconds(90)
+      do {
+        try {
+          Get-FrigateInternalStats *> $null
+          $frigateIdleReady = $true
+          break
+        } catch {
+          Start-Sleep -Milliseconds 500
+        }
+      } while ([DateTime]::UtcNow -lt $frigateIdleDeadline)
+      if (-not $frigateIdleReady) {
+        throw 'Frigate did not become healthy in idle acceptance mode.'
+      }
+      Write-Host 'Acceptance runtime is idle and ready; replay input is stopped.'
     }
     'acceptance-fault' {
       if ([string]::IsNullOrWhiteSpace($FaultScenario)) { throw 'acceptance-fault requires -FaultScenario.' }
@@ -1336,6 +1455,14 @@ try {
     'stop' {
       Invoke-Compose $prefix @('down','--remove-orphans')
       $remaining = @(& docker ps --format '{{.Names}}') | Where-Object { $_ -eq 'frigate' -or $_ -like 'camera-*' }
+      if ($remaining) {
+        # A container created under a different dev profile can keep this
+        # Compose network alive even though it is still launcher-owned.
+        & docker rm -f @remaining *> $null
+        if ($LASTEXITCODE -ne 0) { throw "Unable to remove runtime containers: $($remaining -join ', ')" }
+        Invoke-Compose $prefix @('down','--remove-orphans')
+      }
+      $remaining = @(& docker ps --format '{{.Names}}') | Where-Object { $_ -eq 'frigate' -or $_ -like 'camera-*' }
       if ($remaining) { throw "Shutdown incomplete: $($remaining -join ', ')" }
       Write-Host 'Camera runtime stopped cleanly.'
     }
@@ -1352,3 +1479,42 @@ try {
   Write-Host (Protect-Text ($failure -join "`n") $knownSources) -ForegroundColor Red
   exit 1
 }
+function Convert-DockerHostPath([string]$Path) {
+  $value = $Path.Replace('\','/')
+  if ($value -match '^/run/desktop/mnt/host/([A-Za-z])/(.*)$') {
+    return "$($Matches[1]):/$($Matches[2])"
+  }
+  return $value
+}
+
+function Test-ContainerMount([string]$Container, [string]$Destination, [string]$Expected) {
+  if (-not ((@(& docker ps -a --format '{{.Names}}') -contains $Container))) { return $false }
+  try {
+    $inspect = ((& docker inspect $Container 2>$null) -join "`n" | ConvertFrom-Json | Select-Object -First 1)
+    $source = [string](@($inspect.Mounts | Where-Object Destination -eq $Destination | Select-Object -First 1).Source)
+    $actual = Convert-DockerHostPath $source
+    $wanted = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Expected).Replace('\','/')
+    return $actual.Equals($wanted, [StringComparison]::OrdinalIgnoreCase)
+  } catch {
+    return $false
+  }
+}
+
+function Test-ContainerRunning([string]$Container) {
+  return @(& docker ps --format '{{.Names}}') -contains $Container
+}
+
+function Test-StableEvidenceMount([string]$Container) {
+  if (-not ((@(& docker ps -a --format '{{.Names}}') -contains $Container))) { return $false }
+  try {
+    $inspect = ((& docker inspect $Container 2>$null) -join "`n" | ConvertFrom-Json | Select-Object -First 1)
+    $source = [string](@($inspect.Mounts | Where-Object Destination -eq '/runtime-evidence' | Select-Object -First 1).Source)
+    return $source.Replace('\','/').EndsWith(
+      '/.tmp/runtime/acceptance-session',
+      [StringComparison]::OrdinalIgnoreCase
+    )
+  } catch {
+    return $false
+  }
+}
+    $lines.Add('      PASSAGE_SESSION_FILE: ${PASSAGE_SESSION_FILE:-}')

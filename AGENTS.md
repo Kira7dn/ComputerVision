@@ -42,8 +42,9 @@
 - Fault E2E chính thức là:
   `tools/tests/e2e/run_external_recognition_fault_test.py` với các scenario
   `service_restart`, `stream_disconnect`, `client_disconnect`.
-- Healthy tracker-edge E2E entrypoint là:
-  `tools/tests/e2e/run_external_tracker_runtime_test.py`.
+- Healthy tracker-edge E2E mặc định là:
+  `tools/tests/e2e/run_platform_runtime_test.py`.
+- `tools/tests/e2e/run_external_tracker_runtime_test.py` chỉ là alias tương thích.
 - Fault tracker-edge E2E entrypoint là:
   `tools/tests/e2e/run_external_tracker_fault_test.py` với các scenario
   `tracker_restart`, `stream_disconnect`, `client_disconnect`, `spool_replay`,
