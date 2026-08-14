@@ -1293,27 +1293,38 @@ try {
       Test-RuntimeStorage $runtime $config
       Ensure-FrigateConfigVolume
       Invoke-Compose $prefix @('config','--quiet')
+      $trackerReadiness = @()
+      $dependencyServices = [Collections.Generic.List[string]]::new()
       if ($runtime.ExternalRecognition) {
         Write-LauncherStep 'recognition-readiness' 'starting'
-        Invoke-Compose $prefix @('up','-d','--no-build','--force-recreate','--no-deps','recognition')
-        Wait-RecognitionReady
-        Write-LauncherStep 'recognition-readiness' 'ready'
+        $dependencyServices.Add('recognition')
       } elseif ((& docker ps -a --format '{{.Names}}') -contains 'camera-recognition') {
         & docker rm -f camera-recognition *> $null
       }
       $replaySources = @($sources | Where-Object Mode -eq 'replay')
-      $trackerReadiness = @()
       if ($trackerNodes.Count -gt 0) {
         Write-LauncherStep 'tracker-service-readiness' 'starting'
-        Invoke-Compose $prefix (@('up','-d','--no-build','--force-recreate','--no-deps') + @($trackerNodes.Service))
+        foreach ($service in $trackerNodes.Service) { $dependencyServices.Add($service) }
+      }
+      Write-LauncherStep 'frigate-create' 'starting'
+      $dependencyServices.Add('frigate')
+      if ($dependencyServices.Count -gt 0) {
+        $services = @($dependencyServices | Select-Object -Unique)
+        Invoke-Compose $prefix (@('up','-d','--no-build','--force-recreate','--no-deps') + $services)
+      }
+      # Compose creates independent dependencies in parallel. Keep readiness
+      # checks explicit so each failed boundary remains visible in artifacts.
+      if ($runtime.ExternalRecognition) {
+        Wait-RecognitionReady
+        Write-LauncherStep 'recognition-readiness' 'ready'
+      }
+      if ($trackerNodes.Count -gt 0) {
         # acceptance-start only gates on the tracker service. Camera FPS is
         # established after Frigate main attaches to the direct source and is
         # validated by the acceptance runner, not during topology startup.
         $trackerReadiness = @(Wait-TrackerReady $trackerNodes 30 -RequireCameras:$false)
         Write-LauncherStep 'tracker-service-readiness' 'ready' @{ nodes=$trackerReadiness.Count }
       }
-      Write-LauncherStep 'frigate-create' 'starting'
-      Invoke-Compose $prefix @('up','-d','--no-build','--force-recreate','--no-deps','frigate')
       $frigateServiceReady = $false
       $frigateReadyDeadline = [DateTime]::UtcNow.AddSeconds(90)
       do {
@@ -1492,18 +1503,26 @@ try {
       Test-TrackerDependencies $runtime $trackerNodes
       Test-RuntimeStorage $runtime $config
       Invoke-Compose $prefix @('config','--quiet')
-      Invoke-Compose $prefix @('stop','--timeout','10','frigate')
+      $restoreServices = [Collections.Generic.List[string]]::new()
       if ($runtime.ExternalRecognition) {
-        Invoke-Compose $prefix @('up','-d','--no-build','--force-recreate','--no-deps','recognition')
-        Wait-RecognitionReady
+        $restoreServices.Add('recognition')
       } elseif ((& docker ps -a --format '{{.Names}}') -contains 'camera-recognition') {
         & docker rm -f camera-recognition *> $null
       }
       if ($trackerNodes.Count -gt 0) {
-        Invoke-Compose $prefix (@('up','-d','--no-build','--force-recreate','--no-deps') + @($trackerNodes.Service))
+        foreach ($service in $trackerNodes.Service) { $restoreServices.Add($service) }
+      }
+      $restoreServices.Add('frigate')
+      if ($restoreServices.Count -gt 0) {
+        $services = @($restoreServices | Select-Object -Unique)
+        Invoke-Compose $prefix (@('up','-d','--no-build','--force-recreate','--no-deps') + $services)
+      }
+      if ($runtime.ExternalRecognition) {
+        Wait-RecognitionReady
+      }
+      if ($trackerNodes.Count -gt 0) {
         Wait-TrackerReady $trackerNodes 30 -RequireCameras:$false
       }
-      Invoke-Compose $prefix @('up','-d','--no-build','--force-recreate','--no-deps','frigate')
       $state = [ordered]@{ started_at=[DateTime]::UtcNow.ToString('o'); cameras=@() }
       foreach ($source in $sources) { $state.cameras += [ordered]@{ name=$source.Name; mode=$source.Mode; source=$source.Redacted } }
       Write-AtomicUtf8 $stateFile (($state | ConvertTo-Json -Depth 5) + "`n")

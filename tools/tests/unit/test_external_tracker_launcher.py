@@ -55,7 +55,9 @@ def test_acceptance_script_creates_missing_services_and_waits_for_readiness() ->
     ]
     assert "Test-RuntimeDependencies $runtime" in acceptance
     assert "Invoke-Compose $prefix @('config','--quiet')" in acceptance
-    assert acceptance.count("@('up','-d','--no-build'") >= 3
+    assert "$dependencyServices.Add('recognition')" in acceptance
+    assert "$dependencyServices.Add('frigate')" in acceptance
+    assert "+ $services" in acceptance
     assert "Wait-RecognitionReady" in acceptance
     assert "Wait-TrackerReady" in acceptance
     assert "Get-FrigateInternalStats" in acceptance
@@ -69,21 +71,34 @@ def test_go2rtc_dev_overlay_uses_current_config_package() -> None:
     assert "from frigate.config.env import" not in source
 
 
-def test_tracker_service_readiness_precedes_frigate_without_camera_gate() -> None:
+def test_concurrent_service_start_precedes_readiness_and_input() -> None:
     launcher = _launcher()
     acceptance = launcher.index("    'acceptance-start'")
-    tracker_start = launcher.index(
-        "Invoke-Compose $prefix (@('up','-d','--no-build','--force-recreate','--no-deps') + @($trackerNodes.Service))",
-        acceptance,
-    )
-    tracker_ready = launcher.index("Wait-TrackerReady $trackerNodes", tracker_start)
+    tracker_start = launcher.index("$dependencyServices.Add($service)", acceptance)
     frigate_start = launcher.index(
-        "Invoke-Compose $prefix @('up','-d','--no-build','--force-recreate','--no-deps','frigate')",
+        "$dependencyServices.Add('frigate')",
+        tracker_start,
+    )
+    combined_start = launcher.index(
+        "Invoke-Compose $prefix (@('up','-d','--no-build','--force-recreate','--no-deps') + $services)",
+        frigate_start,
+    )
+    tracker_ready = launcher.index(
+        "Wait-TrackerReady $trackerNodes",
+        combined_start,
+    )
+    frigate_ready = launcher.index(
+        "Get-FrigateInternalStats",
         tracker_ready,
     )
-    assert tracker_start < tracker_ready < frigate_start
-    assert "-RequireCameras:$false" in launcher[tracker_ready:frigate_start]
-    assert "CAMERA_REUSE_SERVICES" not in launcher[acceptance:frigate_start]
+    replay_start = launcher.index(
+        "$acceptanceServices",
+        frigate_ready,
+    )
+    assert tracker_start < frigate_start < combined_start
+    assert combined_start < tracker_ready < frigate_ready < replay_start
+    assert "-RequireCameras:$false" in launcher[tracker_ready:frigate_ready]
+    assert "CAMERA_REUSE_SERVICES" not in launcher[acceptance:replay_start]
     assert "'acceptance-park'" in launcher
     park = launcher[
         launcher.index("    'acceptance-park'") : launcher.index(
@@ -138,10 +153,30 @@ def test_acceptance_validates_storage_and_restores_recognition_lifecycle() -> No
     restore = launcher[launcher.index("    'acceptance-restore'") :]
     assert "Test-RuntimeStorage $runtime $config" in acceptance
     assert "Test-RuntimeStorage $runtime $config" in restore
-    recognition_start = restore.index("'--no-deps','recognition'")
-    recognition_ready = restore.index("Wait-RecognitionReady", recognition_start)
-    frigate_start = restore.index("'--no-deps','frigate'", recognition_ready)
-    assert recognition_start < recognition_ready < frigate_start
+    recognition_start = restore.index("$restoreServices.Add('recognition')")
+    combined_start = restore.index("+ $services)", recognition_start)
+    recognition_ready = restore.index("Wait-RecognitionReady", combined_start)
+    frigate_start = restore.index("$restoreServices.Add('frigate')")
+    assert recognition_start < frigate_start < combined_start < recognition_ready
+
+
+def test_acceptance_starts_recognition_and_tracker_in_one_compose_call() -> None:
+    launcher = _launcher()
+    acceptance = launcher[
+        launcher.index("    'acceptance-start'") : launcher.index(
+            "    'acceptance-park'"
+        )
+    ]
+
+    recognition = acceptance.index("$dependencyServices.Add('recognition')")
+    tracker = acceptance.index("$dependencyServices.Add($service)")
+    combined_start = acceptance.index("+ $services)", tracker)
+    recognition_ready = acceptance.index("Wait-RecognitionReady", combined_start)
+    tracker_ready = acceptance.index("Wait-TrackerReady", recognition_ready)
+
+    assert recognition < combined_start
+    assert tracker < combined_start
+    assert combined_start < recognition_ready < tracker_ready
 
 
 def test_tracker_readiness_treats_startup_connection_errors_as_failed_polls() -> None:

@@ -278,6 +278,23 @@ def wait_file_quiescent(
     return False
 
 
+def wait_files_quiescent(
+    paths: tuple[Path, ...], *, timeout: float = 10.0, stable_seconds: float = 1.0
+) -> dict[Path, bool]:
+    """Wait for independent runtime writers concurrently."""
+    with ThreadPoolExecutor(max_workers=len(paths)) as executor:
+        futures = {
+            path: executor.submit(
+                wait_file_quiescent,
+                path,
+                timeout=timeout,
+                stable_seconds=stable_seconds,
+            )
+            for path in paths
+        }
+        return {path: future.result() for path, future in futures.items()}
+
+
 def validate_runtime_lpr_evidence(
     evidence_dir: Path,
     anchors: dict[str, list[float]],
@@ -3197,7 +3214,7 @@ def collect_native_trace_clips(
         return metadata, trace_dir, ffprobe_clip(target), sha256(target)
 
     if edge_probe_jobs:
-        with ThreadPoolExecutor(max_workers=min(4, len(edge_probe_jobs))) as executor:
+        with ThreadPoolExecutor(max_workers=min(8, len(edge_probe_jobs))) as executor:
             for metadata, trace_dir, probe, digest in executor.map(
                 validate_edge_clip, edge_probe_jobs
             ):
@@ -5757,7 +5774,7 @@ def main(argv: list[str] | None = None) -> int:
                 raise TimeoutError("recognition did not become idle after tracker completion")
             quiescence_started = time.monotonic()
             if not wait_file_quiescent(
-                live_trace_path, timeout=60.0, stable_seconds=2.0
+                live_trace_path, timeout=60.0, stable_seconds=1.0
             ):
                 raise TimeoutError("tracker trace did not become quiescent after EOF")
             summary["timing"]["trace_quiescence_seconds"] = round(
@@ -5816,9 +5833,15 @@ def main(argv: list[str] | None = None) -> int:
         # Frigate owns persisted evidence in both topologies. The external
         # service transports source artifacts but never writes this volume.
         evidence_pipelines = ("lpr", "face")
-        for pipeline in evidence_pipelines:
-            evidence_manifest = output / "media" / pipeline / "evidence.jsonl"
-            if not wait_file_quiescent(evidence_manifest):
+        evidence_manifests = tuple(
+            output / "media" / pipeline / "evidence.jsonl"
+            for pipeline in evidence_pipelines
+        )
+        evidence_quiescence = wait_files_quiescent(evidence_manifests)
+        for pipeline, evidence_manifest in zip(
+            evidence_pipelines, evidence_manifests, strict=True
+        ):
+            if not evidence_quiescence[evidence_manifest]:
                 raise RuntimeError(
                     f"Runtime {pipeline.upper()} evidence writer did not become "
                     "quiescent after replay"

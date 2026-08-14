@@ -32,7 +32,7 @@ python tools/tests/e2e/run_external_recognition_runtime_test.py
 `tools/runtime/validate_platform_runtime.py` là implementation tham số hóa duy nhất. Các wrapper
 không copy scorer, fixture, media writer hoặc report logic.
 
-Entrypoint mặc định dùng isolated lifecycle: force-recreate đúng các service test bằng config,
+Entrypoint mặc định dùng isolated lifecycle: force-recreate đồng thời các service test bằng config,
 database, TLS và evidence directory riêng của run, chạy replay hữu hạn, thu artifact rồi gọi
 `acceptance-restore`. Không teardown Compose network trước khi tạo lại cùng các service. Source hiện tại được
 bind-mount vào Frigate, recognition và tracker nên healthy E2E không yêu cầu build image trong
@@ -40,11 +40,12 @@ development. `deploy/run.ps1 dev-start` dùng Docker Compose watch để tự re
 service khi source thay đổi; MediaMTX và replay publisher không chứa source ứng dụng nên không
 tham gia watch.
 
-Run retention `20260814-213819-309` hoàn tất với `accepted=true`, đủ 15 trace/clip và
+Run retention `20260814-221312-066` hoàn tất với `accepted=true`, đủ 15 trace/clip và
 `runtime_restored=true`. Tracker ghi `edge-media` trực tiếp vào report bind mount; sau khi clip,
 trace và ảnh debug cuối đã được xác nhận, runner xóa transport staging, test TLS và SQLite
-WAL/SHM. Artifact giảm còn `145.496 MiB`; root chỉ còn `summary.json` và ba Docker inspect JSON;
-failed run vẫn giữ staging nguyên vẹn để chẩn đoán.
+WAL/SHM. Healthy E2E mất `104.265` giây nội bộ (`106.026` giây theo host), artifact còn
+`146.401 MiB`; root chỉ có `summary.json` và ba Docker inspect JSON. Failed run vẫn giữ staging
+nguyên vẹn để chẩn đoán.
 
 Mỗi invocation tự tạo một thư mục timestamp:
 
@@ -69,7 +70,7 @@ Script thực hiện:
 7. Chờ deferred recognition/evidence lifecycle và native recording segment được commit.
 8. Lấy `Event.start_time/end_time` và tải clip bằng recording API có sẵn của Frigate.
 9. Thu Docker inspect/log trước khi restore runtime.
-10. Xuất `report.md`, JSON report, direct trace, runtime evidence và clip theo trace.
+10. Xuất `report.md`, canonical `summary.json`, raw JSONL và clip theo trace.
 
 Hai entrypoint trên đều gọi `tools/runtime/validate_platform_runtime.py`; không có hai runtime
 test implementation.
