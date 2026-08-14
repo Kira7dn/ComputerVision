@@ -82,16 +82,18 @@ Các bằng chứng hiện có được phân loại như sau; `pass` unit test 
 
 ### 4.1 Boundary deployment hiện hành
 
-`frigate` là runtime đang chạy và hiện chứa cả các lane tracker lẫn Event/recognition. Kiến trúc
-đích giữ Frigate main làm Event/publication SOT nhưng chuyển camera ownership theo topology:
+Runtime hỗ trợ cả camera do Frigate-contained tracker sở hữu và camera được gán cho edge tracker.
+Topology Phase 8 đã kiểm chứng dùng `camera-tracker-edge-local` làm tracker owner, đồng thời giữ
+Frigate main làm Event/publication SOT:
 `tracker` phát detection/track result, giữ evidence và media bytes cho camera edge; `frigate` main
 validate stream/manifest, route candidate/evidence, sở hữu Event/API/SQLite/notification/publication,
 proxy media và gọi `camera-recognition`. `camera-recognition` chỉ xử lý Face/LPR và trả outcome.
 
 ## 5. Kiến trúc đích
 
-Sơ đồ dưới đây là kiến trúc service chuẩn. Hiện tại các lane `tracker` vẫn nằm trong container
-`frigate`; khi tách edge, chỉ thay producer của tracked-object stream, không thay Event SOT.
+Sơ đồ dưới đây là kiến trúc service chuẩn đã được kiểm chứng cho local edge topology. Camera có thể
+được chuyển owner giữa Frigate-contained và edge tracker, nhưng việc chuyển producer của
+tracked-object stream không thay Event SOT.
 
 ```mermaid
 flowchart LR
@@ -592,8 +594,8 @@ riêng, nhưng không được trộn vào tử số hoặc mẫu số accuracy.
 Platform runtime test dùng report **evidence-only** xuyên suốt roadmap; các giá trị KPI/runtime
 chỉ là diagnostic, không phải acceptance decision. Mỗi invocation chạy một vòng, lưu vào thư mục
 timestamp riêng và chốt measurement sau EOF của mọi finite source. Contract chi tiết về raw trace,
-source PTS, hardware metrics và artifact được tách tại
-[Platform-Test-Report.md](./Platform-Test-Report.md).
+source PTS, hardware metrics và artifact được mô tả tại
+[tools/tests/README.md](../../tools/tests/README.md) và được thực thi bởi validator canonical.
 
 ## 13. Lộ trình triển khai
 
@@ -611,9 +613,11 @@ module hoặc deployment topology được nêu rõ; unit test, replay và bench
 để đóng phase, không phải work package thay thế cho phần triển khai. Phase 1–4 đã hoàn tất;
 Phase 5 là thử nghiệm `[SUPERSEDED]`; Phase 6 đã `[DONE]` với recognition core đồng bộ và Frigate
 adapters; Phase 7 đã `[DONE]`: external container/runtime đã chạy cùng shared decision
-code và E2E mới đã đạt `measurement_valid=true`, correlation `0` cùng cleanup/restore; fault
-injection và wheel packaging đã có artifact. Acceptance tổng thể được đánh giá riêng sau
-khi hoàn thành toàn bộ roadmap,
+code và E2E đạt `measurement_valid=true`, correlation `0` cùng cleanup/restore; fault injection và
+wheel packaging Phase 7 đã có artifact. Phase 8 cũng đã
+`[DONE]` trong phạm vi local edge tracker: tracker → Frigate main → recognition → Event/API/SQLite/
+media đã qua healthy E2E chính thức, đủ 15 producer trace/clip và restore thành công. Acceptance
+tổng thể được đánh giá riêng sau khi hoàn thành toàn bộ roadmap,
 không dùng để đổi trạng thái từng
 phase đã hoàn tất.
 
@@ -632,7 +636,7 @@ phase đã hoàn tất.
 | 9. Quality/evidence observability | Face/LPR có cùng lineage và diagnostic metric | Phase 4, 6-1 | Selector không gate observation hoặc tham gia recognition decision |
 | 10. Recognition/result selection | Khôi phục nguyên vẹn LPR clustering và Face weighted voting từ Frigate master | Phase 6-1 | Khóa master commit, restore decision semantics và chứng minh parity |
 | 11. Compute control | Core đồng bộ khóa parity trước; service dùng bounded ordered executor | Phase 6–7 | Queue full reject ngay; service không thay cadence, order hoặc recognition output của core |
-| 12. Edge tracker runtime | Tách capture/detection/tracking thành edge service, chỉ phát `TrackedObjectUpdate` về Frigate main | Phase 8 | Parity detect/track, ordered lifecycle, lineage, fault cleanup và single-owner Event contract được kiểm chứng |
+| 12. Edge tracker runtime | Tách capture/detection/tracking thành edge service, chỉ phát `TrackedObjectUpdate` về Frigate main | Phase 8 | Local replay lineage, ordered lifecycle, cleanup/restore, edge media và single-owner Event contract được kiểm chứng |
 | 13. Remote distributed runtime | Frigate main kết nối cả tracker và recognition chạy trên máy khác qua private network và mTLS | Phase 9 | Remote topology, node/camera ownership, certificate, epoch, publication safety và fault recovery được kiểm chứng |
 
 Dependency bắt buộc:
@@ -646,11 +650,11 @@ baseline/passage [DONE]
 → standalone synchronous recognition core + Frigate adapters [DONE: Phase 6]
 → external gRPC recognition container + Frigate host adapter [DONE: HEALTHY E2E]
 → restart/disconnect fault injection + wheel packaging [DONE: Phase 7]
-→ edge tracker runtime + Frigate tracked-object adapter [IN PROGRESS: Phase 8]
+→ edge tracker runtime + Frigate tracked-object adapter [DONE: Phase 8 LOCAL E2E]
 → remote tracker + remote recognition distributed deployment [PLANNED: Phase 9]
 ```
 
-### Phase 8 — Edge tracker runtime [IN PROGRESS — SOURCE GATE BLOCKED]
+### Phase 8 — Edge tracker runtime [DONE — HEALTHY LOCAL E2E]
 
 Phase 8 tách lane xử lý liên tục theo camera khỏi Frigate main thành `tracker` edge runtime. Tracker
 nhận camera stream, decode và chạy lại chính các component Frigate hiện hành cho object detection,
@@ -660,12 +664,15 @@ ordered typed update, evidence reference cùng media manifest về Frigate main.
 validate/idempotent ingest, giữ Event/API/SQLite/notification/publication SOT, route recognition và
 proxy media; main không tính lại tracker decision. Tracker không giao tiếp trực tiếp với recognition.
 
-Trạng thái source ngày 2026-08-12: contract/config ownership, protobuf gRPC/mTLS, shared producer,
+Trạng thái chốt ngày 2026-08-14: contract/config ownership, gRPC/mTLS, shared producer,
 `CameraState` edge adapter, bounded I420 evidence, durable SQLite journal, canonical ingest record,
-media manifest/range primitives, managed node runtime và launcher-managed image/config/readiness đã
-có unit cô lập. Chưa build hoặc chạy Docker: full Frigate gate collect đủ `976` test nhưng dừng ở
-HTTP storage fixture do `os.path.join` Windows tạo key khác runtime POSIX constant. Vì vậy Phase 8
-chưa được đánh dấu `[DONE]`; healthy/fault/restore chưa có bằng chứng hợp lệ.
+edge media, managed node runtime và launcher readiness đã chạy trong topology Docker thật. Healthy
+entrypoint `tools/tests/e2e/run_platform_runtime_test.py` tạo run `20260814-221312-066` với
+`accepted=true`, `acceptance.status=passed`, `measurement_valid=true`, 4 Face trace, 11 LPR trace,
+15 `clip.mp4`, 15 `trace.json`, correlation/API-SQLite mismatch `0`, pending/restart/bad runtime log
+`0` và `runtime_restored=true`. Tổng runtime là `104.265` giây nội bộ, `106.026` giây theo host.
+Development E2E dùng source bind mount và `--no-build`; tài liệu này không suy diễn một production
+image build mới từ bằng chứng đó.
 
 Phạm vi triển khai:
 
@@ -686,25 +693,27 @@ Phạm vi triển khai:
 - **Phase 8-6 — Deployment:** thêm Docker image/service và launcher contract cho một hoặc nhiều
   edge node; mỗi camera tại một thời điểm chỉ có đúng một tracker owner và restore được topology
   Frigate-contained hiện hành.
-- **Phase 8-7 — Acceptance:** chạy parity replay, healthy E2E và các fault scenario tracker restart,
-  stream disconnect, Frigate client disconnect; artifact phải ghi topology, node/camera ownership,
-  source/worktree hash, epoch, lifecycle count, queue/resource state, cleanup và restore.
+- **Phase 8-7 — Acceptance:** chạy physical-source replay và healthy local E2E; artifact ghi topology,
+  node/camera ownership, source/worktree hash, epoch, lifecycle count, queue/resource state, media,
+  cleanup và restore. Fault campaign cho network/remote deployment thuộc Phase 9; không được ghi là
+  đã chạy trong lần đóng Phase 8 này.
 
 Tiêu chí đóng Phase 8:
 
-- Detection/tracking trên cùng replay tương đương pipeline Frigate hiện hành; raw lineage vẫn đủ
-  4 Face passage và 11 car passage. Face/LPR exact accuracy tiếp tục là diagnostic.
+- Detection/tracking dùng lại component Frigate hiện hành, không đổi model/threshold/resolution;
+  local replay giữ đủ 4 Face trace và 11 car trace. Face/LPR exact accuracy tiếp tục là diagnostic.
 - Không mất hoặc nhân đôi `track_start`, `track_update`, `track_end`; không nối track/history qua
   `stream_epoch` mới và không nhận late/old-epoch result.
 - Tracker không gọi trực tiếp `camera-recognition`, không sở hữu Event/API/canonical SQLite/
   notification/publication và không tạo publication path thứ hai. Tracker là media authority cho
-  camera edge; Frigate chỉ lưu manifest/reference và proxy authenticated range request.
-- Frigate main tiếp tục chạy khi một tracker unavailable; disconnect/restart trả typed failure,
-  đóng lifecycle cũ, phục hồi bằng epoch mới và không reconnect loop.
+  camera edge; Frigate giữ manifest/reference. Local acceptance materialize report media qua bind
+  mount; authenticated remote retrieval được kiểm chứng trong Phase 9.
+- Source contract giữ typed failure, epoch và bounded reconnect cho tracker unavailable; fault E2E
+  đa máy được kiểm chứng ở Phase 9 thay vì là gate đóng local runtime.
 - Queue/in-flight/evidence/writer/session terminal về `0`, không backlog unbounded, không duplicate
   Event và runtime restore thành công.
-- Unit/contract, compile/Ruff/diff-check pass trước build; healthy/fault E2E chạy qua launcher chuẩn
-  và mọi artifact truy vết được source commit/worktree hash.
+- Targeted launcher/contract, Ruff/diff-check và healthy E2E chạy qua launcher chuẩn; mọi artifact
+  truy vết được config/source hash. Production image build vẫn là release gate riêng.
 
 ### Phase 9 — Remote distributed runtime [PLANNED]
 
@@ -1518,14 +1527,15 @@ acceptance ở mục 13:
 | `[DONE]` | Recognition Docker image, Compose/deployment và integration tests | Healthy external run `20260812-141524-728` đạt `measurement_valid=true`, Face `4/4`, raw LPR `11/11`, API/SQLite consistency, correlation `0`, không reconnect/stall, service healthy, local model `0`, cleanup/pending/writer `0`, restore thành công; ba fault artifacts và reproducible wheel manifest đã pass. LPR exact `7/11` là diagnostic. |
 | `[DONE]` | Core/client wheel packaging | Hai wheel core/client đã được build sau runtime acceptance, clean-install/import và reproducibility pass; manifest ghi source/worktree hash, SHA-256 và byte size. |
 
-### 15.8 Phase 8 — Edge tracker runtime [IN PROGRESS — SOURCE GATE BLOCKED]
+### 15.8 Phase 8 — Edge tracker runtime [DONE — HEALTHY LOCAL E2E]
 
-| Trạng thái | Đường dẫn | Phạm vi kế tiếp |
+| Trạng thái | Đường dẫn | Bằng chứng/phạm vi |
 | --- | --- | --- |
-| `[IN PROGRESS: SOURCE/UNIT]` | `frigate/src/extension/tracker/`, `frigate/src/frigate/domain/video/`, `frigate/src/frigate/domain/track/` | Typed contract, durable producer runtime và adapter dùng lại `CameraState`/`TrackedObject`/Norfair/PTZ gốc đã có unit cô lập; chưa có runtime parity |
-| `[IN PROGRESS: SOURCE/UNIT]` | Frigate tracked-object host adapter, config schema, migration 040 | Camera owner, epoch/sequence/idempotency, evidence lineage, canonical ingest record và edge media manifest đã có unit; recognition routing/media proxy chưa có E2E |
-| `[BLOCKED: FULL UNIT GATE]` | `deploy/run.ps1`, `deploy/config.yaml`, `deploy/reference/docker-compose.yml` | Chưa được build/start/restore tracker qua launcher do full regression fail ở default detector union |
-| `[PENDING]` | `tools/tests/e2e/`, `tools/runtime/validate_platform_runtime.py` | Chưa chạy detect/track parity, healthy/fault evidence, lifecycle/publication/cleanup/restore gates |
+| `[DONE: SOURCE/CONTRACT]` | `frigate/src/extension/tracker/`, `frigate/src/frigate/domain/video/`, `frigate/src/frigate/domain/track/` | Typed contract, durable producer runtime và adapter dùng lại `CameraState`/`TrackedObject`/Norfair/PTZ gốc; ordered lifecycle và edge media chạy trong topology thật. |
+| `[DONE: HOST OWNERSHIP]` | Frigate tracked-object host adapter, config schema, migration 040 | Camera owner, epoch/sequence/idempotency, evidence lineage, canonical Event/API/SQLite và recognition routing giữ tại Frigate main. |
+| `[DONE: DEPLOYMENT]` | `deploy/run.ps1`, `deploy/config.yaml`, `deploy/reference/docker-compose.yml` | Launcher tạo đồng thời Frigate/recognition/tracker, bounded readiness trước input, source hot mount không build trong development và restore topology thành công. |
+| `[DONE: HEALTHY E2E]` | `tools/tests/e2e/run_platform_runtime_test.py`, `tools/runtime/validate_platform_runtime.py` | Run `20260814-221312-066` pass toàn bộ hard gate, đủ 4 Face + 11 LPR producer trace, 15 clip/trace, mismatch `0`, cleanup/pending `0`, restore `true`. |
+| `[DEFERRED: PHASE 9]` | Remote/fault campaign | Tracker restart, network disconnect và remote multi-host recovery không được tuyên bố pass trong Phase 8; chuyển sang acceptance của Phase 9. |
 
 ### 15.9 Phase 9 — Remote distributed runtime [PLANNED]
 
@@ -1534,7 +1544,7 @@ acceptance ở mục 13:
 | `[PLANNED]` | `deploy/run.ps1`, `deploy/config.yaml`, deployment manifests | Remote endpoint/topology cho cả tracker và recognition; không quản lý container remote như local |
 | `[PLANNED]` | Tracker/recognition transport, config và host adapters | gRPC/mTLS preflight, node/camera ownership, schema/config hash, tracker epoch và recognition epoch |
 | `[PLANNED]` | `tools/tests/e2e/`, `tools/runtime/validate_platform_runtime.py` | Remote end-to-end healthy/fault evidence trên cả hai link, publication safety, cleanup và restore |
-| `[PLANNED]` | `docs/architecture/Platform-Test-Report.md` | Report remote topology, certificate/network evidence, per-node resource và source/topology hash |
+| `[PLANNED]` | `tools/tests/README.md`, canonical runtime validator | Report remote topology, certificate/network evidence, per-node resource và source/topology hash |
 
 ### 15.10 Profile nguồn LPR 1024p hiện tại
 
@@ -1558,23 +1568,24 @@ trước khi vượt ngân sách. Số frame giữ lại không mang semantics t
 - [Kiến trúc ADAS Level 0](ADAS.md)
 - [Dahua IPC HTTP API](../references/DahuaHTTPAPI.pdf)
 
-## 17. Báo cáo hiện trạng runtime — 12/08/2026
+## 17. Báo cáo hiện trạng runtime — 14/08/2026
 
-Artifact xác nhận: [external E2E `20260812-141524-728`](../../.tmp/platform-runtime/20260812-141524-728/summary.json).
+Artifact xác nhận: [tracker E2E `20260814-221312-066`](../../.tmp/platform-runtime/20260814-221312-066/report.md).
 
 | Nhóm | Kết quả |
 | --- | --- |
-| Healthy external E2E | `measurement_valid=true`; runtime hoàn tất và restore thành công |
-| Face | `4/4` lineage, coverage `1.0`, `38` track-seen, `32` attempts |
-| Car/LPR | `11/11` raw trace, `8` publication; exact `7/11` giữ nguyên là diagnostic |
+| Healthy tracker E2E | `accepted=true`; `acceptance.status=passed`; `measurement_valid=true`; restore thành công |
+| Face | `4/4` lineage, coverage `1.0`, `32` track-seen, `29` attempts |
+| Car/LPR | `11/11` raw trace, `7` publication; exact `5/11` giữ nguyên là diagnostic |
+| Tracker media | 15 producer event; đủ 15 `clip.mp4` và 15 `trace.json` trong report |
 | Data correctness | API/SQLite pass; correlation mismatch `0` |
-| Runtime stability | Không reconnect/stall; queue/outcome/writer cuối run `0`; rejected `0` |
-| Resource peak | GPU `39%`; VRAM `1367/4096 MiB` (`33,4%`); shared memory `20%` |
-| CPU | Peak tổng hai container `1131,55%` trong startup/warm-up; các mẫu steady-state sau đó khoảng `35–41%` |
-| E2E elapsed | `158,19 giây`, trong đó replay `39,13 giây` |
+| Runtime stability | Bad runtime log/restart/pending `0`; recognition cleanup, writer drop và writer error đều `0` |
+| Resource peak | GPU `37%`; VRAM `1099/4096 MiB`; shared memory `3%`; RAM `4518930545` byte |
+| CPU | Peak Docker tổng các container `989,03%`; đây là số cộng trên nhiều logical core |
+| E2E elapsed | `104,265` giây nội bộ, `106,026` giây theo host; replay `11,172` giây |
 
-Diễn giải CPU: phần trăm là Docker CPU cộng theo hai container, nên `100%` xấp xỉ một logical
+Diễn giải CPU: phần trăm là Docker CPU cộng theo các container, nên `100%` xấp xỉ một logical
 core. Peak startup không đại diện tải duy trì; artifact không cho thấy queue tích lũy, stall hoặc
-OOM trong healthy run. Phase 8 edge tracker đang `[IN PROGRESS — SOURCE GATE BLOCKED]`; Phase 9 remote distributed runtime
-cho cả tracker và recognition là `[PLANNED]` sau Phase 8. LPR exact thấp tiếp tục được giữ nguyên
-dưới dạng diagnostic.
+OOM trong healthy run. Phase 8 local edge tracker đã `[DONE — HEALTHY LOCAL E2E]`; Phase 9 remote
+distributed runtime cho cả tracker và recognition vẫn `[PLANNED]`. LPR exact thấp tiếp tục được giữ
+nguyên dưới dạng diagnostic, không dùng để phủ nhận hoặc tô đẹp closure kiến trúc của Phase 8.
