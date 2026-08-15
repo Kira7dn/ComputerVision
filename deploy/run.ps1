@@ -588,8 +588,17 @@ function New-ReplayOverride([object[]]$Sources, $Runtime, [bool]$NotificationsEn
     $lines.Add('    restart: unless-stopped')
     $lines.Add('    healthcheck: { disable: true }')
     $lines.Add('    depends_on: [mediamtx]')
-    $lines.Add('    entrypoint: ["/usr/lib/ffmpeg/7.0/bin/ffmpeg"]')
-    $lines.Add("    volumes: [$volume]")
+    $replayBarrier = -not [string]::IsNullOrWhiteSpace($env:CAMERA_REPORT_MEDIA_DIR)
+    $replayVolumes = [Collections.Generic.List[string]]::new()
+    $replayVolumes.Add($volume)
+    if ($replayBarrier) {
+      $barrierVolume = (($env:CAMERA_REPORT_MEDIA_DIR.Replace('\','/') + ':/runtime-evidence') | ConvertTo-Json -Compress)
+      $replayVolumes.Add($barrierVolume)
+      $lines.Add('    entrypoint: ["/bin/sh", "-c"]')
+    } else {
+      $lines.Add('    entrypoint: ["/usr/lib/ffmpeg/7.0/bin/ffmpeg"]')
+    }
+    $lines.Add("    volumes: [$($replayVolumes -join ', ')]")
       # Frequent IDR frames let Frigate/go2rtc attach immediately after a
       # publisher restart instead of waiting on a long source GOP.
       $rateArgs = if ($source.Name -eq 'safety_camera') {
@@ -598,7 +607,15 @@ function New-ReplayOverride([object[]]$Sources, $Runtime, [bool]$NotificationsEn
         @()
       }
       $commandArgs = @('-hide_banner','-loglevel','warning','-re','-stream_loop',$loop,'-fflags','+genpts','-i','/runtime/source','-map','0:v:0') + $rateArgs + @('-an','-c:v','libx264','-preset','ultrafast','-tune','zerolatency','-g','15','-keyint_min','15','-sc_threshold','0','-x264-params','repeat-headers=1','-f','rtsp','-rtsp_transport','tcp',("rtsp://mediamtx:18554/$($source.Name)"))
-    $command = $commandArgs | ConvertTo-Json -Compress
+    if ($replayBarrier) {
+      $ffmpeg = $commandArgs -join ' '
+      $barrierCommand = [string[]]@(
+        "while [ ! -f /runtime-evidence/input-start ]; do sleep 0.1; done; exec /usr/lib/ffmpeg/7.0/bin/ffmpeg $ffmpeg"
+      )
+      $command = ConvertTo-Json -InputObject $barrierCommand -Compress
+    } else {
+      $command = $commandArgs | ConvertTo-Json -Compress
+    }
     $lines.Add("    command: $command")
   }
   foreach ($node in $TrackerNodes) {
@@ -652,6 +669,7 @@ function New-ReplayOverride([object[]]$Sources, $Runtime, [bool]$NotificationsEn
     $lines.Add('      PASSAGE_EVIDENCE_MAX_BYTES: ${PASSAGE_EVIDENCE_MAX_BYTES:-134217728}')
     $lines.Add('      PASSAGE_EVIDENCE_MAX_RECORDS: ${PASSAGE_EVIDENCE_MAX_RECORDS:-4096}')
     $lines.Add('      PASSAGE_CAPTURE_START_PATH: ${PASSAGE_CAPTURE_START_PATH:-}')
+    $lines.Add('      PASSAGE_INPUT_START_PATH: ${PASSAGE_INPUT_START_PATH:-}')
     $lines.Add('      PASSAGE_CAPTURE_CUTOFF_PATH: ${PASSAGE_CAPTURE_CUTOFF_PATH:-}')
     $lines.Add('      PASSAGE_RUN_ID: ${PASSAGE_RUN_ID:-}')
     $lines.Add('      PASSAGE_SOURCE_START_DIR: ${PASSAGE_SOURCE_START_DIR:-}')
@@ -920,6 +938,33 @@ raise SystemExit(0 if response.status == health_pb2.HealthCheckResponse.SERVING 
   }
   $logs = (& docker logs --tail 80 camera-recognition 2>&1) -join "`n"
   throw "Recognition service did not become healthy: $logs"
+}
+
+function Wait-SafetyControlReady([int]$TimeoutSeconds = 60) {
+  $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+  $savedErrorActionPreference = $ErrorActionPreference
+  try {
+    $ErrorActionPreference = 'SilentlyContinue'
+    do {
+      $running = (& docker inspect camera-safety --format '{{.State.Running}}' 2>$null).Trim()
+      if ($running -eq 'true') {
+        $healthJson = (& docker exec camera-safety cat /tmp/camera-safety-health.json 2>$null) -join ''
+        if ($healthJson) {
+          try {
+            $health = $healthJson | ConvertFrom-Json
+            if ($health.model -and $health.frigate_api) { return }
+          } catch {
+            # Health is written during startup; retry until it is complete.
+          }
+        }
+      }
+      Start-Sleep -Milliseconds 500
+    } while ([DateTime]::UtcNow -lt $deadline)
+  } finally {
+    $ErrorActionPreference = $savedErrorActionPreference
+  }
+  $logs = (& docker logs --tail 100 camera-safety 2>&1) -join "`n"
+  throw "Safety control plane did not become ready: $logs"
 }
 
 function Wait-SafetyReady([int]$TimeoutSeconds = 60) {
@@ -1488,24 +1533,11 @@ try {
       }
       $replaySources = @($sources | Where-Object Mode -eq 'replay')
       $prestartedReplayNames = @()
-      $safetyReplaySources = @($replaySources | Where-Object Name -eq 'safety_camera')
-      if ($safetyReplaySources.Count -gt 0) {
-        # Safety recording needs a live detect stream before Frigate starts its
-        # direct-source recording process. Start only the Safety publisher
-        # early; car/face replay ordering remains unchanged.
-        Write-LauncherStep 'safety-replay-readiness' 'starting'
-        Invoke-Compose $prefix @('up','-d','--no-build','--force-recreate','--no-deps','mediamtx')
-        $safetyReplayServices = @($safetyReplaySources | ForEach-Object {
-          'replay-' + $_.Name.ToLowerInvariant().Replace('_','-')
-        })
-        Invoke-Compose $prefix (@('up','-d','--no-build','--force-recreate','--no-deps') + @($safetyReplayServices))
-        Wait-ReplayReady $safetyReplaySources
-        $prestartedReplayNames = @($safetyReplaySources | ForEach-Object { $_.Name })
-        Write-LauncherStep 'safety-replay-readiness' 'ready'
-      }
+      $hasSafetyReplay = @($replaySources | Where-Object Name -eq 'safety_camera').Count -gt 0
       if ($trackerNodes.Count -gt 0) {
         Write-LauncherStep 'tracker-service-readiness' 'starting'
-        foreach ($service in $trackerNodes.Service) { $dependencyServices.Add($service) }
+        # Tracker is started in the final input activation batch below so its
+        # direct car/face readers share the same start barrier as Safety replay.
       }
       Write-LauncherStep 'frigate-create' 'starting'
       $dependencyServices.Add('frigate')
@@ -1518,13 +1550,6 @@ try {
       if ($runtime.ExternalRecognition) {
         Wait-RecognitionReady
         Write-LauncherStep 'recognition-readiness' 'ready'
-      }
-      if ($trackerNodes.Count -gt 0) {
-        # acceptance-start only gates on the tracker service. Camera FPS is
-        # established after Frigate main attaches to the direct source and is
-        # validated by the acceptance runner, not during topology startup.
-        $trackerReadiness = @(Wait-TrackerReady $trackerNodes 30 -RequireCameras:$false)
-        Write-LauncherStep 'tracker-service-readiness' 'ready' @{ nodes=$trackerReadiness.Count }
       }
       $frigateServiceReady = $false
       $frigateReadyDeadline = [DateTime]::UtcNow.AddSeconds(90)
@@ -1541,9 +1566,17 @@ try {
         throw 'Frigate service did not become healthy before acceptance input started.'
       }
       Write-LauncherStep 'frigate-create' 'created'
+      if ($runtime.ExternalSafety -and $hasSafetyReplay) {
+        # Warm the Safety control plane before releasing the finite replay.
+        # The worker can wait for the stream; this avoids attaching to an
+        # arbitrary position in a looping source during model startup.
+        Write-LauncherStep 'safety-readiness' 'starting'
+        Invoke-Compose $prefix @('up','-d','--no-build','--force-recreate','--no-deps','safety')
+        Wait-SafetyControlReady
+      }
       # Test input is the final activation step. Matching healthy services are
       # reused above; only replay publishers are recreated for a fresh stream.
-      if ($replaySources.Count -gt 0) {
+      if ($replaySources.Count -gt 0 -or $trackerNodes.Count -gt 0) {
         $acceptanceServices = [Collections.Generic.List[string]]::new()
         if ($prestartedReplayNames.Count -eq 0) {
           Invoke-Compose $prefix @('up','-d','--no-build','--force-recreate','--no-deps','mediamtx')
@@ -1555,8 +1588,17 @@ try {
             $acceptanceServices.Add(('replay-' + $source.Name.ToLowerInvariant().Replace('_','-')))
           }
         }
+        foreach ($service in $trackerNodes.Service) {
+          $acceptanceServices.Add([string]$service)
+        }
         if ($acceptanceServices.Count -gt 0) {
           Invoke-Compose $prefix (@('up','-d','--no-build','--force-recreate','--no-deps') + @($acceptanceServices))
+          if (-not [string]::IsNullOrWhiteSpace($env:CAMERA_REPORT_MEDIA_DIR)) {
+            $inputMarker = Join-Path $env:CAMERA_REPORT_MEDIA_DIR 'input-start'
+            $inputEpoch = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0
+            Write-AtomicUtf8 $inputMarker ("$inputEpoch`n")
+            Write-LauncherStep 'input-barrier' 'released' @{ epoch=$inputEpoch }
+          }
           Start-Sleep -Milliseconds 1200
         }
         foreach ($source in $replaySources) {
@@ -1564,9 +1606,18 @@ try {
           $running = (& docker inspect $container --format '{{.State.Running}}' 2>$null).Trim()
           if ($running -ne 'true') { throw "Replay publisher '$($source.Name)' did not start." }
         }
-        Wait-ReplayReady $replaySources
-      }
-      if ($runtime.ExternalSafety) {
+        if ($replaySources.Count -gt 0) {
+          Wait-ReplayReady $replaySources
+        }
+        if ($trackerNodes.Count -gt 0) {
+          $trackerReadiness = @(Wait-TrackerReady $trackerNodes 30 -RequireCameras:$false)
+          Write-LauncherStep 'tracker-service-readiness' 'ready' @{ nodes=$trackerReadiness.Count }
+        }
+        if ($runtime.ExternalSafety -and $hasSafetyReplay) {
+          Wait-SafetyReady
+          Write-LauncherStep 'safety-readiness' 'ready'
+        }
+      } elseif ($runtime.ExternalSafety) {
         Write-LauncherStep 'safety-readiness' 'starting'
         Invoke-Compose $prefix @('up','-d','--no-build','--force-recreate','--no-deps','safety')
         Wait-SafetyReady

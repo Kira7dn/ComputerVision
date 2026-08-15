@@ -998,7 +998,10 @@ def configure_tracker_topology(
             continue
         snapshots = camera.setdefault("snapshots", {})
         if isinstance(snapshots, dict):
-            snapshots["enabled"] = False
+            # Event notifications use Frigate's canonical snapshot manifest.
+            # The tracker lane must therefore publish one snapshot per ended
+            # lifecycle instead of relying on report-only producer evidence.
+            snapshots["enabled"] = True
         ffmpeg = camera.get("ffmpeg") or {}
         inputs = ffmpeg.get("inputs") or []
         ffmpeg["inputs"] = [
@@ -2571,9 +2574,22 @@ def parse_pending(logs: str) -> int | None:
     return values[-1] if values else None
 
 
-def sqlite_events(ids: list[str], database_path: str) -> dict[str, dict[str, Any]]:
+def sqlite_events(
+    ids: list[str], database_path: str, local_database: Path | None = None
+) -> dict[str, dict[str, Any]]:
     if not ids:
         return {}
+    if local_database is not None and local_database.is_file():
+        with sqlite3.connect(local_database) as connection:
+            rows = connection.execute(
+                "select id,sub_label,data from event where id in (%s)"
+                % ",".join("?" * len(ids)),
+                ids,
+            ).fetchall()
+        return {
+            row[0]: {"sub_label": row[1], "data": json.loads(row[2] or "{}")}
+            for row in rows
+        }
     code = (
         "import sqlite3,json,sys; c=sqlite3.connect(sys.argv[2]); ids=json.loads(sys.argv[1]); "
         "rows=c.execute('select id,sub_label,data from event where id in (%s)' % ','.join('?'*len(ids)),ids).fetchall(); "
@@ -2625,10 +2641,14 @@ def local_notification_summary(output: Path) -> dict[str, Any]:
                 """
             ).fetchall()
             artifact_rows = connection.execute(
-                "select event_id,path from media_artifact order by revision desc"
+                "select id,path,sha256 from media_artifact"
             ).fetchall()
-            evidence_rows = connection.execute(
-                "select event_id,frame_ref from event_evidence order by created_at desc"
+            edge_snapshot_rows = connection.execute(
+                """
+                select event_id,sha256 from edge_media_manifest
+                where media_type='snapshot_jpg'
+                order by end_time desc
+                """
             ).fetchall()
     except sqlite3.Error as error:
         return {"available": False, "error": f"SQLite read failed: {error}"}
@@ -2648,51 +2668,53 @@ def local_notification_summary(output: Path) -> dict[str, Any]:
         ),
     }
     event_lookup = {str(row["id"]): dict(row) for row in event_rows}
-    artifact_lookup = {
-        str(row["event_id"]): str(row["path"])
+
+    notification_image_dir = output / "media" / "notifications"
+    notification_image_dir.mkdir(parents=True, exist_ok=True)
+    image_cache: dict[str, str | None] = {}
+    media_root = database.parents[1]
+    artifact_paths = {
+        str(row["id"]): media_root / str(row["path"])[len("/media/frigate/") :]
         for row in artifact_rows
-        if row["event_id"] and row["path"]
+        if str(row["path"]).startswith("/media/frigate/")
     }
-    evidence_lookup = {
-        str(row["event_id"]): str(row["frame_ref"])
-        for row in evidence_rows
-        if row["event_id"] and row["frame_ref"]
+    edge_sha_by_event: dict[str, str] = {}
+    for row in edge_snapshot_rows:
+        edge_sha_by_event.setdefault(str(row["event_id"]), str(row["sha256"]))
+    edge_paths_by_sha = {
+        hashlib.sha256(path.read_bytes()).hexdigest(): path
+        for path in (output / "media" / "edge-media").rglob("*.jpg")
+        if path.is_file()
     }
 
-    def report_image_path(reference: str | None) -> str | None:
-        if not reference:
-            return None
-        normalized = str(reference).replace("\\", "/")
-        candidates = [
-            Path(normalized),
-            output / normalized.lstrip("/"),
-            output / "test-assets" / "media" / Path(normalized).name,
-        ]
-        for candidate in candidates:
-            if candidate.is_file():
-                return candidate.relative_to(output).as_posix()
-        return normalized
-
-    # Producer evidence is the report-owned image source when Frigate has not
-    # yet materialized a canonical media_artifact row at notification time.
-    evidence_jsonl = list((output / "media").glob("*/evidence.jsonl"))
-    evidence_image_by_event: dict[str, str] = {}
-    for evidence_file in evidence_jsonl:
-        for line in evidence_file.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
+    def materialize_event_image(event_id: str, category: str) -> str | None:
+        """Persist the exact artifact bytes used by notification delivery."""
+        if event_id in image_cache:
+            return image_cache[event_id]
+        destination = notification_image_dir / f"{category}-{event_id}.jpg"
+        event = event_lookup.get(event_id, {})
+        source = artifact_paths.get(str(event.get("canonical_artifact_id") or ""))
+        if source is None:
+            source = edge_paths_by_sha.get(edge_sha_by_event.get(event_id, ""))
+        if source is not None and source.is_file():
+            shutil.copyfile(source, destination)
+            image_cache[event_id] = destination.relative_to(output).as_posix()
+            return image_cache[event_id]
+        for _ in range(10):
             try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            event_id = str(record.get("event_id") or record.get("track_id") or "")
-            artifact_path = record.get("artifact_path")
-            if event_id and artifact_path and (
-                output / "media" / str(artifact_path)
-            ).is_file():
-                evidence_image_by_event[event_id] = (
-                    f"media/{Path(str(artifact_path)).as_posix()}"
-                )
+                with urlopen(
+                    f"http://127.0.0.1:5001/api/events/{quote(event_id, safe='')}/snapshot.jpg",
+                    timeout=10,
+                ) as response:
+                    body = response.read()
+                if body:
+                    destination.write_bytes(body)
+                    image_cache[event_id] = destination.relative_to(output).as_posix()
+                    return image_cache[event_id]
+            except (HTTPError, URLError, TimeoutError, OSError):
+                time.sleep(1)
+        image_cache[event_id] = None
+        return None
 
     by_provider: dict[str, dict[str, dict[str, set[str]]]] = {}
     event_details: dict[str, dict[str, Any]] = {}
@@ -2731,17 +2753,7 @@ def local_notification_summary(output: Path) -> dict[str, Any]:
                 or event.get("label")
                 or category_name,
                 "camera": payload.get("camera") or event.get("camera"),
-                "image": evidence_image_by_event.get(event_id)
-                or report_image_path(artifact_lookup.get(event_id))
-                or report_image_path(evidence_lookup.get(event_id))
-                or (
-                    "media/safety/snapshot-smoking-bbox.jpg"
-                    if category_name == "smoking"
-                    and (
-                        output / "media" / "safety" / "snapshot-smoking-bbox.jpg"
-                    ).is_file()
-                    else None
-                ),
+                "image": materialize_event_image(event_id, category_name),
                 "image_url": payload.get("snapshot_url") or "",
                 "url": payload.get("direct_url") or "",
                 "providers": {},
@@ -2789,6 +2801,68 @@ def local_notification_summary(output: Path) -> dict[str, Any]:
             key=lambda item: (str(item.get("category")), str(item.get("event_id"))),
         ),
     }
+
+
+def wait_notification_delivery(
+    output: Path, expected: int = 32, timeout: float = 150.0
+) -> dict[str, Any]:
+    """Wait for every enabled provider delivery to reach a terminal state.
+
+    The E2E report is collected only after Frigate's SQLite outbox has drained.
+    Reading the database immediately after replay otherwise reports a valid
+    notification as ``pending`` or ``processing`` and may race the runtime
+    restore, which can corrupt the evidence window.
+    """
+    database = (
+        output
+        / "test-assets"
+        / "media"
+        / "passage"
+        / "frigate.infrastructure.db"
+    )
+    deadline = time.monotonic() + timeout
+    last: dict[str, Any] = {
+        "expected": expected,
+        "observed": 0,
+        "pending": 0,
+        "processing": 0,
+        "terminal": 0,
+        "drained": False,
+    }
+    while time.monotonic() < deadline:
+        try:
+            with sqlite3.connect(database) as connection:
+                rows = connection.execute(
+                    """
+                    select status, count(*)
+                    from notification_delivery
+                    where provider in ('telegram', 'zalo')
+                    and source_type = 'event'
+                    group by status
+                    """
+                ).fetchall()
+            counts = {str(status): int(count) for status, count in rows}
+            observed = sum(counts.values())
+            pending = counts.get("pending", 0)
+            processing = counts.get("processing", 0)
+            terminal = sum(
+                counts.get(status, 0)
+                for status in ("sent", "failed", "cancelled")
+            )
+            last = {
+                "expected": expected,
+                "observed": observed,
+                "pending": pending,
+                "processing": processing,
+                "terminal": terminal,
+                "drained": observed >= expected and pending == 0 and processing == 0,
+            }
+            if last["drained"]:
+                return last
+        except (OSError, sqlite3.Error) as error:
+            last["error"] = f"{type(error).__name__}: {error}"
+        time.sleep(1)
+    return last
 
 
 def audit_tracker_lifecycle_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -3049,7 +3123,11 @@ def annotate_safety_snapshot(
 
 
 def collect_safety_evidence(
-    output: Path, database_path: str, capture_start: float, timeout: float = 180.0
+    output: Path,
+    database_path: str,
+    capture_start: float,
+    timeout: float = 180.0,
+    cancel_event: threading.Event | None = None,
 ) -> dict[str, Any]:
     """Collect one real smoking Event and its Frigate API/SQLite/media evidence."""
     safety_dir = output / "media" / "safety"
@@ -3112,6 +3190,9 @@ def collect_safety_evidence(
             }
         )
         while time.monotonic() < deadline:
+            if cancel_event is not None and cancel_event.is_set():
+                result["error"] = "Safety evidence collection cancelled"
+                return result
             try:
                 with urlopen(f"http://127.0.0.1:5001/api/events?{query}", timeout=5) as response:
                     payload = json.loads(response.read().decode("utf-8"))
@@ -3127,7 +3208,10 @@ def collect_safety_evidence(
                     break
             except Exception:
                 pass
-            time.sleep(2)
+            if cancel_event is not None:
+                cancel_event.wait(2)
+            else:
+                time.sleep(2)
         if event is None:
             result["error"] = "no completed smoking Event after capture start"
             return result
@@ -3180,6 +3264,9 @@ def collect_safety_evidence(
             media_deadline = time.monotonic() + 60
             last_error = ""
             while time.monotonic() < media_deadline:
+                if cancel_event is not None and cancel_event.is_set():
+                    result["error"] = "Safety evidence collection cancelled"
+                    return result
                 try:
                     with urlopen(
                         f"http://127.0.0.1:5001/api/events/{quote(event_id, safe='')}/{suffix}",
@@ -3196,7 +3283,10 @@ def collect_safety_evidence(
                         break
                 except Exception as exc:
                     last_error = str(exc)
-                time.sleep(2)
+                if cancel_event is not None:
+                    cancel_event.wait(2)
+                else:
+                    time.sleep(2)
             if not checks[key]:
                 result["media"][key] = {"error": last_error or "media unavailable"}
 
@@ -3833,7 +3923,9 @@ def collect_native_trace_clips(
 
 
 def api_sqlite_consistency(
-    records: list[dict[str, Any]], database_path: str
+    records: list[dict[str, Any]],
+    database_path: str,
+    local_database: Path | None = None,
 ) -> tuple[bool, list[dict[str, Any]], list[dict[str, Any]]]:
     published = [
         r
@@ -3844,7 +3936,11 @@ def api_sqlite_consistency(
     expected = {str(record["track_id"]): record for record in published}
     deadline = time.monotonic() + 2.0
     while True:
-        database = sqlite_events(list(expected), database_path)
+        database = (
+            sqlite_events(list(expected), database_path, local_database)
+            if local_database is not None
+            else sqlite_events(list(expected), database_path)
+        )
         mismatches = []
         absent_both = []
         for event_id, record in expected.items():
@@ -6246,6 +6342,38 @@ def write_compact_runtime_report(output: Path, summary: dict[str, Any]) -> Path:
         ),
         "",
     ]
+    parallel_lanes_section = [
+        "### Parallel camera execution",
+        "",
+        "Ba camera chạy trong cùng một acceptance session; collector Safety được khởi động "
+        "ngay sau readiness và không chờ car/face EOF. Notification do canonical Event "
+        "outbox phát theo thứ tự Event hoàn tất/media sẵn sàng.",
+        "",
+        _md_table(
+            ["Camera", "Lane", "Start evidence", "Notification ordering"],
+            [
+                [
+                    "car_camera",
+                    "tracker -> Frigate Event",
+                    "shared acceptance readiness",
+                    "publish when Event media ready",
+                ],
+                [
+                    "face_camera",
+                    "tracker -> recognition -> Frigate Event",
+                    "shared acceptance readiness",
+                    "publish when Event media ready",
+                ],
+                [
+                    "safety_camera",
+                    "smoker.mp4 -> go2rtc -> camera-safety -> Frigate Event",
+                    f"collector +{timing.get('safety_collector_start_seconds', '—')} s after readiness",
+                    "publish when smoking Event media ready",
+                ],
+            ],
+        ),
+        "",
+    ]
     notifications = summary.get("notifications", {})
     expected_notifications = notifications.get("expected_event_counts", {})
     notification_providers = notifications.get("providers", {})
@@ -6384,6 +6512,7 @@ def write_compact_runtime_report(output: Path, summary: dict[str, Any]) -> Path:
         *total_lpr_section,
         *total_face_section,
         *total_safety_section,
+        *parallel_lanes_section,
         *notification_section,
         *notification_event_section,
         "## Lifecycle evidence",
@@ -6590,6 +6719,7 @@ def main(argv: list[str] | None = None) -> int:
     previous_trace_path = os.environ.get("PASSAGE_TRACE_PATH")
     previous_evidence_dir = os.environ.get("PASSAGE_EVIDENCE_DIR")
     previous_capture_start = os.environ.get("PASSAGE_CAPTURE_START_PATH")
+    previous_input_start = os.environ.get("PASSAGE_INPUT_START_PATH")
     previous_capture_cutoff = os.environ.get("PASSAGE_CAPTURE_CUTOFF_PATH")
     previous_run_id = os.environ.get("PASSAGE_RUN_ID")
     previous_source_start_dir = os.environ.get("PASSAGE_SOURCE_START_DIR")
@@ -6603,6 +6733,9 @@ def main(argv: list[str] | None = None) -> int:
     runtime_started = False
     sampler: ResourceSampler | None = None
     fault_injector: DockerFaultInjector | LauncherFaultInjector | None = None
+    safety_executor: ThreadPoolExecutor | None = None
+    safety_future: Any = None
+    safety_cancel_event = threading.Event()
     isolated_start_wall: float | None = None
     exit_code = 1
     runtime_workspace = output / "test-assets"
@@ -6675,6 +6808,7 @@ def main(argv: list[str] | None = None) -> int:
         os.environ["PASSAGE_TRACE_PATH"] = TRACE_CONTAINER_PATH
         os.environ["PASSAGE_EVIDENCE_DIR"] = EVIDENCE_CONTAINER_DIR
         os.environ["PASSAGE_CAPTURE_START_PATH"] = CAPTURE_START_CONTAINER_PATH
+        os.environ["PASSAGE_INPUT_START_PATH"] = "/runtime-evidence/input-start"
         os.environ["PASSAGE_CAPTURE_CUTOFF_PATH"] = CAPTURE_CUTOFF_CONTAINER_PATH
         os.environ["PASSAGE_RUN_ID"] = run_id
         os.environ["CAMERA_SOURCE_OVERLAY"] = str(
@@ -6718,6 +6852,15 @@ def main(argv: list[str] | None = None) -> int:
                 os.environ.pop("CAMERA_SOURCE_OVERLAY", None)
             else:
                 os.environ["CAMERA_SOURCE_OVERLAY"] = previous_source_overlay
+        input_marker = report_media / "input-start"
+        if not input_marker.is_file():
+            raise RuntimeError("shared camera input barrier was not released")
+        try:
+            summary["input_start_epoch"] = float(
+                input_marker.read_text(encoding="utf-8").strip()
+            )
+        except (OSError, ValueError) as exc:
+            raise RuntimeError("shared camera input barrier is invalid") from exc
         source_started = wait_source_starts(source_start_dir, timeout=60)
         if topology == "tracker":
             tracker_state = wait_tracker_ready(
@@ -6732,6 +6875,26 @@ def main(argv: list[str] | None = None) -> int:
         summary["timing"]["isolated_start_seconds"] = round(
             time.monotonic() - step_started, 3
         )
+        if args.include_safety:
+            # Safety is a live lane, not a post-replay probe. Start collecting
+            # its real Event as soon as the shared runtime is ready so the
+            # smoking notification can race car/face notifications naturally.
+            safety_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="safety-evidence"
+            )
+            safety_started = time.monotonic()
+            safety_future = safety_executor.submit(
+                collect_safety_evidence,
+                output,
+                str(value["database"]["path"]),
+                capture_start,
+                180.0,
+                safety_cancel_event,
+            )
+            summary["timing"]["safety_collector_start_seconds"] = round(
+                safety_started - step_started, 3
+            )
+            summary["parallel_lanes"] = ["car_camera", "face_camera", "safety_camera"]
         observation_wall = time.time()
         initial_restarts = restart_counts(
             include_safety=args.include_safety,
@@ -6799,23 +6962,32 @@ def main(argv: list[str] | None = None) -> int:
             wait_latest_through(source_ended, source_deadline)
             recognition_idle = wait_recognition_idle()
         if args.include_safety:
+            if safety_future is None:
+                raise RuntimeError("Safety collector was not started with the runtime")
             safety_evidence_started = time.monotonic()
-            summary["safety"] = collect_safety_evidence(
-                output,
-                str(value["database"]["path"]),
-                capture_start,
-            )
+            summary["safety"] = safety_future.result()
             summary["timing"]["safety_evidence_seconds"] = round(
                 time.monotonic() - safety_evidence_started, 3
             )
         if args.enable_notifications:
+            notification_drain_started = time.monotonic()
+            summary["notification_drain"] = wait_notification_delivery(output)
+            summary["timing"]["notification_drain_seconds"] = round(
+                time.monotonic() - notification_drain_started, 3
+            )
             summary["notifications"] = local_notification_summary(output)
         live_records = [
             json.loads(line)
             for line in live_trace_path.read_text(encoding="utf-8").splitlines()
             if line.strip()
         ]
-        finalized_track_count = finalize_finite_source_tracks(live_records)
+        # The tracker topology already owns and acknowledges terminal END
+        # updates in wait_tracker_session_complete(). Re-publishing synthetic
+        # ends here duplicates the lifecycle and can race Frigate's SQLite
+        # writer after notifications have drained.
+        finalized_track_count = (
+            0 if topology == "tracker" else finalize_finite_source_tracks(live_records)
+        )
         capture_cutoff = time.time()
         summary["capture_cutoff_epoch"] = capture_cutoff
         (report_media / "capture-cutoff").write_text(
@@ -7057,7 +7229,13 @@ def main(argv: list[str] | None = None) -> int:
                 if re.search(r"traceback|service_disconnected|epoch_mismatch", line, re.I)
             )
         api_consistent, api_mismatches, uncommitted_updates = api_sqlite_consistency(
-            records, str(value["database"]["path"])
+            records,
+            str(value["database"]["path"]),
+            output
+            / "test-assets"
+            / "media"
+            / "passage"
+            / "frigate.infrastructure.db",
         )
         restart_delta = max(
             (
@@ -7078,8 +7256,18 @@ def main(argv: list[str] | None = None) -> int:
         )
         recognition_service_started = topology == "local" or len(service_epochs) == 1
         local_models_disabled = topology == "local" or face_model_loads == 0
-        with urlopen("http://127.0.0.1:5001/api/stats", timeout=2) as response:
-            final_main_stats = json.loads(response.read().decode("utf-8"))
+        final_main_stats: dict[str, Any] | None = None
+        final_stats_error: Exception | None = None
+        for _ in range(10):
+            try:
+                with urlopen("http://127.0.0.1:5001/api/stats", timeout=2) as response:
+                    final_main_stats = json.loads(response.read().decode("utf-8"))
+                break
+            except (HTTPError, URLError, TimeoutError, OSError, ValueError) as error:
+                final_stats_error = error
+                time.sleep(1)
+        if final_main_stats is None:
+            raise RuntimeError("final Frigate stats unavailable") from final_stats_error
         if topology == "tracker":
             run_deploy("status", Path(fixture["config"]), timeout=30)
             launcher_state = json.loads(
@@ -7348,7 +7536,15 @@ def main(argv: list[str] | None = None) -> int:
             gates.update(
                 {
                     "notification_event_counts": expected == target,
-                    "notification_delivery": provider_delivery_complete,
+                    "notification_delivery": provider_delivery_complete
+                    and summary.get("notification_drain", {}).get("drained", False),
+                    "notification_media": bool(notification_summary.get("events"))
+                    and all(
+                        event.get("image")
+                        and event.get("image_url")
+                        and event.get("url")
+                        for event in notification_summary.get("events", [])
+                    ),
                 }
             )
         summary["gates"] = gates
@@ -7359,6 +7555,14 @@ def main(argv: list[str] | None = None) -> int:
         summary["error"] = f"{type(exc).__name__}: {exc}"
         summary.setdefault("gates", {})["error_free"] = False
     finally:
+        if safety_executor is not None:
+            safety_cancel_event.set()
+            try:
+                safety_executor.shutdown(wait=True, cancel_futures=True)
+            except Exception as exc:
+                summary.setdefault("diagnostic_errors", []).append(
+                    f"Safety collector shutdown: {type(exc).__name__}: {exc}"
+                )
         try:
             capture_container_diagnostics(
                 output,
@@ -7510,6 +7714,10 @@ def main(argv: list[str] | None = None) -> int:
                 and summary.get("runtime", {}).get("native_media", {}).get("complete")
             ),
         }
+        notification_artifact_names = tuple(
+            path.relative_to(output).as_posix()
+            for path in sorted((output / "media" / "notifications").glob("*.jpg"))
+        ) if args.enable_notifications else ()
         artifact_names = (
             "media/runtime-trace.jsonl",
             "media/lpr/evidence.jsonl",
@@ -7540,15 +7748,24 @@ def main(argv: list[str] | None = None) -> int:
             ("container-inspect-safety.json", "container-safety.log")
             if args.include_safety
             else ()
-        )
+        ) + notification_artifact_names
         artifacts_complete = all((output / name).is_file() for name in artifact_names)
         native_media_complete = bool(
             summary.get("runtime", {}).get("native_media", {}).get("complete")
         )
+        notification_report_complete = (
+            not args.enable_notifications
+            or bool(summary.get("gates", {}).get("notification_media"))
+        )
         summary["report"] = {
             "mode": "evidence_only",
             "status": "complete"
-            if "error" not in summary and artifacts_complete and native_media_complete
+            if (
+                "error" not in summary
+                and artifacts_complete
+                and native_media_complete
+                and notification_report_complete
+            )
             else "incomplete",
             "criteria": [],
             "artifacts": [
@@ -7568,7 +7785,8 @@ def main(argv: list[str] | None = None) -> int:
                 "runtime_output_and_resource_diagnostics",
                 "container_logs_and_artifact_hashes",
             ]
-            + (["safety_event_api_sqlite_media_review"] if args.include_safety else []),
+            + (["safety_event_api_sqlite_media_review"] if args.include_safety else [])
+            + (["canonical_notification_event_media"] if args.enable_notifications else []),
         }
         cleanup_started = time.monotonic()
         healthy_report = summary["report"]["status"] == "complete" and (
@@ -7596,6 +7814,10 @@ def main(argv: list[str] | None = None) -> int:
             os.environ.pop("PASSAGE_CAPTURE_START_PATH", None)
         else:
             os.environ["PASSAGE_CAPTURE_START_PATH"] = previous_capture_start
+        if previous_input_start is None:
+            os.environ.pop("PASSAGE_INPUT_START_PATH", None)
+        else:
+            os.environ["PASSAGE_INPUT_START_PATH"] = previous_input_start
         if previous_capture_cutoff is None:
             os.environ.pop("PASSAGE_CAPTURE_CUTOFF_PATH", None)
         else:

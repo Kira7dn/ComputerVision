@@ -74,31 +74,31 @@ def test_go2rtc_dev_overlay_uses_current_config_package() -> None:
 def test_concurrent_service_start_precedes_readiness_and_input() -> None:
     launcher = _launcher()
     acceptance = launcher.index("    'acceptance-start'")
-    tracker_start = launcher.index("$dependencyServices.Add($service)", acceptance)
     frigate_start = launcher.index(
         "$dependencyServices.Add('frigate')",
-        tracker_start,
+        acceptance,
     )
     combined_start = launcher.index(
         "Invoke-Compose $prefix (@('up','-d','--no-build','--force-recreate','--no-deps') + $services)",
         frigate_start,
     )
-    tracker_ready = launcher.index(
-        "Wait-TrackerReady $trackerNodes",
-        combined_start,
-    )
     frigate_ready = launcher.index(
         "Get-FrigateInternalStats",
-        tracker_ready,
+        combined_start,
     )
-    replay_start = launcher.index(
-        "$acceptanceServices",
+    tracker_start = launcher.index(
+        "$acceptanceServices.Add([string]$service)",
         frigate_ready,
     )
-    assert tracker_start < frigate_start < combined_start
-    assert combined_start < tracker_ready < frigate_ready < replay_start
-    assert "-RequireCameras:$false" in launcher[tracker_ready:frigate_ready]
-    assert "CAMERA_REUSE_SERVICES" not in launcher[acceptance:replay_start]
+    activation_start = launcher.index(
+        "Invoke-Compose $prefix (@('up','-d','--no-build','--force-recreate','--no-deps') + @($acceptanceServices))",
+        tracker_start,
+    )
+    tracker_ready = launcher.index("Wait-TrackerReady $trackerNodes", activation_start)
+    assert frigate_start < combined_start < frigate_ready < tracker_start
+    assert tracker_start < activation_start < tracker_ready
+    assert "-RequireCameras:$false" in launcher[activation_start:]
+    assert "CAMERA_REUSE_SERVICES" not in launcher[acceptance:activation_start]
     assert "'acceptance-park'" in launcher
     park = launcher[
         launcher.index("    'acceptance-park'") : launcher.index(
@@ -109,6 +109,24 @@ def test_concurrent_service_start_precedes_readiness_and_input() -> None:
     assert "Acceptance runtime is idle and ready" in park
     assert "'replay-' + $_.Name" in park
     assert "state='idle'" in park
+
+
+def test_safety_worker_is_warm_before_one_pass_replay_activation() -> None:
+    launcher = _launcher()
+    acceptance = launcher[
+        launcher.index("    'acceptance-start'") : launcher.index(
+            "    'acceptance-park'"
+        )
+    ]
+    safety_start = acceptance.index("Wait-SafetyControlReady")
+    replay_start = acceptance.index(
+        "Invoke-Compose $prefix (@('up','-d','--no-build','--force-recreate','--no-deps') + @($acceptanceServices))"
+    )
+    replay_ready = acceptance.index("Wait-ReplayReady $replaySources")
+    safety_ready = acceptance.index("Wait-SafetyReady")
+
+    assert safety_start < replay_start < replay_ready < safety_ready
+    assert "$acceptanceServices.Add('safety')" not in acceptance
 
 
 def test_development_restart_stops_frigate_before_replacing_tracker() -> None:
@@ -160,7 +178,7 @@ def test_acceptance_validates_storage_and_restores_recognition_lifecycle() -> No
     assert recognition_start < frigate_start < combined_start < recognition_ready
 
 
-def test_acceptance_starts_recognition_and_tracker_in_one_compose_call() -> None:
+def test_acceptance_starts_tracker_in_the_final_input_batch() -> None:
     launcher = _launcher()
     acceptance = launcher[
         launcher.index("    'acceptance-start'") : launcher.index(
@@ -169,14 +187,13 @@ def test_acceptance_starts_recognition_and_tracker_in_one_compose_call() -> None
     ]
 
     recognition = acceptance.index("$dependencyServices.Add('recognition')")
-    tracker = acceptance.index("$dependencyServices.Add($service)")
-    combined_start = acceptance.index("+ $services)", tracker)
+    tracker = acceptance.index("$acceptanceServices.Add([string]$service)")
+    combined_start = acceptance.index("+ $services)", recognition)
     recognition_ready = acceptance.index("Wait-RecognitionReady", combined_start)
-    tracker_ready = acceptance.index("Wait-TrackerReady", recognition_ready)
+    tracker_ready = acceptance.index("Wait-TrackerReady", tracker)
 
     assert recognition < combined_start
-    assert tracker < combined_start
-    assert combined_start < recognition_ready < tracker_ready
+    assert combined_start < recognition_ready < tracker < tracker_ready
 
 
 def test_tracker_readiness_treats_startup_connection_errors_as_failed_polls() -> None:

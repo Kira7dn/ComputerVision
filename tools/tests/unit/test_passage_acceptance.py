@@ -42,6 +42,17 @@ from tools.runtime.validate_platform_runtime import (
     write_compact_runtime_report,
 )
 
+
+def test_safety_collection_starts_before_replay_completion_wait() -> None:
+    source = Path("tools/runtime/validate_platform_runtime.py").read_text(
+        encoding="utf-8"
+    )
+    submit = source.index("safety_future = safety_executor.submit")
+    replay_eof = source.index("source_ended = wait_source_ends")
+    safety_result = source.index("summary[\"safety\"] = safety_future.result()")
+
+    assert submit < replay_eof < safety_result
+
 ROOT = Path(__file__).resolve().parents[3]
 MANIFEST = ROOT / "tools/fixtures/platform_passage_ground_truth.yaml"
 
@@ -58,7 +69,9 @@ def test_tracker_topology_config_uses_direct_node_map(monkeypatch) -> None:
     assert "nodes" not in tracker
 
 
-def test_tracker_topology_disables_unconsumed_recording_and_snapshots(monkeypatch) -> None:
+def test_tracker_topology_keeps_canonical_snapshots_and_disables_recording(
+    monkeypatch,
+) -> None:
     monkeypatch.setattr(passage_validator, "create_service_tls", lambda *args: None)
     config = {
         "record": {"enabled": True},
@@ -79,7 +92,7 @@ def test_tracker_topology_disables_unconsumed_recording_and_snapshots(monkeypatc
 
     assert config["record"]["enabled"] is False
     camera = config["cameras"]["car_camera"]
-    assert camera["snapshots"]["enabled"] is False
+    assert camera["snapshots"]["enabled"] is True
     assert camera["ffmpeg"]["inputs"] == [
         {"path": "input.mp4", "roles": ["detect"]}
     ]

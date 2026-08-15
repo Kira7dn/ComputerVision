@@ -207,10 +207,11 @@ def add_safety_source(
         raise FileNotFoundError(str(source))
 
     config["runtime"]["replay"] = {
-        # Keep the Safety stream available while tracker/recognition services
-        # warm up; the combined validator selects one completed Event and
-        # restore stops the replay publisher afterward.
-        "loop": True,
+        # The combined E2E launcher starts this publisher only after the
+        # Safety control plane is warm. A single pass preserves the source
+        # timeline, so a smoking detection in the first seconds stays in the
+        # first seconds of the acceptance run.
+        "loop": False,
         "sources": {"safety_camera": str(source)},
     }
     config["go2rtc"] = copy.deepcopy(safety_config.get("go2rtc") or {})
