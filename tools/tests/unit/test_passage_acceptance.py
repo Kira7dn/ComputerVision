@@ -85,6 +85,74 @@ def test_tracker_topology_disables_unconsumed_recording_and_snapshots(monkeypatc
     ]
 
 
+def test_tracker_topology_preserves_safety_media_configuration(monkeypatch) -> None:
+    monkeypatch.setattr(passage_validator, "create_service_tls", lambda *args: None)
+    config = {
+        "record": {"enabled": True},
+        "cameras": {
+            "face_camera": {
+                "snapshots": {"enabled": True},
+                "ffmpeg": {"inputs": [{"path": "face.mp4", "roles": ["detect", "record"]}]},
+            },
+            "car_camera": {
+                "snapshots": {"enabled": True},
+                "ffmpeg": {"inputs": [{"path": "car.mp4", "roles": ["detect", "record"]}]},
+            },
+            "safety_camera": {
+                "snapshots": {"enabled": True},
+                "record": {"enabled": True},
+                "ffmpeg": {"inputs": [{"path": "safety.mp4", "roles": ["detect", "record"]}]},
+            },
+        },
+    }
+
+    passage_validator.configure_tracker_topology(config, "tracker")
+
+    safety = config["cameras"]["safety_camera"]
+    assert safety["detect"]["enabled"] is False
+    assert safety["snapshots"]["enabled"] is True
+    assert safety["record"]["enabled"] is True
+    assert safety["ffmpeg"]["inputs"] == [
+        {"path": "safety.mp4", "roles": ["detect", "record"]}
+    ]
+
+
+def test_compact_report_includes_safety_result(tmp_path: Path) -> None:
+    summary = {
+        "runtime": {},
+        "timing": {},
+        "measurement": {},
+        "lpr": {},
+        "face": {},
+        "safety": {
+            "status": "passed",
+            "event_id": "safety-event-1",
+            "checks": {
+                "runtime_ready": True,
+                "event_completed": True,
+                "api_sqlite_consistent": True,
+                "snapshot": True,
+                "clip": True,
+                "review": True,
+            },
+            "media": {
+                "snapshot": {"path": "media/safety/snapshot-clean.webp"},
+                "clip": {"path": "media/safety/clip.mp4"},
+            },
+        },
+    }
+
+    report = write_compact_runtime_report(tmp_path, summary)
+
+    content = report.read_text(encoding="utf-8")
+    assert "### Safety checks — smoking" in content
+    assert "### Visual evidence" in content
+    assert "### Frigate persistence" in content
+    assert "safety-event-1" in content
+    assert "media/safety/snapshot-clean.webp" in content
+    assert "media/safety/clip.mp4" in content
+
+
 def test_report_asset_finalization_removes_transport_staging(tmp_path: Path) -> None:
     edge_clip = tmp_path / "media/edge-media/clips/event-1/clip.mp4"
     edge_clip.parent.mkdir(parents=True)
@@ -382,11 +450,11 @@ def test_compact_report_has_one_canonical_table_per_pipeline(
 
     report = write_compact_runtime_report(tmp_path, summary).read_text(encoding="utf-8")
 
-    assert "## Run" in report
-    assert "## LPR result" in report
-    assert "## Face result" in report
-    assert report.count("## LPR result") == 1
-    assert report.count("## Face result") == 1
+    assert "## Báo cáo tổng" in report
+    assert "## Lifecycle evidence" in report
+    assert "### Car / LPR lifecycle" in report
+    assert "### Face lifecycle" in report
+    assert "### Safety lifecycle" in report
     assert "| Clip | Outcome | Track | Eligible | Plate | OCR | Publish |" in report
     assert (
         "| Clip | Outcome | Prepare face | Recognition | Decision / publish |"

@@ -45,14 +45,15 @@ def test_external_wrapper_reuses_runtime_validator():
     assert "validate_platform_runtime import main" in wrapper
 
 
-def test_default_e2e_is_tracker_topology() -> None:
-    for entrypoint in (
-        "tools/tests/e2e/run_platform_runtime_test.py",
-        "tools/tests/e2e/run_external_tracker_runtime_test.py",
-    ):
-        wrapper = Path(entrypoint).read_text(encoding="utf-8")
-        assert 'main(["--topology", "tracker"])' in wrapper
-        assert "--preserve-runtime" not in wrapper
+def test_default_e2e_is_combined_tracker_topology() -> None:
+    wrapper = Path(
+        "tools/tests/e2e/run_platform_runtime_test.py"
+    ).read_text(encoding="utf-8")
+    assert '"--topology",' in wrapper
+    assert '"tracker",' in wrapper
+    assert '"--include-safety",' in wrapper
+    assert '"--enable-notifications",' in wrapper
+    assert "--preserve-runtime" not in wrapper
 
 
 def test_default_runtime_uses_an_isolated_lifecycle() -> None:

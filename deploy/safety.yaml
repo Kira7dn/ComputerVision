@@ -1,0 +1,15 @@
+frigate_url: http://frigate:5000
+restream_url: rtsp://mediamtx:18554
+model:
+  path: /models/smoking/best.onnx
+  providers: [TensorrtExecutionProvider, CUDAExecutionProvider, CPUExecutionProvider]
+
+cameras:
+  safety_camera:
+    stream: safety_camera
+    inference_fps: 1
+    labels:
+      smoking: {enabled: true, threshold: 0.10}
+    confirm_seconds: 1.0
+    clear_seconds: 5.0
+

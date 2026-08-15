@@ -207,10 +207,10 @@ def test_tracker_receives_the_same_config_environment_as_frigate() -> None:
     launcher = _launcher()
     tracker = launcher[launcher.index("foreach ($node in $TrackerNodes)") :]
     assert "$lines.Add('    env_file:')" in tracker
-    assert "FRIGATE_TELEGRAM_CHAT_ID" in tracker
-    assert "FRIGATE_TELEGRAM_BOT_TOKEN" in tracker
-    assert "FRIGATE_ZALO_CHAT_ID" in tracker
-    assert "FRIGATE_ZALO_BOT_TOKEN" in tracker
+    assert "TELEGRAM_CHAT_ID" in tracker
+    assert "TELEGRAM_BOT_TOKEN" in tracker
+    assert "ZALO_CHAT_ID" in tracker
+    assert "ZALO_BOT_TOKEN" in tracker
 
 
 def test_each_tracker_runtime_config_contains_only_its_node() -> None:

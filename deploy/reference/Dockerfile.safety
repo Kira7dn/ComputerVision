@@ -1,0 +1,8 @@
+ARG BASE_IMAGE=camera-frigate:current
+FROM ${BASE_IMAGE}
+
+ENTRYPOINT ["python3", "-m", "extension.safety.app"]
+CMD ["run", "--config", "/config/safety.yaml"]
+
+HEALTHCHECK --interval=10s --timeout=5s --retries=6 --start-period=45s CMD ["python3", "-m", "extension.safety.app", "healthcheck", "--config", "/config/safety.yaml"]
+

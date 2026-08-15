@@ -1,4 +1,5 @@
-"""Default healthy E2E for tracker + Frigate + recognition + Safety notifications."""
+"""Healthy combined E2E for tracker + Frigate + recognition + Safety."""
+
 # ruff: noqa: E402, I001
 
 import sys

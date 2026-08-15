@@ -322,8 +322,10 @@ Telegram và Zalo là provider native của Frigate. Token chỉ được đọc
 `.env.local` qua các biến sau:
 
 ```dotenv
-FRIGATE_TELEGRAM_BOT_TOKEN=
-FRIGATE_ZALO_BOT_TOKEN=
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
+ZALO_BOT_TOKEN=
+ZALO_CHAT_ID=
 NGROK_AUTHTOKEN=
 NGROK_URL=https://example.ngrok.app
 ```

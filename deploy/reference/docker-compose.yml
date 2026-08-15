@@ -15,16 +15,31 @@ services:
       - path: ../../.env.local
         required: true
     environment:
-      FRIGATE_TELEGRAM_BOT_TOKEN: ${FRIGATE_TELEGRAM_BOT_TOKEN:-${TELEGRAM_BOT_TOKEN:-}}
-      FRIGATE_TELEGRAM_CHAT_ID: ${FRIGATE_TELEGRAM_CHAT_ID:-${TELEGRAM_CHAT_ID:-}}
-      FRIGATE_ZALO_BOT_TOKEN: ${FRIGATE_ZALO_BOT_TOKEN:-${ZALO_BOT_TOKEN:-}}
-      FRIGATE_ZALO_CHAT_ID: ${FRIGATE_ZALO_CHAT_ID:-${ZALO_CHAT_ID:-}}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      ZALO_BOT_TOKEN: ${ZALO_BOT_TOKEN:-}
+      ZALO_CHAT_ID: ${ZALO_CHAT_ID:-}
     volumes:
       - frigate-config:/config:ro
       - ${CAMERA_CONFIG_FILE:?run.ps1 must set CAMERA_CONFIG_FILE}:/config/config.yml:ro
       - ${CAMERA_MODEL_CACHE_PATH:?run.ps1 must set CAMERA_MODEL_CACHE_PATH}:/config/model_cache:ro
       - ${FRIGATE_MEDIA_DIR:-E:/Docker/Frigate/media}:/media/frigate
       - ${RECOGNITION_TLS_DIR:-../../.tmp/runtime/recognition-tls}:/run/recognition-tls:ro
+      - /etc/localtime:/etc/localtime:ro
+
+  safety:
+    image: ${SAFETY_IMAGE:-camera-safety:current}
+    profiles: ["external-safety"]
+    container_name: camera-safety
+    restart: unless-stopped
+    shm_size: "512mb"
+    gpus: all
+    env_file:
+      - path: ../../.env.local
+        required: true
+    volumes:
+      - ${SAFETY_CONFIG_FILE:-../../deploy/safety.yaml}:/config/safety.yaml:ro
+      - ${SAFETY_MODEL_PATH:-../../assets/models/smoking/best.onnx}:/models/smoking/best.onnx:ro
       - /etc/localtime:/etc/localtime:ro
 
   frigate:
@@ -39,10 +54,10 @@ services:
       - path: ../../.env.local
         required: true
     environment:
-      FRIGATE_TELEGRAM_BOT_TOKEN: ${FRIGATE_TELEGRAM_BOT_TOKEN:-${TELEGRAM_BOT_TOKEN:-}}
-      FRIGATE_TELEGRAM_CHAT_ID: ${FRIGATE_TELEGRAM_CHAT_ID:-${TELEGRAM_CHAT_ID:-}}
-      FRIGATE_ZALO_BOT_TOKEN: ${FRIGATE_ZALO_BOT_TOKEN:-${ZALO_BOT_TOKEN:-}}
-      FRIGATE_ZALO_CHAT_ID: ${FRIGATE_ZALO_CHAT_ID:-${ZALO_CHAT_ID:-}}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      ZALO_BOT_TOKEN: ${ZALO_BOT_TOKEN:-}
+      ZALO_CHAT_ID: ${ZALO_CHAT_ID:-}
       PASSAGE_TRACE_PATH: ${PASSAGE_TRACE_PATH:-}
       PASSAGE_EVIDENCE_DIR: ${PASSAGE_EVIDENCE_DIR:-}
       PASSAGE_EVIDENCE_MAX_BYTES: ${PASSAGE_EVIDENCE_MAX_BYTES:-134217728}

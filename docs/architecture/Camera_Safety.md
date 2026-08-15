@@ -1,7 +1,8 @@
 # Thiết kế Camera Safety Extension
 
 Ngày cập nhật: 15/08/2026
-Trạng thái: thiết kế V1, chưa triển khai
+Trạng thái: Safety integration matrix 6/6 pass; combined E2E đã có report Safety, nhưng tracker
+topology hiện còn fail ở runtime/core gates và chưa được đánh dấu acceptance DONE
 
 ## 1. Kết luận
 
@@ -286,6 +287,29 @@ of truth cho implementation scope.
 `bucket11.mp4` đủ cho mock lifecycle, không phải bằng chứng accuracy production. Healthy container
 hoặc schema validation không đủ để kết luận integration DONE.
 
+### 8.1 Combined E2E với car + face + Safety
+
+Combined E2E là entrypoint chuẩn; Safety, notification và ba rule canonical được bật trong cùng
+một run:
+
+```powershell
+& $python -u tools/tests/e2e/run_platform_runtime_test.py `
+  2>&1 | Tee-Object '.tmp\platform-runtime-safety-e2e.log'
+```
+
+Entry point này dùng `--topology tracker`, `--include-safety`, `--enable-notifications` và chỉ
+enable `car_alert`, `face_recognition`, `smoking_alert`. Fixture được tạo thêm `safety_camera`
+từ `bucket11.mp4`, trong khi car/face vẫn dùng direct source hiện có. Các rule phụ như
+`car_license_plate` không được bật, nên một Event chỉ sinh một notification.
+
+Mỗi run ghi `report.md` với section `Safety result — smoking`, gồm health, smoking `bbox` trong
+`Event.data.draw.boxes`, ảnh annotated full-frame `snapshot-smoking-bbox.jpg` và ảnh crop
+`snapshot-smoking-bbox-crop.jpg`, Event completed, API ↔ SQLite,
+clean snapshot, clip và Review link. Các file Safety nằm ở `media/safety/` khi
+đã thu được; nếu run fail, report vẫn ghi các check false và giữ nguyên artifact chẩn đoán.
+`summary.json.accepted` là acceptance tổng thể, không thay thế `summary.json.safety` hoặc bảng
+Safety trong report.
+
 ## 9. Trạng thái hiện tại
 
 Đã xác minh với code/runtime ngày 15/08/2026:
@@ -295,12 +319,37 @@ hoặc schema validation không đủ để kết luận integration DONE.
 - `FrigateConfig` cấm unknown top-level field.
 - Fragment `safety_camera` với `detect.enabled: false`, record và Review labels validate qua
   `FrigateConfig.model_validate` và `compile_topology`.
-- `run.ps1` hỗ trợ config riêng qua `-ConfigFile`, nhưng chưa có Safety service/profile.
+- `run.ps1` hỗ trợ config riêng qua `-ConfigFile` và Safety tùy chọn qua `-SafetyConfigFile`; mặc định
+  không bật Safety service/profile.
 - Tracker runtime hiện không có go2rtc process/listener 8554.
 
-Đã có smoking model artifact `assets/models/smoking/best.onnx`, nhưng chưa triển khai
-`extension/safety`, Docker/launcher wiring hoặc Safety config thực tế; chưa có Safety unit,
-integration hay E2E pass.
+Cập nhật triển khai P1–P3:
+
+- Đã có `extension/safety` với strict config, ONNX smoking adapter, temporal gate, bounded RTSP
+  reader, Frigate Manual Event client và healthcheck.
+- Đã có `deploy/safety.yaml`, replay config cho `bucket11.mp4`, Safety Dockerfile, Compose profile
+  `external-safety` và launcher option `-SafetyConfigFile`; Safety tắt mặc định.
+- Targeted Safety tests đạt `13 passed`; coverage hiện tập trung vào smoking threshold, temporal
+  lifecycle, timeout reconciliation, fail-closed API, cleanup và bounded reader. `deploy/run.ps1 build` đạt và tạo image
+  `camera-safety:overlay-3361a5100cfe`.
+- Integration matrix thực tế qua Docker/Frigate đã chạy 6 case: startup/latest-frame, API–SQLite
+  lifecycle, media/review API, Safety restart/reconcile, source disconnect/recovery và Frigate
+  restart/no-duplicate. Cả 6/6 case pass trong
+  `.tmp/safety-integration/20260815-135451/summary.json`.
+- Event API–SQLite, clean snapshot WebP, clip thật, ReviewSegment readback, restart/reconcile,
+  source fault recovery và Frigate restart đều pass. Manual Event dùng
+  `/api/events/{id}/snapshot-clean.webp`; `/snapshot.jpg` là canonical-media contract riêng và
+  không được dùng làm gate cho Safety V1 hiện tại.
+- Combined report đã được tích hợp vào platform runtime. Run
+  `.tmp/platform-runtime/20260815-214631-215/report.md` đã ghi section Safety và cho thấy health
+  `true`, nhưng Event completed/API–SQLite/snapshot/clip/Review đều `false`. Nguyên nhân runtime
+  cần xử lý riêng: `detected_frames_processor` có `KeyError: car_camera`, Safety stream vượt FPS
+  limit và recording segment bị invalid dưới tải tracker + Safety. Vì vậy đây là report evidence,
+  chưa phải acceptance pass.
+- Runtime cleanup đã khôi phục Frigate mặc định nhưng `runtime_restored=false`: launcher không giữ
+  default replay runtime ổn định đủ 10 giây. Diagnostic
+  `.tmp/runtime/runtime-ready.json` ghi rõ `car_camera.process_fps=4.0`, dưới ngưỡng `4.5`; face,
+  detector và restart count đều không phải nguyên nhân. Report này không được coi là acceptance DONE.
 
 ## 10. Audit và TODO triển khai MVP
 
@@ -443,7 +492,7 @@ Input là temporary Frigate/Safety configs. Phải chứng minh optional profile
 failure, readiness timeout diagnostic và PowerShell parser; Safety disabled không đổi tracker hoặc
 recognition behavior.
 
-#### [ ] `tools/tests/e2e/run_safety_runtime_test.py`
+#### [x] `tools/tests/e2e/run_safety_runtime_test.py`
 
 Public flow:
 
@@ -463,12 +512,19 @@ POC E2E dùng ONNX smoking thật và `bucket11.mp4`; không cần ground-truth 
 `.tmp/safety-runtime/<run-id>/summary.json` chứa `accepted`, `measurement_valid`, Event IDs,
 lifecycle/latency gates và `runtime_restored`. Fake model chỉ thuộc unit/integration test.
 
+#### [x] `tools/tests/e2e/run_platform_runtime_safety_test.py`
+
+Combined E2E car + face + Safety. Đây là flow opt-in để kiểm tra report hợp nhất; Safety failure
+không bị che bởi kết quả car/face và acceptance tổng thể vẫn phải qua các tracker/core/restore gates.
+
 ### 10.6 Thứ tự thực hiện
 
-- [ ] P1 — Smoking-only core: config label `smoking`, temporal gate, API client và targeted unit tests;
+- [x] P1 — Smoking-only core: config label `smoking`, temporal gate, API client và targeted unit tests;
       không yêu cầu fire/smoke model.
-- [ ] P2 — Reader/app, Compose/launcher optional profile và launcher tests; giữ fire/smoke disabled mặc định.
-- [ ] P3 — Chạy smoking mock bằng `best.onnx` + `bucket11.mp4`; kiểm tra Event/media/restore và resource gate.
+- [x] P2 — Reader/app, Compose/launcher optional profile và launcher tests; giữ fire/smoke disabled mặc định.
+- [ ] P3 — Chạy smoking mock bằng `best.onnx` + `bucket11.mp4`; dedicated integration matrix và
+      Event/media đã pass, nhưng combined tracker runtime còn lỗi core/recording và restore/resource
+      gate cần hoàn tất trước khi đánh dấu acceptance.
 - [ ] P4 — Chỉ khi cần fire/smoke: chọn model, kiểm tra ONNX I/O/license, thêm fixture validation nhỏ và
       benchmark trên thiết bị thật; chỉ sau gate này mới triển khai detector fire/smoke.
 

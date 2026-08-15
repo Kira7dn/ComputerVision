@@ -56,10 +56,9 @@ notifications:
           chat_id: "{ZALO_CHAT_ID}"
           enabled: true
   rules:
-    # Tạm tắt listen event car_camera. Đổi enabled về true để bật lại notification.
     - id: car_alert
       name: Car alert
-      enabled: false #true
+      enabled: true
       event: alert
       filters:
         cameras:
@@ -134,10 +133,9 @@ notifications:
         zalo:
           - operators
       cooldown: 0
-    # Tạm tắt notification khuôn mặt. Đổi enabled về true để bật lại; không gửi identity unknown.
     - id: face_recognition
       name: Face recognition
-      enabled: false #true
+      enabled: true
       event: face_recognized
       filters:
         cameras:
@@ -156,6 +154,26 @@ notifications:
         zalo:
           - operators
       cooldown: 0
+    - id: smoking_alert
+      name: Smoking alert
+      enabled: true
+      event: alert
+      filters:
+        cameras:
+          - safety_camera
+        labels:
+          - smoking
+        zones: []
+        identities: []
+        trigger_names: []
+        conditions: []
+      destinations:
+        webpush: true
+        telegram:
+          - security_team
+        zalo:
+          - operators
+      cooldown: 60
   delivery:
     max_attempts: 5
     initial_backoff: 5

@@ -188,12 +188,84 @@ def lpr_source(
     return source, windows
 
 
+def add_safety_source(
+    config: dict[str, Any], root: Path
+) -> dict[str, Any]:
+    """Add the real smoking replay as a second, run-scoped source topology."""
+    safety_config_path = root / "deploy" / "config.safety-integration.yaml"
+    safety_config = yaml.safe_load(safety_config_path.read_text(encoding="utf-8"))
+    if not isinstance(safety_config, dict):
+        raise ValueError("Safety integration config must be a mapping")
+    safety_runtime = safety_config.get("runtime") or {}
+    safety_replay = safety_runtime.get("replay") or {}
+    safety_sources = safety_replay.get("sources") or {}
+    source_value = safety_sources.get("safety_camera")
+    if not source_value:
+        raise ValueError("Safety integration config must define safety_camera replay")
+    source = (root / str(source_value)).resolve()
+    if not source.is_file():
+        raise FileNotFoundError(str(source))
+
+    config["runtime"]["replay"] = {
+        # Keep the Safety stream available while tracker/recognition services
+        # warm up; the combined validator selects one completed Event and
+        # restore stops the replay publisher afterward.
+        "loop": True,
+        "sources": {"safety_camera": str(source)},
+    }
+    config["go2rtc"] = copy.deepcopy(safety_config.get("go2rtc") or {})
+    safety_camera = (safety_config.get("cameras") or {}).get("safety_camera")
+    if not isinstance(safety_camera, dict):
+        raise ValueError("Safety integration config must define cameras.safety_camera")
+    config.setdefault("cameras", {})["safety_camera"] = copy.deepcopy(safety_camera)
+    # Safety owns inference for this lane. Frigate still captures the stream
+    # for current-frame/recording, but must not run its native detector too.
+    config["cameras"]["safety_camera"].setdefault("detect", {})["enabled"] = False
+    config["record"] = copy.deepcopy(safety_config.get("record") or config.get("record", {}))
+    config["snapshots"] = copy.deepcopy(
+        safety_config.get("snapshots") or config.get("snapshots", {})
+    )
+    return {
+        "source": str(source),
+        "source_sha256": file_hash(source),
+        "config": str(safety_config_path.resolve()),
+        "config_sha256": file_hash(safety_config_path),
+    }
+
+
 def face_source(
     manifest: dict[str, Any], root: Path
 ) -> tuple[Path, list[dict[str, Any]]]:
     """Return the authoritative continuous Face MP4 without modification."""
     source = (root / manifest["face"]["source"]).resolve()
     return source, []
+
+
+def configure_notifications(
+    config: dict[str, Any],
+    enabled: bool,
+    rule_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    """Set the run-scoped notification policy without exposing credentials."""
+    notifications = config.get("notifications")
+    if not isinstance(notifications, dict):
+        raise ValueError("Passage config must define notifications")
+    notifications["enabled"] = enabled
+    if enabled:
+        selected_rules = set(rule_ids) if rule_ids is not None else None
+        for rule in notifications.get("rules", []):
+            if isinstance(rule, dict):
+                rule["enabled"] = (
+                    selected_rules is None or rule.get("id") in selected_rules
+                )
+    return {
+        "enabled": bool(notifications.get("enabled")),
+        "rules": [
+            str(rule.get("id"))
+            for rule in notifications.get("rules", [])
+            if isinstance(rule, dict) and rule.get("enabled")
+        ],
+    }
 
 
 def main() -> int:
@@ -206,6 +278,21 @@ def main() -> int:
     )
     parser.add_argument("--output", type=Path, default=Path(".tmp/platform-passage"))
     parser.add_argument("--workspace", type=Path)
+    parser.add_argument(
+        "--include-safety",
+        action="store_true",
+        help="Add the real smoking replay and Safety camera to the fixture.",
+    )
+    parser.add_argument(
+        "--enable-notifications",
+        action="store_true",
+        help="Enable every configured notification rule for this run.",
+    )
+    parser.add_argument(
+        "--notification-rules",
+        nargs="+",
+        help="Optional notification rule IDs to enable for this run.",
+    )
     args = parser.parse_args()
     started = time.monotonic()
     root = Path.cwd()
@@ -233,6 +320,7 @@ def main() -> int:
     config["runtime"].pop("replay", None)
     config["runtime"]["direct"] = {"sources": direct_sources}
     config.pop("go2rtc", None)
+    safety = add_safety_source(config, root) if args.include_safety else None
     for camera in ("face_camera", "car_camera"):
         config["cameras"][camera]["ffmpeg"]["inputs"] = [
             {
@@ -246,10 +334,14 @@ def main() -> int:
                 "roles": ["record"],
             },
         ]
-    # Runtime evidence must exercise the production media path.  Keep the
-    # configured record/snapshot features intact and suppress only external
-    # notification delivery.
-    config["notifications"]["enabled"] = False
+    # Runtime evidence must exercise the production media path. Notifications
+    # remain disabled by default because the ordinary acceptance run must not
+    # contact external providers. The notification E2E opts in explicitly.
+    notification_runtime = configure_notifications(
+        config,
+        enabled=args.enable_notifications,
+        rule_ids=args.notification_rules,
+    )
     config["database"] = {"path": "/media/frigate/passage/frigate.infrastructure.db"}
     config["cameras"]["face_camera"]["face_recognition"]["min_area"] = 750
     # Match the fixed Face clip's native cadence so short tracks receive enough
@@ -281,8 +373,11 @@ def main() -> int:
         "replay_windows": {"face": face_windows, "lpr": lpr_windows},
         "config": str(config_path),
         "config_sha256": file_hash(config_path),
+        "notifications": notification_runtime,
         "elapsed_seconds": round(time.monotonic() - started, 3),
     }
+    if safety is not None:
+        result["safety"] = safety
     print(json.dumps(result))
     return 0
 

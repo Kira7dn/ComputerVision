@@ -29,7 +29,6 @@ def _load_env_file(path: Path | None) -> None:
         if name:
             os.environ.setdefault(name, value)
 
-
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=Path, required=True)

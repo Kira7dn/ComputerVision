@@ -20,7 +20,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, ClassVar
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 from urllib.request import urlopen
 
 import cv2
@@ -34,6 +34,7 @@ from tools.fixtures.prepare_passage_fixture import load_manifest
 from tools.lib.passage_metrics import bbox_iou, normalize_plate, percentile
 
 CAMERAS = {"face": "face_camera", "lpr": "car_camera"}
+SAFETY_CAMERA = "safety_camera"
 TRACE_CONTAINER_PATH = "/runtime-evidence/runtime-trace.jsonl"
 EVIDENCE_CONTAINER_DIR = "/runtime-evidence"
 CAPTURE_CUTOFF_CONTAINER_PATH = "/runtime-evidence/capture-cutoff"
@@ -623,6 +624,7 @@ def run_deploy(
     config: Path | None = None,
     timeout: int = 45,
     fault_scenario: str | None = None,
+    safety_config: Path | None = None,
 ) -> None:
     args = [
         "powershell",
@@ -637,6 +639,8 @@ def run_deploy(
         args += ["-ConfigFile", str(config)]
     if fault_scenario is not None:
         args += ["-FaultScenario", fault_scenario]
+    if safety_config is not None:
+        args += ["-SafetyConfigFile", str(safety_config)]
     try:
         completed = subprocess.run(
             args,
@@ -971,10 +975,25 @@ def configure_tracker_topology(
         (tls_directory / name).is_file() for name in required_tls
     ):
         create_service_tls(tls_directory, server_name, "frigate-main")
+    managed_cameras = set(CAMERAS.values())
     record = config.get("record")
     if isinstance(record, dict):
-        record["enabled"] = False
-    for camera in (config.get("cameras") or {}).values():
+        if SAFETY_CAMERA in (config.get("cameras") or {}):
+            # Frigate's global record switch must stay on for Safety media.
+            # Disable recording explicitly only on the tracker-managed lanes.
+            record["enabled"] = True
+            safety_camera = (config.get("cameras") or {}).get(SAFETY_CAMERA)
+            if isinstance(safety_camera, dict):
+                safety_camera.setdefault("detect", {})["enabled"] = False
+            for managed_name in managed_cameras:
+                managed = (config.get("cameras") or {}).get(managed_name)
+                if isinstance(managed, dict):
+                    managed.setdefault("record", {})["enabled"] = False
+        else:
+            record["enabled"] = False
+    for camera_name, camera in (config.get("cameras") or {}).items():
+        if camera_name not in managed_cameras:
+            continue
         if not isinstance(camera, dict):
             continue
         snapshots = camera.setdefault("snapshots", {})
@@ -1045,7 +1064,10 @@ def docker_logs(container: str, since: float) -> str:
 
 
 def capture_container_diagnostics(
-    output: Path, since: float | None, topology: str = "local"
+    output: Path,
+    since: float | None,
+    topology: str = "local",
+    include_safety: bool = False,
 ) -> None:
     """Persist acceptance-container evidence before restore replaces it."""
     launcher_steps = Path(".tmp/runtime/launcher-steps.jsonl")
@@ -1056,11 +1078,14 @@ def capture_container_diagnostics(
         containers.append("camera-recognition")
     if topology == "tracker":
         containers.append("camera-tracker-edge-local")
+    if include_safety:
+        containers.append("camera-safety")
     for container in containers:
         suffix = {
             "frigate": "",
             "camera-recognition": "-recognition",
             "camera-tracker-edge-local": "-tracker-edge-local",
+            "camera-safety": "-safety",
         }[container]
         inspect = subprocess.run(
             ["docker", "inspect", container],
@@ -1091,12 +1116,22 @@ def capture_container_diagnostics(
         )
 
 
-def restart_counts() -> dict[str, int]:
+def restart_counts(
+    include_safety: bool = False, replay_cameras: set[str] | None = None
+) -> dict[str, int]:
     names = [
         name
         for name in docker_output("ps", "--format", "{{.Names}}").splitlines()
         if name in {"frigate", "camera-recognition"}
+        or include_safety and name == "camera-safety"
         or name.startswith("camera-replay-")
+        and (
+            replay_cameras is None
+            or any(
+                name.removeprefix("camera-replay-") == camera.replace("_", "-")
+                for camera in replay_cameras
+            )
+        )
     ]
     return {
         name: int(docker_output("inspect", name, "--format", "{{.RestartCount}}"))
@@ -2557,6 +2592,205 @@ def sqlite_events(ids: list[str], database_path: str) -> dict[str, dict[str, Any
     return json.loads(output or "{}")
 
 
+def local_notification_summary(output: Path) -> dict[str, Any]:
+    """Summarize expected event classes and provider deliveries from run SQLite."""
+    database = (
+        output
+        / "test-assets"
+        / "media"
+        / "passage"
+        / "frigate.infrastructure.db"
+    )
+    if not database.is_file():
+        return {"available": False, "error": "run SQLite database is missing"}
+    try:
+        with sqlite3.connect(database) as connection:
+            connection.row_factory = sqlite3.Row
+            event_count_rows = connection.execute(
+                "select label, count(*) as count from event group by label"
+            ).fetchall()
+            delivery_rows = connection.execute(
+                "select provider, source_id, status, payload, last_error "
+                "from notification_delivery order by created_at"
+            ).fetchall()
+            state_rows = connection.execute(
+                "select rule_id, camera, channel, recipient_id, last_source_id "
+                "from notification_rule_state"
+            ).fetchall()
+            event_rows = connection.execute(
+                """
+                select id,camera,label,state,display_label,sub_label,
+                       canonical_sub_label,revision,canonical_artifact_id
+                from event
+                """
+            ).fetchall()
+            artifact_rows = connection.execute(
+                "select event_id,path from media_artifact order by revision desc"
+            ).fetchall()
+            evidence_rows = connection.execute(
+                "select event_id,frame_ref from event_evidence order by created_at desc"
+            ).fetchall()
+    except sqlite3.Error as error:
+        return {"available": False, "error": f"SQLite read failed: {error}"}
+
+    expected = {
+        "car": next(
+            (int(row["count"]) for row in event_count_rows if row["label"] == "car"),
+            0,
+        ),
+        "face": next(
+            (int(row["count"]) for row in event_count_rows if row["label"] == "person"),
+            0,
+        ),
+        "smoking": next(
+            (int(row["count"]) for row in event_count_rows if row["label"] == "smoking"),
+            0,
+        ),
+    }
+    event_lookup = {str(row["id"]): dict(row) for row in event_rows}
+    artifact_lookup = {
+        str(row["event_id"]): str(row["path"])
+        for row in artifact_rows
+        if row["event_id"] and row["path"]
+    }
+    evidence_lookup = {
+        str(row["event_id"]): str(row["frame_ref"])
+        for row in evidence_rows
+        if row["event_id"] and row["frame_ref"]
+    }
+
+    def report_image_path(reference: str | None) -> str | None:
+        if not reference:
+            return None
+        normalized = str(reference).replace("\\", "/")
+        candidates = [
+            Path(normalized),
+            output / normalized.lstrip("/"),
+            output / "test-assets" / "media" / Path(normalized).name,
+        ]
+        for candidate in candidates:
+            if candidate.is_file():
+                return candidate.relative_to(output).as_posix()
+        return normalized
+
+    # Producer evidence is the report-owned image source when Frigate has not
+    # yet materialized a canonical media_artifact row at notification time.
+    evidence_jsonl = list((output / "media").glob("*/evidence.jsonl"))
+    evidence_image_by_event: dict[str, str] = {}
+    for evidence_file in evidence_jsonl:
+        for line in evidence_file.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            event_id = str(record.get("event_id") or record.get("track_id") or "")
+            artifact_path = record.get("artifact_path")
+            if event_id and artifact_path and (
+                output / "media" / str(artifact_path)
+            ).is_file():
+                evidence_image_by_event[event_id] = (
+                    f"media/{Path(str(artifact_path)).as_posix()}"
+                )
+
+    by_provider: dict[str, dict[str, dict[str, set[str]]]] = {}
+    event_details: dict[str, dict[str, Any]] = {}
+    failures: list[dict[str, Any]] = []
+    failure_keys: set[tuple[str, str, str, str | None]] = set()
+    for row in delivery_rows:
+        payload = json.loads(row["payload"] or "{}")
+        camera = str(payload.get("camera") or "")
+        category = {
+            "car_camera": "car",
+            "face_camera": "face",
+            "safety_camera": "smoking",
+        }.get(camera)
+        if category is None:
+            continue
+        provider = str(row["provider"])
+        status = str(row["status"])
+        facts = payload.get("facts") or {}
+        event_id = str(
+            payload.get("event_id")
+            or facts.get("event_id")
+            or payload.get("source_id")
+            or row["source_id"]
+        )
+        event = event_lookup.get(event_id, {})
+        category_name = category
+        detail = event_details.setdefault(
+            event_id,
+            {
+                "event_id": event_id,
+                "category": category_name,
+                "name": event.get("display_label")
+                or event.get("canonical_sub_label")
+                or event.get("sub_label")
+                or payload.get("title")
+                or event.get("label")
+                or category_name,
+                "camera": payload.get("camera") or event.get("camera"),
+                "image": evidence_image_by_event.get(event_id)
+                or report_image_path(artifact_lookup.get(event_id))
+                or report_image_path(evidence_lookup.get(event_id))
+                or (
+                    "media/safety/snapshot-smoking-bbox.jpg"
+                    if category_name == "smoking"
+                    and (
+                        output / "media" / "safety" / "snapshot-smoking-bbox.jpg"
+                    ).is_file()
+                    else None
+                ),
+                "image_url": payload.get("snapshot_url") or "",
+                "url": payload.get("direct_url") or "",
+                "providers": {},
+            },
+        )
+        detail["providers"][provider] = status
+        provider_data = by_provider.setdefault(provider, {})
+        category_data = provider_data.setdefault(
+            category, {"attempted": set(), "sent": set(), "failed": set()}
+        )
+        source_id = str(payload.get("event_id") or facts.get("event_id") or row["source_id"])
+        category_data["attempted"].add(source_id)
+        if status == "sent":
+            category_data["sent"].add(source_id)
+        if status == "failed":
+            category_data["failed"].add(source_id)
+            failure_key = (provider, category, source_id, row["last_error"])
+            if failure_key not in failure_keys:
+                failure_keys.add(failure_key)
+                failures.append(
+                    {
+                        "provider": provider,
+                        "category": category,
+                        "source_id": source_id,
+                        "error": row["last_error"],
+                    }
+                )
+
+    def counts(value: dict[str, set[str]]) -> dict[str, int]:
+        return {key: len(items) for key, items in value.items()}
+
+    providers = {
+        provider: {category: counts(values) for category, values in categories.items()}
+        for provider, categories in by_provider.items()
+    }
+    configured_rule_state = [dict(row) for row in state_rows]
+    return {
+        "available": True,
+        "expected_event_counts": expected,
+        "providers": providers,
+        "failures": failures,
+        "rule_state": configured_rule_state,
+        "events": sorted(
+            event_details.values(),
+            key=lambda item: (str(item.get("category")), str(item.get("event_id"))),
+        ),
+    }
+
+
 def audit_tracker_lifecycle_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
     """Validate producer lifecycle order without inventing terminal events."""
     errors: list[str] = []
@@ -2606,7 +2840,9 @@ def audit_tracker_lifecycle_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def tracker_lifecycle_audit(database_path: str) -> dict[str, Any]:
+def tracker_lifecycle_audit(
+    database_path: str, local_database: Path | None = None
+) -> dict[str, Any]:
     code = r"""
 import json, sqlite3, sys
 db = sqlite3.connect(sys.argv[1])
@@ -2640,10 +2876,58 @@ print(json.dumps({
     'manifest_event_missing': manifest_missing,
 }))
 """
-    output = docker_output(
-        "exec", "frigate", "python3", "-c", code, database_path, timeout=10
-    )
-    raw = json.loads(output)
+    def read_database(connection: sqlite3.Connection) -> dict[str, Any]:
+        rows = []
+        for row in connection.execute(
+            """
+            select node_id,node_epoch,journal_sequence,camera_id,stream_epoch,
+                   event_id,operation,payload
+            from tracker_journal_entry
+            order by node_id,journal_sequence
+            """
+        ):
+            payload = json.loads(row[7] or "{}")
+            rows.append(
+                {
+                    "node_id": row[0],
+                    "node_epoch": row[1],
+                    "journal_sequence": row[2],
+                    "camera_id": row[3],
+                    "stream_epoch": row[4],
+                    "event_id": row[5],
+                    "operation": row[6],
+                    "track_id": payload.get("track_id"),
+                }
+            )
+        event_missing = connection.execute(
+            """
+            select count(*) from (
+                select distinct j.event_id from tracker_journal_entry j
+                left join event e on e.id=j.event_id
+                where j.operation='END' and e.id is null
+            )
+            """
+        ).fetchone()[0]
+        manifest_missing = connection.execute(
+            """
+            select count(*) from edge_media_manifest m
+            left join event e on e.id=m.event_id where e.id is null
+            """
+        ).fetchone()[0]
+        return {
+            "rows": rows,
+            "event_missing": event_missing,
+            "manifest_event_missing": manifest_missing,
+        }
+
+    if local_database is not None and local_database.is_file():
+        with sqlite3.connect(local_database) as connection:
+            raw = read_database(connection)
+    else:
+        output = docker_output(
+            "exec", "frigate", "python3", "-c", code, database_path, timeout=10
+        )
+        raw = json.loads(output)
     result = audit_tracker_lifecycle_rows(raw["rows"])
     result["event_missing"] = int(raw["event_missing"])
     result["manifest_event_missing"] = int(raw["manifest_event_missing"])
@@ -2663,6 +2947,314 @@ def api_event(event_id: str) -> dict[str, Any] | None:
             return json.loads(response.read().decode("utf-8"))
     except Exception:
         return None
+
+
+def sqlite_safety_event(event_id: str, database_path: str) -> dict[str, Any] | None:
+    """Read the Frigate-owned Safety Event row from the acceptance database."""
+    code = """
+import json, sqlite3, sys
+db = sqlite3.connect(sys.argv[2])
+row = db.execute('''
+    select id,camera,label,sub_label,start_time,end_time,has_clip,has_snapshot,data
+    from event where id=?
+''', (sys.argv[1],)).fetchone()
+if row is None:
+    print('null')
+else:
+    print(json.dumps({
+        'id': row[0], 'camera': row[1], 'label': row[2],
+        'sub_label': row[3], 'start_time': row[4], 'end_time': row[5],
+        'has_clip': row[6], 'has_snapshot': row[7],
+        'data': json.loads(row[8] or '{}'),
+    }))
+"""
+    value = docker_output(
+        "exec",
+        "frigate",
+        "python3",
+        "-c",
+        code,
+        event_id,
+        database_path,
+        timeout=10,
+    )
+    return json.loads(value) if value else None
+
+
+def annotate_safety_snapshot(
+    source: Path,
+    destination: Path,
+    draw_boxes: list[dict[str, Any]],
+    crop_destination: Path | None = None,
+) -> tuple[bool, bool]:
+    """Render full-frame and close-up Safety bbox evidence."""
+    image = cv2.imdecode(
+        np.frombuffer(source.read_bytes(), dtype=np.uint8), cv2.IMREAD_COLOR
+    )
+    if image is None:
+        return False, False
+    height, width = image.shape[:2]
+    rendered = False
+    absolute_boxes: list[tuple[int, int, int, int]] = []
+    for draw_box in draw_boxes:
+        box = draw_box.get("box")
+        if not isinstance(box, list | tuple) or len(box) != 4:
+            continue
+        x1, y1, x2, y2 = (
+            max(0, min(width - 1, int(float(box[0]) * width))),
+            max(0, min(height - 1, int(float(box[1]) * height))),
+            max(0, min(width - 1, int(float(box[2]) * width))),
+            max(0, min(height - 1, int(float(box[3]) * height))),
+        )
+        if x2 <= x1 or y2 <= y1:
+            continue
+        absolute_boxes.append((x1, y1, x2, y2))
+        score = draw_box.get("score")
+        label = "smoking" if score is None else f"smoking {float(score):.3f}"
+        cv2.rectangle(image, (x1, y1), (x2, y2), (0, 0, 255), 3)
+        cv2.putText(
+            image,
+            label,
+            (x1, max(24, y1 - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 0, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        rendered = True
+    if not rendered:
+        return False, False
+    encoded_ok, encoded = cv2.imencode(".jpg", image)
+    if not encoded_ok:
+        return False, False
+    destination.write_bytes(encoded.tobytes())
+    crop_rendered = False
+    if crop_destination is not None and absolute_boxes:
+        x1 = min(box[0] for box in absolute_boxes)
+        y1 = min(box[1] for box in absolute_boxes)
+        x2 = max(box[2] for box in absolute_boxes)
+        y2 = max(box[3] for box in absolute_boxes)
+        padding = max(48, int(max(x2 - x1, y2 - y1) * 1.2))
+        crop_x1 = max(0, x1 - padding)
+        crop_y1 = max(0, y1 - padding)
+        crop_x2 = min(width, x2 + padding)
+        crop_y2 = min(height, y2 + padding)
+        crop = image[crop_y1:crop_y2, crop_x1:crop_x2]
+        crop_ok, crop_encoded = cv2.imencode(".jpg", crop)
+        if crop_ok:
+            crop_destination.write_bytes(crop_encoded.tobytes())
+            crop_rendered = True
+    return True, crop_rendered
+
+
+def collect_safety_evidence(
+    output: Path, database_path: str, capture_start: float, timeout: float = 180.0
+) -> dict[str, Any]:
+    """Collect one real smoking Event and its Frigate API/SQLite/media evidence."""
+    safety_dir = output / "media" / "safety"
+    safety_dir.mkdir(parents=True, exist_ok=True)
+    checks = {
+        "runtime_ready": False,
+        "detection_observed": False,
+        "event_created": False,
+        "event_id_match": False,
+        "bbox_present": False,
+        "bbox_image": False,
+        "bbox_crop_image": False,
+        "event_completed": False,
+        "api_sqlite_consistent": False,
+        "snapshot": False,
+        "clip": False,
+        "review": False,
+    }
+    result: dict[str, Any] = {
+        "status": "failed",
+        "camera": SAFETY_CAMERA,
+        "label": "smoking",
+        "sub_label": "camera-safety",
+        "checks": checks,
+        "media": {},
+    }
+    try:
+        def refresh_health() -> dict[str, Any] | None:
+            health_text = docker_output(
+                "exec",
+                "camera-safety",
+                "cat",
+                "/tmp/camera-safety-health.json",
+                check=False,
+            )
+            if not health_text:
+                return None
+            current_health = json.loads(health_text)
+            result["health"] = current_health
+            checks["runtime_ready"] = bool(current_health.get("ready"))
+            checks["detection_observed"] = bool(
+                current_health.get("detection_count", 0)
+                and current_health.get("active_decision_count", 0)
+            )
+            checks["event_created"] = bool(
+                current_health.get("event_create_successes", 0)
+            )
+            return current_health
+
+        refresh_health()
+
+        deadline = time.monotonic() + timeout
+        event: dict[str, Any] | None = None
+        query = urlencode(
+            {
+                "camera": SAFETY_CAMERA,
+                "label": "smoking",
+                "sub_label": "camera-safety",
+                "limit": 100,
+            }
+        )
+        while time.monotonic() < deadline:
+            try:
+                with urlopen(f"http://127.0.0.1:5001/api/events?{query}", timeout=5) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+                events = payload if isinstance(payload, list) else payload.get("events", [])
+                candidates = [
+                    item
+                    for item in events
+                    if float(item.get("start_time") or 0) >= capture_start - 5
+                    and (item.get("end_time") or item.get("duration"))
+                ]
+                if candidates:
+                    event = max(candidates, key=lambda item: float(item.get("start_time") or 0))
+                    break
+            except Exception:
+                pass
+            time.sleep(2)
+        if event is None:
+            result["error"] = "no completed smoking Event after capture start"
+            return result
+
+        event_id = str(event["id"])
+        result["event_id"] = event_id
+        result["event"] = event
+        write_json(safety_dir / "event.json", event)
+        checks["event_completed"] = bool(event.get("end_time") or event.get("duration"))
+
+        event_data = event.get("data") or {}
+        draw_data = event_data.get("draw") if isinstance(event_data, dict) else {}
+        draw_boxes = draw_data.get("boxes", []) if isinstance(draw_data, dict) else []
+        draw_boxes = [box for box in draw_boxes if isinstance(box, dict)]
+        result["bbox"] = {"boxes": draw_boxes}
+        checks["bbox_present"] = bool(draw_boxes)
+        if not checks["bbox_present"] and not result.get("error"):
+            result["error"] = "Safety Event has no draw.boxes payload"
+
+        # The Frigate API is shared state, so a completed Event alone does not
+        # prove that this run's Safety worker created it. Refresh the worker
+        # health after the event appears and require its producer-owned ID.
+        current_health = refresh_health()
+        health_event_id = str((current_health or {}).get("last_event_id") or "")
+        checks["event_id_match"] = bool(health_event_id and health_event_id == event_id)
+        if not checks["detection_observed"] or not checks["event_created"]:
+            result["error"] = (
+                "completed Event is not backed by current Safety detection/create health evidence"
+            )
+        elif not checks["event_id_match"]:
+            result["error"] = (
+                f"Safety health last_event_id {health_event_id!r} does not match Event {event_id!r}"
+            )
+
+        db_event = sqlite_safety_event(event_id, database_path)
+        result["sqlite"] = db_event
+        checks["api_sqlite_consistent"] = bool(
+            db_event
+            and all(
+                db_event.get(key) == event.get(key)
+                for key in ("id", "camera", "label", "sub_label")
+            )
+        )
+
+        for suffix, key in (
+            ("snapshot-clean.webp", "snapshot"),
+            ("clip.mp4", "clip"),
+        ):
+            media_path = safety_dir / suffix
+            media_deadline = time.monotonic() + 60
+            last_error = ""
+            while time.monotonic() < media_deadline:
+                try:
+                    with urlopen(
+                        f"http://127.0.0.1:5001/api/events/{quote(event_id, safe='')}/{suffix}",
+                        timeout=10,
+                    ) as response:
+                        body = response.read()
+                    if body:
+                        media_path.write_bytes(body)
+                        result["media"][key] = {
+                            "path": media_path.relative_to(output).as_posix(),
+                            "bytes": len(body),
+                        }
+                        checks[key] = True
+                        break
+                except Exception as exc:
+                    last_error = str(exc)
+                time.sleep(2)
+            if not checks[key]:
+                result["media"][key] = {"error": last_error or "media unavailable"}
+
+        bbox_path = safety_dir / "snapshot-smoking-bbox.jpg"
+        bbox_crop_path = safety_dir / "snapshot-smoking-bbox-crop.jpg"
+        if checks["snapshot"] and checks["bbox_present"]:
+            checks["bbox_image"], checks["bbox_crop_image"] = annotate_safety_snapshot(
+                safety_dir / "snapshot-clean.webp",
+                bbox_path,
+                draw_boxes,
+                bbox_crop_path,
+            )
+        result["media"]["bbox_image"] = (
+            {
+                "path": bbox_path.relative_to(output).as_posix(),
+                "bytes": bbox_path.stat().st_size,
+            }
+            if checks["bbox_image"]
+            else {"error": "unable to render Safety bbox image"}
+        )
+        result["media"]["bbox_crop_image"] = (
+            {
+                "path": bbox_crop_path.relative_to(output).as_posix(),
+                "bytes": bbox_crop_path.stat().st_size,
+            }
+            if checks["bbox_crop_image"]
+            else {"error": "unable to render Safety bbox crop image"}
+        )
+
+        review_query = urlencode(
+            {"cameras": SAFETY_CAMERA, "labels": "all", "limit": 100}
+        )
+        try:
+            with urlopen(f"http://127.0.0.1:5001/api/review?{review_query}", timeout=10) as response:
+                review_payload = json.loads(response.read().decode("utf-8"))
+            write_json(safety_dir / "review.json", review_payload)
+            review_rows = (
+                review_payload
+                if isinstance(review_payload, list)
+                else review_payload.get("review", review_payload.get("segments", []))
+            )
+            matched = []
+            for row in review_rows if isinstance(review_rows, list) else []:
+                data = row.get("data") or {}
+                detections = data.get("detections") or []
+                objects = data.get("objects") or []
+                if event_id in detections and any(
+                    str(value).split(":", 1)[0] == "smoking" for value in objects
+                ):
+                    matched.append(row)
+            result["review"] = {"matched": len(matched), "rows": len(review_rows)}
+            checks["review"] = bool(matched)
+        except Exception as exc:
+            result["review"] = {"error": str(exc)}
+    except Exception as exc:
+        result["error"] = f"{type(exc).__name__}: {exc}"
+    result["status"] = "passed" if all(checks.values()) else "failed"
+    return result
 
 
 def trace_lifecycle_groups(
@@ -4829,6 +5421,7 @@ def write_compact_runtime_report(output: Path, summary: dict[str, Any]) -> Path:
     gpu = resources.get("gpu", {})
     timing = summary.get("timing", {})
     measurement = summary.get("measurement", {})
+    safety = summary.get("safety", {})
 
     def load_jsonl_records(relative: str) -> list[dict[str, Any]]:
         path = output / relative
@@ -5177,8 +5770,8 @@ def write_compact_runtime_report(output: Path, summary: dict[str, Any]) -> Path:
         )
 
     lpr_lifecycle_lines: list[str] = []
-    failed_runtime_lpr = [row for row in lpr_runtime if row["outcome"] != "MATCH"]
-    if failed_runtime_lpr:
+    lifecycle_runtime_lpr = lpr_runtime
+    if lifecycle_runtime_lpr:
         lifecycle_stages = (
             "track_seen",
             "lpr_eligible",
@@ -5192,7 +5785,7 @@ def write_compact_runtime_report(output: Path, summary: dict[str, Any]) -> Path:
             "event_published",
         )
         lpr_lifecycle_lines.extend(["", "### Lifecycle traces", ""])
-        for row in failed_runtime_lpr:
+        for row in lifecycle_runtime_lpr:
             by_stage: dict[str, list[dict[str, Any]]] = collections.defaultdict(list)
             for record in ordered(row["records"]):
                 by_stage[str(record.get("stage"))].append(record)
@@ -5235,11 +5828,7 @@ def write_compact_runtime_report(output: Path, summary: dict[str, Any]) -> Path:
             )
 
     face_lifecycle_lines: list[str] = []
-    review_face_traces = [
-        row
-        for row in face_runtime
-        if row["outcome"] in {"recognized_unknown", "not_recognized"}
-    ]
+    review_face_traces = face_runtime
     face_rendered_image_count = 0
     if review_face_traces:
         face_lifecycle_lines.extend(["", "### Lifecycle traces", ""])
@@ -5308,7 +5897,7 @@ def write_compact_runtime_report(output: Path, summary: dict[str, Any]) -> Path:
 
     recovered_media_lines = (
         [
-            "## Tracker media",
+            "## Recovered tracker media",
             "",
             "Producer-owned clips and traces were materialized into the final report "
             "before transport staging was removed.",
@@ -5330,6 +5919,425 @@ def write_compact_runtime_report(output: Path, summary: dict[str, Any]) -> Path:
         if recovered_media
         else []
     )
+    safety_checks = safety.get("checks", {})
+    safety_media = safety.get("media", {})
+    safety_lifecycle_lines: list[str] = []
+    if safety:
+        safety_health = safety.get("health", {})
+        safety_event = safety.get("event", {})
+        bbox_media = safety_media.get("bbox_image", {})
+        bbox_crop_media = safety_media.get("bbox_crop_image", {})
+        bbox_relative = bbox_media.get("path")
+        bbox_image = (
+            _md_thumbnail(str(bbox_relative), "smoking_bbox")
+            if bbox_relative and (output / str(bbox_relative)).is_file()
+            else "—"
+        )
+        bbox_crop_relative = bbox_crop_media.get("path")
+        bbox_preview = (
+            _md_thumbnail(str(bbox_crop_relative), "smoking_bbox_crop", width=320)
+            if bbox_crop_relative and (output / str(bbox_crop_relative)).is_file()
+            else bbox_image
+        )
+        bbox_boxes = safety.get("bbox", {}).get("boxes", [])
+        bbox_result = bbox_boxes[0] if bbox_boxes else {}
+        safety_lifecycle_lines = [
+            "",
+            "### Lifecycle traces",
+            "",
+            f"#### `safety_camera:smoking:{safety.get('event_id', '—')}` — `SMOKING_EVENT`",
+            "",
+            _md_table(
+                ["Stage", "Records", "Source time", "Status", "Final result", "Image"],
+                [
+                    [
+                        "model_inference",
+                        safety_health.get("detection_count", 0),
+                        safety_health.get("last_detection_at", "—"),
+                        "observed" if safety_checks.get("detection_observed") else "MISSING",
+                        json.dumps(
+                            {
+                                "label": safety_health.get("last_detection_label"),
+                                "score": safety_health.get("last_detection_score"),
+                                "bbox": safety_health.get("last_detection_bbox"),
+                            },
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
+                        bbox_preview,
+                    ],
+                    [
+                        "temporal_gate_active",
+                        safety_health.get("active_decision_count", 0),
+                        safety_health.get("last_detection_at", "—"),
+                        "observed" if safety_checks.get("detection_observed") else "MISSING",
+                        "ACTIVE" if safety_checks.get("detection_observed") else "MISSING",
+                        bbox_preview,
+                    ],
+                    [
+                        "manual_event_create",
+                        safety_health.get("event_create_successes", 0),
+                        safety_event.get("start_time", "—"),
+                        "observed" if safety_checks.get("event_created") else "MISSING",
+                        json.dumps(
+                            {
+                                "event_id": safety.get("event_id"),
+                                "draw_box": bbox_result.get("box"),
+                                "score": bbox_result.get("score"),
+                            },
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
+                        bbox_preview,
+                    ],
+                    [
+                        "manual_event_complete",
+                        safety_health.get("event_end_successes", 0),
+                        safety_event.get("end_time", "—"),
+                        "observed" if safety_checks.get("event_completed") else "MISSING",
+                        safety.get("event_id", "—"),
+                        bbox_preview,
+                    ],
+                    [
+                        "report_bbox_artifact",
+                        1 if safety_checks.get("bbox_image") else 0,
+                        safety_event.get("end_time", "—"),
+                        "observed" if safety_checks.get("bbox_image") else "MISSING",
+                        bbox_media.get("path", "—"),
+                        bbox_preview,
+                    ],
+                ],
+            ),
+            "",
+        ]
+    safety_section = (
+        [
+            "#### Safety checks — smoking",
+            "",
+            _md_table(
+                ["Check", "Result", "Evidence"],
+                [
+                    [
+                        "Runtime healthy",
+                        safety_checks.get("runtime_ready"),
+                        "camera-safety health",
+                    ],
+                    [
+                        "Smoking detection",
+                        safety_checks.get("detection_observed"),
+                        (
+                            f"{safety.get('health', {}).get('detection_count', 0)} detections; "
+                            f"{safety.get('health', {}).get('last_detection_score', 0):.3f} last score"
+                            if safety.get("health")
+                            else "camera-safety health"
+                        ),
+                    ],
+                    [
+                        "Event create",
+                        safety_checks.get("event_created"),
+                        safety.get("health", {}).get("last_event_id", "—"),
+                    ],
+                    [
+                        "Health ↔ Event ID",
+                        safety_checks.get("event_id_match"),
+                        safety.get("event_id", "—"),
+                    ],
+                    [
+                        "Smoking bbox payload",
+                        safety_checks.get("bbox_present"),
+                        "Event data.draw.boxes",
+                    ],
+                    [
+                        "Smoking bbox image",
+                        safety_checks.get("bbox_image"),
+                        (
+                            f"[{safety_media.get('bbox_image', {}).get('path', '—')}]"
+                            f"({safety_media.get('bbox_image', {}).get('path', '')})"
+                            if safety_media.get("bbox_image", {}).get("path")
+                            else "—"
+                        ),
+                    ],
+                    [
+                        "Smoking bbox crop",
+                        safety_checks.get("bbox_crop_image"),
+                        (
+                            f"[{bbox_crop_media.get('path', '—')}]"
+                            f"({bbox_crop_media.get('path', '')})"
+                            if bbox_crop_media.get("path")
+                            else "—"
+                        ),
+                    ],
+                    [
+                        "Event completed",
+                        safety_checks.get("event_completed"),
+                        safety.get("event_id", "—"),
+                    ],
+                    [
+                        "API ↔ SQLite",
+                        safety_checks.get("api_sqlite_consistent"),
+                        "media/safety/event.json",
+                    ],
+                    [
+                        "Snapshot clean",
+                        safety_checks.get("snapshot"),
+                        (
+                            f"[{safety_media.get('snapshot', {}).get('path', '—')}]"
+                            f"({safety_media.get('snapshot', {}).get('path', '')})"
+                            if safety_media.get("snapshot", {}).get("path")
+                            else "—"
+                        ),
+                    ],
+                    [
+                        "Clip",
+                        safety_checks.get("clip"),
+                        (
+                            f"[{safety_media.get('clip', {}).get('path', '—')}]"
+                            f"({safety_media.get('clip', {}).get('path', '')})"
+                            if safety_media.get("clip", {}).get("path")
+                            else "—"
+                        ),
+                    ],
+                    [
+                        "Review linked",
+                        safety_checks.get("review"),
+                        "media/safety/review.json",
+                    ],
+                ],
+            ),
+            "",
+            f"Safety status: `{safety.get('status', 'not-run')}`; "
+            f"Event: `{safety.get('event_id', '—')}`.",
+            "",
+            "### Visual evidence",
+            "",
+            _md_table(
+                ["Artifact", "Purpose", "Preview"],
+                [
+                    [
+                        "Smoking bbox crop",
+                        "Close-up of the Safety detection with label and score",
+                        bbox_preview,
+                    ],
+                    [
+                        "Smoking bbox full frame",
+                        "Full Frigate frame with the same Safety bbox",
+                        bbox_image,
+                    ],
+                    [
+                        "Clean snapshot",
+                        "Unannotated Frigate snapshot",
+                        (
+                            _md_thumbnail(
+                                str(safety_media.get("snapshot", {}).get("path")),
+                                "smoking_clean_snapshot",
+                            )
+                            if safety_media.get("snapshot", {}).get("path")
+                            else "—"
+                        ),
+                    ],
+                ],
+            ),
+            "",
+            "### Frigate persistence",
+            "",
+            _md_table(
+                ["Check", "Result", "Artifact"],
+                [
+                    [
+                        "Event API ↔ SQLite",
+                        safety_checks.get("api_sqlite_consistent"),
+                        "media/safety/event.json",
+                    ],
+                    [
+                        "Review link",
+                        safety_checks.get("review"),
+                        "media/safety/review.json",
+                    ],
+                    [
+                        "Recording clip",
+                        safety_checks.get("clip"),
+                        "media/safety/clip.mp4",
+                    ],
+                ],
+            ),
+            *safety_lifecycle_lines,
+        ]
+        if safety
+        else []
+    )
+
+    total_lpr_section = [
+        "### Car / LPR summary",
+        "",
+        _md_table(
+            [
+                "Match",
+                "Unexpected",
+                "No output",
+                "Expected missing",
+                "Events",
+                "Clips",
+                "Images",
+            ],
+            [
+                [
+                    f"{lpr_match}/{len(expected_rows)}",
+                    lpr_unexpected,
+                    lpr_no_output,
+                    lpr_missing,
+                    len(lpr_runtime),
+                    sum(bool(item["clip"]) for item in lpr_recovered_media),
+                    f"[{image_index['lpr']} LPR images](media/images.md#lpr)",
+                ]
+            ],
+        ),
+        "",
+    ]
+    total_face_section = [
+        "### Face summary",
+        "",
+        _md_table(
+            [
+                "Known",
+                "Unknown",
+                "Failed",
+                "Events",
+                "Attempts",
+                "Published",
+                "Clips",
+                "Images",
+                "Artifact gallery",
+            ],
+            [
+                [
+                    face_known,
+                    face_unknown,
+                    face_failed,
+                    len(face_rows),
+                    sum(
+                        record.get("stage") == "first_attempt"
+                        for records_for_trace in face_by_trace.values()
+                        for record in records_for_trace
+                    ),
+                    summary.get("face", {}).get("recognition_publish_count", 0),
+                    sum(bool(item["clip"]) for item in face_recovered_media),
+                    face_rendered_image_count,
+                    f"[{image_index['face']} artifacts](media/images.md#face)",
+                ]
+            ],
+        ),
+        "",
+    ]
+    total_safety_section = [
+        "### Safety / smoking summary",
+        "",
+        _md_table(
+            ["Events", "Detections", "BBox payload", "BBox crop", "Clip", "Review"],
+            [
+                [
+                    1 if safety and safety.get("event_id") else 0,
+                    safety.get("health", {}).get("detection_count", 0) if safety else 0,
+                    safety.get("checks", {}).get("bbox_present", False) if safety else False,
+                    safety.get("checks", {}).get("bbox_crop_image", False) if safety else False,
+                    safety.get("checks", {}).get("clip", False) if safety else False,
+                    safety.get("checks", {}).get("review", False) if safety else False,
+                ]
+            ],
+        ),
+        "",
+    ]
+    notifications = summary.get("notifications", {})
+    expected_notifications = notifications.get("expected_event_counts", {})
+    notification_providers = notifications.get("providers", {})
+    notification_section = [
+        "### Notification delivery (canonical events)",
+        "",
+        _md_table(
+            [
+                "Category",
+                "Expected events",
+                "Attempted",
+                "Telegram sent",
+                "Zalo sent",
+                "Failures",
+            ],
+            [
+                [
+                    category,
+                    expected_notifications.get(category, 0),
+                    max(
+                        notification_providers.get("telegram", {})
+                        .get(category, {})
+                        .get("attempted", 0),
+                        notification_providers.get("zalo", {})
+                        .get(category, {})
+                        .get("attempted", 0),
+                    ),
+                    notification_providers.get("telegram", {})
+                    .get(category, {})
+                    .get("sent", 0),
+                    notification_providers.get("zalo", {})
+                    .get(category, {})
+                    .get("sent", 0),
+                    sum(
+                        1
+                        for failure in notifications.get("failures", [])
+                        if failure.get("category") == category
+                    ),
+                ]
+                for category in ("car", "face", "smoking")
+            ],
+        ),
+        "",
+    ]
+    notification_event_rows = []
+    for event in notifications.get("events", []):
+        image = event.get("image") or "—"
+        image_cell = (
+            f"[{Path(str(image)).name}]({image})" if str(image).startswith("media/") else image
+        )
+        image_url = str(event.get("image_url") or "")
+        image_url_cell = (
+            f"[Open image]({image_url})" if image_url.startswith("http") else (image_url or "—")
+        )
+        url = str(event.get("url") or "")
+        url_cell = f"[Open]({url})" if url.startswith("http") else (url or "—")
+        providers = event.get("providers", {})
+        notification_event_rows.append(
+            [
+                event.get("category", "—"),
+                event.get("event_id", "—"),
+                event.get("name", "—"),
+                event.get("camera", "—"),
+                image_cell,
+                image_url_cell,
+                url_cell,
+                providers.get("telegram", "—"),
+                providers.get("zalo", "—"),
+            ]
+        )
+    notification_event_section = [
+        "### Notification event evidence",
+        "",
+        "Mỗi dòng là một Event canonical duy nhất; image path và public URL được giữ "
+        "riêng với lifecycle evidence bên dưới.",
+        "",
+        _md_table(
+            [
+                "Category",
+                "Event ID",
+                "Event name",
+                "Camera",
+                "Image path",
+                "Image URL",
+                "Public URL",
+                "Telegram",
+                "Zalo",
+            ],
+            notification_event_rows or [["—"] * 9],
+        ),
+        "",
+    ]
 
     lines = [
         "# Runtime Test Report",
@@ -5343,7 +6351,7 @@ def write_compact_runtime_report(output: Path, summary: dict[str, Any]) -> Path:
             if summary.get("error")
             else []
         ),
-        "## Run",
+        "## Báo cáo tổng",
         "",
         _md_table(
             [
@@ -5373,30 +6381,14 @@ def write_compact_runtime_report(output: Path, summary: dict[str, Any]) -> Path:
         ),
         "",
         *recovered_media_lines,
-        "## LPR result",
+        *total_lpr_section,
+        *total_face_section,
+        *total_safety_section,
+        *notification_section,
+        *notification_event_section,
+        "## Lifecycle evidence",
         "",
-        _md_table(
-            [
-                "Match",
-                "Unexpected",
-                "No output",
-                "Expected missing",
-                "Raw traces",
-                "Clips",
-                "Debug images",
-            ],
-            [
-                [
-                    f"{lpr_match}/{len(expected_rows)}",
-                    lpr_unexpected,
-                    lpr_no_output,
-                    lpr_missing,
-                    len(lpr_runtime),
-                    sum(bool(item["clip"]) for item in lpr_recovered_media),
-                    f"[{image_index['lpr']} LPR images](media/images.md#lpr)",
-                ]
-            ],
-        ),
+        "### Car / LPR lifecycle",
         "",
         "Bảng dưới đây chỉ dùng producer trace. Fixture chỉ tham gia tính KPI Match ở bảng tổng hợp.",
         "",
@@ -5406,38 +6398,7 @@ def write_compact_runtime_report(output: Path, summary: dict[str, Any]) -> Path:
         ),
         *lpr_lifecycle_lines,
         "",
-        "## Face result",
-        "",
-        _md_table(
-            [
-                "Known",
-                "Unknown",
-                "Failed",
-                "Raw traces",
-                "Attempts",
-                "Published",
-                "Clips",
-                "Rendered images",
-                "Artifact gallery",
-            ],
-            [
-                [
-                    face_known,
-                    face_unknown,
-                    face_failed,
-                    len(face_rows),
-                    sum(
-                        record.get("stage") == "first_attempt"
-                        for records_for_trace in face_by_trace.values()
-                        for record in records_for_trace
-                    ),
-                    summary.get("face", {}).get("recognition_publish_count", 0),
-                    sum(bool(item["clip"]) for item in face_recovered_media),
-                    face_rendered_image_count,
-                    f"[{image_index['face']} artifacts](media/images.md#face)",
-                ]
-            ],
-        ),
+        "### Face lifecycle",
         "",
         "Face chỉ có ba stage nghiệp vụ production; input frame và producer evidence chỉ dùng để truy vết.",
         "",
@@ -5453,6 +6414,9 @@ def write_compact_runtime_report(output: Path, summary: dict[str, Any]) -> Path:
         ),
         *face_lifecycle_lines,
         "",
+        "### Safety lifecycle",
+        "",
+        *safety_section,
         "## Hardware and runtime health",
         "",
         _md_table(
@@ -5550,6 +6514,21 @@ def main(argv: list[str] | None = None) -> int:
         ),
         help="Inject one launcher-owned fault during replay.",
     )
+    parser.add_argument(
+        "--include-safety",
+        action="store_true",
+        help="Run the smoking Safety integration lane alongside car and face.",
+    )
+    parser.add_argument(
+        "--enable-notifications",
+        action="store_true",
+        help="Enable every configured notification rule and provider for this E2E run.",
+    )
+    parser.add_argument(
+        "--notification-rules",
+        nargs="+",
+        help="Optional notification rule IDs to enable for this E2E run.",
+    )
     args = parser.parse_args(argv)
     topology = str(args.topology)
     if args.fault_scenario and topology == "local":
@@ -5585,6 +6564,29 @@ def main(argv: list[str] | None = None) -> int:
         "gates": {},
         "timing": {},
     }
+    if args.include_safety:
+        summary["safety"] = {
+            "status": "not-run",
+            "camera": SAFETY_CAMERA,
+            "label": "smoking",
+            "sub_label": "camera-safety",
+            "checks": {
+                "runtime_ready": False,
+                "detection_observed": False,
+                "event_created": False,
+                "event_id_match": False,
+                "bbox_present": False,
+                "bbox_image": False,
+                "bbox_crop_image": False,
+                "event_completed": False,
+                "api_sqlite_consistent": False,
+                "snapshot": False,
+                "clip": False,
+                "review": False,
+            },
+            "media": {},
+            "error": "Safety evidence collection did not start",
+        }
     previous_trace_path = os.environ.get("PASSAGE_TRACE_PATH")
     previous_evidence_dir = os.environ.get("PASSAGE_EVIDENCE_DIR")
     previous_capture_start = os.environ.get("PASSAGE_CAPTURE_START_PATH")
@@ -5620,6 +6622,12 @@ def main(argv: list[str] | None = None) -> int:
             "--workspace",
             str(runtime_workspace),
         ]
+        if args.include_safety:
+            prepare_args.append("--include-safety")
+        if args.enable_notifications:
+            prepare_args.append("--enable-notifications")
+        if args.notification_rules:
+            prepare_args.extend(["--notification-rules", *args.notification_rules])
         base_config = yaml.safe_load(config.read_text(encoding="utf-8"))
         # Keep every generated fixture asset inside this timestamped run.
         prepared = subprocess.run(
@@ -5637,6 +6645,9 @@ def main(argv: list[str] | None = None) -> int:
         fixture = json.loads(prepared.stdout)
         isolated_config = Path(fixture["config"])
         value = yaml.safe_load(isolated_config.read_text(encoding="utf-8"))
+        replay_camera_names = set(
+            (value.get("runtime", {}).get("replay", {}).get("sources") or {}).keys()
+        )
         value["runtime"]["image"] = base_config["runtime"]["image"]
         tls_workspace = runtime_workspace
         tls_workspace.mkdir(parents=True, exist_ok=True)
@@ -5693,6 +6704,7 @@ def main(argv: list[str] | None = None) -> int:
                 "acceptance-start",
                 Path(fixture["config"]),
                 timeout=180 if topology in ("recognition", "tracker") else 30,
+                safety_config=Path("deploy/safety.yaml") if args.include_safety else None,
             )
             launcher_state_path = Path(".tmp/runtime/state.json")
             if not launcher_state_path.is_file():
@@ -5721,7 +6733,10 @@ def main(argv: list[str] | None = None) -> int:
             time.monotonic() - step_started, 3
         )
         observation_wall = time.time()
-        initial_restarts = restart_counts()
+        initial_restarts = restart_counts(
+            include_safety=args.include_safety,
+            replay_cameras=replay_camera_names,
+        )
         sampler = ResourceSampler(topology)
         sampler.start()
         if args.fault_scenario:
@@ -5783,6 +6798,18 @@ def main(argv: list[str] | None = None) -> int:
         else:
             wait_latest_through(source_ended, source_deadline)
             recognition_idle = wait_recognition_idle()
+        if args.include_safety:
+            safety_evidence_started = time.monotonic()
+            summary["safety"] = collect_safety_evidence(
+                output,
+                str(value["database"]["path"]),
+                capture_start,
+            )
+            summary["timing"]["safety_evidence_seconds"] = round(
+                time.monotonic() - safety_evidence_started, 3
+            )
+        if args.enable_notifications:
+            summary["notifications"] = local_notification_summary(output)
         live_records = [
             json.loads(line)
             for line in live_trace_path.read_text(encoding="utf-8").splitlines()
@@ -5828,7 +6855,10 @@ def main(argv: list[str] | None = None) -> int:
         )
         evidence_pinned_min = min(sampler.evidence_pinned, default=None)
         recognition_stats = sampler.recognition[-1] if sampler.recognition else {}
-        final_restarts = restart_counts()
+        final_restarts = restart_counts(
+            include_safety=args.include_safety,
+            replay_cameras=replay_camera_names,
+        )
 
         # Frigate owns persisted evidence in both topologies. The external
         # service transports source artifacts but never writes this volume.
@@ -5928,8 +6958,17 @@ def main(argv: list[str] | None = None) -> int:
         summary["timing"]["clip_validation_seconds"] = round(
             time.monotonic() - clip_validation_started, 3
         )
+        tracker_database = (
+            output
+            / "test-assets"
+            / "media"
+            / "passage"
+            / "frigate.infrastructure.db"
+        )
         tracker_lifecycle = (
-            tracker_lifecycle_audit(str(value["database"]["path"]))
+            tracker_lifecycle_audit(
+                str(value["database"]["path"]), local_database=tracker_database
+            )
             if topology == "tracker"
             else {"valid": True, "journal_entries": 0, "event_count": 0}
         )
@@ -6269,6 +7308,49 @@ def main(argv: list[str] | None = None) -> int:
             "tracker_not_degraded": tracker_not_degraded,
             "tracker_lifecycle_valid": tracker_lifecycle.get("valid", False),
         }
+        if args.include_safety:
+            safety_checks = summary.get("safety", {}).get("checks", {})
+            gates.update(
+                {
+                    "safety_runtime_ready": bool(safety_checks.get("runtime_ready")),
+                    "safety_detection_observed": bool(
+                        safety_checks.get("detection_observed")
+                    ),
+                    "safety_event_created": bool(safety_checks.get("event_created")),
+                    "safety_event_id_match": bool(safety_checks.get("event_id_match")),
+                    "safety_bbox_present": bool(safety_checks.get("bbox_present")),
+                    "safety_bbox_image": bool(safety_checks.get("bbox_image")),
+                    "safety_bbox_crop_image": bool(
+                        safety_checks.get("bbox_crop_image")
+                    ),
+                    "safety_event_completed": bool(safety_checks.get("event_completed")),
+                    "safety_api_sqlite_consistent": bool(
+                        safety_checks.get("api_sqlite_consistent")
+                    ),
+                    "safety_snapshot": bool(safety_checks.get("snapshot")),
+                    "safety_clip": bool(safety_checks.get("clip")),
+                    "safety_review": bool(safety_checks.get("review")),
+                    "safety_integration": summary.get("safety", {}).get("status")
+                    == "passed",
+                }
+            )
+        if args.enable_notifications:
+            notification_summary = summary.get("notifications", {})
+            expected = notification_summary.get("expected_event_counts", {})
+            target = {"car": 11, "face": 4, "smoking": 1}
+            providers = notification_summary.get("providers", {})
+            provider_delivery_complete = all(
+                providers.get(provider, {}).get(category, {}).get("sent", 0)
+                == target[category]
+                for provider in ("telegram", "zalo")
+                for category in target
+            )
+            gates.update(
+                {
+                    "notification_event_counts": expected == target,
+                    "notification_delivery": provider_delivery_complete,
+                }
+            )
         summary["gates"] = gates
         summary["timing"]["postprocess_seconds"] = round(
             time.monotonic() - postprocess_started, 3
@@ -6278,7 +7360,12 @@ def main(argv: list[str] | None = None) -> int:
         summary.setdefault("gates", {})["error_free"] = False
     finally:
         try:
-            capture_container_diagnostics(output, isolated_start_wall, topology)
+            capture_container_diagnostics(
+                output,
+                isolated_start_wall,
+                topology,
+                include_safety=args.include_safety,
+            )
         except Exception as exc:
             summary.setdefault("diagnostic_errors", []).append(
                 f"{type(exc).__name__}: {exc}"
@@ -6339,12 +7426,16 @@ def main(argv: list[str] | None = None) -> int:
                     ("CAMERA_READY_STABLE_SECONDS", previous_ready_seconds),
                     ("CAMERA_SKIP_READY_WAIT", previous_skip_ready),
                     ("CAMERA_REPORT_MEDIA_DIR", previous_report_media),
-                    ("RECOGNITION_TLS_DIR", previous_recognition_tls),
                 ):
                     if previous is None:
                         os.environ.pop(name, None)
                     else:
                         os.environ[name] = previous
+                # Never let the run-scoped TLS path leak into the restored
+                # launcher. Clear it first, then restore the caller's value.
+                os.environ.pop("RECOGNITION_TLS_DIR", None)
+                if previous_recognition_tls is not None:
+                    os.environ["RECOGNITION_TLS_DIR"] = previous_recognition_tls
                 run_deploy("acceptance-restore", config, timeout=30)
                 restore_ok = restore_mounts_verified(config)
             except Exception as exc:
@@ -6434,6 +7525,21 @@ def main(argv: list[str] | None = None) -> int:
             ("container-inspect-tracker-edge-local.json", "container-tracker-edge-local.log")
             if topology == "tracker"
             else ()
+        ) + (
+            (
+                "media/safety/event.json",
+                "media/safety/snapshot-clean.webp",
+                "media/safety/snapshot-smoking-bbox.jpg",
+                "media/safety/snapshot-smoking-bbox-crop.jpg",
+                "media/safety/clip.mp4",
+                "media/safety/review.json",
+            )
+            if args.include_safety
+            else ()
+        ) + (
+            ("container-inspect-safety.json", "container-safety.log")
+            if args.include_safety
+            else ()
         )
         artifacts_complete = all((output / name).is_file() for name in artifact_names)
         native_media_complete = bool(
@@ -6461,7 +7567,8 @@ def main(argv: list[str] | None = None) -> int:
                 "raw_ocr_and_quality_lineage",
                 "runtime_output_and_resource_diagnostics",
                 "container_logs_and_artifact_hashes",
-            ],
+            ]
+            + (["safety_event_api_sqlite_media_review"] if args.include_safety else []),
         }
         cleanup_started = time.monotonic()
         healthy_report = summary["report"]["status"] == "complete" and (
