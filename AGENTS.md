@@ -140,6 +140,7 @@ Rules:
 # - run dev-restart (do not rebuild unless images are changed).
 # - run start for image validation.
 # - never replace start with build, and never replace dev-* with start.
+# - do not use docker rm or bulk container removal unless explicitly requested by the user.
 ```
 
 ## Official E2E commands
