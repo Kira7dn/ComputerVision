@@ -19,9 +19,8 @@ import requests
 
 ROOT = Path(__file__).resolve().parents[3]
 LAUNCHER = ROOT / "deploy" / "run.ps1"
-CONFIG = ROOT / "deploy" / "config.safety-integration.yaml"
+CONFIG = ROOT / "deploy" / "config.yaml"
 DEFAULT_CONFIG = ROOT / "deploy" / "config.yaml"
-SAFETY_CONFIG = ROOT / "deploy" / "safety.yaml"
 API_URL = "http://127.0.0.1:5001"
 CAMERA = "safety_camera"
 LABEL = "smoking"
@@ -33,7 +32,6 @@ TEST_START_EPOCH = 0.0
 def _run_launcher(
     command: str,
     config: Path,
-    safety: Path | None = SAFETY_CONFIG,
     timeout: int = 180,
 ) -> None:
     args = [
@@ -48,8 +46,6 @@ def _run_launcher(
         "-ConfigFile",
         str(config),
     ]
-    if safety is not None:
-        args += ["-SafetyConfigFile", str(safety)]
     result = subprocess.run(
         args,
         cwd=ROOT,
@@ -392,11 +388,11 @@ def main() -> int:
             except Exception as exc:
                 report["errors"].append(f"cleanup acceptance-park: {exc}")
             try:
-                _run_launcher("stop", CONFIG, SAFETY_CONFIG, timeout=120)
+                _run_launcher("stop", CONFIG, timeout=120)
             except Exception as exc:
                 report["errors"].append(f"cleanup safety stop: {exc}")
             try:
-                _run_launcher("start", DEFAULT_CONFIG, None, timeout=180)
+                _run_launcher("start", DEFAULT_CONFIG, timeout=180)
                 report["runtime_restored"] = True
             except Exception as exc:
                 report["errors"].append(f"cleanup default restore: {exc}")

@@ -29,8 +29,14 @@ services:
 
   safety:
     image: ${SAFETY_IMAGE:-camera-safety:current}
-    profiles: ["external-safety"]
     container_name: camera-safety
+    command: ["run", "--config", "/config/config.yml"]
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /tmp/camera-safety-health.json && grep -q '\"ready\": true' /tmp/camera-safety-health.json"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 45s
     restart: unless-stopped
     shm_size: "512mb"
     gpus: all
@@ -38,7 +44,7 @@ services:
       - path: ../../.env.local
         required: true
     volumes:
-      - ${SAFETY_CONFIG_FILE:-../../deploy/safety.yaml}:/config/safety.yaml:ro
+      - ${CAMERA_CONFIG_FILE:?run.ps1 must set CAMERA_CONFIG_FILE}:/config/config.yml:ro
       - ${SAFETY_MODEL_PATH:-../../assets/models/smoking/best.onnx}:/models/smoking/best.onnx:ro
       - /etc/localtime:/etc/localtime:ro
 

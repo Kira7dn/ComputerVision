@@ -17,15 +17,12 @@ import requests
 
 ROOT = Path(__file__).resolve().parents[3]
 LAUNCHER = ROOT / "deploy" / "run.ps1"
-CONFIG = ROOT / "deploy" / "config.safety-replay-smoker.yaml"
+CONFIG = ROOT / "deploy" / "config.yaml"
 DEFAULT_CONFIG = ROOT / "deploy" / "config.yaml"
-SAFETY_CONFIG = ROOT / "deploy" / "safety.yaml"
 
 
-def _run_launcher(command: str, config: Path, safety: Path | None = SAFETY_CONFIG, timeout: int = 180) -> None:
+def _run_launcher(command: str, config: Path, timeout: int = 180) -> None:
     args = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(LAUNCHER), "-Command", command, "-ConfigFile", str(config)]
-    if safety is not None:
-        args += ["-SafetyConfigFile", str(safety)]
     result = subprocess.run(args, cwd=ROOT, text=True, capture_output=True, timeout=timeout)
     if result.returncode:
         raise RuntimeError(f"launcher {command} failed:\n{result.stdout}\n{result.stderr}")
@@ -84,8 +81,8 @@ def main() -> int:
         if not report["measurement_valid"]:
             raise RuntimeError("no completed camera-safety smoking Event observed before timeout")
         _run_launcher("acceptance-park", CONFIG, timeout=60)
-        _run_launcher("stop", CONFIG, SAFETY_CONFIG, timeout=120)
-        _run_launcher("start", DEFAULT_CONFIG, None, timeout=180)
+        _run_launcher("stop", CONFIG, timeout=120)
+        _run_launcher("start", DEFAULT_CONFIG, timeout=180)
         report["runtime_restored"] = True
         report["accepted"] = True
     except Exception as exc:

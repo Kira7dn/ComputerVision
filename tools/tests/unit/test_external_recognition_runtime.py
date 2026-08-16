@@ -2,9 +2,27 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from cryptography import x509
+from cryptography.hazmat.primitives import serialization
 from extension.topology.fingerprint import canonical_json, fingerprint
 
 import tools.runtime.validate_platform_runtime as runtime
+
+
+def test_service_tls_is_generated_directly_on_host(tmp_path):
+    runtime.create_service_tls(tmp_path, "recognition", "frigate")
+
+    ca = x509.load_pem_x509_certificate((tmp_path / "ca.crt").read_bytes())
+    server = x509.load_pem_x509_certificate((tmp_path / "server.crt").read_bytes())
+    client = x509.load_pem_x509_certificate((tmp_path / "client.crt").read_bytes())
+    serialization.load_pem_private_key((tmp_path / "server.key").read_bytes(), None)
+    serialization.load_pem_private_key((tmp_path / "client.key").read_bytes(), None)
+
+    assert server.issuer == ca.subject
+    assert client.issuer == ca.subject
+    assert x509.DNSName("recognition") in server.extensions.get_extension_for_class(
+        x509.SubjectAlternativeName
+    ).value
 
 
 def test_topology_configuration_has_one_source_of_truth(monkeypatch, tmp_path):
@@ -56,14 +74,14 @@ def test_default_e2e_is_combined_tracker_topology() -> None:
     assert "--preserve-runtime" not in wrapper
 
 
-def test_default_runtime_uses_an_isolated_lifecycle() -> None:
+def test_default_runtime_uses_the_same_compose_lifecycle_as_production() -> None:
     validator = Path("tools/runtime/validate_platform_runtime.py").read_text(
         encoding="utf-8"
     )
     assert "--preserve-runtime" not in validator
     assert "CAMERA_REUSE_SERVICES" not in validator
     assert 'run_deploy(\n            "stop",' not in validator
-    assert "acceptance-start force-recreates every test service" in validator
+    assert "Production and E2E use the same Compose convergence path" in validator
     assert 'run_deploy("acceptance-restore", config' in validator
     assert "configure_recognition_topology(value, topology, tls_workspace)" in validator
     assert "configure_tracker_topology(value, topology)" in validator
@@ -76,7 +94,7 @@ def test_default_runtime_keeps_evidence_in_the_timestamped_report() -> None:
     assert 'report_media = output / "media"' in validator
     assert 'runtime_workspace = output / "test-assets"' in validator
     assert "PASSAGE_SESSION_FILE" not in validator
-    assert 'run_deploy("acceptance-park"' not in validator
+    assert 'run_deploy("acceptance-park"' in validator
     assert 'run_deploy("acceptance-restore", config' in validator
     assert 'topology != "tracker" or summary["accepted"] is True' in validator
     assert "finalize_report_assets(output)" in validator

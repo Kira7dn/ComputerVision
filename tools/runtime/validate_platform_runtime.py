@@ -26,6 +26,10 @@ from urllib.request import urlopen
 import cv2
 import numpy as np
 import yaml
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID, ObjectIdentifier
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -38,6 +42,63 @@ SAFETY_CAMERA = "safety_camera"
 TRACE_CONTAINER_PATH = "/runtime-evidence/runtime-trace.jsonl"
 EVIDENCE_CONTAINER_DIR = "/runtime-evidence"
 CAPTURE_CUTOFF_CONTAINER_PATH = "/runtime-evidence/capture-cutoff"
+
+
+def terminate_process_tree(pid: int) -> None:
+    """Terminate a timed-out external command and descendants on Windows."""
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        return
+    try:
+        os.kill(pid, 9)
+    except OSError:
+        pass
+
+
+def run_bounded(
+    args: list[str], *, timeout: float | None = None, check: bool = False, **kwargs: Any
+) -> subprocess.CompletedProcess[str]:
+    """Run an external command without leaving descendants after interruption."""
+    if kwargs.pop("capture_output", False):
+        kwargs["stdout"] = subprocess.PIPE
+        kwargs["stderr"] = subprocess.PIPE
+    process = subprocess.Popen(args, **kwargs)
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        terminate_process_tree(process.pid)
+        try:
+            stdout, stderr = process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            stdout, stderr = process.communicate()
+        raise subprocess.TimeoutExpired(
+            args,
+            timeout,
+            output=stdout or exc.output,
+            stderr=stderr or exc.stderr,
+        ) from exc
+    except BaseException:
+        terminate_process_tree(process.pid)
+        raise
+    completed = subprocess.CompletedProcess(args, process.returncode, stdout, stderr)
+    if check and completed.returncode:
+        raise subprocess.CalledProcessError(
+            completed.returncode,
+            args,
+            output=completed.stdout,
+            stderr=completed.stderr,
+        )
+    return completed
 CAPTURE_START_CONTAINER_PATH = "/runtime-evidence/capture-start"
 SOURCE_START_CONTAINER_DIR = "/runtime-evidence/source-start"
 LEAD_SECONDS = 0.0
@@ -154,11 +215,12 @@ def copy_tracker_clip(event_id: str, target: Path) -> bool:
     )
     temporary = target.with_suffix(target.suffix + ".tmp")
     temporary.unlink(missing_ok=True)
-    result = subprocess.run(
+    result = run_bounded(
         ["docker", "cp", source, str(temporary)],
         check=False,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
+        timeout=30,
     )
     if result.returncode != 0 or not temporary.is_file() or temporary.stat().st_size == 0:
         temporary.unlink(missing_ok=True)
@@ -223,7 +285,7 @@ def copy_tracker_report_artifacts(
         for name in ("traces", "clips"):
             target = staging / name
             target.mkdir()
-            result = subprocess.run(
+            result = run_bounded(
                 [
                     "docker",
                     "cp",
@@ -234,6 +296,7 @@ def copy_tracker_report_artifacts(
                 check=False,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
+                timeout=30,
             )
             if result.returncode != 0:
                 return {
@@ -624,7 +687,6 @@ def run_deploy(
     config: Path | None = None,
     timeout: int = 45,
     fault_scenario: str | None = None,
-    safety_config: Path | None = None,
 ) -> None:
     args = [
         "powershell",
@@ -639,10 +701,8 @@ def run_deploy(
         args += ["-ConfigFile", str(config)]
     if fault_scenario is not None:
         args += ["-FaultScenario", fault_scenario]
-    if safety_config is not None:
-        args += ["-SafetyConfigFile", str(safety_config)]
     try:
-        completed = subprocess.run(
+        completed = run_bounded(
             args,
             check=False,
             capture_output=True,
@@ -793,7 +853,9 @@ class DockerFaultInjector:
         if self.scenario == "service_restart":
             command = ["docker", "restart", "camera-recognition"]
             self._record("restart_service", command)
-            completed = subprocess.run(command, capture_output=True, text=True, check=False)
+            completed = run_bounded(
+                command, capture_output=True, text=True, check=False, timeout=15
+            )
             self.records[-1]["exit_code"] = completed.returncode
             self.records[-1]["restore"] = "docker restart completed"
         elif self.scenario == "stream_disconnect":
@@ -805,11 +867,15 @@ class DockerFaultInjector:
                 return
             command = ["docker", "network", "disconnect", network_name, "frigate"]
             self._record("disconnect_stream", command, network_name)
-            completed = subprocess.run(command, capture_output=True, text=True, check=False)
+            completed = run_bounded(
+                command, capture_output=True, text=True, check=False, timeout=15
+            )
             self.records[-1]["exit_code"] = completed.returncode
             if not self.stop_event.wait(1.0):
                 reconnect = ["docker", "network", "connect", network_name, "frigate"]
-                reconnected = subprocess.run(reconnect, capture_output=True, text=True, check=False)
+                reconnected = run_bounded(
+                    reconnect, capture_output=True, text=True, check=False, timeout=15
+                )
                 self.records[-1]["reconnect"] = reconnect
                 self.records[-1]["reconnect_exit_code"] = reconnected.returncode
         else:
@@ -824,11 +890,15 @@ class DockerFaultInjector:
                 return
             command = ["docker", "network", "disconnect", network_name, "camera-recognition"]
             self._record("disconnect_client", command, network_name)
-            completed = subprocess.run(command, capture_output=True, text=True, check=False)
+            completed = run_bounded(
+                command, capture_output=True, text=True, check=False, timeout=15
+            )
             self.records[-1]["exit_code"] = completed.returncode
             if not self.stop_event.wait(1.0):
                 reconnect = ["docker", "network", "connect", network_name, "camera-recognition"]
-                restored = subprocess.run(reconnect, capture_output=True, text=True, check=False)
+                restored = run_bounded(
+                    reconnect, capture_output=True, text=True, check=False, timeout=15
+                )
                 self.records[-1]["reconnect"] = reconnect
                 self.records[-1]["reconnect_exit_code"] = restored.returncode
             self.records[-1]["restore"] = "docker network reconnect completed"
@@ -838,87 +908,77 @@ def create_service_tls(
     directory: Path, server_name: str, client_name: str = "frigate"
 ) -> None:
     """Create a run-scoped CA and server/client identities for mTLS."""
-    openssl = shutil.which("openssl")
     directory.mkdir(parents=True, exist_ok=True)
-    server_ext = directory / "server.ext"
-    client_ext = directory / "client.ext"
-    server_ext.write_text(
-        f"subjectAltName=DNS:{server_name}\nextendedKeyUsage=serverAuth\n",
-        encoding="utf-8",
+    now = datetime.datetime.now(datetime.UTC)
+    valid_from = now - datetime.timedelta(minutes=1)
+    valid_until = now + datetime.timedelta(days=1)
+
+    ca_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    ca_name = x509.Name(
+        [x509.NameAttribute(NameOID.COMMON_NAME, f"{server_name}-test-ca")]
     )
-    client_ext.write_text("extendedKeyUsage=clientAuth\n", encoding="utf-8")
-    commands = (
-        (
-            "req", "-x509", "-newkey", "rsa:2048", "-nodes",
-            "-keyout", "ca.key", "-out", "ca.crt", "-days", "1",
-            "-subj", f"/CN={server_name}-test-ca",
-        ),
-        (
-            "req", "-newkey", "rsa:2048", "-nodes", "-keyout", "server.key",
-            "-out", "server.csr", "-subj", f"/CN={server_name}",
-        ),
-        (
-            "x509", "-req", "-in", "server.csr", "-CA", "ca.crt",
-            "-CAkey", "ca.key", "-CAcreateserial", "-out", "server.crt",
-            "-days", "1", "-extfile", "server.ext",
-        ),
-        (
-            "req", "-newkey", "rsa:2048", "-nodes", "-keyout", "client.key",
-            "-out", "client.csr", "-subj", f"/CN={client_name}",
-        ),
-        (
-            "x509", "-req", "-in", "client.csr", "-CA", "ca.crt",
-            "-CAkey", "ca.key", "-CAcreateserial", "-out", "client.crt",
-            "-days", "1", "-extfile", "client.ext",
-        ),
+    ca_cert = (
+        x509.CertificateBuilder()
+        .subject_name(ca_name)
+        .issuer_name(ca_name)
+        .public_key(ca_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(valid_from)
+        .not_valid_after(valid_until)
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .sign(ca_key, hashes.SHA256())
     )
-    if openssl is None:
-        script = "\n".join(
-            "openssl " + subprocess.list2cmdline(list(command))
-            for command in commands
+
+    def issue_identity(
+        common_name: str,
+        usage: ObjectIdentifier,
+        *,
+        dns_name: str | None = None,
+    ) -> tuple[rsa.RSAPrivateKey, x509.Certificate]:
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, common_name)])
+        builder = (
+            x509.CertificateBuilder()
+            .subject_name(subject)
+            .issuer_name(ca_cert.subject)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(valid_from)
+            .not_valid_after(valid_until)
+            .add_extension(x509.ExtendedKeyUsage([usage]), critical=False)
         )
-        completed = subprocess.run(
-            [
-                "docker",
-                "run",
-                "--rm",
-                "--volume",
-                f"{directory.resolve()}:/tls",
-                "--workdir",
-                "/tls",
-                "--entrypoint",
-                "/bin/sh",
-                "camera-recognition:current",
-                "-ec",
-                script,
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=60,
-        )
-        if completed.returncode != 0:
-            raise RuntimeError(
-                f"{server_name} TLS generation failed: {completed.stderr.strip()}"
+        if dns_name is not None:
+            builder = builder.add_extension(
+                x509.SubjectAlternativeName([x509.DNSName(dns_name)]), critical=False
             )
-        return
-    for command in commands:
-        completed = subprocess.run(
-            [openssl, *command],
-            cwd=directory,
-            check=False,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=15,
-        )
-        if completed.returncode != 0:
-            raise RuntimeError(
-                f"{server_name} TLS generation failed: {completed.stderr.strip()}"
+        return key, builder.sign(ca_key, hashes.SHA256())
+
+    server_key, server_cert = issue_identity(
+        server_name, ExtendedKeyUsageOID.SERVER_AUTH, dns_name=server_name
+    )
+    client_key, client_cert = issue_identity(
+        client_name, ExtendedKeyUsageOID.CLIENT_AUTH
+    )
+
+    def write_key(path: Path, key: rsa.RSAPrivateKey) -> None:
+        path.write_bytes(
+            key.private_bytes(
+                serialization.Encoding.PEM,
+                serialization.PrivateFormat.TraditionalOpenSSL,
+                serialization.NoEncryption(),
             )
+        )
+
+    (directory / "ca.crt").write_bytes(ca_cert.public_bytes(serialization.Encoding.PEM))
+    write_key(directory / "ca.key", ca_key)
+    (directory / "server.crt").write_bytes(
+        server_cert.public_bytes(serialization.Encoding.PEM)
+    )
+    write_key(directory / "server.key", server_key)
+    (directory / "client.crt").write_bytes(
+        client_cert.public_bytes(serialization.Encoding.PEM)
+    )
+    write_key(directory / "client.key", client_key)
 
 
 def create_recognition_tls(directory: Path) -> None:
@@ -1038,7 +1098,7 @@ def configure_tracker_topology(
 
 
 def docker_output(*args: str, timeout: int = 10, check: bool = True) -> str:
-    result = subprocess.run(
+    result = run_bounded(
         ["docker", *args],
         check=check,
         capture_output=True,
@@ -1050,9 +1110,29 @@ def docker_output(*args: str, timeout: int = 10, check: bool = True) -> str:
     return result.stdout.strip()
 
 
+def copy_acceptance_media(output: Path) -> None:
+    """Copy the acceptance media volume into the run artifact after parking."""
+    target = output / "test-assets" / "media"
+    target.mkdir(parents=True, exist_ok=True)
+    result = run_bounded(
+        ["docker", "cp", "frigate:/media/frigate/.", str(target)],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            "Unable to copy acceptance media volume: "
+            + (result.stderr.strip() or "docker cp failed")
+        )
+
+
 def docker_logs(container: str, since: float) -> str:
     """Read both container streams because Python logging uses stderr."""
-    result = subprocess.run(
+    result = run_bounded(
         ["docker", "logs", "--since", str(int(since)), container],
         check=False,
         capture_output=True,
@@ -1090,7 +1170,7 @@ def capture_container_diagnostics(
             "camera-tracker-edge-local": "-tracker-edge-local",
             "camera-safety": "-safety",
         }[container]
-        inspect = subprocess.run(
+        inspect = run_bounded(
             ["docker", "inspect", container],
             check=False,
             capture_output=True,
@@ -1105,7 +1185,7 @@ def capture_container_diagnostics(
         args = ["docker", "logs", container]
         if since is not None:
             args += ["--since", str(int(since))]
-        logs = subprocess.run(
+        logs = run_bounded(
             args,
             check=False,
             capture_output=True,
@@ -1143,7 +1223,7 @@ def restart_counts(
 
 
 def replay_duration(path: Path) -> float:
-    result = subprocess.run(
+    result = run_bounded(
         [
             "ffprobe",
             "-v",
@@ -1495,7 +1575,7 @@ class ResourceSampler:
                     memory_total += parse_bytes(memory_text.split("/")[0])
                 self.cpu_percent.append(cpu_total)
                 self.memory_bytes.append(memory_total)
-                gpu = subprocess.run(
+                gpu = run_bounded(
                     [
                         "nvidia-smi",
                         "--query-gpu=utilization.gpu,memory.used,memory.total",
@@ -2803,15 +2883,17 @@ def local_notification_summary(output: Path) -> dict[str, Any]:
     }
 
 
-def wait_notification_delivery(
-    output: Path, expected: int = 32, timeout: float = 150.0
+def wait_notification_dispatch(
+    output: Path,
+    expected: int = 32,
+    timeout: float = 30.0,
 ) -> dict[str, Any]:
-    """Wait for every enabled provider delivery to reach a terminal state.
+    """Wait until every expected event delivery reaches a terminal state.
 
-    The E2E report is collected only after Frigate's SQLite outbox has drained.
-    Reading the database immediately after replay otherwise reports a valid
-    notification as ``pending`` or ``processing`` and may race the runtime
-    restore, which can corrupt the evidence window.
+    Notification delivery is an event side effect. The worker sends each row
+    as soon as it is claimed. Acceptance only observes its own bounded set of
+    rows long enough for configured transient retries; it does not trigger a
+    separate outbox drain.
     """
     database = (
         output
@@ -2827,20 +2909,35 @@ def wait_notification_delivery(
         "pending": 0,
         "processing": 0,
         "terminal": 0,
-        "drained": False,
+        "materialized": False,
     }
+    container_database = "/media/frigate/passage/frigate.infrastructure.db"
     while time.monotonic() < deadline:
         try:
-            with sqlite3.connect(database) as connection:
-                rows = connection.execute(
-                    """
-                    select status, count(*)
-                    from notification_delivery
-                    where provider in ('telegram', 'zalo')
-                    and source_type = 'event'
-                    group by status
-                    """
-                ).fetchall()
+            if database.is_file():
+                with sqlite3.connect(database) as connection:
+                    rows = connection.execute(
+                        """
+                        select status, count(*)
+                        from notification_delivery
+                        where provider in ('telegram', 'zalo')
+                        and source_type = 'event'
+                        group by status
+                        """
+                    ).fetchall()
+            else:
+                state = json.loads(
+                    docker_output(
+                        "exec",
+                        "frigate",
+                        "python3",
+                        "-c",
+                        "import json,sqlite3,sys; db=sqlite3.connect(sys.argv[1]); rows=db.execute(\"select status,count(*) from notification_delivery where provider in ('telegram','zalo') and source_type='event' group by status\").fetchall(); print(json.dumps({'rows':rows}))",
+                        container_database,
+                        timeout=5,
+                    )
+                )
+                rows = state.get("rows", [])
             counts = {str(status): int(count) for status, count in rows}
             observed = sum(counts.values())
             pending = counts.get("pending", 0)
@@ -2855,11 +2952,11 @@ def wait_notification_delivery(
                 "pending": pending,
                 "processing": processing,
                 "terminal": terminal,
-                "drained": observed >= expected and pending == 0 and processing == 0,
+                "materialized": observed >= expected,
             }
-            if last["drained"]:
+            if last["materialized"] and terminal >= expected:
                 return last
-        except (OSError, sqlite3.Error) as error:
+        except (OSError, sqlite3.Error, subprocess.SubprocessError) as error:
             last["error"] = f"{type(error).__name__}: {error}"
         time.sleep(1)
     return last
@@ -3061,7 +3158,13 @@ def annotate_safety_snapshot(
     draw_boxes: list[dict[str, Any]],
     crop_destination: Path | None = None,
 ) -> tuple[bool, bool]:
-    """Render full-frame and close-up Safety bbox evidence."""
+    """Persist canonical Safety image and render only its close-up crop.
+
+    The external snapshot-clean endpoint already returns Frigate's canonical
+    artifact, including its one bbox/label overlay. Drawing again here would
+    create the misleading double-label image used by the old acceptance
+    collector.
+    """
     image = cv2.imdecode(
         np.frombuffer(source.read_bytes(), dtype=np.uint8), cv2.IMREAD_COLOR
     )
@@ -3083,19 +3186,6 @@ def annotate_safety_snapshot(
         if x2 <= x1 or y2 <= y1:
             continue
         absolute_boxes.append((x1, y1, x2, y2))
-        score = draw_box.get("score")
-        label = "smoking" if score is None else f"smoking {float(score):.3f}"
-        cv2.rectangle(image, (x1, y1), (x2, y2), (0, 0, 255), 3)
-        cv2.putText(
-            image,
-            label,
-            (x1, max(24, y1 - 8)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            (0, 0, 255),
-            2,
-            cv2.LINE_AA,
-        )
         rendered = True
     if not rendered:
         return False, False
@@ -3120,6 +3210,24 @@ def annotate_safety_snapshot(
             crop_destination.write_bytes(crop_encoded.tobytes())
             crop_rendered = True
     return True, crop_rendered
+
+
+def event_epoch(value: Any) -> float:
+    """Normalize Frigate API timestamps and producer epoch values."""
+    if isinstance(value, int | float):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            try:
+                parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                return 0.0
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=datetime.UTC)
+            return parsed.timestamp()
+    return 0.0
 
 
 def collect_safety_evidence(
@@ -3200,11 +3308,11 @@ def collect_safety_evidence(
                 candidates = [
                     item
                     for item in events
-                    if float(item.get("start_time") or 0) >= capture_start - 5
+                    if event_epoch(item.get("start_time")) >= capture_start - 5
                     and (item.get("end_time") or item.get("duration"))
                 ]
                 if candidates:
-                    event = max(candidates, key=lambda item: float(item.get("start_time") or 0))
+                    event = max(candidates, key=lambda item: event_epoch(item.get("start_time")))
                     break
             except Exception:
                 pass
@@ -3226,6 +3334,19 @@ def collect_safety_evidence(
         draw_data = event_data.get("draw") if isinstance(event_data, dict) else {}
         draw_boxes = draw_data.get("boxes", []) if isinstance(draw_data, dict) else []
         draw_boxes = [box for box in draw_boxes if isinstance(box, dict)]
+        if not draw_boxes:
+            producer_box = event.get("box")
+            if not isinstance(producer_box, list | tuple) and isinstance(event_data, dict):
+                producer_box = event_data.get("box")
+            if isinstance(producer_box, list | tuple) and len(producer_box) == 4:
+                draw_boxes = [
+                    {
+                        "box": list(producer_box),
+                        "score": event_data.get("score", event.get("top_score"))
+                        if isinstance(event_data, dict)
+                        else event.get("top_score"),
+                    }
+                ]
         result["bbox"] = {"boxes": draw_boxes}
         checks["bbox_present"] = bool(draw_boxes)
         if not checks["bbox_present"] and not result.get("error"):
@@ -3319,28 +3440,44 @@ def collect_safety_evidence(
         review_query = urlencode(
             {"cameras": SAFETY_CAMERA, "labels": "all", "limit": 100}
         )
-        try:
-            with urlopen(f"http://127.0.0.1:5001/api/review?{review_query}", timeout=10) as response:
-                review_payload = json.loads(response.read().decode("utf-8"))
-            write_json(safety_dir / "review.json", review_payload)
-            review_rows = (
-                review_payload
-                if isinstance(review_payload, list)
-                else review_payload.get("review", review_payload.get("segments", []))
-            )
-            matched = []
-            for row in review_rows if isinstance(review_rows, list) else []:
-                data = row.get("data") or {}
-                detections = data.get("detections") or []
-                objects = data.get("objects") or []
-                if event_id in detections and any(
-                    str(value).split(":", 1)[0] == "smoking" for value in objects
-                ):
-                    matched.append(row)
-            result["review"] = {"matched": len(matched), "rows": len(review_rows)}
-            checks["review"] = bool(matched)
-        except Exception as exc:
-            result["review"] = {"error": str(exc)}
+        review_deadline = time.monotonic() + 10
+        while time.monotonic() < review_deadline:
+            try:
+                with urlopen(
+                    f"http://127.0.0.1:5001/api/review?{review_query}", timeout=5
+                ) as response:
+                    review_payload = json.loads(response.read().decode("utf-8"))
+                write_json(safety_dir / "review.json", review_payload)
+                review_rows = (
+                    review_payload
+                    if isinstance(review_payload, list)
+                    else review_payload.get(
+                        "review", review_payload.get("segments", [])
+                    )
+                )
+                matched = []
+                for row in review_rows if isinstance(review_rows, list) else []:
+                    data = row.get("data") or {}
+                    detections = data.get("detections") or []
+                    objects = data.get("objects") or []
+                    if event_id in detections and any(
+                        str(value).split(":", 1)[0] == "smoking"
+                        for value in objects
+                    ):
+                        matched.append(row)
+                result["review"] = {
+                    "matched": len(matched),
+                    "rows": len(review_rows),
+                }
+                checks["review"] = bool(matched)
+                if matched:
+                    break
+            except Exception as exc:
+                result["review"] = {"error": str(exc)}
+            if cancel_event is not None:
+                cancel_event.wait(0.5)
+            else:
+                time.sleep(0.5)
     except Exception as exc:
         result["error"] = f"{type(exc).__name__}: {exc}"
     result["status"] = "passed" if all(checks.values()) else "failed"
@@ -3602,7 +3739,7 @@ def wait_recordings_through(
 
 def ffprobe_clip(path: Path) -> dict[str, Any]:
     """Inspect a downloaded native clip without modifying it."""
-    result = subprocess.run(
+    result = run_bounded(
         [
             "ffprobe",
             "-v",
@@ -6730,7 +6867,11 @@ def main(argv: list[str] | None = None) -> int:
     previous_source_overlay = os.environ.get("CAMERA_SOURCE_OVERLAY")
     previous_report_media = os.environ.get("CAMERA_REPORT_MEDIA_DIR")
     previous_recognition_tls = os.environ.get("RECOGNITION_TLS_DIR")
+    previous_acceptance_media_volume = os.environ.get(
+        "CAMERA_ACCEPTANCE_MEDIA_VOLUME"
+    )
     runtime_started = False
+    runtime_parked = False
     sampler: ResourceSampler | None = None
     fault_injector: DockerFaultInjector | LauncherFaultInjector | None = None
     safety_executor: ThreadPoolExecutor | None = None
@@ -6742,6 +6883,16 @@ def main(argv: list[str] | None = None) -> int:
     runtime_workspace.mkdir(parents=True, exist_ok=True)
     report_media = output / "media"
     try:
+        try:
+            docker_version = docker_output(
+                "version", "--format", "{{.Server.Version}}", timeout=10
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise RuntimeError(
+                "Docker preflight failed before acceptance-start; "
+                "Docker CLI/daemon did not respond within 10 seconds"
+            ) from exc
+        summary["docker_preflight"] = {"server_version": docker_version}
         step_started = time.monotonic()
         manifest = load_manifest(manifest_path, Path.cwd())
         contract = fixture_contract(manifest)
@@ -6763,7 +6914,7 @@ def main(argv: list[str] | None = None) -> int:
             prepare_args.extend(["--notification-rules", *args.notification_rules])
         base_config = yaml.safe_load(config.read_text(encoding="utf-8"))
         # Keep every generated fixture asset inside this timestamped run.
-        prepared = subprocess.run(
+        prepared = run_bounded(
             [
                 sys.executable,
                 "tools/fixtures/prepare_passage_fixture.py",
@@ -6782,6 +6933,7 @@ def main(argv: list[str] | None = None) -> int:
             (value.get("runtime", {}).get("replay", {}).get("sources") or {}).keys()
         )
         value["runtime"]["image"] = base_config["runtime"]["image"]
+        acceptance_media_volume = f"camera-acceptance-media-{run_id.lower()}"
         tls_workspace = runtime_workspace
         tls_workspace.mkdir(parents=True, exist_ok=True)
         tls_directory = configure_recognition_topology(value, topology, tls_workspace)
@@ -6797,10 +6949,9 @@ def main(argv: list[str] | None = None) -> int:
         summary["fixture"] = fixture
         summary["fixture_contract"] = contract
         summary["timing"]["fixture_seconds"] = round(time.monotonic() - step_started, 3)
-        # acceptance-start force-recreates every test service against this
-        # run-scoped config, database, TLS and evidence directory. A full
-        # Compose teardown here only destroys the shared network and makes the
-        # exact same containers get created again.
+        # Production and E2E use the same Compose convergence path. The fixture
+        # config changes only camera sources; Compose decides which services
+        # need an update and the launcher never resets the shared project.
         runtime_started = True
 
         isolated_start_wall = time.time()
@@ -6833,25 +6984,22 @@ def main(argv: list[str] | None = None) -> int:
             {"run_id": run_id, "created_at": capture_start},
         )
         summary["capture_start_epoch"] = capture_start
-        try:
-            run_deploy(
-                "acceptance-start",
-                Path(fixture["config"]),
-                timeout=180 if topology in ("recognition", "tracker") else 30,
-                safety_config=Path("deploy/safety.yaml") if args.include_safety else None,
-            )
-            launcher_state_path = Path(".tmp/runtime/state.json")
-            if not launcher_state_path.is_file():
-                raise RuntimeError("launcher state artifact is missing")
-            launcher_state = json.loads(
-                launcher_state_path.read_text(encoding="utf-8")
-            )
-            summary["launcher_state"] = launcher_state
-        finally:
-            if previous_source_overlay is None:
-                os.environ.pop("CAMERA_SOURCE_OVERLAY", None)
-            else:
-                os.environ["CAMERA_SOURCE_OVERLAY"] = previous_source_overlay
+        os.environ["CAMERA_ACCEPTANCE_MEDIA_VOLUME"] = acceptance_media_volume
+        # Keep the source overlay through evidence collection and
+        # acceptance-restore so both paths execute the code under test. The
+        # outer cleanup restores the caller's value after restore.
+        run_deploy(
+            "acceptance-start",
+            Path(fixture["config"]),
+            timeout=180 if topology in ("recognition", "tracker") else 30,
+        )
+        launcher_state_path = Path(".tmp/runtime/state.json")
+        if not launcher_state_path.is_file():
+            raise RuntimeError("launcher state artifact is missing")
+        launcher_state = json.loads(
+            launcher_state_path.read_text(encoding="utf-8")
+        )
+        summary["launcher_state"] = launcher_state
         input_marker = report_media / "input-start"
         if not input_marker.is_file():
             raise RuntimeError("shared camera input barrier was not released")
@@ -6970,11 +7118,28 @@ def main(argv: list[str] | None = None) -> int:
                 time.monotonic() - safety_evidence_started, 3
             )
         if args.enable_notifications:
-            notification_drain_started = time.monotonic()
-            summary["notification_drain"] = wait_notification_delivery(output)
-            summary["timing"]["notification_drain_seconds"] = round(
-                time.monotonic() - notification_drain_started, 3
+            notification_dispatch_started = time.monotonic()
+            summary["notification_dispatch"] = wait_notification_dispatch(output)
+            summary["timing"]["notification_dispatch_seconds"] = round(
+                time.monotonic() - notification_dispatch_started, 3
             )
+            if not summary["notification_dispatch"].get("materialized", False):
+                raise TimeoutError(
+                    "notification deliveries were not materialized after event publication "
+                    f"({summary['notification_dispatch']})"
+                )
+        if runtime_started and not runtime_parked:
+            try:
+                run_deploy("acceptance-park", config, timeout=30)
+                runtime_parked = True
+            except Exception as exc:
+                summary.setdefault("diagnostic_errors", []).append(
+                    f"Acceptance replay park: {type(exc).__name__}: {exc}"
+                )
+        if runtime_parked:
+            copy_acceptance_media(output)
+            os.environ.pop("CAMERA_ACCEPTANCE_MEDIA_VOLUME", None)
+        if args.enable_notifications:
             summary["notifications"] = local_notification_summary(output)
         live_records = [
             json.loads(line)
@@ -7537,7 +7702,9 @@ def main(argv: list[str] | None = None) -> int:
                 {
                     "notification_event_counts": expected == target,
                     "notification_delivery": provider_delivery_complete
-                    and summary.get("notification_drain", {}).get("drained", False),
+                    and summary.get("notification_dispatch", {}).get(
+                        "materialized", False
+                    ),
                     "notification_media": bool(notification_summary.get("events"))
                     and all(
                         event.get("image")
@@ -7614,6 +7781,24 @@ def main(argv: list[str] | None = None) -> int:
                     "events": [],
                     "error": f"{type(exc).__name__}: {exc}",
                 }
+        if runtime_started and not runtime_parked:
+            try:
+                run_deploy("acceptance-park", config, timeout=30)
+                runtime_parked = True
+            except Exception as exc:
+                summary.setdefault("diagnostic_errors", []).append(
+                    f"Acceptance replay park: {type(exc).__name__}: {exc}"
+                )
+        if runtime_parked:
+            try:
+                copy_acceptance_media(output)
+            except Exception as exc:
+                summary.setdefault("diagnostic_errors", []).append(
+                    f"Acceptance media copy: {type(exc).__name__}: {exc}"
+                )
+        os.environ.pop("CAMERA_ACCEPTANCE_MEDIA_VOLUME", None)
+        if previous_acceptance_media_volume is not None:
+            os.environ["CAMERA_ACCEPTANCE_MEDIA_VOLUME"] = previous_acceptance_media_volume
         step_started = time.monotonic()
         restore_ok = not runtime_started
         if runtime_started:
@@ -7640,7 +7825,7 @@ def main(argv: list[str] | None = None) -> int:
                 os.environ.pop("RECOGNITION_TLS_DIR", None)
                 if previous_recognition_tls is not None:
                     os.environ["RECOGNITION_TLS_DIR"] = previous_recognition_tls
-                run_deploy("acceptance-restore", config, timeout=30)
+                run_deploy("acceptance-restore", config, timeout=120)
                 restore_ok = restore_mounts_verified(config)
             except Exception as exc:
                 summary.setdefault("restore_errors", []).append(

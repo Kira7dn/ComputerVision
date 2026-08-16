@@ -61,6 +61,31 @@ def test_acceptance_script_creates_missing_services_and_waits_for_readiness() ->
     assert "Wait-RecognitionReady" in acceptance
     assert "Wait-TrackerReady" in acceptance
     assert "Get-FrigateInternalStats" in acceptance
+    preflight = launcher[
+        launcher.index("$notificationsEnabled") : launcher.index(
+            "$topology = Initialize-PlatformTopology"
+        )
+    ]
+    assert "Stop-CameraComposeRuntime" not in preflight
+    assert "docker rm" not in acceptance
+    assert "--remove-orphans" not in acceptance
+    assert "--force-recreate" not in acceptance
+    assert "'run','--rm','--entrypoint','python3'" not in launcher
+
+
+def test_finite_replay_publishers_are_not_restarted_after_eof() -> None:
+    launcher = _launcher()
+    assert "$replayRestart = if ($Runtime.ReplayLoop) { 'unless-stopped' } else { 'no' }" in launcher
+    assert '$lines.Add("    restart: $replayRestart")' in launcher
+
+
+def test_acceptance_media_volume_is_opt_in_and_linux_owned() -> None:
+    launcher = _launcher()
+    assert "CAMERA_ACCEPTANCE_MEDIA_VOLUME" in launcher
+    assert "acceptance-media:/media/frigate" in launcher
+    assert "name: $($Runtime.AcceptanceMediaVolume)" in launcher
+    assert "Initialize-AcceptanceMediaVolume $runtime" in launcher
+    assert "mkdir -p /media/frigate/passage" in launcher
 
 
 def test_go2rtc_dev_overlay_uses_current_config_package() -> None:
@@ -79,7 +104,7 @@ def test_concurrent_service_start_precedes_readiness_and_input() -> None:
         acceptance,
     )
     combined_start = launcher.index(
-        "Invoke-Compose $prefix (@('up','-d','--no-build','--force-recreate','--no-deps') + $services)",
+        "Invoke-Compose $prefix (@('up','-d','--no-build','--no-deps') + $services)",
         frigate_start,
     )
     frigate_ready = launcher.index(
@@ -91,7 +116,7 @@ def test_concurrent_service_start_precedes_readiness_and_input() -> None:
         frigate_ready,
     )
     activation_start = launcher.index(
-        "Invoke-Compose $prefix (@('up','-d','--no-build','--force-recreate','--no-deps') + @($acceptanceServices))",
+        "Invoke-Compose $prefix (@('up','-d','--no-build','--no-deps') + @($acceptanceServices))",
         tracker_start,
     )
     tracker_ready = launcher.index("Wait-TrackerReady $trackerNodes", activation_start)
@@ -120,7 +145,7 @@ def test_safety_worker_is_warm_before_one_pass_replay_activation() -> None:
     ]
     safety_start = acceptance.index("Wait-SafetyControlReady")
     replay_start = acceptance.index(
-        "Invoke-Compose $prefix (@('up','-d','--no-build','--force-recreate','--no-deps') + @($acceptanceServices))"
+        "Invoke-Compose $prefix (@('up','-d','--no-build','--no-deps') + @($acceptanceServices))"
     )
     replay_ready = acceptance.index("Wait-ReplayReady $replaySources")
     safety_ready = acceptance.index("Wait-SafetyReady")
@@ -129,25 +154,40 @@ def test_safety_worker_is_warm_before_one_pass_replay_activation() -> None:
     assert "$acceptanceServices.Add('safety')" not in acceptance
 
 
-def test_development_restart_stops_frigate_before_replacing_tracker() -> None:
+def test_development_restart_uses_compose_convergence_without_reset() -> None:
     launcher = _launcher()
     restart = launcher[
         launcher.index("    'dev-restart' {") : launcher.index(
             "    'acceptance-start'", launcher.index("    'dev-restart' {")
         )
     ]
-    stop_main = restart.index("@('stop','--timeout','10','frigate')")
-    recreate_tracker = restart.index("@('up','-d','--no-build','--force-recreate','--no-deps')")
-    assert stop_main < recreate_tracker
+    assert "Stop-CameraComposeRuntime" not in restart
+    assert "--force-recreate" not in restart
+    assert "@('up','-d','--no-build','--no-deps')" in restart
 
 
-def test_stop_removes_launcher_owned_containers_left_by_another_profile() -> None:
+def test_development_restart_converges_expected_services() -> None:
+    launcher = _launcher()
+    restart = launcher[
+        launcher.index("    'dev-restart' {") : launcher.index(
+            "    'acceptance-start'", launcher.index("    'dev-restart' {")
+        )
+    ]
+    converge_main = restart.index(
+        "Invoke-Compose $prefix @('up','-d','--no-build','--no-deps','frigate')"
+    )
+    converge_safety = restart.index(
+        "Invoke-Compose $prefix @('up','-d','--no-build','--no-deps','safety')"
+    )
+    assert converge_main < converge_safety
+
+
+def test_stop_uses_compose_stop_without_deleting_containers() -> None:
     launcher = _launcher()
     stop = launcher[launcher.index("    'stop' {") :]
-    assert "$_ -eq 'frigate' -or $_ -like 'camera-*'" in stop
-    assert "docker rm -f $remaining" in stop
-    assert "docker rm -f @remaining" not in stop
-    assert stop.count("@('down','--remove-orphans')") == 2
+    assert "Invoke-Compose $prefix @('stop','--timeout','10')" in stop
+    assert "docker rm" not in stop
+    assert "@('down'" not in stop
 
 
 def test_acceptance_timeouts_are_nested_and_launcher_steps_are_durable() -> None:
@@ -242,7 +282,8 @@ def test_each_tracker_runtime_config_contains_only_its_node() -> None:
     assert "compile_platform_topology.py" in launcher
     assert "yaml.safe_load" not in topology_launcher
     assert '$effectiveConfig = if (' in launcher
-    assert "'-v',\"${effectiveConfig}:/config/config.yml:ro\"" in launcher
+    assert "FrigateConfig.parse_object(value)" in launcher
+    assert "Join-Path $workspace '.venv\\Scripts\\python.exe'" in launcher
 
 
 def test_main_live_streams_proxy_private_edge_go2rtc() -> None:

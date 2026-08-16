@@ -102,6 +102,9 @@ def load_manifest(path: Path, root: Path) -> dict[str, Any]:
 
 
 FACE_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
+SAFETY_FIXTURE_SOURCE = Path(
+    "assets/fixtures/mock_videos/smoker/samples/part1/bucket11.mp4"
+)
 
 
 def snapshot_face_library(
@@ -191,21 +194,15 @@ def lpr_source(
 def add_safety_source(
     config: dict[str, Any], root: Path
 ) -> dict[str, Any]:
-    """Add the real smoking replay as a second, run-scoped source topology."""
-    safety_config_path = root / "deploy" / "config.safety-integration.yaml"
-    safety_config = yaml.safe_load(safety_config_path.read_text(encoding="utf-8"))
-    if not isinstance(safety_config, dict):
-        raise ValueError("Safety integration config must be a mapping")
-    safety_runtime = safety_config.get("runtime") or {}
-    safety_replay = safety_runtime.get("replay") or {}
-    safety_sources = safety_replay.get("sources") or {}
-    source_value = safety_sources.get("safety_camera")
-    if not source_value:
-        raise ValueError("Safety integration config must define safety_camera replay")
-    source = (root / str(source_value)).resolve()
+    """Inject the Safety mock source only into an isolated E2E config."""
+    config.setdefault("runtime", {})
+    source = (root / SAFETY_FIXTURE_SOURCE).resolve()
     if not source.is_file():
         raise FileNotFoundError(str(source))
 
+    config.setdefault("go2rtc", {}).setdefault("streams", {})[
+        "safety_camera"
+    ] = ["rtsp://mediamtx:18554/safety_camera"]
     config["runtime"]["replay"] = {
         # The combined E2E launcher starts this publisher only after the
         # Safety control plane is warm. A single pass preserves the source
@@ -214,23 +211,18 @@ def add_safety_source(
         "loop": False,
         "sources": {"safety_camera": str(source)},
     }
-    config["go2rtc"] = copy.deepcopy(safety_config.get("go2rtc") or {})
-    safety_camera = (safety_config.get("cameras") or {}).get("safety_camera")
+    safety_camera = (config.get("cameras") or {}).get("safety_camera")
     if not isinstance(safety_camera, dict):
-        raise ValueError("Safety integration config must define cameras.safety_camera")
-    config.setdefault("cameras", {})["safety_camera"] = copy.deepcopy(safety_camera)
-    # Safety owns inference for this lane. Frigate still captures the stream
-    # for current-frame/recording, but must not run its native detector too.
+        raise ValueError("config.yaml must define cameras.safety_camera")
+    safety_camera["enabled"] = True
+    # Safety owns inference and evidence for this lane. Frigate must not run
+    # its native detector or capture fallback media for this camera.
     config["cameras"]["safety_camera"].setdefault("detect", {})["enabled"] = False
-    config["record"] = copy.deepcopy(safety_config.get("record") or config.get("record", {}))
-    config["snapshots"] = copy.deepcopy(
-        safety_config.get("snapshots") or config.get("snapshots", {})
-    )
     return {
         "source": str(source),
         "source_sha256": file_hash(source),
-        "config": str(safety_config_path.resolve()),
-        "config_sha256": file_hash(safety_config_path),
+        "config": str((root / "deploy" / "config.yaml").resolve()),
+        "config_sha256": file_hash(root / "deploy" / "config.yaml"),
     }
 
 
@@ -320,8 +312,15 @@ def main() -> int:
     direct_sources = {"face_camera": str(face_replay), "car_camera": str(lpr_replay)}
     config["runtime"].pop("replay", None)
     config["runtime"]["direct"] = {"sources": direct_sources}
-    config.pop("go2rtc", None)
-    safety = add_safety_source(config, root) if args.include_safety else None
+    if args.include_safety:
+        config["runtime"]["replay"] = {
+            "loop": False,
+            "sources": {"safety_camera": str(SAFETY_FIXTURE_SOURCE)},
+        }
+        safety = add_safety_source(config, root)
+    else:
+        config["cameras"]["safety_camera"]["enabled"] = False
+        safety = None
     for camera in ("face_camera", "car_camera"):
         config["cameras"][camera]["ffmpeg"]["inputs"] = [
             {

@@ -6,34 +6,45 @@ import yaml
 from tools.fixtures.prepare_passage_fixture import configure_notifications
 
 
-def test_safety_launcher_is_optional_and_has_explicit_profile() -> None:
+def test_safety_launcher_uses_the_canonical_camera_config() -> None:
     launcher = Path("deploy/run.ps1").read_text(encoding="utf-8")
-    assert "[string]$SafetyConfigFile = ''" in launcher
-    assert "external-safety" in launcher
+    assert "SafetyConfigFile" not in launcher
+    assert "safetyConfigFile" not in launcher
     assert "Wait-SafetyReady" in launcher
     assert "Test-SafetyConfig $config" in launcher
 
 
-def test_safety_compose_mounts_config_and_model_read_only() -> None:
+def test_safety_compose_mounts_canonical_config_and_model_read_only() -> None:
     compose = Path("deploy/reference/docker-compose.yml").read_text(encoding="utf-8")
-    assert "profiles: [\"external-safety\"]" in compose
-    assert "SAFETY_CONFIG_FILE" in compose and ":/config/safety.yaml:ro" in compose
+    assert "CAMERA_CONFIG_FILE" in compose and ":/config/config.yml:ro" in compose
+    assert "safety.yaml" not in compose
     assert "SAFETY_MODEL_PATH" in compose and ":/models/smoking/best.onnx:ro" in compose
 
 
-def test_safety_replay_uses_real_fixture_and_no_loop() -> None:
-    config = Path("deploy/config.safety-replay-smoker.yaml").read_text(encoding="utf-8")
-    assert "bucket11.mp4" in config
-    assert "loop: false" in config
+def test_runtime_uses_dahua_channels_and_e2e_injects_safety_fixture() -> None:
+    config = Path("deploy/config.yaml").read_text(encoding="utf-8")
+    assert "bucket11.mp4" not in config
+    assert (
+        "{FRIGATE_DAHUA_USER}:{FRIGATE_DAHUA_PASSWORD}@192.168.100.229" in config
+    )
+    assert "channel=1&subtype=1" in config
+    assert "channel=2&subtype=1" in config
+    assert "channel=3&subtype=1" in config
+    assert "safety_camera:" in config
     assert "detect:\n      enabled: false" in config
+    assert "tracker:" in config
+    assert "cameras: [face_camera, car_camera]" in config
+    fixture = Path("tools/fixtures/prepare_passage_fixture.py").read_text(
+        encoding="utf-8"
+    )
+    assert "bucket11.mp4" in fixture
+    assert "rtsp://mediamtx:18554/safety_camera" in fixture
 
 
 @pytest.mark.parametrize(
     "config_path",
     [
         Path("deploy/config.yaml"),
-        Path("deploy/config.safety-replay-smoker.yaml"),
-        Path("deploy/config.safety-integration.yaml"),
     ],
 )
 def test_safety_notification_rule_is_present_in_effective_configs(

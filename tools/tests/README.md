@@ -6,9 +6,9 @@
 | `integration/` | Cross-component integration checks; package-owned Frigate checks remain in `frigate/tests/` | `python -m pytest frigate/tests/test_evidence_quality.py frigate/tests/test_recognition_lifecycle.py -q` |
 | `e2e/` | Default tracker → Frigate → recognition → Safety healthy Docker E2E with direct MP4 inputs and notification delivery | `python tools/tests/e2e/run_platform_runtime_test.py` |
 
-Default E2E force-recreates its test services with run-scoped config, database, TLS and evidence,
-then restores the configured runtime after artifact collection. It does not tear down the Compose
-network just to recreate the same services. Current source is bind-mounted into Frigate, external
+Default E2E uses the same Compose convergence path as production and changes only camera sources
+to the declared replay fixtures. It does not reset the Compose project or force-recreate services.
+After artifact collection it applies the production config through that same path. Current source is bind-mounted into Frigate, external
 recognition and tracker, so development verification remains independent from an image build.
 Successful tracker runs retain only report data, final clips/traces, debug images, compact SQLite
 evidence and container/launcher logs. Transport I420, raw edge staging, test TLS and SQLite

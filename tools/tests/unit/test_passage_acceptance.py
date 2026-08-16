@@ -1,3 +1,4 @@
+import datetime
 import json
 import sqlite3
 from pathlib import Path
@@ -37,6 +38,7 @@ from tools.runtime.validate_platform_runtime import (
     validate_external_recognition_evidence,
     validate_runtime_lpr_evidence,
     wait_file_quiescent,
+    wait_notification_dispatch,
     wait_recognition_idle,
     wait_tracker_session_complete,
     write_compact_runtime_report,
@@ -52,6 +54,61 @@ def test_safety_collection_starts_before_replay_completion_wait() -> None:
     safety_result = source.index("summary[\"safety\"] = safety_future.result()")
 
     assert submit < replay_eof < safety_result
+
+
+def test_external_commands_cleanup_windows_process_trees() -> None:
+    source = Path("tools/runtime/validate_platform_runtime.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert '"taskkill", "/PID", str(pid), "/T", "/F"' in source
+    assert "except BaseException:" in source
+    assert "completed = run_bounded(" in source
+    assert '"Docker preflight failed before acceptance-start' in source
+
+
+def test_notification_dispatch_returns_without_waiting_for_provider_terminal_state(
+    tmp_path: Path,
+) -> None:
+    database = (
+        tmp_path
+        / "test-assets"
+        / "media"
+        / "passage"
+        / "frigate.infrastructure.db"
+    )
+    database.parent.mkdir(parents=True)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            """
+            create table notification_delivery (
+                provider text,
+                source_type text,
+                source_id text,
+                status text,
+                updated_at text
+            )
+            """
+        )
+        updated_at = (
+            datetime.datetime.now(datetime.UTC) - datetime.timedelta(seconds=60)
+        ).isoformat()
+        connection.execute(
+            "insert into notification_delivery values (?, ?, ?, ?, ?)",
+            ("telegram", "event", "event-1", "processing", updated_at),
+        )
+        connection.execute(
+            "insert into notification_delivery values (?, ?, ?, ?, ?)",
+            ("zalo", "event", "event-2", "pending", updated_at),
+        )
+        connection.commit()
+
+    result = wait_notification_dispatch(tmp_path, expected=2, timeout=2)
+
+    assert result["materialized"] is True
+    assert result["pending"] == 1
+    assert result["processing"] == 1
+    assert result["terminal"] == 0
 
 ROOT = Path(__file__).resolve().parents[3]
 MANIFEST = ROOT / "tools/fixtures/platform_passage_ground_truth.yaml"
@@ -931,7 +988,7 @@ def test_tracker_report_recovery_filters_current_node_epoch(
                 (event_dir / "clip.mp4").write_bytes(event_id.encode())
         return Result()
 
-    monkeypatch.setattr(passage_validator.subprocess, "run", run)
+    monkeypatch.setattr(passage_validator, "run_bounded", run)
 
     result = passage_validator.copy_tracker_report_artifacts(
         tmp_path, "epoch-current", ["current"]
@@ -969,7 +1026,7 @@ def test_tracker_report_recovery_uses_direct_report_mount(
     def unexpected_run(*_args, **_kwargs):
         raise AssertionError("direct report mount must not call docker cp")
 
-    monkeypatch.setattr(passage_validator.subprocess, "run", unexpected_run)
+    monkeypatch.setattr(passage_validator, "run_bounded", unexpected_run)
 
     result = passage_validator.copy_tracker_report_artifacts(
         tmp_path, "epoch-current", ["current"]

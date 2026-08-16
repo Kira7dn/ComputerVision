@@ -152,43 +152,20 @@ tự sinh Frigate Event ID.
 
 ## 5. Cấu hình tối thiểu
 
-Giữ hai file, không thêm top-level `safety:` vào Frigate config vì schema dùng `extra="forbid"`.
+Chỉ giữ một file cấu hình runtime là `deploy/config.yaml`. Safety dùng camera external trong
+cùng topology; không có file cấu hình Safety thứ hai.
 
 | File | Sở hữu |
 | --- | --- |
-| `deploy/config.yaml` | Camera, go2rtc, record, Review và topology của Frigate |
-| `deploy/safety.yaml` | Model, camera Safety, threshold và temporal policy |
+| `deploy/config.yaml` | Camera, go2rtc, replay, record, Review và topology của Frigate/Safety |
 
-### 5.1 Safety config
-
-```yaml
-frigate_url: http://frigate:5000
-restream_url: rtsp://frigate:8554
-model:
-  path: /models/smoking/best.onnx
-  providers: [TensorrtExecutionProvider, CUDAExecutionProvider, CPUExecutionProvider]
-
-cameras:
-  safety_camera:
-    stream: safety_camera
-    inference_fps: 1
-    labels:
-      smoking: {enabled: true, threshold: 0.10}
-    confirm_seconds: 1.0
-    clear_seconds: 5.0
-```
-
-Camera key trong Safety config phải tồn tại trong Frigate config. Threshold `0.10` chỉ phục vụ mock
-với model hiện có và không phải production threshold. Fire/smoke sẽ dùng config/model riêng khi
-capability đó được triển khai.
-
-### 5.2 Frigate camera fragment
+### 5.1 Frigate camera fragment
 
 ```yaml
 go2rtc:
   streams:
     safety_camera:
-      - rtsp://user:password@camera.local/live
+      - "rtsp://{FRIGATE_DAHUA_USER}:{FRIGATE_DAHUA_PASSWORD}@192.168.100.229:554/cam/realmonitor?channel=3&subtype=1"
 
 cameras:
   safety_camera:
@@ -216,14 +193,13 @@ cameras:
         enabled: false
 ```
 
-`detect.enabled: false` tắt object inference của Frigate nhưng giữ capture/current-frame path qua
-`detect` role. Safety inference vẫn chạy độc lập.
+`media_mode: external` và `detect.enabled: false` xác định Frigate không tạo capture/detector/record
+cho camera này. Safety inference và evidence là producer-owned.
 
-### 5.3 Replay và acceptance config
+### 5.2 Replay chỉ dành cho acceptance
 
-Không thêm `bucket11.mp4` vào `deploy/config.yaml` hiện tại vì file này dùng
-`runtime.replay.loop: true` cho face/car. `deploy/config.safety-replay-smoker.yaml` dùng riêng để
-kiểm tra video plumbing và chạy smoking mock với model đã có:
+Runtime thường không khai báo mock replay; `go2rtc` đọc Dahua channel 3 và Safety đọc lại
+stream `safety_camera` qua Frigate go2rtc. E2E mới tạo overlay tạm thời:
 
 ```yaml
 runtime:
@@ -242,9 +218,8 @@ Các contract hiện có của `run.ps1` vẫn áp dụng: replay/camera/go2rtc 
 đúng `rtsp://mediamtx:18554/<name>`, input phải H.264 và readiness runtime yêu cầu
 `camera_fps/process_fps >= 4.5`.
 
-POC E2E dùng `deploy/safety.yaml` với `/models/smoking/best.onnx` và xác nhận Event `smoking` từ
-`bucket11.mp4`. Không gọi kết quả này là fire/smoke accuracy. Config fire/smoke riêng chỉ cần khi
-capability đó được triển khai.
+E2E inject `bucket11.mp4` vào overlay bằng fixture builder, đổi stream Safety sang MediaMTX trong
+thời gian test rồi khôi phục config Dahua. Không gọi kết quả này là fire/smoke accuracy.
 
 ## 6. Rủi ro và quyết định giảm thiểu
 
@@ -319,16 +294,14 @@ Safety trong report.
 - `FrigateConfig` cấm unknown top-level field.
 - Fragment `safety_camera` với `detect.enabled: false`, record và Review labels validate qua
   `FrigateConfig.model_validate` và `compile_topology`.
-- `run.ps1` hỗ trợ config riêng qua `-ConfigFile` và Safety tùy chọn qua `-SafetyConfigFile`; mặc định
-  không bật Safety service/profile.
+- `run.ps1` chỉ nhận `-ConfigFile`; Safety được suy ra từ camera external trong topology.
 - Tracker runtime hiện không có go2rtc process/listener 8554.
 
 Cập nhật triển khai P1–P3:
 
 - Đã có `extension/safety` với strict config, ONNX smoking adapter, temporal gate, bounded RTSP
   reader, Frigate Manual Event client và healthcheck.
-- Đã có `deploy/safety.yaml`, replay config cho `bucket11.mp4`, Safety Dockerfile, Compose profile
-  `external-safety` và launcher option `-SafetyConfigFile`; Safety tắt mặc định.
+- Safety dùng cùng `deploy/config.yaml`, cùng replay topology và cùng Frigate producer ingress.
 - Targeted Safety tests đạt `13 passed`; coverage hiện tập trung vào smoking threshold, temporal
   lifecycle, timeout reconciliation, fail-closed API, cleanup và bounded reader. `deploy/run.ps1 build` đạt và tạo image
   `camera-safety:overlay-3361a5100cfe`.
@@ -406,10 +379,10 @@ Package marker, không có side effect khi import.
 | --- | --- | --- | --- |
 | `LabelPolicy` | `enabled`, `threshold` | Validated policy | Threshold trong `[0,1]` |
 | `CameraSafetyConfig` | Stream, FPS, labels, confirm/clear seconds | Validated camera policy | Giá trị dương, có ít nhất một label enabled |
-| `SafetyConfig` | Frigate/restream URL, model path/provider, camera map | Immutable config | Unknown field làm validation fail |
+| `SafetyConfig` | Frigate go2rtc URL, model path/provider, camera map | Immutable config | Camera external phải có policy smoking |
 | `load_config(path)` | UTF-8 YAML | `SafetyConfig` | Parse/validate một lần lúc startup |
 | `validate_camera_keys(safety, frigate_names)` | Hai tập camera names | `None` hoặc lỗi | Safety cameras phải là tập con của Frigate cameras |
-| `resolve_stream_url(config, camera)` | Restream base + stream name | RTSP URL | Không lặp RTSP credential trong Safety config |
+| `resolve_stream_url(config, camera)` | Frigate go2rtc base + stream name | RTSP URL | Không lặp RTSP credential trong Safety config |
 
 #### [ ] `frigate/src/extension/safety/inference.py`
 
@@ -454,19 +427,16 @@ vào trước khi profiling chứng minh cần thiết.
 | `assets/models/smoking/best.onnx` | Model đã có | Mount read-only; map `cigarette` → `smoking`; decode output `[1,5,8400]` |
 | `assets/models/fire-smoke.onnx` | Model tương lai | Chỉ thêm khi bật fire/smoke; không blocker cho smoking mock |
 | `tools/fixtures/safety_ground_truth.yaml` | Optional production review | Không cần cho mock; chỉ dùng khi muốn claim accuracy |
-| `deploy/safety.yaml` | Mẫu mục 5.1 | Model path/provider, per-camera label/threshold/temporal policy |
-| `deploy/config.safety-replay-smoker.yaml` | `bucket11.mp4` | Video plumbing/smoking development, không phải fire/smoke accuracy |
-| `deploy/config.safety-acceptance.yaml` | Future fire/smoke acceptance fixture | Chỉ thêm sau khi đã chọn model; one-camera, `loop:false`, record/Review enabled |
 | `deploy/reference/Dockerfile.safety` | Existing runtime base + Safety source | `camera-safety:current`; config/model không bake vào image |
-| `deploy/reference/docker-compose.yml` | Safety image/config/model | Optional `external-safety` profile, private network, no published port |
-| `deploy/run.ps1` | Optional `-SafetyConfigFile` | Validate, start, wait-ready và stop Safety mà không đổi default runtime |
+| `deploy/reference/docker-compose.yml` | Safety image/config/model | Canonical Frigate config, private network, no published port |
+| `deploy/run.ps1` | Canonical `-ConfigFile` | Validate topology, start, wait-ready và stop Safety |
 
 Chỉ cần ba thay đổi public trong launcher:
 
 | Function/change | Input | Output/logic |
 | --- | --- | --- |
-| `Test-SafetyConfig` | Safety + selected Frigate config | Fail trước Compose khi camera/model/config không hợp lệ |
-| `Get-ComposePrefix(..., ExternalSafety)` | Safety enabled flag | Thêm profile chỉ khi user truyền `-SafetyConfigFile` |
+| `Test-SafetyConfig` | Selected Frigate config | Fail trước Compose khi camera/model/config không hợp lệ |
+| `Get-ComposePrefix(...)` | Compiled topology | Dùng một Compose topology cho Frigate và producer |
 | `Wait-SafetyReady` | Camera list + timeout | Chờ model/source/API ready; timeout phải có diagnostic |
 
 Không thêm command launcher mới. `dev-start/start/stop/build` dùng cùng flow hiện có; build Safety
