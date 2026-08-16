@@ -21,6 +21,8 @@ logger:
   default: info
 
 auth:
+  user: "admin"
+  password: "123456"
   reset_admin_password: false
 
 notifications:
@@ -45,7 +47,7 @@ notifications:
           chat_id: "{TELEGRAM_CHAT_ID}"
           enabled: true
     zalo:
-      enabled: true
+      enabled: false
       media_url_ttl: 300
       recipients:
         - id: operators
@@ -339,11 +341,6 @@ tracker:
     spool:
       max_bytes: 268435456
       retention: 86400
-    tls:
-      ca: /run/tracker-tls/ca.crt
-      certificate: /run/tracker-tls/client.crt
-      key: /run/tracker-tls/client.key
-      server_name: tracker-edge-local
 version: 0.18-0
 
 semantic_search:

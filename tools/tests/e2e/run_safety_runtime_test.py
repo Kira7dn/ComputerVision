@@ -37,7 +37,7 @@ def _events(api_url: str) -> list[dict]:
 
 def _resource_snapshot() -> list[dict]:
     result = subprocess.run(
-        ["docker", "stats", "--no-stream", "--format", "{{.Name}}|{{.CPUPerc}}|{{.MemUsage}}", "frigate", "camera-safety"],
+        ["docker", "stats", "--no-stream", "--format", "{{.Name}}|{{.CPUPerc}}|{{.MemUsage}}", "frigate", "edge-safety"],
         cwd=ROOT,
         text=True,
         capture_output=True,

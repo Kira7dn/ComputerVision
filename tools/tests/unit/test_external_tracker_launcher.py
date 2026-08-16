@@ -245,17 +245,14 @@ def test_tracker_readiness_treats_startup_connection_errors_as_failed_polls() ->
     assert "$ErrorActionPreference = $savedErrorActionPreference" in readiness
 
 
-def test_tracker_runtime_uses_private_state_and_mtls() -> None:
+def test_tracker_runtime_uses_private_state_and_plaintext_endpoint() -> None:
     launcher = _launcher()
     # Edge mounts its private volume at Frigate's existing media root so the
     # shared recorder/output code is reused without path-specific forks.
     assert ":/media/frigate" in launcher
     assert ":/var/lib/camera-tracker/spool" in launcher
-    assert ":/run/tracker-tls:ro" in launcher
-    assert "grpc.secure_channel" in launcher
-    assert "grpc.ssl_channel_credentials" in launcher
-    assert "root_certificates=" in launcher
-    assert "private_key=" in launcher
+    assert ":/run/tracker-tls:ro" not in launcher
+    assert "grpc.insecure_channel" in launcher
     assert "certificate_chain=" in launcher
     assert "response['schema_version'] == 1" in launcher
 

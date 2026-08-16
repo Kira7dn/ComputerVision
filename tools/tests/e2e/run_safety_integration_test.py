@@ -25,7 +25,7 @@ API_URL = "http://127.0.0.1:5001"
 CAMERA = "safety_camera"
 LABEL = "smoking"
 SUB_LABEL = "camera-safety"
-REPLAY_CONTAINER = "camera-replay-safety-camera"
+REPLAY_CONTAINER = "edge-replay-safety-camera"
 TEST_START_EPOCH = 0.0
 
 
@@ -81,7 +81,7 @@ def _container_health(name: str) -> str:
 
 
 def _safety_health() -> dict[str, Any]:
-    result = _docker("exec", "camera-safety", "cat", "/tmp/camera-safety-health.json")
+    result = _docker("exec", "edge-safety", "cat", "/tmp/camera-safety-health.json")
     if result.returncode:
         return {"ready": False, "error": result.stderr.strip()}
     return json.loads(result.stdout)
@@ -179,7 +179,7 @@ def _case(report: dict[str, Any], name: str, fn: Callable[[], dict[str, Any]]) -
 
 def _case_startup_and_source() -> dict[str, Any]:
     health = _wait_for(
-        lambda: _safety_health() if _container_health("camera-safety") == "healthy" else None,
+        lambda: _safety_health() if _container_health("edge-safety") == "healthy" else None,
         90,
         "Safety healthy state",
     )
@@ -291,11 +291,11 @@ def _case_restart_reconcile() -> dict[str, Any]:
         1.0,
     )
     active_id = str(active["id"])
-    result = _docker("restart", "camera-safety", timeout=60)
+    result = _docker("restart", "edge-safety", timeout=60)
     if result.returncode:
         raise RuntimeError(result.stderr.strip())
     _wait_for(
-        lambda: _safety_health() if _container_health("camera-safety") == "healthy" else None,
+        lambda: _safety_health() if _container_health("edge-safety") == "healthy" else None,
         90,
         "Safety healthy after restart",
     )

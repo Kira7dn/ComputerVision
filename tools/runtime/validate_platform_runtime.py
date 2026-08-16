@@ -210,7 +210,7 @@ def finalize_report_assets(output: Path) -> dict[str, Any]:
 def copy_tracker_clip(event_id: str, target: Path) -> bool:
     """Copy one producer-owned tracker clip into the host report."""
     source = (
-        "camera-tracker-edge-local:/media/frigate/edge-media/"
+        "edge-tracker:/media/frigate/edge-media/"
         f"clips/{event_id}/clip.mp4"
     )
     temporary = target.with_suffix(target.suffix + ".tmp")
@@ -289,7 +289,7 @@ def copy_tracker_report_artifacts(
                 [
                     "docker",
                     "cp",
-                    "camera-tracker-edge-local:/media/frigate/edge-media/"
+                    "edge-tracker:/media/frigate/edge-media/"
                     f"{name}/.",
                     str(target),
                 ],
@@ -1023,18 +1023,12 @@ def configure_recognition_topology(
 def configure_tracker_topology(
     config: dict[str, Any], topology: str, *, reuse_tls: bool = False
 ) -> Path | None:
-    """Build the E2E tracker fixture overlay; launcher compiles its runtime views."""
+    """Build the E2E tracker fixture overlay without transport TLS."""
     if topology != "tracker":
         config.pop("tracker", None)
         return None
     node_id = "edge-local"
     server_name = "tracker-edge-local"
-    tls_directory = Path(".tmp/runtime/tracker-tls") / node_id
-    required_tls = ("ca.crt", "server.crt", "server.key", "client.crt", "client.key")
-    if not reuse_tls or not all(
-        (tls_directory / name).is_file() for name in required_tls
-    ):
-        create_service_tls(tls_directory, server_name, "frigate-main")
     managed_cameras = set(CAMERAS.values())
     record = config.get("record")
     if isinstance(record, dict):
@@ -1085,12 +1079,6 @@ def configure_tracker_topology(
             "spool": {
                 "max_bytes": 256 * 1024 * 1024,
                 "retention": 24 * 60 * 60,
-            },
-            "tls": {
-                "ca": "/run/tracker-tls/ca.crt",
-                "certificate": "/run/tracker-tls/client.crt",
-                "key": "/run/tracker-tls/client.key",
-                "server_name": server_name,
             },
         }
     }
@@ -1158,17 +1146,17 @@ def capture_container_diagnostics(
         shutil.copy2(launcher_steps, output / "launcher-steps.jsonl")
     containers = ["frigate"]
     if topology in ("recognition", "tracker"):
-        containers.append("camera-recognition")
+        containers.append("edge-recognition")
     if topology == "tracker":
-        containers.append("camera-tracker-edge-local")
+        containers.append("edge-tracker")
     if include_safety:
-        containers.append("camera-safety")
+        containers.append("edge-safety")
     for container in containers:
         suffix = {
             "frigate": "",
-            "camera-recognition": "-recognition",
-            "camera-tracker-edge-local": "-tracker-edge-local",
-            "camera-safety": "-safety",
+            "edge-recognition": "-recognition",
+            "edge-tracker": "-tracker-edge-local",
+            "edge-safety": "-safety",
         }[container]
         inspect = run_bounded(
             ["docker", "inspect", container],
@@ -1205,13 +1193,13 @@ def restart_counts(
     names = [
         name
         for name in docker_output("ps", "--format", "{{.Names}}").splitlines()
-        if name in {"frigate", "camera-recognition"}
-        or include_safety and name == "camera-safety"
-        or name.startswith("camera-replay-")
+        if name in {"frigate", "edge-recognition"}
+            or include_safety and name == "edge-safety"
+        or name.startswith("edge-replay-")
         and (
             replay_cameras is None
             or any(
-                name.removeprefix("camera-replay-") == camera.replace("_", "-")
+                name.removeprefix("edge-replay-") == camera.replace("_", "-")
                 for camera in replay_cameras
             )
         )
@@ -1529,10 +1517,10 @@ def parse_bytes(value: str) -> int:
 class ResourceSampler:
     def __init__(self, topology: str = "local") -> None:
         self.containers = ["frigate"] + (
-            ["camera-recognition"] if topology in ("recognition", "tracker") else []
+            ["edge-recognition"] if topology in ("recognition", "tracker") else []
         )
         if topology == "tracker":
-            self.containers.append("camera-tracker-edge-local")
+            self.containers.append("edge-tracker")
         self.stop_event = threading.Event()
         self.memory_bytes: list[int] = []
         self.cpu_percent: list[float] = []
@@ -7360,14 +7348,14 @@ def main(argv: list[str] | None = None) -> int:
         runtime_logs = docker_logs("frigate", observation_wall)
         model_logs = docker_logs("frigate", isolated_start_wall)
         tracker_logs = (
-            docker_logs("camera-tracker-edge-local", isolated_start_wall)
+            docker_logs("edge-tracker", isolated_start_wall)
             if topology == "tracker"
             else ""
         )
         if tracker_logs:
             model_logs = f"{model_logs}\n{tracker_logs}"
         recognition_logs = (
-            docker_logs("camera-recognition", isolated_start_wall)
+            docker_logs("edge-recognition", isolated_start_wall)
             if topology in ("recognition", "tracker")
             else ""
         )

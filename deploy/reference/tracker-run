@@ -8,8 +8,4 @@ exec python3 -u -m extension.tracker.app \
   --node-id "${TRACKER_NODE_ID:?TRACKER_NODE_ID is required}" \
   --bind 0.0.0.0:50052 \
   --spool-dir /var/lib/camera-tracker/spool \
-  --media-dir /media/frigate \
-  --certificate /run/tracker-tls/server.crt \
-  --key /run/tracker-tls/server.key \
-  --client-ca /run/tracker-tls/ca.crt \
-  --allow-client frigate-main
+  --media-dir /media/frigate

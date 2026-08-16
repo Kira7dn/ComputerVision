@@ -20,8 +20,8 @@ import yaml
 
 RUNTIME_CONTAINERS = (
     "frigate",
-    "camera-replay-face-camera",
-    "camera-replay-car-camera",
+    "edge-replay-face-camera",
+    "edge-replay-car-camera",
 )
 
 
@@ -450,7 +450,7 @@ async def collect(args: argparse.Namespace) -> dict[str, Any]:
     if args.manifest:
         manifest = yaml.safe_load(Path(args.manifest).read_text(encoding="utf-8"))
         passages = manifest["lpr"]["passages"]
-        replay_started = container_started_epoch("camera-replay-car-camera")
+        replay_started = container_started_epoch("edge-replay-car-camera")
 
         def passage_for(event: dict[str, Any]) -> dict[str, Any] | None:
             return match_passage(

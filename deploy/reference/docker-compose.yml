@@ -7,7 +7,7 @@ services:
   recognition:
     image: ${RECOGNITION_IMAGE:-camera-recognition:current}
     profiles: ["external-recognition"]
-    container_name: camera-recognition
+    container_name: edge-recognition
     restart: unless-stopped
     shm_size: "1gb"
     gpus: all
@@ -29,7 +29,7 @@ services:
 
   safety:
     image: ${SAFETY_IMAGE:-camera-safety:current}
-    container_name: camera-safety
+    container_name: edge-safety
     command: ["run", "--config", "/config/config.yml"]
     healthcheck:
       test: ["CMD-SHELL", "test -f /tmp/camera-safety-health.json && grep -q '\"ready\": true' /tmp/camera-safety-health.json"]
@@ -43,9 +43,14 @@ services:
     env_file:
       - path: ../../.env.local
         required: true
+    environment:
+      SAFETY_GRPC_URL: ${SAFETY_GRPC_URL:-frigate:50052}
+      CAMERA_MOCK_VIDEO_SAFETY_CAMERA: /mock-videos/smoker/samples/part1/bucket11.mp4
     volumes:
+      - frigate-config:/config
       - ${CAMERA_CONFIG_FILE:?run.ps1 must set CAMERA_CONFIG_FILE}:/config/config.yml:ro
       - ${SAFETY_MODEL_PATH:-../../assets/models/smoking/best.onnx}:/models/smoking/best.onnx:ro
+      - ${CAMERA_FIXTURE_DIR:-../../assets/fixtures/mock_videos}:/mock-videos:ro
       - /etc/localtime:/etc/localtime:ro
 
   frigate:
@@ -75,6 +80,10 @@ services:
       PASSAGE_RUN_ID: ${PASSAGE_RUN_ID:-}
       PASSAGE_SESSION_FILE: ${PASSAGE_SESSION_FILE:-}
       PASSAGE_SOURCE_START_DIR: ${PASSAGE_SOURCE_START_DIR:-}
+      CAMERA_OPEN_RUNTIME_API: ${CAMERA_OPEN_RUNTIME_API:-1}
+      CAMERA_MOCK_VIDEO_FACE_CAMERA: /mock-videos/face-recognition/segments/01_P1E_S1_C1_5s-20s.mp4
+      CAMERA_MOCK_VIDEO_CAR_CAMERA: /mock-videos/car-number-plate-video/Traffic Control CCTV.mp4
+      CAMERA_MOCK_VIDEO_SAFETY_CAMERA: /mock-videos/smoker/samples/part1/bucket11.mp4
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:5000/api/stats >/dev/null && test -w /config && test -w /config/config.yml && test -w /media/frigate"]
       interval: 15s
@@ -82,7 +91,6 @@ services:
       retries: 6
       start_period: 60s
     ports:
-      - "8971:8971"
       # Local-only acceptance endpoint; bypasses the auth proxy without
       # exposing Frigate's internal HTTP service to the network.
       - "127.0.0.1:5001:5000"
@@ -94,12 +102,50 @@ services:
       - ${CAMERA_MODEL_CACHE_PATH:?run.ps1 must set CAMERA_MODEL_CACHE_PATH}:/config/model_cache
       - ${FRIGATE_MEDIA_DIR:-E:/Docker/Frigate/media}:/media/frigate
       - ${CAMERA_MODEL_PATH:?run.ps1 must set CAMERA_MODEL_PATH}:/assets/models/yolov9-t-320.onnx:ro
+      - ${CAMERA_FIXTURE_DIR:-../../assets/fixtures/mock_videos}:/mock-videos:ro
       - ${RECOGNITION_TLS_DIR:-../../.tmp/runtime/recognition-tls}:/run/recognition-tls:ro
       - /etc/localtime:/etc/localtime:ro
 
+  frontend-dev:
+    image: node:22-bookworm-slim
+    container_name: frontend-dev
+    profiles: ["frontend-dev"]
+    working_dir: /app
+    environment:
+      PROXY_HOST: ${CAMERA_FRONTEND_PROXY_HOST:-frigate:5001}
+      LIVE_PROXY_HOST: frigate:8971
+      LIVE_PROXY_PROTOCOL: ws
+      MEDIA_PROXY_HOST: frigate:8971
+      MEDIA_PROXY_PROTOCOL: http
+    command:
+      - sh
+      - -lc
+      - >-
+        if [ ! -x node_modules/.bin/vite ] || [ ! -f node_modules/@rollup/rollup-linux-x64-gnu/package.json ]; then
+        npm install --include=optional --no-audit --no-fund;
+        fi;
+        exec npm run dev -- --host 0.0.0.0 --port 5173
+    depends_on:
+      frigate:
+        condition: service_healthy
+    ports:
+      - "${CAMERA_FRONTEND_PORT:-8971}:5173"
+    volumes:
+      - ${CAMERA_WEB_DIR:-../../frigate/web}:/app
+      - frontend-node-modules:/app/node_modules
+
+  frontend:
+    image: ${FRONTEND_IMAGE:-camera-frontend:current}
+    container_name: frontend
+    depends_on:
+      frigate:
+        condition: service_healthy
+    ports:
+      - "${CAMERA_FRONTEND_PORT:-8971}:5173"
+
   ngrok:
     image: ngrok/ngrok:latest
-    container_name: camera-ngrok
+    container_name: edge-ngrok
     restart: unless-stopped
     depends_on:
       frigate:
@@ -107,7 +153,7 @@ services:
     command:
       - http
       - --url=${NGROK_URL:?NGROK_URL is required}
-      - https://frigate:8971
+      - ${CAMERA_UI_UPSTREAM:-https://frontend:5173}
     environment:
       NGROK_AUTHTOKEN: ${NGROK_AUTHTOKEN:?NGROK_AUTHTOKEN is required}
     # Port 4040 deliberately stays inside the Compose network. The Agent API
@@ -115,7 +161,7 @@ services:
 
   mediamtx:
     image: bluenviron/mediamtx:1.19.3
-    container_name: camera-mediamtx
+    container_name: edge-mediamtx
     profiles: ["replay"]
     restart: unless-stopped
     ports:
@@ -127,3 +173,5 @@ volumes:
   frigate-config:
     name: camera-frigate-config
     external: true
+  frontend-node-modules:
+    name: camera-frontend-node-modules

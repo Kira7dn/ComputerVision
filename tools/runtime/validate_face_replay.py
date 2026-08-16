@@ -48,7 +48,7 @@ def restart_counts() -> dict[str, int]:
     names = [
         name
         for name in docker("ps", "--format", "{{.Names}}").splitlines()
-        if name == "frigate" or name.startswith("camera-replay-")
+        if name == "frigate" or name.startswith("edge-replay-")
     ]
     return {
         name: int(docker("inspect", name, "--format", "{{.RestartCount}}"))
@@ -258,7 +258,7 @@ def main() -> int:
         [
             name
             for name in docker("ps", "--format", "{{.Names}}").splitlines()
-            if name.startswith("camera-replay-")
+            if name.startswith("edge-replay-")
         ]
     )
     events = get_json(
