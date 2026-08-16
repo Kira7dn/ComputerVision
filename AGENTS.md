@@ -109,26 +109,37 @@ Do not edit `frigate/docs/static/frigate-api.yaml` or generated translation arti
 
 ## Development runtime
 
-Read the launcher before selecting an action:
+Read the launcher once before picking a path:
 
 ```powershell
 Get-Content -LiteralPath 'deploy\run.ps1' -Encoding utf8
 ```
 
-Start source-mounted development services with hot reload and no image build:
+Use this as the only split rule:
 
 ```powershell
-.\deploy\run.ps1 dev-start
+# Production-like runtime (image-based). No source mount, no dev watch.
+.\deploy\run.ps1 start
 .\deploy\run.ps1 status
-.\deploy\run.ps1 dev-logs
+.\deploy\run.ps1 stop
+
+# Development runtime (source-mounted + hot reload via compose watch).
+.\deploy\run.ps1 dev-start
 .\deploy\run.ps1 dev-restart
+.\deploy\run.ps1 dev-logs
 .\deploy\run.ps1 dev-stop
+
+# Build is only for production/release packaging and must be explicitly requested.
+.\deploy\run.ps1 build
 ```
 
-Build only when explicitly requested for a production/release check:
+Rules:
 
 ```powershell
-.\deploy\run.ps1 build
+# Default operation after a code change:
+# - run dev-restart (do not rebuild unless images are changed).
+# - run start for image validation.
+# - never replace start with build, and never replace dev-* with start.
 ```
 
 ## Official E2E commands
