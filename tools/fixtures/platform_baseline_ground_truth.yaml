@@ -19,7 +19,7 @@ face:
       expected_identity: unknown
 
 lpr:
-  source: assets/fixtures/mock_videos/car-number-plate-video/cam-in/pexels-casey-whalen-6571483 (1024p).mp4
+  source: assets/fixtures/mock_videos/car-number-plate-video/cam-in/pexels-casey-whalen-6571483-1024p.mp4
   duration_s: 15
   passages:
     - {id: lpr-01, start_s: 0.4, end_s: 1.0, expected_plate: null, readable: false}

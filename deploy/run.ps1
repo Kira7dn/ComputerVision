@@ -218,9 +218,8 @@ function Initialize-PlatformTopology {
     throw 'Workspace Python is required to compile the platform topology.'
   }
   $compiler = Join-Path $workspace 'tools\runtime\compile_platform_topology.py'
-  # E2E and production are compiled by the same code. They use two explicit
-  # generated destinations only to avoid replacing a Windows bind-mounted file
-  # while the other runtime view is active.
+  # E2E and production are compiled by the same code. Only tracker edge
+  # configs are materialized; the main runtime reads deploy/config.yaml.
   $topologyOutputDir = if ($Command -eq 'acceptance-start') {
     Join-Path $runtimeDir 'acceptance-topology'
   } else {
@@ -243,20 +242,10 @@ function Initialize-PlatformTopology {
     throw 'Topology compiler did not write platform-topology.json.'
   }
   $manifest = Get-Content -LiteralPath $topologyManifestPath -Encoding utf8 -Raw | ConvertFrom-Json
-  # Frigate must use the compiler-owned main view in every runtime mode.
-  # The source config is the input to topology compilation; mounting it
-  # directly omits topology_revision and prevents Frigate from connecting to
-  # managed Tracker nodes.
-  $effectiveConfig = [string]$manifest.main_config
-  $effectiveNgrokUrl = Get-EnvFileValue 'NGROK_URL'
-  if (-not [string]::IsNullOrWhiteSpace($effectiveNgrokUrl) -and (Test-Path -LiteralPath $effectiveConfig -PathType Leaf)) {
-    $configText = [IO.File]::ReadAllText($effectiveConfig, [Text.Encoding]::UTF8)
-    if ($configText.Contains('{NGROK_URL}')) {
-      $configText = $configText.Replace('{NGROK_URL}', [string]$effectiveNgrokUrl)
-      [IO.File]::WriteAllText($effectiveConfig, $configText, [Text.UTF8Encoding]::new($false))
-    }
-  }
-  $env:CAMERA_CONFIG_FILE = $effectiveConfig.Replace('\','/')
+  # deploy/config.yaml is the sole runtime configuration source. The topology
+  # compiler still produces edge-node artifacts, but Frigate and Safety read
+  # the source file directly instead of a hidden derived main config.
+  $env:CAMERA_CONFIG_FILE = $configFile.Replace('\','/')
   $nodes = @()
   foreach ($node in @($manifest.nodes)) {
     $nodeId = [string]$node.id
@@ -581,6 +570,8 @@ function New-ReplayOverride([object[]]$Sources, $Runtime, [bool]$NotificationsEn
     $mounts = @($frigateVolumes | ForEach-Object { $_ | ConvertTo-Json -Compress }) -join ', '
     $lines.Add('  frigate:')
     $lines.Add("    volumes: [$mounts]")
+    $lines.Add('    environment:')
+    $lines.Add('      PYTHONDONTWRITEBYTECODE: "1"')
     if ($env:CAMERA_HOT_RELOAD -eq '1') {
       $watchPath = $sourceOverlay.Replace('\','/') | ConvertTo-Json -Compress
       $lines.Add('    develop:')
@@ -596,6 +587,8 @@ function New-ReplayOverride([object[]]$Sources, $Runtime, [bool]$NotificationsEn
     ) -join ', '
     $lines.Add('  recognition:')
     $lines.Add("    volumes: [$recognitionMounts]")
+    $lines.Add('    environment:')
+    $lines.Add('      PYTHONDONTWRITEBYTECODE: "1"')
     if ($env:CAMERA_HOT_RELOAD -eq '1') {
       $watchPath = $sourceOverlay.Replace('\','/') | ConvertTo-Json -Compress
       $lines.Add('    develop:')
@@ -611,6 +604,8 @@ function New-ReplayOverride([object[]]$Sources, $Runtime, [bool]$NotificationsEn
     ) -join ', '
     $lines.Add('  safety:')
     $lines.Add("    volumes: [$safetyMounts]")
+    $lines.Add('    environment:')
+    $lines.Add('      PYTHONDONTWRITEBYTECODE: "1"')
     if ($env:CAMERA_HOT_RELOAD -eq '1') {
       $watchPath = $sourceOverlay.Replace('\','/') | ConvertTo-Json -Compress
       $lines.Add('    develop:')
@@ -679,7 +674,10 @@ function New-ReplayOverride([object[]]$Sources, $Runtime, [bool]$NotificationsEn
     $lines.Add("    command: $command")
   }
   foreach ($node in $TrackerNodes) {
-    $configMount = (($node.ConfigPath.Replace('\','/') + ':/config/config.yml:ro') | ConvertTo-Json -Compress)
+    # All runtime services consume the canonical deploy/config.yaml. The
+    # topology manifest still describes ownership, but must not create a
+    # second runtime configuration source for the tracker.
+    $configMount = (($configFile.Replace('\','/') + ':/config/config.yml:ro') | ConvertTo-Json -Compress)
     $modelMount = (($Runtime.ModelPath.Replace('\','/') + ':/assets/models/yolov9-t-320.onnx:ro') | ConvertTo-Json -Compress)
     $trackerVolumes = [Collections.Generic.List[string]]::new()
     $trackerVolumes.Add('frigate-config:/config')
@@ -724,9 +722,7 @@ function New-ReplayOverride([object[]]$Sources, $Runtime, [bool]$NotificationsEn
     $lines.Add('        required: true')
     $lines.Add('    environment:')
     $lines.Add("      TRACKER_NODE_ID: $($node.Id)")
-    $lines.Add('      CAMERA_MOCK_VIDEO_FACE_CAMERA: /mock-videos/face-recognition/segments/01_P1E_S1_C1_5s-20s.mp4')
-    $lines.Add('      CAMERA_MOCK_VIDEO_CAR_CAMERA: /mock-videos/car-number-plate-video/Traffic Control CCTV.mp4')
-    $lines.Add('      CAMERA_MOCK_VIDEO_SAFETY_CAMERA: /mock-videos/smoker/samples/part1/bucket11.mp4')
+    $lines.Add('      PYTHONDONTWRITEBYTECODE: "1"')
     $lines.Add('      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}')
     $lines.Add('      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}')
     $lines.Add('      ZALO_BOT_TOKEN: ${ZALO_BOT_TOKEN:-}')
@@ -744,13 +740,8 @@ function New-ReplayOverride([object[]]$Sources, $Runtime, [bool]$NotificationsEn
       $lines.Add('    entrypoint: ["/bin/sh", "/tracker-run"]')
     }
     $lines.Add("    volumes: [$volumeList, ${mediaVolume}:/media/frigate, ${spoolVolume}:/var/lib/camera-tracker/spool]")
-    if ($env:CAMERA_HOT_RELOAD -eq '1') {
-      $watchPath = $sourceOverlay.Replace('\','/') | ConvertTo-Json -Compress
-      $lines.Add('    develop:')
-      $lines.Add('      watch:')
-      $lines.Add("        - path: $watchPath")
-      $lines.Add('          action: restart')
-    }
+    # Keep tracker source mounted for direct development, but never let
+    # Compose Watch restart the runtime tracker during input handoff.
   }
   if ($TrackerNodes.Count -gt 0 -or -not [string]::IsNullOrWhiteSpace($Runtime.AcceptanceMediaVolume)) {
     $lines.Add('volumes:')
@@ -880,7 +871,6 @@ function Get-DevWatchServices([bool]$ExternalRecognition, [object[]]$TrackerNode
   $services.Add('frigate')
   if ($ExternalRecognition) { $services.Add('recognition') }
   if ($ExternalSafety) { $services.Add('safety') }
-  foreach ($node in $TrackerNodes) { $services.Add([string]$node.Service) }
   return @($services)
 }
 

@@ -389,8 +389,6 @@ def test_finalize_finite_source_tracks_uses_raw_ids_once(
     [
         "D:/BusinessAnalyze/Camera/deploy/config.yaml",
         "/run/desktop/mnt/host/d/BusinessAnalyze/Camera/deploy/config.yaml",
-        "D:/BusinessAnalyze/Camera/.tmp/runtime/config.main.yml",
-        "/run/desktop/mnt/host/d/BusinessAnalyze/Camera/.tmp/runtime/config.main.yml",
     ],
 )
 def test_restore_mount_verification_accepts_windows_docker_path_forms(

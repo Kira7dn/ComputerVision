@@ -5,30 +5,41 @@ runtime:
   model_path: assets/models/yolov9-t-320.onnx
   media_dir: E:/Docker/Frigate/media
   rtsp_transport: tcp
+  input_mode: rtsp
+  test_timeout_seconds: 300
+  mock_sources:
+    face_camera: /mock-videos/face-recognition/segments/01_P1E_S1_C1_5s-20s.mp4
+    car_camera: 
+      /mock-videos/car-number-plate-video/cam-in/pexels-casey-whalen-6571483-1024p.mp4
+    safety_camera: /mock-videos/smoker/samples/part1/bucket11.mp4
 mqtt:
   enabled: false
 
 go2rtc:
   streams:
     face_camera:
-      - "rtsp://{FRIGATE_DAHUA_USER}:{FRIGATE_DAHUA_PASSWORD}@192.168.100.229:554/cam/realmonitor?channel=2&subtype=1"
+    - rtsp://{FRIGATE_DAHUA_USER}:{FRIGATE_DAHUA_PASSWORD}@192.168.100.229:554/cam/realmonitor?channel=2&subtype=1
     car_camera:
-      - "rtsp://{FRIGATE_DAHUA_USER}:{FRIGATE_DAHUA_PASSWORD}@192.168.100.229:554/cam/realmonitor?channel=1&subtype=1"
+    - rtsp://{FRIGATE_DAHUA_USER}:{FRIGATE_DAHUA_PASSWORD}@192.168.100.229:554/cam/realmonitor?channel=1&subtype=1
     safety_camera:
-      - "rtsp://{FRIGATE_DAHUA_USER}:{FRIGATE_DAHUA_PASSWORD}@192.168.100.229:554/cam/realmonitor?channel=3&subtype=1"
+    - rtsp://{FRIGATE_DAHUA_USER}:{FRIGATE_DAHUA_PASSWORD}@192.168.100.229:554/cam/realmonitor?channel=3&subtype=1
 
 logger:
   default: info
 
 auth:
-  user: "admin"
-  password: "123456"
+  enabled: false
+  user: admin
+  password: '123456'
   reset_admin_password: false
+
+tls:
+  enabled: false
 
 notifications:
   schema_version: 2
   enabled: true
-  public_base_url: "{NGROK_URL}"
+  public_base_url: '{NGROK_URL}'
   pipeline:
     finalization_timeout: 5
     shadow_mode: false
@@ -42,137 +53,117 @@ notifications:
     telegram:
       enabled: true
       recipients:
-        - id: security_team
-          name: Security Team
-          chat_id: "{TELEGRAM_CHAT_ID}"
-          enabled: true
-    zalo:
-      enabled: false
-      media_url_ttl: 300
-      recipients:
-        - id: operators
-          name: Operators
-          chat_id: "{ZALO_CHAT_ID}"
-          enabled: true
+      - id: security_team
+        name: Security Team
+        chat_id: '{TELEGRAM_CHAT_ID}'
+        enabled: true
   rules:
-    - id: car_alert
-      name: Car alert
-      enabled: true
-      event: alert
-      filters:
-        cameras:
-          - car_camera
-        labels:
-          - car
-        zones: []
-        identities: []
-        trigger_names: []
-        conditions: []
-      destinations:
-        webpush: true
-        telegram:
-          - security_team
-        zalo:
-          - operators
-      cooldown: 0
-    - id: car_license_plate
-      name: Car license plate
-      enabled: false
-      event: license_plate
-      filters:
-        cameras:
-          - car_camera
-        labels: []
-        zones: []
-        identities: []
-        trigger_names: []
-        conditions: []
-      destinations:
-        webpush: false
-        telegram:
-          - security_team
-        zalo:
-          - operators
-      cooldown: 0
-    - id: car_semantic_trigger
-      name: Car semantic trigger
-      enabled: false
-      event: semantic_trigger
-      filters:
-        cameras:
-          - car_camera
-        labels: []
-        zones: []
-        identities: []
-        trigger_names: []
-        conditions: []
-      destinations:
-        webpush: true
-        telegram:
-          - security_team
-        zalo:
-          - operators
-      cooldown: 0
-    - id: car_monitoring
-      name: Car monitoring
-      enabled: false
-      event: camera_monitoring
-      filters:
-        cameras:
-          - car_camera
-        labels: []
-        zones: []
-        identities: []
-        trigger_names: []
-        conditions: []
-      destinations:
-        webpush: true
-        telegram:
-          - security_team
-        zalo:
-          - operators
-      cooldown: 0
-    - id: face_recognition
-      name: Face recognition
-      enabled: true
-      event: face_recognized
-      filters:
-        cameras:
-          - face_camera
-        labels:
-          - person
-        zones: []
-        identities:
-          - "*"
-        trigger_names: []
-        conditions: []
-      destinations:
-        webpush: true
-        telegram:
-          - security_team
-        zalo:
-          - operators
-      cooldown: 0
-    - id: smoking_alert
-      name: Smoking alert
-      enabled: true
-      event: alert
-      filters:
-        cameras:
-          - safety_camera
-        labels:
-          - smoking
-        zones: []
-        identities: []
-        trigger_names: []
-        conditions: []
-      destinations:
-        webpush: true
-        telegram:
-          - security_team
-        zalo:
-          - operators
-      cooldown: 60
+  - id: car_alert
+    name: Car alert
+    enabled: true
+    event: alert
+    filters:
+      cameras:
+      - car_camera
+      labels:
+      - car
+      zones: []
+      identities: []
+      trigger_names: []
+      conditions: []
+    destinations:
+      webpush: true
+      telegram:
+      - security_team
+    cooldown: 0
+  - id: car_license_plate
+    name: Car license plate
+    enabled: false
+    event: license_plate
+    filters:
+      cameras:
+      - car_camera
+      labels: []
+      zones: []
+      identities: []
+      trigger_names: []
+      conditions: []
+    destinations:
+      webpush: false
+      telegram:
+      - security_team
+    cooldown: 0
+  - id: car_semantic_trigger
+    name: Car semantic trigger
+    enabled: false
+    event: semantic_trigger
+    filters:
+      cameras:
+      - car_camera
+      labels: []
+      zones: []
+      identities: []
+      trigger_names: []
+      conditions: []
+    destinations:
+      webpush: true
+      telegram:
+      - security_team
+    cooldown: 0
+  - id: car_monitoring
+    name: Car monitoring
+    enabled: false
+    event: camera_monitoring
+    filters:
+      cameras:
+      - car_camera
+      labels: []
+      zones: []
+      identities: []
+      trigger_names: []
+      conditions: []
+    destinations:
+      webpush: true
+      telegram:
+      - security_team
+    cooldown: 0
+  - id: face_recognition
+    name: Face recognition
+    enabled: true
+    event: face_recognized
+    filters:
+      cameras:
+      - face_camera
+      labels:
+      - person
+      zones: []
+      identities:
+      - '*'
+      trigger_names: []
+      conditions: []
+    destinations:
+      webpush: true
+      telegram:
+      - security_team
+    cooldown: 0
+  - id: smoking_alert
+    name: Smoking alert
+    enabled: true
+    event: alert
+    filters:
+      cameras:
+      - safety_camera
+      labels:
+      - smoking
+      zones: []
+      identities: []
+      trigger_names: []
+      conditions: []
+    destinations:
+      webpush: true
+      telegram:
+      - security_team
+    cooldown: 60
   delivery:
     max_attempts: 5
     initial_backoff: 5
@@ -237,7 +228,7 @@ snapshots:
 cameras:
   face_camera: &face_camera_defaults
     enabled: true
-    media_mode: external
+    media_mode: native
     friendly_name: Face Recognition Camera
     face_recognition:
       enabled: true
@@ -252,9 +243,9 @@ cameras:
       track: [person]
     ffmpeg:
       inputs:
-        - path: rtsp://127.0.0.1:8554/face_camera
-          input_args: preset-rtsp-restream
-          roles: [detect, record]
+      - path: rtsp://127.0.0.1:8554/face_camera
+        input_args: preset-rtsp-restream
+        roles: [detect, record]
     live:
       streams:
         Main: face_camera
@@ -269,6 +260,7 @@ cameras:
       improve_contrast: true
   car_camera:
     <<: *face_camera_defaults
+    media_mode: native
     friendly_name: Car Camera
     lpr:
       enabled: true
@@ -294,9 +286,9 @@ cameras:
       track: [car]
     ffmpeg:
       inputs:
-        - path: rtsp://127.0.0.1:8554/car_camera
-          input_args: preset-rtsp-restream
-          roles: [detect, record]
+      - path: rtsp://127.0.0.1:8554/car_camera
+        input_args: preset-rtsp-restream
+        roles: [detect, record]
     live:
       streams:
         Main: car_camera
@@ -306,9 +298,9 @@ cameras:
     friendly_name: Safety Smoking Camera
     ffmpeg:
       inputs:
-        - path: rtsp://127.0.0.1:8554/safety_camera
-          input_args: preset-rtsp-restream
-          roles: [detect, record]
+      - path: rtsp://127.0.0.1:8554/safety_camera
+        input_args: preset-rtsp-restream
+        roles: [detect, record]
     live:
       streams:
         Main: safety_camera
@@ -325,22 +317,6 @@ cameras:
         labels: [smoking]
       detections:
         enabled: false
-
-tracker:
-  edge-local:
-    managed: true
-    endpoint: tracker-edge-local:50052
-    cameras: [face_camera, car_camera]
-    deadline: 5
-    output_capacity: 256
-    control_capacity: 64
-    shutdown_drain: 10
-    evidence:
-      memory_bytes_per_camera: 33554432
-      ttl: 45
-    spool:
-      max_bytes: 268435456
-      retention: 86400
 version: 0.18-0
 
 semantic_search:

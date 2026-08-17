@@ -1460,9 +1460,6 @@ def wait_latest_through(source_ended: dict[str, float], deadline: float) -> None
 def restore_mounts_verified(config: Path) -> bool:
     expected_paths = {
         str(config.resolve()).replace("\\", "/").lower(),
-        str(Path(".tmp/runtime/config.main.yml").resolve())
-        .replace("\\", "/")
-        .lower(),
     }
     expected_suffixes = {
         value[0] + value[2:]

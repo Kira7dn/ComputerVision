@@ -45,7 +45,6 @@ services:
         required: true
     environment:
       SAFETY_GRPC_URL: ${SAFETY_GRPC_URL:-frigate:50052}
-      CAMERA_MOCK_VIDEO_SAFETY_CAMERA: /mock-videos/smoker/samples/part1/bucket11.mp4
     volumes:
       - frigate-config:/config
       - ${CAMERA_CONFIG_FILE:?run.ps1 must set CAMERA_CONFIG_FILE}:/config/config.yml:ro
@@ -59,7 +58,7 @@ services:
     restart: unless-stopped
     shm_size: "1gb"
     mem_limit: "7g"
-    cpus: ${FRIGATE_CPU_LIMIT:-4}
+    cpus: ${FRIGATE_CPU_LIMIT:?run.ps1 must set runtime.cpu_limit}
     gpus: all
     env_file:
       - path: ../../.env.local
@@ -81,9 +80,6 @@ services:
       PASSAGE_SESSION_FILE: ${PASSAGE_SESSION_FILE:-}
       PASSAGE_SOURCE_START_DIR: ${PASSAGE_SOURCE_START_DIR:-}
       CAMERA_OPEN_RUNTIME_API: ${CAMERA_OPEN_RUNTIME_API:-1}
-      CAMERA_MOCK_VIDEO_FACE_CAMERA: /mock-videos/face-recognition/segments/01_P1E_S1_C1_5s-20s.mp4
-      CAMERA_MOCK_VIDEO_CAR_CAMERA: /mock-videos/car-number-plate-video/Traffic Control CCTV.mp4
-      CAMERA_MOCK_VIDEO_SAFETY_CAMERA: /mock-videos/smoker/samples/part1/bucket11.mp4
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:5000/api/stats >/dev/null && test -w /config && test -w /config/config.yml && test -w /media/frigate"]
       interval: 15s
@@ -100,8 +96,8 @@ services:
       - frigate-config:/config
       - ${CAMERA_CONFIG_FILE:?run.ps1 must set CAMERA_CONFIG_FILE}:/config/config.yml
       - ${CAMERA_MODEL_CACHE_PATH:?run.ps1 must set CAMERA_MODEL_CACHE_PATH}:/config/model_cache
-      - ${FRIGATE_MEDIA_DIR:-E:/Docker/Frigate/media}:/media/frigate
-      - ${CAMERA_MODEL_PATH:?run.ps1 must set CAMERA_MODEL_PATH}:/assets/models/yolov9-t-320.onnx:ro
+      - ${FRIGATE_MEDIA_DIR:?run.ps1 must set runtime.media_dir}:/media/frigate
+      - ${CAMERA_MODEL_PATH:?run.ps1 must set runtime.model_path}:/assets/models/yolov9-t-320.onnx:ro
       - ${CAMERA_FIXTURE_DIR:-../../assets/fixtures/mock_videos}:/mock-videos:ro
       - ${RECOGNITION_TLS_DIR:-../../.tmp/runtime/recognition-tls}:/run/recognition-tls:ro
       - /etc/localtime:/etc/localtime:ro
@@ -153,7 +149,7 @@ services:
     command:
       - http
       - --url=${NGROK_URL:?NGROK_URL is required}
-      - ${CAMERA_UI_UPSTREAM:-https://frontend:5173}
+      - ${CAMERA_UI_UPSTREAM:-http://frontend:5173}
     environment:
       NGROK_AUTHTOKEN: ${NGROK_AUTHTOKEN:?NGROK_AUTHTOKEN is required}
     # Port 4040 deliberately stays inside the Compose network. The Agent API
