@@ -1,0 +1,75 @@
+runtime:
+  wsl_distro: Ubuntu-22.04
+  mediamtx_config: /opt/camera-deepstream/mediamtx/mediamtx.yml
+  mediamtx_binary: /opt/camera-deepstream/mediamtx/mediamtx
+
+input:
+  mode: mock
+  camera: safety_camera
+  rtsp_url: rtsp://127.0.0.1:8554/safety_mock
+  mock_video: /mnt/d/BusinessAnalyze/Camera/assets/fixtures/mock_videos/face-recognition/segments/01_P1E_S1_C1.mp4
+  mock_loop: true
+  width: 1920
+  height: 1080
+  latency_ms: 200
+
+output:
+  rtsp_url: rtsp://127.0.0.1:8554/safety_bbox
+
+model:
+  onnx_path: /mnt/d/BusinessAnalyze/Camera/assets/models/smoking/best.onnx
+  input_width: 640
+  input_height: 640
+  confidence: 0.10
+  iou: 0.45
+  label: cigarette
+
+person:
+  onnx_path: /mnt/d/BusinessAnalyze/Camera/assets/models/yolov9-t-320.onnx
+  engine_path: /opt/camera-deepstream/models/person-yolov9-t320-fixed.engine
+  input_width: 320
+  input_height: 320
+  confidence: 0.05
+  iou: 0.45
+  label: person
+
+recognition:
+  enabled: true
+  stream_epoch: deepstream-safety
+  face:
+    unknown_score: 0.8
+    recognition_threshold: 0.8
+    min_faces: 2
+    identity_switch_similarity: 0.65
+    max_attempts: 24
+    max_attempts_after_recognition: 6
+    area_cap: 4000
+  face_runtime:
+    detector_model: /mnt/d/BusinessAnalyze/Camera/assets/models/face/facedet.onnx
+    recognizer_model: /mnt/d/BusinessAnalyze/Camera/assets/models/face/arcface.onnx
+    library_directory: /mnt/d/BusinessAnalyze/Camera/deepstream_safety/face_library
+    trace_directory: /mnt/d/BusinessAnalyze/Camera/.tmp/deepstream-safety/recognition
+    detection_threshold: 0.5
+    min_area: 1200
+    detect_interval_frames: 15
+  lpr:
+    detect_fps: 5
+    recognition_threshold: 0.9
+    cluster_threshold: 0.85
+    min_plate_length: 0
+    plate_format: null
+
+metadata:
+  zmq_pub_url: tcp://127.0.0.1:5555
+
+snapshots:
+  enabled: true
+  directory: /mnt/d/BusinessAnalyze/Camera/.tmp/deepstream-safety/snapshots
+  min_interval_ms: 1000
+
+events:
+  enabled: true
+  camera: safety_mock
+  confirm_seconds: 1.0
+  clear_seconds: 5.0
+  directory: /mnt/d/BusinessAnalyze/Camera/.tmp/deepstream-safety/events

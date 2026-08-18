@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Safety Live</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, sans-serif; }
+    body { margin: 0; min-height: 100vh; background: #101418; color: #eef2f5; }
+    main { width: min(1200px, calc(100% - 32px)); margin: 24px auto; }
+    header { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 16px; }
+    h1 { margin: 0; font-size: 22px; }
+    .status { color: #ffb020; font-size: 14px; }
+    .status.live { color: #39d98a; }
+    .frame { overflow: hidden; background: #050607; border: 1px solid #2a333b; border-radius: 10px; }
+    video { display: block; width: 100%; aspect-ratio: 16 / 9; object-fit: contain; }
+    .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 8px; margin-top: 12px; }
+    .metric { padding: 10px 12px; background: #161d23; border: 1px solid #2a333b; border-radius: 8px; }
+    .metric small { display: block; color: #9da9b2; font-size: 11px; }
+    .metric strong { display: block; margin-top: 4px; font-size: 16px; }
+    footer { display: flex; justify-content: space-between; gap: 16px; margin-top: 10px; color: #9da9b2; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Safety live bbox</h1>
+      <div id="status" class="status">Connecting...</div>
+    </header>
+    <div class="frame">
+      <video id="video" controls autoplay muted playsinline></video>
+    </div>
+    <section class="metrics" aria-label="Runtime metrics">
+      <div class="metric"><small>WSL CPU</small><strong id="hostCpu">--</strong></div>
+      <div class="metric"><small>WSL RAM</small><strong id="hostRam">--</strong></div>
+      <div class="metric"><small>DeepStream CPU (100% = 1 core)</small><strong id="pipelineCpu">--</strong></div>
+      <div class="metric"><small>DeepStream RAM</small><strong id="pipelineRam">--</strong></div>
+      <div class="metric"><small>GPU</small><strong id="gpu">--</strong></div>
+      <div class="metric"><small>HLS latency</small><strong id="latency">--</strong></div>
+    </section>
+    <footer>
+      <span>Source: DeepStream safety_bbox</span>
+      <span id="stream">HLS: connecting</span>
+    </footer>
+  </main>
+  <script>
+    const video = document.getElementById('video');
+    const status = document.getElementById('status');
+    const stream = document.getElementById('stream');
+    const hlsUrl = 'http://localhost:8888/safety_bbox/index.m3u8';
+
+    function setStatus(text, live) {
+      status.textContent = text;
+      status.classList.toggle('live', live);
+    }
+
+    video.addEventListener('playing', () => {
+      setStatus('LIVE', true);
+      stream.textContent = 'HLS: connected';
+    });
+    video.addEventListener('waiting', () => setStatus('Buffering...', false));
+    function startHls() {
+      if (video.canPlayType('application/vnd.apple.mpegurl')) {
+        video.src = hlsUrl;
+        stream.textContent = 'HLS: connecting';
+        return;
+      }
+      const script = document.createElement('script');
+      script.src = 'https://cdn.jsdelivr.net/npm/hls.js@1.5.17';
+      script.onload = () => {
+        if (!window.Hls || !Hls.isSupported()) throw new Error('HLS unsupported');
+        const hls = new Hls({ liveSyncDurationCount: 3 });
+        hls.loadSource(hlsUrl);
+        hls.attachMedia(video);
+        hls.on(Hls.Events.ERROR, (_event, data) => {
+          if (data.fatal) setStatus('Offline - HLS unavailable', false);
+        });
+        stream.textContent = 'HLS: connecting';
+      };
+      script.onerror = () => setStatus('Offline - HLS player unavailable', false);
+      document.head.appendChild(script);
+    }
+
+    const text = (id, value) => { document.getElementById(id).textContent = value; };
+    async function refreshMetrics() {
+      try {
+        const data = await fetch('/api/metrics', { cache: 'no-store' }).then(response => response.json());
+        const memory = data.host.memory;
+        text('hostCpu', data.host.cpu_percent == null ? '--' : `${data.host.cpu_percent}%`);
+        text('hostRam', memory.percent == null ? '--' : `${memory.percent}% (${memory.used_mb}/${memory.total_mb} MB)`);
+        text('pipelineCpu', !data.pipeline.running ? 'stopped' : data.pipeline.cpu_percent == null ? '--' : `${data.pipeline.cpu_percent}% (~${(data.pipeline.cpu_percent / 100).toFixed(1)} cores)`);
+        text('pipelineRam', !data.pipeline.running ? 'stopped' : `${data.pipeline.rss_mb} MB`);
+        text('gpu', !data.gpu.available ? 'unavailable' : `${data.gpu.utilization_percent}% / ${data.gpu.memory_used_mb} MB / ${data.gpu.temperature_c}°C`);
+        text('latency', !data.stream.hls_live ? 'offline' : `${data.stream.playlist_latency_ms} ms`);
+      } catch (_) {
+        text('pipelineCpu', 'metrics unavailable');
+      }
+    }
+
+    startHls();
+    refreshMetrics();
+    setInterval(refreshMetrics, 2000);
+  </script>
+</body>
+</html>

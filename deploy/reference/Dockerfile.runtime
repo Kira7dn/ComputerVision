@@ -1,8 +1,0 @@
-ARG BASE_IMAGE=camera-frigate:0.18.0-33c00a27e-runtime3-tensorrt
-FROM ${BASE_IMAGE}
-
-RUN rm -rf /opt/frigate/web
-COPY src/frigate /opt/frigate/frigate
-COPY src/extension /opt/frigate/extension
-COPY migrations /opt/frigate/migrations
-COPY docker/main/rootfs/usr/local/nginx/conf/nginx.conf /usr/local/nginx/conf/nginx.conf

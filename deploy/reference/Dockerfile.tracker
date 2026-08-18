@@ -1,8 +1,0 @@
-ARG BASE_IMAGE=camera-frigate:current
-FROM ${BASE_IMAGE}
-
-COPY --from=trackerfiles tracker-run /tracker-run
-RUN sed -i 's/\r$//' /tracker-run && chmod 0755 /tracker-run
-
-HEALTHCHECK NONE
-ENTRYPOINT ["/bin/sh", "/tracker-run"]

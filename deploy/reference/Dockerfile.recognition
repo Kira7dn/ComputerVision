@@ -1,7 +1,0 @@
-ARG BASE_IMAGE=camera-frigate:current
-FROM ${BASE_IMAGE}
-
-ENTRYPOINT ["python3", "-m", "extension.recognition.app"]
-CMD ["--config", "/config/config.yml", "--bind", "0.0.0.0:50051", "--certificate", "/run/recognition-tls/server.crt", "--key", "/run/recognition-tls/server.key", "--client-ca", "/run/recognition-tls/ca.crt", "--allow-client", "frigate"]
-
-HEALTHCHECK NONE

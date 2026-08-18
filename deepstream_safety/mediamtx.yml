@@ -1,0 +1,12 @@
+logLevel: info
+rtsp: true
+rtspAddress: :8554
+hls: true
+hlsAddress: :8888
+hlsAlwaysRemux: true
+hlsAllowOrigins: ['*']
+webrtc: true
+webrtcAddress: :8889
+webrtcAllowOrigins: ['*']
+paths:
+  all_others: {}

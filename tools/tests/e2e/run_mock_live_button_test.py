@@ -24,6 +24,26 @@ ROOT = Path(__file__).resolve().parents[3]
 CAMERAS = ("car_camera", "face_camera", "safety_camera")
 
 
+def _wait_for_runtime_mode(
+    base: str, target: str, timeout: float,
+) -> dict:
+    deadline = time.monotonic() + timeout
+    last_state: dict = {"inputs": {}}
+    while time.monotonic() < deadline:
+        try:
+            last_state = _api(base, "/api/runtime/input")
+        except requests.RequestException:
+            time.sleep(1)
+            continue
+        inputs = last_state.get("inputs", {})
+        if set(inputs) == set(CAMERAS) and all(
+            inputs[camera] == target for camera in CAMERAS
+        ):
+            return last_state
+        time.sleep(0.5)
+    raise RuntimeError(f"Runtime input did not reach {target}: {last_state}")
+
+
 def _health() -> dict:
     result = subprocess.run(
         ["docker", "exec", "edge-safety", "sh", "-lc", "cat /tmp/camera-safety-health.json"],
@@ -37,7 +57,7 @@ def _health() -> dict:
 
 
 def _api(base: str, path: str) -> dict:
-    response = requests.get(f"{base}{path}", timeout=10)
+    response = requests.get(f"{base}{path}", timeout=30)
     response.raise_for_status()
     payload = response.json()
     return payload if isinstance(payload, dict) else {"items": payload}
@@ -60,6 +80,29 @@ def _browser_live_state(page) -> dict[str, dict[str, int | bool | float]]:
     )
 
 
+def _wait_for_live_gate(
+    page, base_url: str, *, bbox: bool, timeout: float
+) -> tuple[str, dict[str, object] | None]:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        runtime = _api(base_url, "/api/runtime/input")
+        reason = runtime.get("reason") or ""
+        if all(
+            runtime.get("inputs", {}).get(camera) == "rtsp" for camera in CAMERAS
+        ) and reason.startswith("mock_source_eof:"):
+            return "ended", runtime
+        states = _browser_live_state(page)
+        if all(
+            state.get("bbox_count", 0) > 0 if bbox else state.get("video_ready")
+            for state in states.values()
+        ):
+            return "ready", None
+        time.sleep(0.5)
+    raise TimeoutError(
+        f"Timed out waiting for live {'bbox' if bbox else 'video'} state"
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-url", default="http://127.0.0.1:8971")
@@ -75,6 +118,7 @@ def main() -> int:
         "gates": {},
         "errors": [],
     }
+    runtime_restored = False
     try:
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(headless=True)
@@ -93,7 +137,7 @@ def main() -> int:
             with page.expect_response(
                 lambda response: response.request.method == "POST"
                 and response.url.endswith("/api/runtime/input/start"),
-                timeout=30000,
+                timeout=args.timeout * 1000,
             ) as start_response_info:
                 page.get_by_role("button", name="Test mock live").click()
             start_response = start_response_info.value
@@ -102,7 +146,9 @@ def main() -> int:
                     f"Runtime mock start failed with HTTP {start_response.status}"
                 )
             start_payload = start_response.json()
-            if any(value != "mock" for value in start_payload.get("inputs", {}).values()):
+            if set(start_payload.get("inputs", {})) != set(CAMERAS) or any(
+                value != "mock" for value in start_payload.get("inputs", {}).values()
+            ):
                 raise RuntimeError(f"Runtime mock start returned unexpected state: {start_payload}")
             page.wait_for_function(
                 """async () => {
@@ -116,33 +162,31 @@ def main() -> int:
             report["gates"]["frontend_clicked"] = True
             report["gates"]["runtime_mock"] = _api(args.base_url, "/api/runtime/input")
 
-            page.wait_for_function(
-                """(cameraNames) => {
-                    const state = Object.fromEntries(cameraNames.map((name) => {
-                        const root = document.querySelector(`[data-camera="${name}"]`);
-                        const video = root?.querySelector("video");
-                        return [name, Boolean(video && video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0)];
-                    }));
-                    return cameraNames.every((name) => state[name]);
-                }""",
-                arg=list(CAMERAS),
-                timeout=args.timeout * 1000,
+            frame_gate, ended_state = _wait_for_live_gate(
+                page, args.base_url, bbox=False, timeout=args.timeout
             )
+            if frame_gate == "ended":
+                report["gates"]["runtime_auto_stopped"] = ended_state
+                raise RuntimeError("A mock video ended before all live frames were ready")
             live_state = _browser_live_state(page)
             report["gates"]["live_video_frames"] = live_state
 
-            page.wait_for_function(
-                """(cameraNames) => cameraNames.every((name) => {
-                    const root = document.querySelector(`[data-camera="${name}"]`);
-                    return Boolean(root?.querySelector("svg rect"));
-                })""",
-                arg=list(CAMERAS),
-                timeout=args.timeout * 1000,
+            bbox_gate, ended_state = _wait_for_live_gate(
+                page, args.base_url, bbox=True, timeout=args.timeout
             )
+            if bbox_gate == "ended":
+                report["gates"]["runtime_auto_stopped"] = ended_state
+                raise RuntimeError("A mock video ended before live bbox was ready for all cameras")
             report["gates"]["live_bbox"] = _browser_live_state(page)
 
             deadline = time.monotonic() + args.timeout
             while time.monotonic() < deadline:
+                runtime_state = _api(args.base_url, "/api/runtime/input")
+                if all(
+                    runtime_state.get("inputs", {}).get(camera) == "rtsp"
+                    for camera in CAMERAS
+                ):
+                    raise RuntimeError("A mock video ended before Safety produced its event")
                 health = _health()
                 if (
                     health.get("source_mode") == "mock"
@@ -154,6 +198,37 @@ def main() -> int:
                 time.sleep(1)
             else:
                 raise RuntimeError("Safety did not produce mock source bbox and event")
+
+            auto_stop_deadline = time.monotonic() + min(args.timeout, 60)
+            while time.monotonic() < auto_stop_deadline:
+                state_after_event = _api(args.base_url, "/api/runtime/input")
+                reason = state_after_event.get("reason") or ""
+                if all(
+                    state_after_event.get("inputs", {}).get(camera) == "rtsp"
+                    for camera in CAMERAS
+                ) and reason.startswith("mock_source_eof:"):
+                    report["gates"]["runtime_auto_stopped"] = state_after_event
+                    report["gates"]["runtime_restored"] = True
+                    runtime_restored = True
+                    break
+                time.sleep(0.5)
+            else:
+                report["gates"]["runtime_auto_stopped"] = False
+                with page.expect_response(
+                    lambda response: response.request.method == "POST"
+                    and response.url.endswith("/api/runtime/input/stop"),
+                    timeout=args.timeout * 1000,
+                ) as stop_response_info:
+                    page.get_by_role("button", name="Stop mock live").click()
+                stop_response = stop_response_info.value
+                if stop_response.status != 200:
+                    raise RuntimeError(
+                        f"Runtime restore failed with HTTP {stop_response.status}"
+                    )
+                report["gates"]["frontend_stop_clicked"] = True
+                _wait_for_runtime_mode(args.base_url, "rtsp", 90)
+                report["gates"]["runtime_restored"] = True
+                runtime_restored = True
 
             telegram_before = notification_before.get("telegram", {}).get("last_success")
             deadline = time.monotonic() + args.timeout
@@ -178,28 +253,25 @@ def main() -> int:
     except Exception as exc:  # noqa: BLE001 - report the complete acceptance failure
         report["errors"].append(str(exc))
     finally:
-        try:
-            requests.post(f"{args.base_url}/api/runtime/input/stop", timeout=30).raise_for_status()
-            deadline = time.monotonic() + 45
-            recovery_error = None
-            while time.monotonic() < deadline:
-                try:
-                    state = _api(args.base_url, "/api/runtime/input")
-                except requests.RequestException as exc:
-                    recovery_error = exc
-                    time.sleep(1)
-                    continue
-                if all(value == "rtsp" for value in state.get("inputs", {}).values()):
-                    report["gates"]["runtime_restored"] = True
-                    break
-                time.sleep(0.5)
-            else:
+        if not runtime_restored:
+            recovery_request_error = None
+            try:
+                requests.post(
+                    f"{args.base_url}/api/runtime/input/stop", timeout=90
+                ).raise_for_status()
+            except requests.RequestException as exc:
+                recovery_request_error = exc
+            try:
+                _wait_for_runtime_mode(args.base_url, "rtsp", 90)
+                report["gates"]["runtime_restored"] = True
+                runtime_restored = True
+            except Exception as exc:  # noqa: BLE001
                 report["gates"]["runtime_restored"] = False
-                if recovery_error is not None:
-                    report["errors"].append(f"recovery polling: {recovery_error}")
-        except Exception as exc:  # noqa: BLE001
-            report["gates"]["runtime_restored"] = False
-            report["errors"].append(f"recovery: {exc}")
+                if recovery_request_error is not None:
+                    report["errors"].append(f"recovery request: {recovery_request_error}")
+                report["errors"].append(f"recovery: {exc}")
+        else:
+            report["gates"]["runtime_restored"] = True
         required_gates = (
             "frontend_clicked",
             "runtime_mock",
@@ -208,6 +280,7 @@ def main() -> int:
             "live_bbox",
             "safety_bbox_event",
             "telegram_sent",
+            "runtime_auto_stopped",
             "runtime_restored",
         )
         report["accepted"] = not report["errors"] and all(

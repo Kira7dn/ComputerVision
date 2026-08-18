@@ -95,27 +95,48 @@ playback. SDK Python trong bộ này không có API seed video vào channel XVR;
 vào MediaMTX/pipeline. `capture_to_browser_ms` chưa được đo vì TS callback không cung cấp PTS
 camera usable.
 
-## Frigate Camera runtime v2
+## DeepStream Safety runtime
 
-Entrypoint duy nhất nằm tại `deploy/run.ps1`. Hướng dẫn đầy đủ nằm trong
-`deploy/README.md`; toàn bộ cấu hình runtime và Frigate nằm trong `deploy/config.yaml`.
-Production nhận RTSP H.264 trực tiếp qua go2rtc. Replay file bật MediaMTX cùng FFmpeg
-trong Docker. Root `.env.local` chỉ chứa secret và được Docker Compose nạp trực tiếp.
+Safety live now runs as a standalone DeepStream pipeline. It does not import Frigate,
+read Frigate configuration, or require Docker.
 
-```powershell
-# Xem toàn bộ chức năng, không cần nhớ tên nhiều script
-./deploy/run.ps1 help
+Source code:
 
-./deploy/run.ps1 doctor
-./deploy/run.ps1 start
-./deploy/run.ps1 dev-start
-./deploy/run.ps1 dev-restart
-./deploy/run.ps1 status
-./deploy/run.ps1 logs
-./deploy/run.ps1 stop
+```text
+deepstream_safety/pipeline.py
+deepstream_safety/config.yaml
+deepstream_safety/start.ps1
+deepstream_safety/dashboard.html
+deepstream_safety/mediamtx.yml
 ```
 
-Khai báo nhiều source trực tiếp trong `go2rtc.streams`, `cameras` và
-`runtime.replay.sources`. Mỗi source phải là H.264 và giải mã được ít nhất một frame.
-Runtime mount trực tiếp `deploy/config.yaml` thành `/config/config.yml`; không sinh thêm
-một bản Frigate config hoặc runtime env trung gian.
+The source stays in this workspace. WSL Ubuntu-22.04 provides the DeepStream runtime;
+MediaMTX provides RTSP and WebRTC/HLS transport.
+
+```powershell
+# Start mock RTSP input, DeepStream inference, MediaMTX and the dashboard
+./deepstream_safety/start.ps1 start
+
+# Check or stop the standalone runtime
+./deepstream_safety/start.ps1 status
+./deepstream_safety/start.ps1 stop
+```
+
+Open the dashboard at:
+
+```text
+http://localhost:8080/dashboard.html
+```
+
+The annotated stream is published as `rtsp://127.0.0.1:8554/safety_bbox` and is
+played in the browser through MediaMTX WebRTC. Detection metadata is published on
+ZeroMQ `tcp://127.0.0.1:5555`.
+
+Snapshots are enabled in `deepstream_safety/config.yaml` and are written only when
+a detection is present, at most once per second:
+
+```text
+.tmp/deepstream-safety/snapshots
+```
+
+Detailed setup and troubleshooting is in `docs/DeepStream.md`.
