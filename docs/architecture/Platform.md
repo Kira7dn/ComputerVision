@@ -1,5 +1,9 @@
 # Kiến trúc Camera AI B2B
 
+> Legacy reference: the active Camera runtime is the standalone DeepStream
+> stack documented in `docs/architecture/DeepStream.md`. The Frigate ownership
+> model below is not an active startup path or event/evidence owner.
+
 Ngày cập nhật: 15/08/2026
 
 ## 1. Mục tiêu

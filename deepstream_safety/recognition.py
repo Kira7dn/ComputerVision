@@ -58,6 +58,8 @@ class FacePolicy:
     max_attempts: int = 12
     max_attempts_after_recognition: int = 6
     area_cap: int = 4000
+    identity_switch_similarity: float = 0.65
+    identity_switch_frames: int = 5
 
 
 @dataclass(frozen=True, slots=True)

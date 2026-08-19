@@ -1,20 +1,33 @@
-"""Standalone Safety event state, trace, and event-owned snapshots."""
+"""Per-person smoking event lifecycle; EvidenceStore owns durable artifacts."""
 
 from __future__ import annotations
 
-import json
 import time
 import uuid
 from dataclasses import dataclass
 from enum import Enum
-from pathlib import Path
 from typing import Any
+
+import numpy as np
+
+try:
+    from .evidence import EvidenceStore
+except ImportError:  # pipeline.py is also executed as a standalone script
+    from evidence import EvidenceStore
 
 
 class EventState(str, Enum):
     IDLE = "idle"
     PENDING = "pending"
     ACTIVE = "active"
+
+
+@dataclass(frozen=True)
+class SafetyDetection:
+    track_id: int
+    score: float
+    bbox: tuple[float, float, float, float]
+    model_roi_bbox: tuple[float, float, float, float] | None = None
 
 
 @dataclass(frozen=True)
@@ -25,179 +38,227 @@ class EventTransition:
     frame_num: int
     score: float
     bbox: tuple[float, float, float, float] | None
+    person_track_id: int | None
+
+
+@dataclass
+class _TrackState:
+    track_id: int
+    candidate_since: float
+    clear_since: float | None = None
+    event_id: str | None = None
+    last_score: float = 0.0
+    last_bbox: tuple[float, float, float, float] | None = None
+    last_model_roi_bbox: tuple[float, float, float, float] | None = None
+    last_trace_at: float | None = None
 
 
 class SafetyEventStore:
-    """Keep temporal event state and durable local trace without Frigate imports."""
+    """Keep an independent pending/active lifecycle for every person track."""
 
-    def __init__(self, config: dict[str, Any]) -> None:
-        event_cfg = config.get("events", {})
+    def __init__(self, config: dict[str, Any], evidence: EvidenceStore) -> None:
+        event_cfg = config.get("events", {}) or {}
         self.enabled = bool(event_cfg.get("enabled", True))
-        self.camera = str(event_cfg.get("camera", "safety_mock"))
-        self.label = str(config.get("model", {}).get("label", "cigarette"))
+        self.camera = str(
+            event_cfg.get("camera")
+            or (config.get("input", {}) or {}).get("camera", "camera")
+        )
+        self.function = "smoking_behavior"
         self.confirm_seconds = float(event_cfg.get("confirm_seconds", 1.0))
         self.clear_seconds = float(event_cfg.get("clear_seconds", 5.0))
-        self.root = Path(event_cfg.get("directory", "/tmp/deepstream-safety/events"))
-        self.root.mkdir(parents=True, exist_ok=True)
-        self.trace_path = self.root / "runtime-trace.jsonl"
-        self.state = EventState.IDLE
-        self.active_event_id: str | None = None
-        self.candidate_since: float | None = None
-        self.clear_since: float | None = None
-        self.last_score = 0.0
-        self.last_bbox: tuple[float, float, float, float] | None = None
-        self.event_count = 0
-        self._event: dict[str, Any] | None = None
-
-    @staticmethod
-    def _bbox(values: Any) -> tuple[float, float, float, float] | None:
-        if values is None or len(values) != 4:
-            return None
-        return tuple(round(float(value), 6) for value in values)  # type: ignore[return-value]
-
-    def _append(self, path: Path, payload: dict[str, Any]) -> None:
-        with path.open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps(payload, separators=(",", ":")) + "\n")
-
-    def _write_event(self) -> None:
-        if self._event is None:
-            return
-        event_dir = self.root / self._event["event_id"]
-        event_dir.mkdir(parents=True, exist_ok=True)
-        (event_dir / "event.json").write_text(
-            json.dumps(self._event, indent=2), encoding="utf-8"
+        self.trace_interval = max(
+            0.3, float(event_cfg.get("trace_interval_ms", 400)) / 1000.0
         )
+        self.evidence = evidence
+        self._tracks: dict[int, _TrackState] = {}
 
-    def _trace(
+    @property
+    def state(self) -> EventState:
+        if any(item.event_id for item in self._tracks.values()):
+            return EventState.ACTIVE
+        if self._tracks:
+            return EventState.PENDING
+        return EventState.IDLE
+
+    @property
+    def active_event_id(self) -> str | None:
+        active = [item for item in self._tracks.values() if item.event_id]
+        if not active:
+            return None
+        return max(active, key=lambda item: item.last_score).event_id
+
+    @property
+    def active_event_ids(self) -> list[str]:
+        return [item.event_id for item in self._tracks.values() if item.event_id]
+
+    def _record(
         self,
-        timestamp: float,
+        item: _TrackState,
+        operation: str,
+        *,
         frame_num: int,
-        bbox_count: int,
-        operation: str | None,
-        event_id: str | None,
-        score: float,
-        bbox: tuple[float, float, float, float] | None,
+        timestamp: float,
+        detection: SafetyDetection | None,
+        frame: np.ndarray | None,
     ) -> None:
-        payload = {
-            "timestamp": round(timestamp, 6),
-            "frame_num": frame_num,
-            "camera": self.camera,
-            "label": self.label,
-            "state": self.state.value,
-            "operation": operation,
-            "event_id": event_id,
-            "bbox_count": bbox_count,
-            "score": round(score, 6),
-            "bbox": bbox,
-        }
-        self._append(self.trace_path, payload)
-        if event_id:
-            self._append(self.root / event_id / "trace.jsonl", payload)
+        if not item.event_id:
+            return
+        score = detection.score if detection else item.last_score
+        bbox = detection.bbox if detection else item.last_bbox
+        self.evidence.record(
+            item.event_id,
+            operation,
+            {
+                "label": "smoking",
+                "person_track_id": item.track_id,
+                "source_timestamp": timestamp,
+                "person_bbox": list(bbox) if bbox is not None else None,
+                "model_roi_bbox": (
+                    list(detection.model_roi_bbox)
+                    if detection is not None and detection.model_roi_bbox is not None
+                    else None
+                ),
+            },
+            frame=frame,
+            frame_number=frame_num,
+            bbox=bbox,
+            score=score,
+            force_image=operation in {"START", "END"},
+        )
+        item.last_trace_at = timestamp
+
+    def _finish(
+        self,
+        item: _TrackState,
+        *,
+        frame_num: int,
+        frame: np.ndarray | None,
+    ) -> EventTransition | None:
+        if not item.event_id:
+            return None
+        event_id = item.event_id
+        self.evidence.finish_event(
+            event_id,
+            payload={
+                "label": "smoking",
+                "person_track_id": item.track_id,
+                "person_bbox": list(item.last_bbox) if item.last_bbox is not None else None,
+                "model_roi_bbox": (
+                    list(item.last_model_roi_bbox)
+                    if item.last_model_roi_bbox is not None
+                    else None
+                ),
+            },
+            frame=frame,
+            frame_number=frame_num,
+            bbox=item.last_bbox,
+            score=item.last_score,
+        )
+        return EventTransition(
+            "END",
+            event_id,
+            time.time(),
+            frame_num,
+            item.last_score,
+            item.last_bbox,
+            item.track_id,
+        )
 
     def observe(
         self,
         frame_num: int,
         timestamp: float,
-        detections: list[tuple[float, tuple[float, float, float, float]]],
+        detections: list[SafetyDetection],
+        frame: np.ndarray | None = None,
     ) -> EventTransition | None:
         if not self.enabled:
             return None
-        best = max(detections, key=lambda item: item[0], default=None)
-        transition: EventTransition | None = None
-        if best is not None:
-            score, bbox = float(best[0]), self._bbox(best[1])
-            self.last_score, self.last_bbox, self.clear_since = score, bbox, None
-            if self.state is EventState.IDLE:
-                self.state = EventState.PENDING
-                self.candidate_since = timestamp
-            if (
-                self.state is EventState.PENDING
-                and self.candidate_since is not None
-                and timestamp - self.candidate_since >= self.confirm_seconds
-            ):
-                event_id = f"safety-{uuid.uuid4().hex[:24]}"
-                self.active_event_id = event_id
-                self.state = EventState.ACTIVE
-                self.event_count += 1
-                self._event = {
-                    "event_id": event_id,
-                    "camera": self.camera,
-                    "label": self.label,
-                    "state": "active",
-                    "started_at": timestamp,
-                    "ended_at": None,
-                    "last_score": score,
-                    "last_bbox": bbox,
-                    "snapshot_count": 0,
-                }
-                self._write_event()
-                transition = EventTransition("START", event_id, timestamp, frame_num, score, bbox)
-            elif self.state is EventState.ACTIVE and self.active_event_id:
-                if self._event is not None:
-                    self._event["last_score"] = score
-                    self._event["last_bbox"] = bbox
-                transition = EventTransition(
-                    "UPDATE", self.active_event_id, timestamp, frame_num, score, bbox
-                )
-        else:
-            if self.state is EventState.PENDING:
-                self.clear_since = self.clear_since or timestamp
-                if timestamp - self.clear_since >= self.clear_seconds:
-                    self.state = EventState.IDLE
-                    self.candidate_since = None
-                    self.clear_since = None
-            elif self.state is EventState.ACTIVE and self.active_event_id:
-                self.clear_since = self.clear_since or timestamp
-                if timestamp - self.clear_since >= self.clear_seconds:
-                    event_id = self.active_event_id
-                    self.state = EventState.IDLE
-                    self.active_event_id = None
-                    self.candidate_since = None
-                    self.clear_since = None
-                    if self._event is not None:
-                        self._event["state"] = "ended"
-                        self._event["ended_at"] = timestamp
-                        self._write_event()
-                    transition = EventTransition(
-                        "END", event_id, timestamp, frame_num, self.last_score, self.last_bbox
+        transitions: list[EventTransition] = []
+        seen: set[int] = set()
+        for detection in detections:
+            seen.add(detection.track_id)
+            item = self._tracks.get(detection.track_id)
+            if item is None:
+                item = _TrackState(detection.track_id, timestamp)
+                self._tracks[detection.track_id] = item
+            item.clear_since = None
+            item.last_score = detection.score
+            item.last_bbox = detection.bbox
+            item.last_model_roi_bbox = detection.model_roi_bbox
+            if item.event_id is None:
+                if timestamp - item.candidate_since >= self.confirm_seconds:
+                    item.event_id = (
+                        f"smoking-{self.evidence.worker_epoch}-{uuid.uuid4().hex[:24]}"
                     )
-                    self._event = None
+                    self.evidence.start_event(
+                        event_id=item.event_id,
+                        function=self.function,
+                        classification="smoking",
+                        camera_id=self.camera,
+                        person_track_id=item.track_id,
+                        metadata={
+                            "label": "smoking",
+                            "person_bbox": list(detection.bbox),
+                            "model_roi_bbox": (
+                                list(detection.model_roi_bbox)
+                                if detection.model_roi_bbox is not None
+                                else None
+                            ),
+                        },
+                        frame=frame,
+                        frame_number=frame_num,
+                        bbox=detection.bbox,
+                        score=detection.score,
+                    )
+                    item.last_trace_at = timestamp
+                    transitions.append(
+                        EventTransition(
+                            "START",
+                            item.event_id,
+                            timestamp,
+                            frame_num,
+                            detection.score,
+                            detection.bbox,
+                            detection.track_id,
+                        )
+                    )
+            elif item.last_trace_at is None or timestamp - item.last_trace_at >= self.trace_interval:
+                self._record(
+                    item,
+                    "UPDATE",
+                    frame_num=frame_num,
+                    timestamp=timestamp,
+                    detection=detection,
+                    frame=frame,
+                )
+                transitions.append(
+                    EventTransition(
+                        "UPDATE",
+                        item.event_id,
+                        timestamp,
+                        frame_num,
+                        detection.score,
+                        detection.bbox,
+                        detection.track_id,
+                    )
+                )
 
-        event_id = self.active_event_id
-        operation = transition.operation if transition else None
-        self._trace(
-            timestamp,
-            frame_num,
-            len(detections),
-            operation,
-            transition.event_id if transition else event_id,
-            self.last_score if best is None else float(best[0]),
-            self.last_bbox if best is None else self._bbox(best[1]),
-        )
-        return transition
+        for track_id, item in list(self._tracks.items()):
+            if track_id in seen:
+                continue
+            item.clear_since = item.clear_since or timestamp
+            if timestamp - item.clear_since < self.clear_seconds:
+                continue
+            transition = self._finish(item, frame_num=frame_num, frame=frame)
+            if transition is not None:
+                transitions.append(transition)
+            self._tracks.pop(track_id, None)
 
-    def save_snapshot(self, content: bytes, timestamp: float) -> Path | None:
-        if not self.enabled or not self.active_event_id:
+        if not transitions:
             return None
-        event_id = self.active_event_id
-        event_dir = self.root / event_id
-        event_dir.mkdir(parents=True, exist_ok=True)
-        count = int(self._event.get("snapshot_count", 0) if self._event else 0) + 1
-        path = event_dir / f"snapshot-{int(timestamp * 1000)}-{count:04d}.jpg"
-        path.write_bytes(content)
-        if self._event is not None:
-            self._event["snapshot_count"] = count
-            self._write_event()
-        return path
+        return max(transitions, key=lambda item: (item.operation == "END", item.timestamp))
 
     def close(self) -> None:
-        if self.active_event_id and self._event is not None:
-            now = time.time()
-            self._event["state"] = "ended"
-            self._event["ended_at"] = now
-            self._write_event()
-            self._append(
-                self.root / self.active_event_id / "trace.jsonl",
-                {"timestamp": now, "operation": "END", "event_id": self.active_event_id},
-            )
-            self.active_event_id = None
+        for item in list(self._tracks.values()):
+            self._finish(item, frame_num=-1, frame=None)
+        self._tracks.clear()

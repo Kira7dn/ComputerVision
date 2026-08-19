@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -12,7 +12,6 @@ from typing import Any
 import cv2
 import numpy as np
 import onnxruntime as ort
-
 
 LOG = logging.getLogger("deepstream.face")
 _UNTRACKED = (1 << 64) - 1
@@ -34,10 +33,55 @@ class GalleryEntry:
     source: str
 
 
+class TrackRecognitionScheduler:
+    """Limit face inference by elapsed time for each active track."""
+
+    def __init__(
+        self,
+        interval_ms: int | float = 400,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        # Keep the runtime contract bounded to the 300-500 ms target from the
+        # performance report even when a malformed config value is supplied.
+        self.interval_ms = max(300.0, min(500.0, float(interval_ms)))
+        self.interval_seconds = self.interval_ms / 1000.0
+        self._clock = clock
+        self._last_attempt_at: dict[int, float] = {}
+
+    def now(self) -> float:
+        return float(self._clock())
+
+    def due(self, track_id: int, now: float | None = None) -> bool:
+        current = self.now() if now is None else float(now)
+        previous = self._last_attempt_at.get(track_id)
+        return previous is None or current - previous >= self.interval_seconds
+
+    def mark_attempt(self, track_id: int, now: float | None = None) -> None:
+        self._last_attempt_at[track_id] = self.now() if now is None else float(now)
+
+    def forget(self, track_id: int) -> None:
+        self._last_attempt_at.pop(track_id, None)
+
+
+def _select_onnx_providers(requested: list[str], available: list[str]) -> list[str]:
+    """Return configured providers that are actually available to ONNX Runtime."""
+    available_set = set(available)
+    selected = [provider for provider in requested if provider in available_set]
+    if not selected and "CPUExecutionProvider" in available_set:
+        selected.append("CPUExecutionProvider")
+    elif "CPUExecutionProvider" in available_set and "CPUExecutionProvider" not in selected:
+        selected.append("CPUExecutionProvider")
+    return selected
+
+
 class FaceRecognitionEngine:
     """Recognize faces belonging to currently tracked person objects."""
 
-    def __init__(self, config: dict[str, Any]):
+    def __init__(
+        self,
+        config: dict[str, Any],
+        trace_sink: Callable[[int, dict[str, Any], np.ndarray | None], None] | None = None,
+    ):
         section = config.get("recognition", {}) or {}
         policy = section.get("face", {}) or {}
         face = section.get("face_runtime", {}) or {}
@@ -46,12 +90,14 @@ class FaceRecognitionEngine:
         input_config = config.get("input", {}) or {}
         self.output_width = int(input_config.get("width", 0) or 0)
         self.output_height = int(input_config.get("height", 0) or 0)
-        self.interval = max(1, int(face.get("detect_interval_frames", 5)))
         self.unknown_score = float(policy.get("unknown_score", 0.8))
         self.threshold = float(policy.get("recognition_threshold", 0.9))
         self.detector_threshold = float(face.get("detection_threshold", 0.5))
         self.min_area = int(face.get("min_area", 1200))
         self.max_attempts = int(policy.get("max_attempts", 12))
+        self.max_attempts_after_recognition = max(
+            0, int(policy.get("max_attempts_after_recognition", 6))
+        )
         self.min_faces = max(2, int(policy.get("min_faces", 2)))
         self.identity_switch_similarity = float(policy.get("identity_switch_similarity", 0.65))
         self.identity_switch_frames = max(5, int(policy.get("identity_switch_frames", 5)))
@@ -59,9 +105,25 @@ class FaceRecognitionEngine:
         self.detector_path = Path(str(face.get("detector_model", "")))
         self.recognizer_path = Path(str(face.get("recognizer_model", "")))
         self.library_path = Path(str(face.get("library_directory", "")))
-        self.trace_path = Path(str(face.get("trace_directory", ".tmp/deepstream-safety/recognition")))
+        self.trace_enabled = bool(face.get("trace_enabled", True))
+        self.trace_sink = trace_sink
+        self.recognition_scheduler = TrackRecognitionScheduler(
+            face.get("recognition_interval_ms", 400)
+        )
+        self.provider_preference = [
+            str(provider)
+            for provider in face.get(
+                "providers",
+                [
+                    "TensorrtExecutionProvider",
+                    "CUDAExecutionProvider",
+                    "CPUExecutionProvider",
+                ],
+            )
+        ]
+        self.require_gpu_provider = bool(face.get("require_gpu_provider", False))
+        self.active_providers: list[str] = []
         self.gallery: list[GalleryEntry] = []
-        self._last_attempt: dict[int, int] = {}
         self._track_names: dict[int, str] = {}
         self._track_scores: dict[int, float] = {}
         self._started_tracks: set[int] = set()
@@ -81,16 +143,20 @@ class FaceRecognitionEngine:
         self._track_last_confirmed: dict[int, int] = {}
         self._track_face_misses: dict[int, int] = {}
         self.max_disappeared = max(2, int((config.get("input", {}) or {}).get("fps", 5)) * 2)
-        self._trace_files: dict[int, Any] = {}
         self.latest_frame: np.ndarray | None = None
         self.last_processed_frame: np.ndarray | None = None
         self.last_processed_frame_number: int | None = None
         self._frames_by_pts: dict[int, np.ndarray] = {}
         self._pts_order: list[int] = []
-        self._debug_frame_saved = False
         self._last_decode_info: dict[str, int] = {}
         self.detector = None
         self.session = None
+        LOG.info(
+            "face runtime: camera=%s enabled=%s trace_enabled=%s",
+            self.camera_id,
+            self.enabled,
+            self.trace_enabled,
+        )
         if not self.enabled:
             LOG.info("face recognition disabled by recognition.enabled")
             return
@@ -109,10 +175,36 @@ class FaceRecognitionEngine:
         self.detector = creator(
             str(self.detector_path), "", (320, 320), self.detector_threshold, 0.3, 5000
         )
-        self.session = ort.InferenceSession(
-            str(self.recognizer_path), providers=["CUDAExecutionProvider", "CPUExecutionProvider"]
+        available = list(ort.get_available_providers())
+        selected = _select_onnx_providers(self.provider_preference, available)
+        gpu_providers = {"TensorrtExecutionProvider", "CUDAExecutionProvider"}
+        if self.require_gpu_provider and not gpu_providers.intersection(selected):
+            raise RuntimeError(
+                "GPU face provider requested but unavailable; "
+                f"requested={self.provider_preference} available={available}"
+            )
+        if not selected:
+            raise RuntimeError(f"No usable ONNX Runtime provider; available={available}")
+        self.session = ort.InferenceSession(str(self.recognizer_path), providers=selected)
+        self.active_providers = list(self.session.get_providers())
+        if not gpu_providers.intersection(self.active_providers):
+            LOG.warning(
+                "face recognizer is running on CPU; requested=%s available=%s active=%s",
+                self.provider_preference,
+                available,
+                self.active_providers,
+            )
+        else:
+            LOG.info("face recognizer GPU provider active: %s", self.active_providers)
+        LOG.info(
+            "face models loaded: detector=%s recognizer=%s requested_providers=%s "
+            "available_providers=%s active_providers=%s",
+            self.detector_path,
+            self.recognizer_path,
+            self.provider_preference,
+            available,
+            self.active_providers,
         )
-        LOG.info("face models loaded: detector=%s recognizer=%s providers=%s", self.detector_path, self.recognizer_path, self.session.get_providers())
 
     def _load_gallery(self) -> None:
         if not self.library_path.is_dir():
@@ -199,15 +291,9 @@ class FaceRecognitionEngine:
         return result / norm if norm > 0 else result
 
     def _trace(self, track_id: int, data: dict[str, Any]) -> None:
-        self.trace_path.mkdir(parents=True, exist_ok=True)
-        handle = self._trace_files.get(track_id)
-        if handle is None:
-            path = self.trace_path / self.camera_id / f"track-{track_id}.jsonl"
-            path.parent.mkdir(parents=True, exist_ok=True)
-            handle = path.open("a", encoding="utf-8")
-            self._trace_files[track_id] = handle
-        handle.write(json.dumps({"ts": time.time(), **data}, separators=(",", ":")) + "\n")
-        handle.flush()
+        if not self.trace_enabled or self.trace_sink is None:
+            return
+        self.trace_sink(track_id, {"ts": time.time(), **data}, self.last_processed_frame)
 
     def _start_track(self, track_id: int, frame_number: int, bbox: list[int]) -> None:
         self._track_last_seen[track_id] = frame_number
@@ -235,7 +321,6 @@ class FaceRecognitionEngine:
         self._track_locked.discard(track_id)
         self._track_names.pop(track_id, None)
         self._track_scores.pop(track_id, None)
-        self._last_attempt.pop(track_id, None)
         self._track_last_confirmed.pop(track_id, None)
         self._track_identity_switches[track_id] = 0
         self._track_alternative_names.pop(track_id, None)
@@ -265,7 +350,6 @@ class FaceRecognitionEngine:
         self._track_locked.discard(track_id)
         self._track_names.pop(track_id, None)
         self._track_scores.pop(track_id, None)
-        self._last_attempt.pop(track_id, None)
         self._track_identity_embeddings[track_id] = embedding.copy()
         self._track_embedding_means[track_id] = embedding.copy()
         self._track_embedding_counts[track_id] = 1
@@ -334,8 +418,8 @@ class FaceRecognitionEngine:
         self._track_embedding_counts.pop(track_id, None)
         self._track_last_confirmed.pop(track_id, None)
         self._track_face_misses.pop(track_id, None)
-        self._last_attempt.pop(track_id, None)
         self._started_tracks.discard(track_id)
+        self.recognition_scheduler.forget(track_id)
 
     def _record_candidate(self, track_id: int, label: str, score: float, area: int) -> tuple[str, float]:
         if track_id in self._track_locked:
@@ -432,12 +516,17 @@ class FaceRecognitionEngine:
             LOG.debug("CPU BGRx frame mapping failed: %s", exc)
             return None
 
+    def decode_bgrx_frame(self, buffer: Any, width: int, height: int) -> np.ndarray | None:
+        """Expose the stride-aware CPU frame decoder to other ROI stages."""
+        return self._decode_bgrx(buffer, width, height)
+
     def process(self, buffer: Any, frame_meta: Any, frame_number: int) -> dict[int, dict[str, Any]]:
         if not self.enabled:
             return {}
         results: dict[int, dict[str, Any]] = {}
         active_track_ids: set[int] = set()
-        should_map = False
+        due_track_ids: set[int] = set()
+        now = self.recognition_scheduler.now()
         node = frame_meta.obj_meta_list
         while node is not None:
             try:
@@ -468,13 +557,26 @@ class FaceRecognitionEngine:
             if track_id in self._track_names:
                 self._track_last_confirmed[track_id] = frame_number
             results[track_id] = {"track_id": track_id, "camera": self.camera_id, "name": self._track_names.get(track_id, "unknown"), "score": self._track_scores.get(track_id, 0.0), "state": "recognized" if track_id in self._track_names and self._track_names[track_id] != "unknown" else "unknown"}
-            if self._track_attempts.get(track_id, 0) < self.max_attempts and frame_number - self._last_attempt.get(track_id, -self.interval) >= self.interval:
-                should_map = True
+            attempt_limit = (
+                self.max_attempts_after_recognition
+                if track_id in self._track_locked
+                else self.max_attempts
+            )
+            if (
+                self._track_attempts.get(track_id, 0) < attempt_limit
+                and self.recognition_scheduler.due(track_id, now)
+            ):
+                due_track_ids.add(track_id)
         for track_id in list(self._track_last_seen):
             if track_id not in active_track_ids and frame_number - self._track_last_seen[track_id] > self.max_disappeared:
                 self._finish_track(track_id, frame_number)
-        if not should_map:
+        if not due_track_ids:
             return results
+        # Mark scheduled attempts before mapping the buffer. If a frame cannot
+        # be mapped, the track still waits for the next cadence window instead
+        # of retrying on every incoming frame.
+        for track_id in due_track_ids:
+            self.recognition_scheduler.mark_attempt(track_id, now)
         width = int(getattr(frame_meta, "source_frame_width", 0) or 0)
         height = int(getattr(frame_meta, "source_frame_height", 0) or 0)
         frame = self._decode_bgrx(buffer, width, height) if width > 0 and height > 0 else None
@@ -495,16 +597,6 @@ class FaceRecognitionEngine:
         output_height = self.output_height or frame.shape[0]
         scale_x = frame.shape[1] / output_width if output_width > 0 else 1.0
         scale_y = frame.shape[0] / output_height if output_height > 0 else 1.0
-        full_faces = self._detect_all(frame)
-        assigned_full_faces: set[int] = set()
-        debug_track_id = next(iter(results), None)
-        if debug_track_id is not None and not self._debug_frame_saved:
-            debug_dir = self.trace_path / self.camera_id
-            debug_dir.mkdir(parents=True, exist_ok=True)
-            debug_path = debug_dir / "debug-frame.jpg"
-            cv2.imwrite(str(debug_path), frame)
-            self._trace(debug_track_id, {"event": "debug_frame", "frame": frame_number, "shape": list(frame.shape), "mean": float(frame.mean()), "min": int(frame.min()), "max": int(frame.max()), **self._last_decode_info})
-            self._debug_frame_saved = True
         node = frame_meta.obj_meta_list
         while node is not None:
             try:
@@ -523,9 +615,8 @@ class FaceRecognitionEngine:
                 continue
             result = {"track_id": track_id, "camera": self.camera_id, "name": self._track_names.get(track_id, "unknown"), "score": self._track_scores.get(track_id, 0.0), "state": "recognized" if track_id in self._track_names and self._track_names[track_id] != "unknown" else "unknown", "attempted": False}
             results[track_id] = result
-            if frame_number - self._last_attempt.get(track_id, -self.interval) < self.interval:
+            if track_id not in due_track_ids:
                 continue
-            self._last_attempt[track_id] = frame_number
             self._track_attempts[track_id] = self._track_attempts.get(track_id, 0) + 1
             result["attempted"] = True
             raw_left = int(obj.rect_params.left * scale_x)
@@ -541,51 +632,9 @@ class FaceRecognitionEngine:
             person = frame[top:bottom, left:right]
             if person.size == 0 or person.shape[0] * person.shape[1] < self.min_area:
                 continue
-            if self._debug_frame_saved and not getattr(self, "_debug_person_saved", False):
-                debug_dir = self.trace_path / self.camera_id
-                debug_dir.mkdir(parents=True, exist_ok=True)
-                cv2.imwrite(str(debug_dir / "debug-person.jpg"), person)
-                self._debug_person_saved = True
-            detected = None
-            person_center_x = (left + right) / 2.0
-            person_center_y = (top + bottom) / 2.0
-            person_span = max(right - left, bottom - top)
-            face_candidates: list[tuple[float, float, int, np.ndarray]] = []
-            candidate_faces = (
-                [(0.0, full_faces[0])]
-                if len(results) == 1 and len(full_faces) == 1
-                else []
-            )
-            for index, face in enumerate(full_faces):
-                if index in assigned_full_faces:
-                    continue
-                face_left, face_top, face_width, face_height = [float(value) for value in face[:4]]
-                center_x = face_left + face_width / 2.0
-                center_y = face_top + face_height / 2.0
-                if not (
-                    raw_left <= center_x <= raw_right
-                    and raw_top <= center_y <= raw_bottom
-                ):
-                    continue
-                distance = float(np.hypot(center_x - person_center_x, center_y - person_center_y))
-                if distance > max(160.0, person_span * 1.5):
-                    continue
-                face_candidates.append((distance, -float(face[-1]), index, face))
-            if candidate_faces:
-                selected_faces = [(distance, 0.0, 0, face) for distance, face in candidate_faces]
-            else:
-                selected_faces = sorted(face_candidates)
-            for _, _, index, face in selected_faces:
-                local_face = face.copy()
-                local_face[0] -= left
-                local_face[1] -= top
-                local_face[4:14:2] -= left
-                local_face[5:14:2] -= top
-                detected = local_face
-                assigned_full_faces.add(index)
-                break
-            if detected is None:
-                detected = self._detect(person)
+            # The person detector already limits the search area. Avoid a
+            # full-frame face pass and run the face detector only on this ROI.
+            detected = self._detect(person)
             if detected is None:
                 self._trace(track_id, {"event": "attempt", "frame": frame_number, "result": "no_face", "person_bbox": [left, top, right, bottom]})
                 self._record_face_miss(track_id, frame_number, "no_face")
@@ -666,6 +715,3 @@ class FaceRecognitionEngine:
     def close(self) -> None:
         for track_id in list(self._track_last_seen):
             self._finish_track(track_id, self._track_last_seen[track_id])
-        for handle in self._trace_files.values():
-            handle.close()
-        self._trace_files.clear()

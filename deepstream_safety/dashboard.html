@@ -6,79 +6,387 @@
   <title>Safety Live</title>
   <style>
     :root { color-scheme: dark; font-family: system-ui, sans-serif; }
-    body { margin: 0; min-height: 100vh; background: #101418; color: #eef2f5; }
-    main { width: min(1200px, calc(100% - 32px)); margin: 24px auto; }
+    body { height: 100vh; margin: 0; min-height: 100vh; overflow: hidden; background: #101418; color: #eef2f5; }
+    main { display: flex; width: min(1360px, calc(100% - 32px)); height: 100vh; box-sizing: border-box; margin: 0 auto; padding: 24px 0 32px; flex-direction: column; }
     header { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 16px; }
     h1 { margin: 0; font-size: 22px; }
     .status { color: #ffb020; font-size: 14px; }
     .status.live { color: #39d98a; }
-    .frame { overflow: hidden; background: #050607; border: 1px solid #2a333b; border-radius: 10px; }
-    video { display: block; width: 100%; aspect-ratio: 16 / 9; object-fit: contain; }
-    .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 8px; margin-top: 12px; }
-    .metric { padding: 10px 12px; background: #161d23; border: 1px solid #2a333b; border-radius: 8px; }
-    .metric small { display: block; color: #9da9b2; font-size: 11px; }
-    .metric strong { display: block; margin-top: 4px; font-size: 16px; }
+    .dashboard-layout { display: grid; min-height: 0; flex: 1; grid-template-columns: minmax(0, 1fr) minmax(260px, 300px); gap: 14px; align-items: stretch; }
+    .dashboard-content { display: flex; min-width: 0; min-height: 0; height: 100%; flex-direction: column; }
+    .cameras { display: grid; min-height: 0; flex: 1; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); align-content: start; gap: 12px; overflow-y: auto; }
+    .camera { overflow: hidden; background: #0b0f12; border: 1px solid #2a333b; border-radius: 10px; }
+    .camera header { padding: 12px 14px; margin: 0; border-bottom: 1px solid #2a333b; }
+    .camera h2 { margin: 0; font-size: 17px; }
+    .camera small { color: #9da9b2; }
+    .frame { position: relative; overflow: hidden; aspect-ratio: 16 / 9; background: #050607; }
+    video { display: block; width: 100%; height: 100%; object-fit: contain; }
+    .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(135px, 1fr)); gap: 6px; margin-top: 10px; }
+    .metric { padding: 7px 9px; background: #161d23; border: 1px solid #2a333b; border-radius: 7px; }
+    .metric small { display: block; color: #9da9b2; font-size: 10px; }
+    .metric strong { display: block; margin-top: 3px; font-size: 14px; }
     footer { display: flex; justify-content: space-between; gap: 16px; margin-top: 10px; color: #9da9b2; font-size: 13px; }
+    .event-panel { display: flex; min-width: 0; min-height: 0; height: 100%; flex-direction: column; background: #0b0f12; border: 1px solid #2a333b; border-radius: 10px; overflow: hidden; }
+    .event-panel-header { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 12px; border-bottom: 1px solid #2a333b; }
+    .event-panel-header h2 { margin: 0; font-size: 15px; }
+    .event-panel-header small { color: #9da9b2; }
+    #eventToaster { display: flex; min-height: 0; flex: 1; flex-direction: column; gap: 8px; overflow-y: auto; padding: 8px; }
+    .toast { flex: 0 0 auto; padding: 9px 10px; background: #182027; border: 1px solid #3a4650; border-left: 4px solid #64a8ff; border-radius: 8px; box-shadow: 0 8px 20px #0008; }
+    .toast.new-event { animation: event-slide-down 240ms ease-out; }
+    @keyframes event-slide-down {
+      from { opacity: 0; transform: translateY(-10px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    .toast.danger { border-left-color: #ff4d5e; }
+    .toast.warning { border-left-color: #ffb020; }
+    .toast.event { border-left-color: #64a8ff; }
+    .toast-head, .toast-meta { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+    .toast-head { color: #d8e1e8; font-size: 11px; }
+    .toast-kind { font-weight: 700; text-transform: uppercase; }
+    .toast.danger .toast-kind { color: #ff7885; }
+    .toast.warning .toast-kind { color: #ffca62; }
+    .toast.event .toast-kind { color: #8fc2ff; }
+    .toast-time, .toast-meta { color: #9da9b2; font-size: 11px; }
+    .toast-event { margin: 5px 0; color: #fff; font-size: 13px; font-weight: 700; }
+    .toast-state { color: #9da9b2; font-size: 10px; }
+    .stream-state { position: absolute; inset: 0; display: grid; place-items: center; color: #9da9b2; font-size: 14px; }
+    video[hidden], .stream-state[hidden] { display: none; }
+    @media (max-width: 900px) {
+      body { height: auto; min-height: 100vh; overflow: auto; }
+      main { height: auto; min-height: 100vh; }
+      .dashboard-layout { height: auto; min-height: 0; flex: none; grid-template-columns: 1fr; }
+      .dashboard-content { height: auto; }
+      .cameras { flex: none; overflow: visible; }
+      .event-panel { height: auto; }
+      #eventToaster { max-height: 520px; flex: none; }
+    }
   </style>
 </head>
 <body>
   <main>
     <header>
-      <h1>Safety live bbox</h1>
+      <h1>Camera live dashboard</h1>
       <div id="status" class="status">Connecting...</div>
     </header>
-    <div class="frame">
-      <video id="video" controls autoplay muted playsinline></video>
+    <div class="dashboard-layout">
+      <div class="dashboard-content">
+        <section id="cameras" class="cameras" aria-label="Camera streams"></section>
+        <section class="metrics" aria-label="Runtime metrics">
+          <div class="metric"><small>WSL CPU</small><strong id="hostCpu">--</strong></div>
+          <div class="metric"><small>WSL RAM</small><strong id="hostRam">--</strong></div>
+          <div class="metric"><small>DeepStream CPU</small><strong id="pipelineCpu">--</strong></div>
+          <div class="metric"><small>DeepStream RAM (all cameras)</small><strong id="pipelineRam">--</strong></div>
+          <div class="metric"><small>GPU</small><strong id="gpu">--</strong></div>
+          <div class="metric"><small>HLS latency</small><strong id="latency">--</strong></div>
+        </section>
+        <footer>
+          <span>DeepStream outputs</span>
+          <span id="stream">HLS: connecting</span>
+        </footer>
+      </div>
+      <aside class="event-panel" aria-label="Danh sách sự kiện">
+        <div class="event-panel-header">
+          <h2>Danh sách sự kiện</h2>
+          <small id="eventCount">0</small>
+        </div>
+        <div id="eventToaster" aria-live="polite" aria-atomic="false"></div>
+      </aside>
     </div>
-    <section class="metrics" aria-label="Runtime metrics">
-      <div class="metric"><small>WSL CPU</small><strong id="hostCpu">--</strong></div>
-      <div class="metric"><small>WSL RAM</small><strong id="hostRam">--</strong></div>
-      <div class="metric"><small>DeepStream CPU (100% = 1 core)</small><strong id="pipelineCpu">--</strong></div>
-      <div class="metric"><small>DeepStream RAM</small><strong id="pipelineRam">--</strong></div>
-      <div class="metric"><small>GPU</small><strong id="gpu">--</strong></div>
-      <div class="metric"><small>HLS latency</small><strong id="latency">--</strong></div>
-    </section>
-    <footer>
-      <span>Source: DeepStream safety_bbox</span>
-      <span id="stream">HLS: connecting</span>
-    </footer>
   </main>
   <script>
-    const video = document.getElementById('video');
     const status = document.getElementById('status');
     const stream = document.getElementById('stream');
-    const hlsUrl = 'http://localhost:8888/safety_bbox/index.m3u8';
+    const cameras = document.getElementById('cameras');
+    const eventCount = document.getElementById('eventCount');
+    const players = new Map();
+    let cameraSignature = '';
+    let hlsLoader = null;
+    const eventToaster = document.getElementById('eventToaster');
+    const toastEntries = new Map();
+    const seenEventIds = new Set();
+    const maxEventRows = 10;
+    let eventCursor = null;
+    let eventRunId = null;
+    let eventsRequestInFlight = false;
+    let runtimeReady = false;
+    let liveCameras = new Set();
 
     function setStatus(text, live) {
       status.textContent = text;
       status.classList.toggle('live', live);
     }
 
-    video.addEventListener('playing', () => {
-      setStatus('LIVE', true);
-      stream.textContent = 'HLS: connected';
-    });
-    video.addEventListener('waiting', () => setStatus('Buffering...', false));
-    function startHls() {
-      if (video.canPlayType('application/vnd.apple.mpegurl')) {
-        video.src = hlsUrl;
-        stream.textContent = 'HLS: connecting';
+    function escapeHtml(value) {
+      return String(value ?? '').replace(/[&<>"']/g, character => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+      }[character]));
+    }
+
+    function formatEventTime(timestamp) {
+      if (timestamp == null) return '--:--:--';
+      return new Date(Number(timestamp) * 1000).toLocaleTimeString('vi-VN', {
+        hour: '2-digit', minute: '2-digit', second: '2-digit'
+      });
+    }
+
+    function setVideoState(video, message, visible) {
+      const frame = video.closest('.frame');
+      const label = frame?.querySelector('.stream-state');
+      video.hidden = !visible;
+      if (label) {
+        label.textContent = message;
+        label.hidden = visible;
+      }
+    }
+
+    function clearToasters() {
+      toastEntries.clear();
+      seenEventIds.clear();
+      eventToaster.replaceChildren();
+      eventCount.textContent = '0';
+    }
+
+    function updateOverallStatus() {
+      const states = [...players.values()];
+      const liveCount = states.filter(state => state.live).length;
+      if (liveCount > 0) {
+        setStatus(liveCount === states.length ? 'LIVE' : `LIVE (${liveCount}/${states.length})`, true);
+        stream.textContent = `HLS: ${liveCount}/${states.length} camera streams`;
+      } else if (states.some(state => !state.error)) {
+        setStatus('Connecting...', false);
+      } else {
+        setStatus('Runtime offline', false);
+      }
+    }
+
+    function renderToast(toast, event) {
+      const confidence = event.confidence == null ? '--' : `${(Number(event.confidence) * 100).toFixed(0)}%`;
+      const severity = ['danger', 'warning', 'event'].includes(event.severity) ? event.severity : 'event';
+      toast.className = `toast ${severity}`;
+      toast.innerHTML = `
+        <div class="toast-head">
+          <span class="toast-kind">${escapeHtml(event.severity_label || 'Sự kiện')}</span>
+          <span class="toast-time">${escapeHtml(formatEventTime(event.timestamp))}</span>
+        </div>
+        <div class="toast-event">${escapeHtml(event.event_name || 'Event')}</div>
+        <div class="toast-meta">
+          <span>Camera: ${escapeHtml(event.camera || 'unknown')}</span>
+          <span>${escapeHtml(confidence)}</span>
+        </div>
+        <div class="toast-state">${event.state === 'active' ? 'Đang xử lý' : 'Đã kết thúc'}</div>`;
+    }
+
+    function eventTimestamp(event) {
+      const timestamp = Number(event.timestamp);
+      return Number.isFinite(timestamp) ? timestamp : Number.MAX_SAFE_INTEGER;
+    }
+
+    function reorderEventList() {
+      [...toastEntries.values()]
+        .sort((left, right) => eventTimestamp(right.event) - eventTimestamp(left.event))
+        .forEach(entry => eventToaster.append(entry.toast));
+    }
+
+    function trimEventList() {
+      while (toastEntries.size > maxEventRows) {
+        const oldestId = toastEntries.keys().next().value;
+        const oldest = toastEntries.get(oldestId);
+        oldest?.toast.remove();
+        toastEntries.delete(oldestId);
+      }
+      eventCount.textContent = String(toastEntries.size);
+    }
+
+    function enqueueEvent(event) {
+      const eventId = String(event.event_id || `${event.camera}-${event.timestamp}-${event.event_name}`);
+      event.event_id = eventId;
+      const existing = toastEntries.get(eventId);
+      if (existing) {
+        existing.event = event;
+        renderToast(existing.toast, event);
+        reorderEventList();
         return;
       }
-      const script = document.createElement('script');
-      script.src = 'https://cdn.jsdelivr.net/npm/hls.js@1.5.17';
-      script.onload = () => {
-        if (!window.Hls || !Hls.isSupported()) throw new Error('HLS unsupported');
-        const hls = new Hls({ liveSyncDurationCount: 3 });
-        hls.loadSource(hlsUrl);
-        hls.attachMedia(video);
-        hls.on(Hls.Events.ERROR, (_event, data) => {
-          if (data.fatal) setStatus('Offline - HLS unavailable', false);
-        });
-        stream.textContent = 'HLS: connecting';
+      if (seenEventIds.has(eventId)) return;
+      seenEventIds.add(eventId);
+      const toast = document.createElement('article');
+      toast.classList.add('new-event');
+      const entry = { event, toast };
+      renderToast(toast, event);
+      toastEntries.set(eventId, entry);
+      eventToaster.append(toast);
+      trimEventList();
+      reorderEventList();
+      eventCount.textContent = String(toastEntries.size);
+    }
+
+    function enqueueEvents(events) {
+      for (const event of events) enqueueEvent(event);
+    }
+
+    async function refreshEvents() {
+      if (eventsRequestInFlight) return;
+      eventsRequestInFlight = true;
+      try {
+        const after = eventCursor === null ? 0 : eventCursor;
+        const initialLimit = eventCursor === null ? `&limit=${maxEventRows * 2}` : '';
+        const data = await fetch(`/api/events?after=${after}${initialLimit}`, { cache: 'no-store' }).then(response => response.json());
+        if (eventCursor === null) {
+          eventRunId = data.run_id;
+          eventCursor = data.cursor;
+          const initialEvents = [...(data.events || [])]
+            .sort((left, right) => Number(left.sequence || 0) - Number(right.sequence || 0))
+            .filter(event => liveCameras.size === 0 || liveCameras.has(event.camera));
+          enqueueEvents(initialEvents);
+          return;
+        }
+        if (data.run_id !== eventRunId) {
+          // A new pipeline run has a new event journal. Establish its cursor
+          // first so old events are not replayed as fresh notifications.
+          eventRunId = data.run_id;
+          eventCursor = data.cursor;
+          clearToasters();
+          return;
+        }
+        eventCursor = data.cursor;
+        if (runtimeReady) {
+          const events = [...(data.events || [])]
+            .sort((left, right) => Number(left.sequence || 0) - Number(right.sequence || 0))
+            .filter(event => liveCameras.has(event.camera));
+          enqueueEvents(events);
+        }
+      } catch (_) {
+        // Metrics failure is handled by refreshMetrics; do not show stale events.
+      } finally {
+        eventsRequestInFlight = false;
+      }
+    }
+
+    function loadHls() {
+      if (window.Hls) return Promise.resolve(window.Hls);
+      if (hlsLoader) return hlsLoader;
+      hlsLoader = new Promise((resolve, reject) => {
+        const script = document.createElement('script');
+        script.src = 'https://cdn.jsdelivr.net/npm/hls.js@1.5.17';
+        script.onload = () => window.Hls ? resolve(window.Hls) : reject(new Error('hls.js unavailable'));
+        script.onerror = () => reject(new Error('hls.js load failed'));
+        document.head.appendChild(script);
+      });
+      return hlsLoader;
+    }
+
+    function startHls(video, hlsUrl, state) {
+      let hls = null;
+      let retryTimer = null;
+      let destroyed = false;
+
+      const scheduleRetry = () => {
+        if (destroyed || retryTimer !== null) return;
+        state.error = true;
+        state.live = false;
+        setVideoState(video, 'Connecting...', false);
+        updateOverallStatus();
+        retryTimer = window.setTimeout(() => {
+          retryTimer = null;
+          attach();
+        }, 2000);
       };
-      script.onerror = () => setStatus('Offline - HLS player unavailable', false);
-      document.head.appendChild(script);
+
+      const onPlaying = () => {
+        if (destroyed) return;
+        state.live = true;
+        state.error = false;
+        setVideoState(video, 'Live', true);
+        updateOverallStatus();
+      };
+      const onWaiting = () => {
+        if (destroyed) return;
+        state.live = false;
+        setVideoState(video, 'Buffering...', false);
+        updateOverallStatus();
+      };
+      const onTimeUpdate = () => {
+        if (!destroyed && !video.paused && video.readyState >= 3) onPlaying();
+      };
+      video.addEventListener('playing', onPlaying);
+      video.addEventListener('waiting', onWaiting);
+      video.addEventListener('timeupdate', onTimeUpdate);
+
+      const attach = async () => {
+        if (destroyed) return;
+        try {
+          if (video.canPlayType('application/vnd.apple.mpegurl')) {
+            video.src = hlsUrl;
+            video.load();
+            video.play().catch(() => scheduleRetry());
+            return;
+          }
+          const Hls = await loadHls();
+          if (destroyed) return;
+          if (!Hls.isSupported()) throw new Error('HLS is not supported');
+          hls?.destroy();
+          hls = new Hls({ liveSyncDurationCount: 3 });
+          hls.loadSource(hlsUrl);
+          hls.attachMedia(video);
+          hls.on(Hls.Events.MANIFEST_PARSED, () => {
+            video.play().catch(() => scheduleRetry());
+          });
+          hls.on(Hls.Events.ERROR, (_event, data) => {
+            if (data.fatal) {
+              hls?.destroy();
+              hls = null;
+              scheduleRetry();
+            }
+          });
+        } catch (_) {
+          scheduleRetry();
+        }
+      };
+
+      state.destroy = () => {
+        destroyed = true;
+        if (retryTimer !== null) window.clearTimeout(retryTimer);
+        hls?.destroy();
+        hls = null;
+        video.removeEventListener('playing', onPlaying);
+        video.removeEventListener('waiting', onWaiting);
+        video.removeEventListener('timeupdate', onTimeUpdate);
+        video.removeAttribute('src');
+        video.load();
+      };
+      attach();
+    }
+
+    function renderCameras(cameraDetails) {
+      // Rebuild a player when MediaMTX becomes available after dashboard startup.
+      // The first metrics poll can happen before the mock RTSP publisher is online;
+      // using hls_live in the signature lets a failed initial HLS attach recover.
+      const signature = cameraDetails
+        .map(camera => `${camera.id}:${camera.hls_url}:${camera.hls_live ? 'live' : 'offline'}`)
+        .join('|');
+      if (signature === cameraSignature) return;
+      cameraSignature = signature;
+      // Replacing the video DOM also replaces the media element that HLS was
+      // attached to. Destroy all existing players before rebuilding it; the
+      // old `players.has(id)` entry must not suppress the new attachment.
+      for (const [id, player] of players) {
+        player.destroy?.();
+        players.delete(id);
+      }
+      cameras.innerHTML = cameraDetails.map(camera => {
+        return `<article class="camera">
+          <header><h2>${camera.id}</h2><small>${camera.running ? `worker ${camera.pid}` : 'worker stopped'}</small></header>
+          <div class="frame"><video id="video-${camera.id}" hidden controls autoplay muted playsinline></video><div class="stream-state">${camera.running ? 'Connecting...' : 'Runtime offline'}</div></div>
+        </article>`;
+      }).join('');
+      for (const camera of cameraDetails) {
+        if (players.has(camera.id)) continue;
+        const video = document.getElementById(`video-${camera.id}`);
+        if (!video) continue;
+        const state = { live: false, error: false };
+        startHls(video, camera.hls_url, state);
+        players.set(camera.id, state);
+      }
     }
 
     const text = (id, value) => { document.getElementById(id).textContent = value; };
@@ -88,18 +396,40 @@
         const memory = data.host.memory;
         text('hostCpu', data.host.cpu_percent == null ? '--' : `${data.host.cpu_percent}%`);
         text('hostRam', memory.percent == null ? '--' : `${memory.percent}% (${memory.used_mb}/${memory.total_mb} MB)`);
-        text('pipelineCpu', !data.pipeline.running ? 'stopped' : data.pipeline.cpu_percent == null ? '--' : `${data.pipeline.cpu_percent}% (~${(data.pipeline.cpu_percent / 100).toFixed(1)} cores)`);
+        text('pipelineCpu', !data.pipeline.running ? 'stopped' : data.pipeline.cpu_percent == null ? '--' : `${data.pipeline.cpu_percent}%`);
         text('pipelineRam', !data.pipeline.running ? 'stopped' : `${data.pipeline.rss_mb} MB`);
         text('gpu', !data.gpu.available ? 'unavailable' : `${data.gpu.utilization_percent}% / ${data.gpu.memory_used_mb} MB / ${data.gpu.temperature_c}°C`);
         text('latency', !data.stream.hls_live ? 'offline' : `${data.stream.playlist_latency_ms} ms`);
+        const cameraDetails = data.pipeline.camera_details || [];
+        liveCameras = new Set(cameraDetails.filter(camera => camera.running && camera.hls_live).map(camera => camera.id));
+        runtimeReady = Boolean(data.pipeline.running && liveCameras.size > 0);
+        renderCameras(cameraDetails);
+        stream.textContent = liveCameras.size ? `HLS: ${liveCameras.size}/${cameraDetails.length} camera streams` : 'HLS: offline';
+        if (!runtimeReady) {
+          setStatus('Runtime offline', false);
+          stream.textContent = 'HLS: offline';
+          for (const video of document.querySelectorAll('video')) {
+            setVideoState(video, 'Runtime offline', false);
+          }
+          clearToasters();
+        }
       } catch (_) {
         text('pipelineCpu', 'metrics unavailable');
+        runtimeReady = false;
+        liveCameras = new Set();
+        setStatus('Runtime offline', false);
+        stream.textContent = 'HLS: offline';
+        for (const video of document.querySelectorAll('video')) {
+          setVideoState(video, 'Runtime offline', false);
+        }
+        clearToasters();
       }
     }
 
-    startHls();
     refreshMetrics();
     setInterval(refreshMetrics, 2000);
+    refreshEvents();
+    setInterval(refreshEvents, 1000);
   </script>
 </body>
 </html>

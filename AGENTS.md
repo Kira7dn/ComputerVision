@@ -1,5 +1,21 @@
 # Camera workspace runbook
 
+## Current architecture boundary
+
+The current Camera runtime is the WSL-hosted DeepStream stack under `deepstream_safety/`:
+
+`config.yaml` -> `multi_runner.py` -> one `pipeline.py` worker per camera -> MediaMTX RTSP output
+and `dashboard_server.py` on `http://localhost:8080`.
+
+Camera functions are selected from `deepstream_safety/config.yaml` per camera. The current
+functions include face recognition, smoking behavior, fire/smoke detection, and trace/evidence.
+`EvidenceStore` owns run evidence under `.tmp/deepstream-safety`.
+
+The nested `frigate/` tree and the old Docker/Frigate tracker architecture are not part of the
+current Camera runtime. Do not use them as a startup path, test gate, media owner, event store, or
+source of truth for DeepStream changes. Do not add Camera guidance that routes media through
+Frigate, `/media/frigate`, Frigate APIs, or `deploy/run.ps1`.
+
 ## Shell and encoding
 
 Run commands from PowerShell. Always read Vietnamese text as UTF-8.
@@ -11,177 +27,133 @@ Set-Location $cameraRoot
 Get-Content -LiteralPath <path> -Encoding utf8
 ```
 
-Use the shared root interpreter for workspace and nested `frigate`; do not create a nested virtual
-environment.
+Use the shared root interpreter. Do not create a nested virtual environment.
 
 ## Preflight
 
 ```powershell
 git status --short
-git -C frigate status --short
 Get-CimInstance Win32_Process |
   Where-Object { $_.Name -in @('python.exe', 'pytest.exe') -and $_.CommandLine -like '*BusinessAnalyze\Camera*' } |
   Select-Object ProcessId, Name, CommandLine
+wsl.exe -d Ubuntu-22.04 -- bash -lc "pgrep -af '[m]ediamtx|[d]ashboard_server.py|[m]ulti_runner.py|[p]ipeline.py|[f]fmpeg.*mock' || true"
 ```
 
-After an interrupted test, stop only confirmed stale Camera processes. Remove stale test databases
-with Python, not a recursive shell delete.
+After an interrupted run, stop only confirmed stale Camera processes. Keep failed evidence for
+diagnosis until it is no longer needed. When cleaning `.tmp`, stop the runtime first and target
+only `D:\BusinessAnalyze\Camera\.tmp`.
 
-## Baseline commands
+## Configuration and runtime ownership
 
-Upstream unittest discovery:
+- `deepstream_safety/config.yaml` is the source of truth for camera IDs, sources, outputs, and
+  enabled functions.
+- `deepstream_safety/multi_runner.py` creates one worker per configured camera and one shared run ID.
+- `deepstream_safety/pipeline.py` owns inference, tracking/annotation, RTSP output, and function
+  dispatch for one camera.
+- `deepstream_safety/start.ps1` is the WSL launcher for MediaMTX, dashboard, mock inputs, and all
+  DeepStream workers.
+- `package.json` exposes `npm run camera:start`, `npm run camera:stop`, and
+  `npm run camera:status`.
+- `deepstream_safety/dashboard_server.py` serves the dashboard at `http://localhost:8080`.
+- `.tmp/deepstream-safety/snapshots-acceptance-<run-id>` contains the manifest, SQLite idempotency
+  index, event records, traces, and accepted snapshots for a run.
+
+## Starting and stopping the runtime
+
+Preferred commands:
 
 ```powershell
-Push-Location frigate
-& $python -u -m unittest
-Pop-Location
+npm run camera:start
+npm run camera:status
+npm run camera:stop
 ```
 
-Frozen 248-test workspace baseline:
+Equivalent direct launcher commands:
 
 ```powershell
-Push-Location frigate
-& $python -u -m pytest -c pytest-baseline.ini
-Pop-Location
+.\deepstream_safety\start.ps1 start
+.\deepstream_safety\start.ps1 status
+.\deepstream_safety\start.ps1 stop
 ```
 
-Run only the baseline gate requested for the task; do not automatically run both and do not replace
-either command with broad `pytest frigate/tests` collection.
+`camera:start` starts WSL services and the configured `camera_face` and `camera_safety` workers in
+the foreground. The terminal remains attached to the worker log and appends the same output to
+`/opt/camera-deepstream/logs/pipeline.log`. `Ctrl+C` ends the foreground client; use
+`npm run camera:stop` to terminate the WSL services reliably. A successful launcher message is not
+sufficient proof of health; verify the process list, dashboard HTTP 200, RTSP output, and recent
+pipeline log activity.
+
+Do not start individual workers in parallel with `multi_runner.py` unless isolating a failure.
+Do not use Docker compose, `deploy/run.ps1`, or Frigate services for this runtime.
 
 ## Targeted tests
 
-Nested Frigate files:
+Run only the checks relevant to the change:
 
 ```powershell
-Push-Location frigate
-$env:PYTHONPATH = 'src'
-& $python -u -m pytest -vv -s --capture=tee-sys -o log_cli=true -o log_cli_level=DEBUG `
-  tests/test_tracker_edge.py `
-  tests/test_notification_media.py `
-  tests/test_notification_providers.py `
-  tests/test_ptz_autotrack.py `
-  2>&1 | Tee-Object '..\.tmp\pytest-frigate-targeted.log'
-Remove-Item Env:PYTHONPATH
-Pop-Location
+& $python -u -m pytest -q `
+  tools/tests/unit/test_deepstream_face_engine.py `
+  tools/tests/unit/test_evidence_store.py `
+  tools/tests/unit/test_safety_launcher.py
 ```
 
-Workspace launcher and runtime validator tests:
+For a failed test, rerun only its file or node with verbose output:
 
 ```powershell
-& $python -u -m pytest -vv -s --capture=tee-sys -o log_cli=true -o log_cli_level=DEBUG `
-  tools/tests/unit/test_external_tracker_launcher.py `
-  tools/tests/unit/test_passage_acceptance.py `
-  2>&1 | Tee-Object '.tmp\pytest-runtime-targeted.log'
-```
-
-When a test fails, rerun only its file or node with the same verbose/logging options:
-
-```powershell
-& $python -u -m pytest -vv -s --capture=tee-sys -o log_cli=true -o log_cli_level=DEBUG `
+& $python -u -m pytest -vv -s --capture=tee-sys `
   '<file>::<test_node>' 2>&1 | Tee-Object '.tmp\pytest-failed-node.log'
 ```
 
 ## Static checks
 
 ```powershell
-& $python -m ruff check server frigate/src tools
-& $python -m ty check
+& $python -m ruff check deepstream_safety tools/tests
+& $python -m compileall -q deepstream_safety
 
 $parseErrors = $null
 [System.Management.Automation.Language.Parser]::ParseFile(
-  (Resolve-Path 'deploy\run.ps1'),
+  (Resolve-Path 'deepstream_safety\start.ps1'),
   [ref]$null,
   [ref]$parseErrors
 ) > $null
 $parseErrors
 
+Get-Content -LiteralPath 'package.json' -Raw -Encoding utf8 | ConvertFrom-Json > $null
 git diff --check
 ```
 
-Generate API or translations only from their source scripts:
+Classify unit tests, static checks, runtime startup, dashboard health, RTSP health, and evidence
+inspection separately. A launcher message, process existence, timeout, or collected test count is
+not by itself acceptance evidence.
+
+## Live runtime verification
+
+After starting the runtime:
 
 ```powershell
-& $python frigate/generate_api_auth_spec.py
-& $python frigate/generate_config_translations.py
-```
-
-Do not edit `frigate/docs/static/frigate-api.yaml` or generated translation artifacts manually.
-
-## Development runtime
-
-Read the launcher once before picking a path:
-
-```powershell
-Get-Content -LiteralPath 'deploy\run.ps1' -Encoding utf8
-```
-
-Use this as the only split rule:
-
-```powershell
-# Production-like runtime (image-based). No source mount, no dev watch.
-.\deploy\run.ps1 start
-.\deploy\run.ps1 status
-.\deploy\run.ps1 stop
-
-# Development runtime (source-mounted + hot reload via compose watch).
-.\deploy\run.ps1 dev-start
-.\deploy\run.ps1 dev-restart
-.\deploy\run.ps1 dev-logs
-.\deploy\run.ps1 dev-stop
-
-# Build is only for production/release packaging and must be explicitly requested.
-.\deploy\run.ps1 build
-```
-
-Rules:
-
-```powershell
-# Default operation after a code change:
-# - run dev-restart (do not rebuild unless images are changed).
-# - run start for image validation.
-# - never replace start with build, and never replace dev-* with start.
-# - do not use docker rm or bulk container removal unless explicitly requested by the user.
-```
-
-## Official E2E commands
-
-Default healthy tracker runtime:
-
-```powershell
-& $python -u tools/tests/e2e/run_platform_runtime_test.py `
-  2>&1 | Tee-Object '.tmp\platform-runtime-e2e.log'
-```
-
-Healthy external-recognition runtime:
-
-```powershell
-& $python -u tools/tests/e2e/run_external_recognition_runtime_test.py `
-  2>&1 | Tee-Object '.tmp\external-recognition-e2e.log'
-```
-
-`tools/runtime/validate_platform_runtime.py` is an implementation detail. Do not invoke it directly
-and report that invocation as an official E2E entrypoint.
-
-## E2E evidence checks
-
-```powershell
-$run = Get-ChildItem '.tmp\platform-runtime' -Directory |
+(Invoke-WebRequest -UseBasicParsing -Uri 'http://localhost:8080/dashboard.html').StatusCode
+wsl.exe -d Ubuntu-22.04 -- bash -lc "pgrep -af '[m]ediamtx|[d]ashboard_server.py|[m]ulti_runner.py|[p]ipeline.py|[f]fmpeg.*mock' || true"
+Get-ChildItem '.tmp\deepstream-safety' -Directory |
   Sort-Object LastWriteTimeUtc -Descending |
   Select-Object -First 1
-$summary = Get-Content -LiteralPath (Join-Path $run.FullName 'summary.json') -Raw -Encoding utf8 |
-  ConvertFrom-Json
-
-$summary.accepted
-$summary.acceptance.status
-$summary.measurement.measurement_valid
-$summary.gates.runtime_restored
-$summary.timing
-
-Get-ChildItem (Join-Path $run.FullName 'media') -Recurse -File -Filter 'clip.mp4'
-Get-ChildItem (Join-Path $run.FullName 'media') -Recurse -File -Filter 'trace.json'
-docker ps --format '{{.Names}}|{{.Status}}'
 ```
 
-Classify baseline, targeted tests, static checks, build, healthy E2E and restore separately. A
-collected test count, launcher scaffold, process timeout or incomplete report is not pass evidence.
-Keep failed runtime artifacts unchanged for diagnosis.
+Inspect the actual RTSP output with a client or FFmpeg. For `camera_safety`, verify that raw
+person boxes are hidden unless smoking behavior is confirmed, fire/smoke labels use the canonical
+`FIRE xx%` / `SMOKE AREA xx%` form, and temporal smoothing prevents inference-cycle flicker.
+
+## Evidence and cleanup
+
+Evidence is written only by the active DeepStream run. Inspect the newest run directory and its
+`manifest.json`, `events.jsonl`, `index.sqlite3`, and camera/function event folders before calling
+an acceptance run complete.
+
+Do not delete evidence while a pipeline is writing it. To clean generated temporary artifacts:
+
+```powershell
+npm run camera:stop
+# Inspect the exact target before removing D:\BusinessAnalyze\Camera\.tmp contents.
+```
+
+Preserve unrelated worktree changes. Do not use destructive Git commands such as `git reset --hard`,
+`git checkout --`, or broad recursive deletion outside an explicitly approved temporary directory.

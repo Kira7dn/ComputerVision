@@ -7,16 +7,39 @@ import time
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Lock
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 from urllib.request import urlopen
 
+from config import camera_ids, load_raw_config, resolve_camera_config
 
 ROOT = Path(__file__).resolve().parent
-HLS_URL = "http://127.0.0.1:8888/safety_bbox/index.m3u8"
+CONFIG_PATH = ROOT / "config.yaml"
 CLK_TCK = os.sysconf("SC_CLK_TCK")
 CPU_LOCK = Lock()
 PREVIOUS_CPU: tuple[int, int] | None = None
 PREVIOUS_PROCESSES: dict[int, tuple[int, float]] = {}
+
+
+def _camera_definitions() -> list[dict[str, object]]:
+    try:
+        raw_config = load_raw_config(CONFIG_PATH)
+        definitions: list[dict[str, object]] = []
+        for camera_id in camera_ids(raw_config):
+            config = resolve_camera_config(raw_config, camera_id)
+            output_url = str(config["output"]["rtsp_url"])
+            output_path = urlparse(output_url).path.strip("/")
+            definitions.append(
+                {
+                    "id": camera_id,
+                    "source": config["input"].get("mock_video") or config["input"].get("rtsp_url"),
+                    "output": output_url,
+                    "hls_url": f"http://localhost:8888/{output_path}/index.m3u8",
+                    "functions": config.get("functions", {}),
+                }
+            )
+        return definitions
+    except (OSError, TypeError, ValueError, KeyError):
+        return []
 
 
 def _proc_cpu() -> tuple[int, int] | None:
@@ -52,8 +75,12 @@ def _processes() -> list[dict[str, int | str]]:
     for entry in Path("/proc").glob("[0-9]*"):
         try:
             pid = int(entry.name)
+            comm = (entry / "comm").read_text(encoding="ascii").strip()
+            if comm not in {"python", "python3"}:
+                continue
             command = (entry / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="ignore").strip()
-            if "deepstream_safety/pipeline.py" not in command:
+            parts = command.split()
+            if not any(part.endswith("/deepstream_safety/pipeline.py") for part in parts):
                 continue
             stat = (entry / "stat").read_text(encoding="ascii")
             rest = stat[stat.rfind(")") + 2 :].split()
@@ -64,10 +91,181 @@ def _processes() -> list[dict[str, int | str]]:
                 if line.startswith("VmRSS:"):
                     rss_kb = int(line.split()[1])
                     break
-            result.append({"pid": pid, "ticks": ticks, "start_ticks": start_ticks, "rss_mb": round(rss_kb / 1024, 1)})
+            camera = "unknown"
+            run_id = "unknown"
+            if "--camera-id" in parts:
+                index = parts.index("--camera-id")
+                if index + 1 < len(parts):
+                    camera = parts[index + 1]
+            if "--run-id" in parts:
+                index = parts.index("--run-id")
+                if index + 1 < len(parts):
+                    run_id = parts[index + 1]
+            result.append({"pid": pid, "camera": camera, "run_id": run_id, "ticks": ticks, "start_ticks": start_ticks, "rss_mb": round(rss_kb / 1024, 1)})
         except (FileNotFoundError, PermissionError, IndexError, ValueError):
             continue
     return result
+
+
+def _runtime_status(camera_id: str) -> dict[str, object]:
+    try:
+        raw_config = load_raw_config(CONFIG_PATH)
+        runtime = raw_config.get("runtime", {}) or {}
+        status_dir = Path(str(runtime.get("status_directory", "/opt/camera-deepstream/status")))
+        path = status_dir / f"{camera_id}.json"
+        if not path.is_file():
+            return {}
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        return payload if isinstance(payload, dict) else {}
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return {}
+
+
+def _evidence_metrics() -> dict[str, object]:
+    try:
+        raw_config = load_raw_config(CONFIG_PATH)
+        evidence = raw_config.get("evidence", {}) or {}
+        root = Path(str(evidence.get("directory", ".tmp/deepstream-safety")))
+        prefix = str(evidence.get("prefix", "snapshots-acceptance"))
+        runs = [path for path in root.glob(f"{prefix}-*") if path.is_dir()]
+        if not runs:
+            return {"available": False, "run_id": None, "event_count": 0, "root": str(root)}
+        latest = max(runs, key=lambda path: path.stat().st_mtime)
+        events_path = latest / "events.jsonl"
+        event_ids: set[str] = set()
+        if events_path.is_file():
+            for line in events_path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                event_id = record.get("event_id")
+                if event_id:
+                    event_ids.add(str(event_id))
+        return {
+            "available": (latest / "manifest.json").is_file(),
+            "run_id": latest.name.removeprefix(f"{prefix}-"),
+            "event_count": len(event_ids),
+            "root": str(latest),
+        }
+    except (OSError, TypeError, ValueError):
+        return {"available": False, "run_id": None, "event_count": 0}
+
+
+def _event_feed(after: int = 0, limit: int | None = None) -> dict[str, object]:
+    """Return event lifecycle records after an events.jsonl cursor.
+
+    START is emitted immediately so the dashboard can show an active event;
+    END carries the same event_id and lets the dashboard update that row.
+    """
+    try:
+        raw_config = load_raw_config(CONFIG_PATH)
+        evidence = raw_config.get("evidence", {}) or {}
+        root = Path(str(evidence.get("directory", ".tmp/deepstream-safety")))
+        prefix = str(evidence.get("prefix", "snapshots-acceptance"))
+        runs = [path for path in root.glob(f"{prefix}-*") if path.is_dir()]
+        if not runs:
+            return {"run_id": None, "cursor": 0, "events": []}
+        latest = max(runs, key=lambda path: path.stat().st_mtime)
+        run_id = latest.name.removeprefix(f"{prefix}-")
+        events_path = latest / "events.jsonl"
+        if not events_path.is_file():
+            return {"run_id": run_id, "cursor": 0, "events": []}
+
+        lines = events_path.read_text(encoding="utf-8").splitlines()
+        start = max(0, int(after))
+        if start == 0 and limit is not None and limit > 0:
+            start = max(0, len(lines) - limit)
+        events: list[dict[str, object]] = []
+        severity_by_function = {
+            "face_recognition": ("event", "Sự kiện"),
+            "smoking_behavior": ("warning", "Cảnh báo"),
+            "fire_smoke": ("warning", "Cảnh báo"),
+        }
+        for sequence, line in enumerate(lines[start:], start=start + 1):
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            record_type = str(record.get("record_type") or "").upper()
+            if record_type not in {"START", "END"}:
+                continue
+
+            event_file: Path | None = None
+            event_path = Path(str(record.get("event_path", "")))
+            if event_path and not event_path.is_absolute() and ".." not in event_path.parts:
+                candidate = latest / event_path / "event.json"
+                if candidate.is_file():
+                    event_file = candidate
+            details: dict[str, object] = {}
+            if event_file is not None:
+                try:
+                    loaded = json.loads(event_file.read_text(encoding="utf-8"))
+                    if isinstance(loaded, dict):
+                        details = loaded
+                except (OSError, json.JSONDecodeError):
+                    pass
+
+            function = str(record.get("function") or details.get("function") or "event")
+            classification = str(
+                record.get("classification") or details.get("classification") or function
+            )
+            identity_value = record.get("identity")
+            if identity_value is None and record_type == "END":
+                identity_value = details.get("identity")
+            identity = str(identity_value or "").strip()
+            if function == "face_recognition":
+                identity = identity or "unknown"
+                event_name = f"Nhận diện khuôn mặt: {identity}"
+            elif function == "smoking_behavior":
+                event_name = "Hành vi hút thuốc"
+            elif function == "fire_smoke":
+                event_name = "Lửa" if classification == "fire" else "Khói"
+            else:
+                event_name = {
+                    "recognized": "Đã nhận diện",
+                    "unrecognized": "Không nhận diện được",
+                }.get(classification, classification.replace("_", " ").title())
+
+            severity, severity_label = severity_by_function.get(
+                function, ("event", "Sự kiện")
+            )
+            if function == "fire_smoke" and classification == "fire":
+                severity, severity_label = "danger", "Nguy hiểm"
+            score_value = details.get("last_score") if record_type == "END" else None
+            try:
+                score = round(float(score_value), 4) if score_value is not None else None
+            except (TypeError, ValueError):
+                score = None
+            timestamp = (
+                record.get("ended_at") or details.get("ended_at")
+                if record_type == "END"
+                else record.get("started_at") or details.get("started_at")
+            )
+            events.append(
+                {
+                    "sequence": sequence,
+                    "event_id": str(record.get("event_id") or details.get("event_id") or sequence),
+                    "camera": str(record.get("camera_id") or details.get("camera_id") or "unknown"),
+                    "event_name": event_name,
+                    "name": identity or "unknown",
+                    "function": function,
+                    "classification": classification,
+                    "severity": severity,
+                    "severity_label": severity_label,
+                    "timestamp": timestamp,
+                    "confidence": score,
+                    "state": "ended" if record_type == "END" else "active",
+                    "record_type": record_type,
+                }
+            )
+        return {"run_id": run_id, "cursor": len(lines), "events": events}
+    except (OSError, TypeError, ValueError):
+        return {"run_id": None, "cursor": 0, "events": []}
 
 
 def _gpu() -> dict[str, object]:
@@ -105,43 +303,93 @@ def collect_metrics() -> dict[str, object]:
         PREVIOUS_CPU = cpu
 
     processes = _processes()
-    pipeline = processes[0] if processes else None
-    pipeline_cpu = None
-    pipeline_age = None
-    if pipeline is not None:
+    pipeline_cpu_values: list[float] = []
+    pipeline_age_values: list[float] = []
+    for pipeline in processes:
         pid = int(pipeline["pid"])
         previous = PREVIOUS_PROCESSES.get(pid)
         if previous is not None:
             tick_delta = int(pipeline["ticks"]) - previous[0]
             elapsed = max(0.001, now - previous[1])
-            pipeline_cpu = round(tick_delta / CLK_TCK / elapsed * 100, 1)
+            pipeline_cpu_values.append(tick_delta / CLK_TCK / elapsed * 100)
         PREVIOUS_PROCESSES[pid] = (int(pipeline["ticks"]), now)
         uptime = float(Path("/proc/uptime").read_text(encoding="ascii").split()[0])
-        pipeline_age = round(max(0.0, uptime - int(pipeline["start_ticks"]) / CLK_TCK), 1)
+        pipeline_age_values.append(max(0.0, uptime - int(pipeline["start_ticks"]) / CLK_TCK))
 
-    playlist_latency = None
-    hls_live = False
-    try:
-        started = time.perf_counter()
-        with urlopen(HLS_URL, timeout=2) as response:
-            hls_live = response.status == 200
-            response.read(128)
-        playlist_latency = round((time.perf_counter() - started) * 1000, 1)
-    except OSError:
-        pass
+    pipeline_cpu = round(sum(pipeline_cpu_values), 1) if pipeline_cpu_values else None
+    pipeline_rss = round(sum(float(item["rss_mb"]) for item in processes), 1) if processes else None
+    pipeline_age = round(min(pipeline_age_values), 1) if pipeline_age_values else None
+
+    configured_cameras = _camera_definitions()
+    processes_by_camera = {str(item["camera"]): item for item in processes}
+    camera_metrics: list[dict[str, object]] = []
+    latencies: list[float] = []
+    for camera in configured_cameras:
+        camera_id = str(camera["id"])
+        process = processes_by_camera.get(camera_id)
+        runtime_status = _runtime_status(camera_id)
+        hls_live = False
+        playlist_latency = None
+        try:
+            started = time.perf_counter()
+            with urlopen(str(camera["hls_url"]), timeout=2) as response:
+                hls_live = response.status == 200
+                response.read(128)
+            playlist_latency = round((time.perf_counter() - started) * 1000, 1)
+            latencies.append(playlist_latency)
+        except OSError:
+            pass
+        last_frame_at = runtime_status.get("last_frame_at")
+        try:
+            last_frame_age = round(max(0.0, time.time() - float(last_frame_at)), 1)
+        except (TypeError, ValueError):
+            last_frame_age = None
+        ready = bool(process and hls_live and last_frame_age is not None and last_frame_age <= 5.0)
+        camera_metrics.append(
+            {
+                **camera,
+                "running": process is not None,
+                "pid": process["pid"] if process else None,
+                "run_id": process["run_id"] if process else None,
+                "rss_mb": process["rss_mb"] if process else None,
+                "hls_live": hls_live,
+                "ready": ready,
+                "playlist_latency_ms": playlist_latency,
+                "last_frame_age_seconds": last_frame_age,
+                "frame_count": runtime_status.get("frame_count"),
+                "analysis_queue_depth": runtime_status.get("analysis_queue_depth"),
+                "worker_epoch": runtime_status.get("worker_epoch"),
+                "analysis_error": runtime_status.get("analysis_error"),
+            }
+        )
+
+    default_stream = next(
+        (camera for camera in camera_metrics if camera["id"] == "camera_safety"),
+        camera_metrics[0] if camera_metrics else {},
+    )
 
     return {
         "timestamp": time.time(),
         "host": {"cpu_percent": cpu_percent, "cpu_cores": os.cpu_count(), "memory": _memory()},
         "gpu": _gpu(),
         "pipeline": {
-            "running": pipeline is not None,
-            "pid": pipeline["pid"] if pipeline else None,
+            "running": bool(processes),
+            "pid": processes[0]["pid"] if processes else None,
+            "pids": [item["pid"] for item in processes],
+            "camera_count": len(processes),
+            "ready": bool(camera_metrics) and all(bool(camera["ready"]) for camera in camera_metrics),
+            "cameras": [item["camera"] for item in processes],
             "cpu_percent": pipeline_cpu,
-            "rss_mb": pipeline["rss_mb"] if pipeline else None,
+            "rss_mb": pipeline_rss,
             "age_seconds": pipeline_age,
+            "camera_details": camera_metrics,
         },
-        "stream": {"hls_live": hls_live, "playlist_latency_ms": playlist_latency, "hls_url": HLS_URL.replace("127.0.0.1", "localhost")},
+        "stream": {
+            "hls_live": any(bool(camera["hls_live"]) for camera in camera_metrics),
+            "playlist_latency_ms": round(sum(latencies) / len(latencies), 1) if latencies else None,
+            "hls_url": default_stream.get("hls_url"),
+        },
+        "evidence": _evidence_metrics(),
     }
 
 
@@ -150,8 +398,33 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         super().__init__(*args, directory=str(ROOT), **kwargs)
 
     def do_GET(self) -> None:
-        if urlparse(self.path).path == "/api/metrics":
+        parsed = urlparse(self.path)
+        path = parsed.path
+        if path == "/":
+            self.send_response(302)
+            self.send_header("Location", "/dashboard.html")
+            self.end_headers()
+            return
+        if path == "/api/metrics":
             payload = json.dumps(collect_metrics()).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+        if path == "/api/events":
+            query = parse_qs(parsed.query)
+            try:
+                after = int(query.get("after", ["0"])[0])
+            except ValueError:
+                after = 0
+            try:
+                limit = int(query.get("limit", ["0"])[0])
+            except ValueError:
+                limit = 0
+            payload = json.dumps(_event_feed(after, limit if limit > 0 else None)).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Cache-Control", "no-store")

@@ -1,25 +1,32 @@
 #!/usr/bin/env python3
 """Standalone DeepStream Safety pipeline.
 
-The pipeline owns only one video path:
-RTSP input -> person detector -> Python person tracker -> cigarette detector
--> Python tensor decode -> NVOSD -> RTSP output.
-It does not import Frigate or read any Frigate configuration.
+RTSP input -> person detector/tracker -> function-specific analysis -> NVOSD
+-> RTSP output. Smoking behavior is a state attached to a person bbox;
+fire/smoke are camera-level environmental detections. The pipeline does not
+import Frigate or read any Frigate configuration.
 """
 
 from __future__ import annotations
 
 import argparse
 import ctypes
+import datetime as dt
 import json
 import logging
 import os
+import queue
 import signal
 import subprocess
 import tempfile
+import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any
+
+from config import load_config
+from evidence import EvidenceStore
 
 DEEPSTREAM_ROOT = os.environ.get("DEEPSTREAM_ROOT", "/opt/nvidia/deepstream/deepstream-7.1")
 os.environ["GIO_USE_PROXY"] = "0"
@@ -38,27 +45,22 @@ os.environ["LD_LIBRARY_PATH"] = os.pathsep.join(
     _library_paths + ([os.environ["LD_LIBRARY_PATH"]] if os.environ.get("LD_LIBRARY_PATH") else [])
 )
 
-import gi
-import numpy as np
-import pyds
-import yaml
-import zmq
-
-from events import SafetyEventStore
-from face_engine import FaceRecognitionEngine
-from recognition import RecognitionCore, TrackKey
+import gi  # noqa: E402
+import numpy as np  # noqa: E402
+import pyds  # noqa: E402
+import zmq  # noqa: E402
+from events import SafetyDetection, SafetyEventStore  # noqa: E402
+from face_engine import FaceRecognitionEngine  # noqa: E402
+from fire_smoke_engine import FireSmokeEngine  # noqa: E402
+from fire_smoke_events import FireSmokeEventStore  # noqa: E402
+from recognition import RecognitionCore, TrackKey  # noqa: E402
+from smoking_behavior_engine import SmokingBehaviorEngine  # noqa: E402
 
 gi.require_version("Gst", "1.0")
 gi.require_version("GLib", "2.0")
 from gi.repository import GLib, Gst  # noqa: E402
 
-
 LOG = logging.getLogger("deepstream-safety")
-
-
-def load_config(path: Path) -> dict[str, Any]:
-    with path.open("r", encoding="utf-8") as stream:
-        return yaml.safe_load(stream)
 
 
 def make_element(factory: str, name: str) -> Gst.Element:
@@ -141,43 +143,54 @@ def nms(boxes: list[np.ndarray], threshold: float) -> list[np.ndarray]:
 
 
 class SafetyPipeline:
-    def __init__(self, config: dict[str, Any], config_path: Path) -> None:
+    def __init__(self, config: dict[str, Any], config_path: Path, run_id: str) -> None:
         self.config = config
         self.config_path = config_path
+        self.run_id = run_id
         self.loop = GLib.MainLoop()
         self.pipeline = Gst.Pipeline.new("deepstream-safety")
         if self.pipeline is None:
             raise RuntimeError("Unable to create GStreamer pipeline")
         self.depay: Gst.Element | None = None
         self.person_infer: Gst.Element | None = None
-        self.infer: Gst.Element | None = None
         self.frame_probe_id: int | None = None
         self.started_at = time.monotonic()
+        runtime = config.get("runtime", {}) or {}
+        self.status_dir = Path(str(runtime.get("status_directory", "/opt/camera-deepstream/status")))
+        self.status_path = self.status_dir / f"{config.get('input', {}).get('camera', 'camera')}.json"
+        self.last_frame_at: float | None = None
+        functions = config.get("functions", {}) or {}
+        self.smoking_behavior_enabled = bool(functions.get("smoking_behavior", False))
+        self.fire_smoke_enabled = bool(functions.get("fire_smoke", False))
+        self.trace_enabled = bool(functions.get("trace", True))
+        LOG.info(
+            "function topology: camera=%s face_recognition=%s smoking_behavior=%s fire_smoke=%s",
+            config.get("input", {}).get("camera", "unknown"),
+            bool(functions.get("face_recognition", False)),
+            self.smoking_behavior_enabled,
+            self.fire_smoke_enabled,
+        )
         self.frame_count = 0
         self.person_frame_count = 0
         self.last_person_count = 0
         self.last_bbox_count = 0
-        self.tensor_logged = False
+        self.last_fire_smoke_count = 0
         self.person_tensor_logged = False
         self.person_score_logged = False
-        self.event_store = SafetyEventStore(config)
+        self.evidence = EvidenceStore(config, run_id)
+        self.event_store = SafetyEventStore(config, self.evidence)
+        self.fire_smoke_events = FireSmokeEventStore(config, self.evidence)
+        self._face_event_ids: dict[int, str] = {}
+        self._smoking_by_track: dict[int, Any] = {}
         self.mock_publisher: subprocess.Popen | None = None
         self.recognition = RecognitionCore(config)
-        self.face_engine = FaceRecognitionEngine(config)
+        self.face_engine = FaceRecognitionEngine(config, self._on_face_trace)
+        self.smoking_behavior_engine = (
+            SmokingBehaviorEngine(config) if self.smoking_behavior_enabled else None
+        )
+        self.fire_smoke_engine = FireSmokeEngine(config) if self.fire_smoke_enabled else None
         self.recognition_last_frame: dict[TrackKey, int] = {}
         self.last_event_transition: str | None = None
-        snapshot_cfg = config.get("snapshots", {})
-        self.snapshot_enabled = bool(snapshot_cfg.get("enabled", False))
-        self.snapshot_dir = Path(snapshot_cfg.get("directory", "/tmp/deepstream-safety/snapshots"))
-        self.snapshot_recognized_dir = self.snapshot_dir / "recognized"
-        self.snapshot_unrecognized_dir = self.snapshot_dir / "unrecognized"
-        self.snapshot_count = 0
-        self._recognized_track_ids: set[int] = set()
-        self._recognized_track_names: dict[int, str] = {}
-        self._recognized_snapshot_names: set[str] = set()
-        self._unknown_snapshot_frames: dict[Path, set[int]] = {}
-        self._pending_output_evidence: list[dict[str, Any]] = []
-        self._event_snapshot_saved_ids: set[str] = set()
         self._person_tracks: dict[int, dict[str, Any]] = {}
         self._next_person_track_id = 1
         tracking_config = config.get("person", {}).get("tracking", {})
@@ -195,53 +208,89 @@ class SafetyPipeline:
         self._person_distance_threshold = float(
             tracking_config.get("distance_threshold", 2.5)
         )
-        self.last_tensor_error: str | None = None
-        if self.snapshot_enabled:
-            self.snapshot_dir.mkdir(parents=True, exist_ok=True)
-            self.snapshot_recognized_dir.mkdir(parents=True, exist_ok=True)
-            self.snapshot_unrecognized_dir.mkdir(parents=True, exist_ok=True)
+        self._person_bbox_smoothing_alpha = min(
+            1.0,
+            max(0.05, float(tracking_config.get("bbox_smoothing_alpha", 0.30))),
+        )
+        self.last_behavior_error: str | None = None
+        self.analysis_enabled = self.smoking_behavior_enabled or self.fire_smoke_enabled
+        self._analysis_queue: queue.Queue = queue.Queue(maxsize=1)
+        self._analysis_stop = threading.Event()
+        self._analysis_thread: threading.Thread | None = None
+        self._analysis_lock = threading.RLock()
+        self._analysis_detections: list[Any] = []
+        self._analysis_fire_smoke: list[Any] = []
+        self._analysis_transitions: list[Any] = []
+        self._analysis_last_transition: str | None = None
+        self._analysis_error: str | None = None
         self.socket = zmq.Context.instance().socket(zmq.PUB)
         self.socket.bind(config["metadata"]["zmq_pub_url"])
-        self.infer_config = self._write_infer_config()
         self.person_infer_config = self._write_person_infer_config()
         self._build()
+        if self.analysis_enabled:
+            self._analysis_thread = threading.Thread(
+                target=self._analysis_loop,
+                name=f"analysis-{config['input'].get('camera', 'camera')}",
+                daemon=True,
+            )
+            self._analysis_thread.start()
 
-    def _write_infer_config(self) -> str:
-        model = self.config["model"]
-        model_path = os.path.abspath(model["onnx_path"])
-        engine_path = "/opt/camera-deepstream/models/safety-smoking.engine"
-        model_source = (
-            f"model-engine-file={engine_path}"
-            if Path(engine_path).is_file()
-            else f"onnx-file={model_path}\nmodel-engine-file={engine_path}"
+    def _on_face_trace(
+        self, track_id: int, data: dict[str, Any], frame: np.ndarray | None
+    ) -> None:
+        event_name = str(data.get("event", "update"))
+        event_id = self._face_event_ids.get(track_id)
+        if event_name == "track_start":
+            event_id = self.evidence.start_event(
+                event_id=(
+                    f"face-{self.run_id}-{self.config['input']['camera']}"
+                    f"-{self.evidence.worker_epoch}-{track_id}"
+                ),
+                function="face_recognition",
+                classification="pending",
+                camera_id=str(self.config["input"]["camera"]),
+                person_track_id=track_id,
+                pending=True,
+            )
+            self._face_event_ids[track_id] = event_id
+            return
+        if event_id is None:
+            event_id = self.evidence.start_event(
+                event_id=(
+                    f"face-{self.run_id}-{self.config['input']['camera']}"
+                    f"-{self.evidence.worker_epoch}-{track_id}"
+                ),
+                function="face_recognition",
+                classification="pending",
+                camera_id=str(self.config["input"]["camera"]),
+                person_track_id=track_id,
+                pending=True,
+            )
+            self._face_event_ids[track_id] = event_id
+        if event_name == "track_end":
+            final_name = str(data.get("name") or "unknown")
+            self.evidence.finish_event(
+                event_id,
+                classification="recognized" if final_name != "unknown" else "unrecognized",
+                identity=None if final_name == "unknown" else final_name,
+                payload=data,
+                frame=frame,
+                frame_number=int(data.get("frame", -1)),
+                bbox=tuple(data.get("person_bbox", [])) if data.get("person_bbox") else None,
+                score=float(data.get("score", 0.0)),
+            )
+            self._face_event_ids.pop(track_id, None)
+            return
+        stable_name = str(data.get("stable_result") or "unknown")
+        self.evidence.record(
+            event_id,
+            "UPDATE",
+            {**data, "identity": None if stable_name == "unknown" else stable_name},
+            frame=frame,
+            frame_number=int(data.get("frame", -1)),
+            bbox=tuple(data.get("person_bbox", [])) if data.get("person_bbox") else None,
+            score=float(data.get("stable_score", data.get("score", 0.0))),
         )
-        content = f"""[property]
-gpu-id=0
-{model_source}
-labelfile-path=/tmp/deepstream-safety-labels.txt
-batch-size=1
-network-mode=2
-network-type=100
-model-color-format=1
-net-scale-factor=0.00392156862745098
-num-detected-classes=1
-infer-dims=3;{int(model['input_width'])};{int(model['input_height'])}
-interval=0
-gie-unique-id=1
-process-mode=1
-output-tensor-meta=1
-maintain-aspect-ratio=0
-"""
-        labels = f"{model['label']}\n"
-        labels_path = "/tmp/deepstream-safety-labels.txt"
-        Path(labels_path).write_text(labels, encoding="utf-8")
-        handle = tempfile.NamedTemporaryFile(
-            mode="w", prefix="deepstream-safety-infer-", suffix=".txt", delete=False
-        )
-        with handle:
-            handle.write(content)
-        LOG.info("nvinfer config: %s", handle.name)
-        return handle.name
 
     def _write_person_infer_config(self) -> str:
         model = self.config["person"]
@@ -284,10 +333,20 @@ maintain-aspect-ratio=0
 
         source = make_element("rtspsrc", "rtsp-source")
         source.set_property("location", input_cfg["rtsp_url"])
+        if input_cfg.get("rtsp_username"):
+            source.set_property("user-id", input_cfg["rtsp_username"])
+        if input_cfg.get("rtsp_password"):
+            source.set_property("user-pw", input_cfg["rtsp_password"])
         source.set_property("latency", int(input_cfg["latency_ms"]))
         source.set_property("protocols", 4)
-        self.depay = make_element("rtph264depay", "rtp-h264-depay")
-        parser = make_element("h264parse", "input-h264-parse")
+        codec = str(input_cfg.get("codec", "h264")).lower()
+        if codec in {"h265", "hevc"}:
+            depay = make_element("rtph265depay", "rtp-h265-depay")
+            parser = make_element("h265parse", "input-h265-parse")
+        else:
+            depay = make_element("rtph264depay", "rtp-h264-depay")
+            parser = make_element("h264parse", "input-h264-parse")
+        self.depay = depay
         decoder = make_element("nvv4l2decoder", "input-decoder")
         mux = make_element("nvstreammux", "stream-muxer")
         mux.set_property("batch-size", 1)
@@ -298,8 +357,6 @@ maintain-aspect-ratio=0
 
         self.person_infer = make_element("nvinfer", "person-inference")
         self.person_infer.set_property("config-file-path", self.person_infer_config)
-        self.infer = make_element("nvinfer", "smoking-inference")
-        self.infer.set_property("config-file-path", self.infer_config)
         face_cpu_convert = make_element("nvvideoconvert", "face-cpu-convert")
         face_cpu_caps = make_element("capsfilter", "face-cpu-caps")
         face_cpu_caps.set_property("caps", Gst.Caps.from_string("video/x-raw,format=BGRx"))
@@ -323,18 +380,6 @@ maintain-aspect-ratio=0
         output_parser.set_property("config-interval", 1)
         sink = make_element("rtspclientsink", "rtsp-output")
         sink.set_property("location", output_cfg["rtsp_url"])
-        snapshot_queue = make_element("queue", "snapshot-queue")
-        snapshot_convert = make_element("nvvideoconvert", "snapshot-convert")
-        snapshot_caps = make_element("capsfilter", "snapshot-caps")
-        snapshot_caps.set_property("caps", Gst.Caps.from_string("video/x-raw,format=I420"))
-        snapshot_encoder = make_element("jpegenc", "snapshot-jpeg-encoder")
-        snapshot_sink = make_element("appsink", "snapshot-sink")
-        snapshot_sink.set_property("emit-signals", True)
-        snapshot_sink.set_property("sync", False)
-        snapshot_sink.set_property("max-buffers", 1)
-        snapshot_sink.set_property("drop", True)
-        snapshot_sink.set_property("caps", Gst.Caps.from_string("image/jpeg"))
-        snapshot_sink.connect("new-sample", self._on_snapshot_sample)
 
         elements = [
             source,
@@ -343,9 +388,11 @@ maintain-aspect-ratio=0
             decoder,
             mux,
             self.person_infer,
-            self.infer,
-            face_cpu_convert,
-            face_cpu_caps,
+            *(
+                [face_cpu_convert, face_cpu_caps]
+                if self.face_engine.enabled or self.smoking_behavior_enabled or self.fire_smoke_enabled
+                else []
+            ),
             convert_before_osd,
             face_rgba_caps,
             osd,
@@ -356,11 +403,6 @@ maintain-aspect-ratio=0
             encoder,
             output_parser,
             sink,
-            snapshot_queue,
-            snapshot_convert,
-            snapshot_caps,
-            snapshot_encoder,
-            snapshot_sink,
         ]
         self.pipeline.add(*elements)
         source.connect("pad-added", self._on_source_pad_added)
@@ -372,41 +414,47 @@ maintain-aspect-ratio=0
             raise RuntimeError("Unable to link decoder to nvstreammux")
         if not mux.link(self.person_infer):
             raise RuntimeError("Unable to link nvstreammux to person nvinfer")
-        if not self.person_infer.link(self.infer):
-            raise RuntimeError("Unable to link person detector to cigarette nvinfer")
-        if not self.infer.link(face_cpu_convert):
-            raise RuntimeError("Unable to link smoking nvinfer to face converter")
-        infer_src = self.infer.get_static_pad("src")
+        metadata_source = self.person_infer
+        needs_cpu_frame = self.face_engine.enabled or self.smoking_behavior_enabled or self.fire_smoke_enabled
+        if needs_cpu_frame:
+            if not metadata_source.link(face_cpu_convert):
+                raise RuntimeError("Unable to link analysis source to face converter")
+            if not face_cpu_convert.link(face_cpu_caps):
+                raise RuntimeError("Unable to link face converter to CPU caps")
+            analysis_src = face_cpu_caps
+        else:
+            if not metadata_source.link(convert_before_osd):
+                raise RuntimeError("Unable to link analysis source to OSD converter")
+            analysis_src = metadata_source
+        infer_src = metadata_source.get_static_pad("src")
         if infer_src is None:
-            raise RuntimeError("Smoking nvinfer has no src pad")
-        infer_src.add_probe(Gst.PadProbeType.BUFFER, self._on_metadata_buffer)
-        if not face_cpu_convert.link(face_cpu_caps):
-            raise RuntimeError("Unable to link face converter to CPU caps")
-        if not face_cpu_caps.link(convert_before_osd) or not convert_before_osd.link(face_rgba_caps):
+            raise RuntimeError("Person nvinfer has no src pad")
+        if needs_cpu_frame and not face_cpu_caps.link(convert_before_osd):
+            raise RuntimeError("Unable to link face CPU branch to OSD converter")
+        if not convert_before_osd.link(face_rgba_caps):
             raise RuntimeError("Unable to link CPU face frame to OSD converter")
         if not face_rgba_caps.link(osd) or not osd.link(convert_after_osd):
             raise RuntimeError("Unable to link OSD branch")
         if not convert_after_osd.link(output_i420_caps) or not output_i420_caps.link(output_tee):
             raise RuntimeError("Unable to link output tee")
-        if not output_tee.link(output_queue) or not output_tee.link(snapshot_queue):
+        if not output_tee.link(output_queue):
             raise RuntimeError("Unable to link output branches")
         if not output_queue.link(encoder) or not encoder.link(output_parser):
             raise RuntimeError("Unable to link output encoder")
         if not output_parser.link(sink):
             raise RuntimeError("Unable to link RTSP output")
-        if not snapshot_queue.link(snapshot_convert) or not snapshot_convert.link(snapshot_caps):
-            raise RuntimeError("Unable to link snapshot conversion")
-        if not snapshot_caps.link(snapshot_encoder) or not snapshot_encoder.link(snapshot_sink):
-            raise RuntimeError("Unable to link snapshot sink")
         person_src = self.person_infer.get_static_pad("src")
         if person_src is None:
             raise RuntimeError("Person nvinfer has no src pad")
+        # Create person objects before assigning stable application track IDs;
+        # otherwise behavior and face recognition see every object as UNTRACKED.
         person_src.add_probe(Gst.PadProbeType.BUFFER, self._on_person_buffer)
-        face_src = face_cpu_caps.get_static_pad("src")
+        person_src.add_probe(Gst.PadProbeType.BUFFER, self._on_metadata_buffer)
+        face_src = analysis_src.get_static_pad("src")
         if face_src is None:
-            raise RuntimeError("CPU face probe has no src pad")
+            raise RuntimeError("Analysis probe has no src pad")
         self.frame_probe_id = face_src.add_probe(
-            Gst.PadProbeType.BUFFER, self._on_infer_buffer
+            Gst.PadProbeType.BUFFER, self._on_behavior_buffer
         )
 
     def _on_source_pad_added(self, source: Gst.Element, pad: Gst.Pad) -> None:
@@ -465,54 +513,6 @@ maintain-aspect-ratio=0
             ctypes.cast(ptr, ctypes.POINTER(ctypes.c_float)), shape=(elements,)
         ).copy()
         return raw, dims
-
-    def _decode_boxes(self, tensor_meta: Any, frame_width: int, frame_height: int) -> list[np.ndarray]:
-        model = self.config["model"]
-        threshold = float(model["confidence"])
-        input_width = float(model["input_width"])
-        input_height = float(model["input_height"])
-        for index in range(int(tensor_meta.num_output_layers)):
-            layer = pyds.get_nvds_LayerInfo(tensor_meta, index)
-            values, dims = self._layer_array(layer)
-            if not self.tensor_logged:
-                channel_major = values.reshape(dims).T
-                candidate_major = values.reshape((-1, dims[0]))
-                channel_scores = channel_major[:, 4]
-                candidate_scores = candidate_major[:, 4]
-                LOG.info("tensor dims=%s elements=%d min=%.6f max=%.6f first=%s", dims, values.size,
-                         float(values.min()), float(values.max()), np.round(values[:10], 4).tolist())
-                LOG.info("tensor layouts channel_major score_max=%.6f score_count=%.0f candidate_major score_max=%.6f score_count=%.0f",
-                         float(channel_scores.max()), float((channel_scores >= 0.25).sum()),
-                         float(candidate_scores.max()), float((candidate_scores >= 0.25).sum()))
-                self.tensor_logged = True
-            if len(dims) == 3 and dims[0] == 1:
-                dims = dims[1:]
-            if len(dims) != 2:
-                continue
-            if dims[0] < dims[1]:
-                matrix = values.reshape(dims).T
-            elif dims[1] < dims[0]:
-                matrix = values.reshape((dims[1], dims[0])).T
-            else:
-                matrix = values.reshape(dims)
-            if matrix.shape[1] < 5:
-                continue
-            boxes: list[np.ndarray] = []
-            scale_x = frame_width / input_width
-            scale_y = frame_height / input_height
-            for row in matrix:
-                score = float(row[4]) if matrix.shape[1] == 5 else float(np.max(row[4:]))
-                if score < threshold:
-                    continue
-                center_x, center_y, width, height = [float(value) for value in row[:4]]
-                left = max(0.0, (center_x - width / 2.0) * scale_x)
-                top = max(0.0, (center_y - height / 2.0) * scale_y)
-                right = min(float(frame_width), (center_x + width / 2.0) * scale_x)
-                bottom = min(float(frame_height), (center_y + height / 2.0) * scale_y)
-                if right > left and bottom > top:
-                    boxes.append(np.array([left, top, right, bottom, score], dtype=np.float32))
-            return nms(boxes, float(model["iou"]))
-        return []
 
     @staticmethod
     def _deduplicate_person_boxes(boxes: list[np.ndarray]) -> list[np.ndarray]:
@@ -611,6 +611,156 @@ maintain-aspect-ratio=0
                 break
         return objects
 
+    def _decode_bgrx_buffer(self, buffer: Any, width: int, height: int) -> np.ndarray | None:
+        """Map the CPU BGRx analysis surface using the stride-aware decoder."""
+        return self.face_engine.decode_bgrx_frame(buffer, width, height)
+
+    def _queue_analysis_sample(
+        self,
+        frame_num: int,
+        frame: np.ndarray | None,
+        persons: list[tuple[int, float, float, float, float]],
+    ) -> None:
+        if frame is None or not self.analysis_enabled:
+            return
+        sample = (frame.copy(), persons, frame_num, time.time())
+        try:
+            self._analysis_queue.put_nowait(sample)
+        except queue.Full:
+            try:
+                self._analysis_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._analysis_queue.put_nowait(sample)
+            except queue.Full:
+                pass
+
+    def _analysis_loop(self) -> None:
+        while not self._analysis_stop.is_set():
+            try:
+                sample = self._analysis_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if sample is None:
+                break
+            frame, persons, frame_num, timestamp = sample
+            try:
+                detection_results: list[Any] = []
+                fire_smoke_detections: list[Any] = []
+                if self.smoking_behavior_enabled and self.smoking_behavior_engine is not None:
+                    detection_results = self.smoking_behavior_engine.process(
+                        frame, persons, int(frame_num)
+                    )
+                if self.fire_smoke_enabled and self.fire_smoke_engine is not None:
+                    fire_smoke_detections = self.fire_smoke_engine.process(frame)
+                detections = [
+                    SafetyDetection(
+                        track_id=detection.track_id,
+                        score=float(detection.score),
+                        bbox=detection.person_bbox,
+                        model_roi_bbox=detection.model_roi_bbox,
+                    )
+                    for detection in detection_results
+                ]
+                transitions: list[Any] = []
+                transition = (
+                    self.event_store.observe(
+                        frame_num=int(frame_num),
+                        timestamp=timestamp,
+                        detections=detections,
+                        frame=frame,
+                    )
+                    if self.smoking_behavior_enabled
+                    else None
+                )
+                if transition is not None:
+                    transitions.append(transition)
+                if self.fire_smoke_enabled:
+                    transitions.extend(
+                        self.fire_smoke_events.observe(
+                            frame_num=int(frame_num),
+                            timestamp=timestamp,
+                            detections=fire_smoke_detections,
+                            frame=frame,
+                        )
+                    )
+                with self._analysis_lock:
+                    self._analysis_detections = list(detection_results)
+                    self._analysis_fire_smoke = list(fire_smoke_detections)
+                    self._analysis_transitions = transitions
+                    self._analysis_last_transition = (
+                        transitions[-1].operation if transitions else None
+                    )
+                    self.last_bbox_count = len(detection_results)
+                    self.last_fire_smoke_count = len(fire_smoke_detections)
+            except Exception as exc:
+                message = str(exc)
+                if message != self._analysis_error:
+                    LOG.exception("background analysis failed: %s", message)
+                    self._analysis_error = message
+
+    def _cached_analysis(self) -> tuple[list[Any], list[Any], list[Any], str | None]:
+        with self._analysis_lock:
+            return (
+                list(self._analysis_detections),
+                list(self._analysis_fire_smoke),
+                list(self._analysis_transitions),
+                self._analysis_last_transition,
+            )
+
+    def _stop_analysis_worker(self) -> None:
+        if self._analysis_thread is None:
+            return
+        self._analysis_stop.set()
+        try:
+            self._analysis_queue.put_nowait(None)
+        except queue.Full:
+            try:
+                self._analysis_queue.get_nowait()
+                self._analysis_queue.put_nowait(None)
+            except queue.Empty:
+                pass
+        self._analysis_thread.join(timeout=5)
+        self._analysis_thread = None
+
+    def _write_runtime_status(self) -> bool:
+        payload = {
+            "camera": self.config["input"].get("camera", "unknown"),
+            "run_id": self.run_id,
+            "worker_epoch": self.evidence.worker_epoch,
+            "pid": os.getpid(),
+            "started_at": self.started_at,
+            "updated_at": time.time(),
+            "last_frame_at": self.last_frame_at,
+            "frame_count": self.frame_count,
+            "analysis_queue_depth": self._analysis_queue.qsize(),
+            "analysis_error": self._analysis_error,
+        }
+        try:
+            self.status_dir.mkdir(parents=True, exist_ok=True)
+            temporary = self.status_path.with_suffix(".json.tmp")
+            temporary.write_text(json.dumps(payload), encoding="utf-8")
+            temporary.replace(self.status_path)
+        except OSError as exc:
+            LOG.warning("runtime status write failed: %s", exc)
+        return True
+
+    def _person_rois(self, frame_meta: Any) -> list[tuple[int, float, float, float, float]]:
+        persons: list[tuple[int, float, float, float, float]] = []
+        for obj_meta in self._frame_objects(frame_meta):
+            if str(obj_meta.obj_label) != self.config["person"]["label"]:
+                continue
+            track_id = int(obj_meta.object_id)
+            if track_id in {0, 18446744073709551615}:
+                continue
+            left = float(obj_meta.rect_params.left)
+            top = float(obj_meta.rect_params.top)
+            right = left + float(obj_meta.rect_params.width)
+            bottom = top + float(obj_meta.rect_params.height)
+            persons.append((track_id, left, top, right, bottom))
+        return persons
+
     def _on_person_buffer(self, pad: Gst.Pad, info: Gst.PadProbeInfo) -> Gst.PadProbeReturn:
         buffer = info.get_buffer()
         if buffer is None:
@@ -622,6 +772,7 @@ maintain-aspect-ratio=0
         while frame_list is not None:
             try:
                 frame_meta = pyds.NvDsFrameMeta.cast(frame_list.data)
+                self.last_frame_at = time.time()
                 tensor_meta = self._get_tensor_meta(frame_meta, batch_meta, 2)
                 person_count = 0
                 if tensor_meta is not None:
@@ -650,14 +801,12 @@ maintain-aspect-ratio=0
                         detector_box.top = float(box[1])
                         detector_box.width = float(box[2] - box[0])
                         detector_box.height = float(box[3] - box[1])
-                        obj_meta.rect_params.border_width = 2
-                        obj_meta.rect_params.border_color.set(0.1, 1.0, 0.1, 1.0)
+                        # Keep detector metadata for tracking, but render only the
+                        # canonical annotation in the behavior probe below.
+                        obj_meta.rect_params.border_width = 0
                         obj_meta.rect_params.has_bg_color = 0
-                        obj_meta.text_params.display_text = f"person {float(box[4]):.2f}"
-                        obj_meta.text_params.font_params.font_name = "Sans"
-                        obj_meta.text_params.font_params.font_size = 14
-                        obj_meta.text_params.set_bg_clr = 1
-                        obj_meta.text_params.text_bg_clr.set(0.0, 0.0, 0.0, 0.65)
+                        obj_meta.text_params.display_text = ""
+                        obj_meta.text_params.set_bg_clr = 0
                         pyds.nvds_add_obj_meta_to_frame(frame_meta, obj_meta, None)
                 self.last_person_count = person_count
                 self.person_frame_count += 1
@@ -667,30 +816,6 @@ maintain-aspect-ratio=0
             except StopIteration:
                 break
         return Gst.PadProbeReturn.OK
-
-    def _smoking_boxes_inside_persons(self, frame_meta: Any, boxes: list[np.ndarray]) -> list[np.ndarray]:
-        persons = []
-        for obj_meta in self._frame_objects(frame_meta):
-            if str(obj_meta.obj_label) != self.config["person"]["label"]:
-                continue
-            rect = obj_meta.rect_params
-            left = float(rect.left)
-            top = float(rect.top)
-            right = left + float(rect.width)
-            bottom = top + float(rect.height)
-            expand_x = (right - left) * 0.20
-            expand_y = (bottom - top) * 0.20
-            persons.append((left - expand_x, top - expand_y, right + expand_x, bottom + expand_y))
-        if not persons:
-            return []
-        return [
-            box for box in boxes
-            if any(
-                left <= (float(box[0]) + float(box[2])) / 2.0 <= right
-                and top <= (float(box[1]) + float(box[3])) / 2.0 <= bottom
-                for left, top, right, bottom in persons
-            )
-        ]
 
     def _assign_person_track_ids(self, frame_meta: Any) -> None:
         persons = [
@@ -745,18 +870,26 @@ maintain-aspect-ratio=0
             _, box, center = detections[index]
             track = self._person_tracks[track_id]
             previous_box = track["box"]
-            delta = box - previous_box
+            smoothed_box = (
+                previous_box * (1.0 - self._person_bbox_smoothing_alpha)
+                + box * self._person_bbox_smoothing_alpha
+            )
+            delta = smoothed_box - previous_box
             previous_velocity = track.get(
                 "velocity", np.zeros(4, dtype=np.float32)
             )
             track.update(
-                box=box,
-                center=center,
+                box=smoothed_box,
+                center=((smoothed_box[0] + smoothed_box[2]) / 2.0, smoothed_box[3]),
                 velocity=previous_velocity * 0.7 + delta * 0.3,
                 disappeared=0,
                 last_frame=frame_number,
                 frames_seen=int(track.get("frames_seen", 0)) + 1,
             )
+            detections[index][0].rect_params.left = float(smoothed_box[0])
+            detections[index][0].rect_params.top = float(smoothed_box[1])
+            detections[index][0].rect_params.width = float(smoothed_box[2] - smoothed_box[0])
+            detections[index][0].rect_params.height = float(smoothed_box[3] - smoothed_box[1])
             detections[index][0].object_id = track_id
 
         for track_id in list(self._person_tracks):
@@ -819,76 +952,52 @@ maintain-aspect-ratio=0
                 self.recognition_last_frame.pop(key, None)
         return tracks
 
-    def _discard_unknown_evidence(self, track_id: int) -> None:
-        for path, track_ids in list(self._unknown_snapshot_frames.items()):
-            if track_id not in track_ids:
+    def _attach_objects(self, frame_meta: Any, detections: list[Any]) -> None:
+        """Annotate the existing person object; never render ROI as a new object."""
+        self._smoking_by_track = {int(item.track_id): item for item in detections}
+        smoking_ids = set(self._smoking_by_track)
+        for obj_meta in self._frame_objects(frame_meta):
+            if str(obj_meta.obj_label) != self.config["person"]["label"]:
                 continue
-            try:
-                path.unlink()
-            except FileNotFoundError:
-                pass
-            self._unknown_snapshot_frames.pop(path, None)
-
-    def _queue_recognition_evidence(
-        self,
-        frame_tracks: list[dict[str, Any]],
-        face_tracks: dict[int, dict[str, Any]],
-        frame_number: int,
-        source_pts: int,
-    ) -> None:
-        """Queue evidence until the corresponding post-OSD output frame arrives."""
-        if not self.snapshot_enabled:
-            return
-        recognized_names: set[str] = set()
-        unknown_track_ids: set[int] = set()
-        recognized_present = False
-        for track in frame_tracks:
-            if track.get("label") != "person":
+            track_id = int(obj_meta.object_id)
+            if track_id not in smoking_ids:
                 continue
-            track_id = int(track["track_id"])
-            result = face_tracks.get(track_id)
-            if not result:
-                continue
-            name = str(result.get("name") or "unknown")
-            if name != "unknown" or track_id in self._recognized_track_ids:
-                recognized_present = True
-            if not result.get("attempted"):
-                continue
-            if name != "unknown":
-                self._recognized_track_ids.add(track_id)
-                self._recognized_track_names[track_id] = name
-                self._discard_unknown_evidence(track_id)
-                if name not in self._recognized_snapshot_names:
-                    recognized_names.add(name)
-            elif track_id not in self._recognized_track_ids:
-                unknown_track_ids.add(track_id)
-        if recognized_present:
-            unknown_track_ids.clear()
-        if recognized_names or unknown_track_ids:
-            self._pending_output_evidence.append(
-                {
-                    "source_pts": source_pts,
-                    "frame": frame_number,
-                    "recognized_names": recognized_names,
-                    "unknown_track_ids": unknown_track_ids,
-                }
-            )
-
-    def _attach_objects(self, batch_meta: Any, frame_meta: Any, boxes: list[np.ndarray]) -> None:
-        label = self.config["model"]["label"]
-        for box in boxes:
-            obj_meta = pyds.nvds_acquire_obj_meta_from_pool(batch_meta)
-            obj_meta.class_id = 0
-            obj_meta.confidence = float(box[4])
-            obj_meta.obj_label = label
-            obj_meta.rect_params.left = float(box[0])
-            obj_meta.rect_params.top = float(box[1])
-            obj_meta.rect_params.width = float(box[2] - box[0])
-            obj_meta.rect_params.height = float(box[3] - box[1])
-            obj_meta.rect_params.border_width = 3
-            obj_meta.rect_params.border_color.set(1.0, 0.1, 0.1, 1.0)
+            detection = self._smoking_by_track[track_id]
+            obj_meta.rect_params.border_width = 4
+            obj_meta.rect_params.border_color.set(0.0, 0.0, 1.0, 1.0)
             obj_meta.rect_params.has_bg_color = 0
-            obj_meta.text_params.display_text = f"{label} {float(box[4]):.2f}"
+            obj_meta.text_params.display_text = (
+                f"person #{track_id} | SMOKING {float(detection.score):.2f}"
+            )
+            obj_meta.text_params.font_params.font_name = "Sans"
+            obj_meta.text_params.font_params.font_size = 16
+            obj_meta.text_params.set_bg_clr = 1
+            obj_meta.text_params.text_bg_clr.set(0.0, 0.0, 0.0, 0.75)
+
+    def _attach_fire_smoke_objects(
+        self, batch_meta: Any, frame_meta: Any, detections: list[Any]
+    ) -> None:
+        colors = {
+            "fire": (1.0, 0.35, 0.0, 1.0),
+            # Bright cyan stays visible over both the dark room and the white
+            # smoke plume; gray was too low-contrast on the live stream.
+            "smoke": (0.0, 1.0, 1.0, 1.0),
+        }
+        for detection in detections:
+            left, top, right, bottom = detection.bbox
+            obj_meta = pyds.nvds_acquire_obj_meta_from_pool(batch_meta)
+            obj_meta.class_id = 0 if detection.label == "fire" else 1
+            obj_meta.confidence = float(detection.score)
+            obj_meta.obj_label = detection.label
+            obj_meta.rect_params.left = float(left)
+            obj_meta.rect_params.top = float(top)
+            obj_meta.rect_params.width = float(right - left)
+            obj_meta.rect_params.height = float(bottom - top)
+            obj_meta.rect_params.border_width = 3
+            obj_meta.rect_params.border_color.set(*colors.get(detection.label, colors["smoke"]))
+            obj_meta.rect_params.has_bg_color = 0
+            display_label = "SMOKE AREA" if detection.label == "smoke" else "FIRE"
+            obj_meta.text_params.display_text = f"{display_label} {detection.score * 100:.0f}%"
             obj_meta.text_params.font_params.font_name = "Sans"
             obj_meta.text_params.font_params.font_size = 14
             obj_meta.text_params.set_bg_clr = 1
@@ -912,7 +1021,25 @@ maintain-aspect-ratio=0
                 break
         return Gst.PadProbeReturn.OK
 
-    def _on_infer_buffer(self, pad: Gst.Pad, info: Gst.PadProbeInfo) -> Gst.PadProbeReturn:
+    def _add_live_timestamp(self, batch_meta: Any, frame_meta: Any) -> None:
+        """Stamp output frames with wall-clock time for live/event comparison."""
+        display_meta = pyds.nvds_acquire_display_meta_from_pool(batch_meta)
+        display_meta.num_labels = 1
+        text_params = display_meta.text_params[0]
+        text_params.display_text = (
+            f"{self.config['input'].get('camera', 'camera')} | "
+            f"LIVE {dt.datetime.now().astimezone().strftime('%H:%M:%S.%f')[:-3]}"
+        )
+        text_params.x_offset = 24
+        text_params.y_offset = 50
+        text_params.font_params.font_name = "Sans"
+        text_params.font_params.font_size = 32
+        text_params.font_params.font_color.set(1.0, 1.0, 1.0, 1.0)
+        text_params.set_bg_clr = 1
+        text_params.text_bg_clr.set(0.0, 0.0, 0.0, 0.70)
+        pyds.nvds_add_display_meta_to_frame(frame_meta, display_meta)
+
+    def _on_behavior_buffer(self, pad: Gst.Pad, info: Gst.PadProbeInfo) -> Gst.PadProbeReturn:
         buffer = info.get_buffer()
         if buffer is None:
             return Gst.PadProbeReturn.OK
@@ -923,42 +1050,126 @@ maintain-aspect-ratio=0
         while frame_list is not None:
             try:
                 frame_meta = pyds.NvDsFrameMeta.cast(frame_list.data)
-                tensor_meta = self._get_tensor_meta(frame_meta, batch_meta, 1)
-                boxes = self._decode_boxes(
-                    tensor_meta,
-                    int(self.config["input"]["width"]),
-                    int(self.config["input"]["height"]),
-                ) if tensor_meta is not None else []
-                boxes = self._smoking_boxes_inside_persons(frame_meta, boxes)
-                self._attach_objects(batch_meta, frame_meta, boxes)
+                frame: np.ndarray | None = None
+                boxes: list[np.ndarray] = []
+                detections: list[SafetyDetection] = []
+                detection_results: list[Any] = []
+                fire_smoke_detections: list[Any] = []
+                if self.analysis_enabled:
+                    frame = self._decode_bgrx_buffer(
+                        buffer,
+                        int(getattr(frame_meta, "source_frame_width", 0) or 0),
+                        int(getattr(frame_meta, "source_frame_height", 0) or 0),
+                    )
+                    self._queue_analysis_sample(
+                        int(frame_meta.frame_num), frame, self._person_rois(frame_meta)
+                    )
+                    (
+                        detection_results,
+                        fire_smoke_detections,
+                        cached_transitions,
+                        cached_transition,
+                    ) = self._cached_analysis()
+                    boxes = [
+                        np.array(
+                            [*detection.person_bbox, detection.score],
+                            dtype=np.float32,
+                        )
+                        for detection in detection_results
+                    ]
+                    detections = [
+                        SafetyDetection(
+                            track_id=detection.track_id,
+                            score=float(detection.score),
+                            bbox=detection.person_bbox,
+                            model_roi_bbox=detection.model_roi_bbox,
+                        )
+                        for detection in detection_results
+                    ]
+                else:
+                    cached_transitions = []
+                    cached_transition = None
+                if self.smoking_behavior_enabled:
+                    self._attach_objects(frame_meta, detection_results)
+                if self.fire_smoke_enabled:
+                    self._attach_fire_smoke_objects(batch_meta, frame_meta, fire_smoke_detections)
                 tracks = self._recognition_tracks(frame_meta)
                 self.last_bbox_count = len(boxes)
-                transition = self.event_store.observe(
-                    frame_num=int(frame_meta.frame_num),
-                    timestamp=time.time(),
-                    detections=[
-                        (float(box[4]), (float(box[0]), float(box[1]), float(box[2]), float(box[3])))
-                        for box in boxes
-                    ],
-                )
-                self.last_event_transition = transition.operation if transition else None
+                self.last_fire_smoke_count = len(fire_smoke_detections)
+                if self.analysis_enabled:
+                    fire_smoke_transitions = cached_transitions
+                    self.last_event_transition = cached_transition
+                else:
+                    transition = (
+                        self.event_store.observe(
+                            frame_num=int(frame_meta.frame_num),
+                            timestamp=time.time(),
+                            detections=detections,
+                            frame=frame,
+                        )
+                        if self.smoking_behavior_enabled
+                        else None
+                    )
+                    self.last_event_transition = transition.operation if transition else None
+                    fire_smoke_transitions = (
+                        self.fire_smoke_events.observe(
+                            frame_num=int(frame_meta.frame_num),
+                            timestamp=time.time(),
+                            detections=fire_smoke_detections,
+                            frame=frame,
+                        )
+                        if self.fire_smoke_enabled
+                        else []
+                    )
                 face_tracks = self.face_engine.process(buffer, frame_meta, int(frame_meta.frame_num))
                 labels: list[tuple[str, int, int]] = []
                 for obj_meta in self._frame_objects(frame_meta):
-                    if str(obj_meta.obj_label) != self.config["person"]["label"]:
+                    object_label = str(obj_meta.obj_label)
+                    if object_label not in {self.config["person"]["label"], "fire", "smoke"}:
                         continue
-                    name, score = self.face_engine.current_label(
-                        int(obj_meta.object_id), int(frame_meta.frame_num)
-                    )
-                    label = f"person {name} {score:.2f}"
-                    obj_meta.text_params.display_text = label
+                    if object_label == self.config["person"]["label"]:
+                        name, score = self.face_engine.current_label(
+                            int(obj_meta.object_id), int(frame_meta.frame_num)
+                        )
+                        track_id = int(obj_meta.object_id)
+                        smoking = self._smoking_by_track.get(track_id)
+                        if smoking is not None:
+                            left, top, right, bottom = smoking.person_bbox
+                            obj_meta.rect_params.left = float(left)
+                            obj_meta.rect_params.top = float(top)
+                            obj_meta.rect_params.width = float(right - left)
+                            obj_meta.rect_params.height = float(bottom - top)
+                            label = f"person #{track_id} | SMOKING {float(smoking.score) * 100:.0f}%"
+                            obj_meta.rect_params.border_width = 4
+                            obj_meta.rect_params.border_color.set(1.0, 0.0, 0.0, 1.0)
+                        else:
+                            # camera_safety must not show raw/false person boxes.
+                            if str(self.config["input"].get("camera")) == "camera_safety":
+                                obj_meta.rect_params.border_width = 0
+                                obj_meta.text_params.display_text = ""
+                                obj_meta.text_params.set_bg_clr = 0
+                                continue
+                            obj_meta.rect_params.border_width = 3
+                            obj_meta.rect_params.border_color.set(0.0, 0.65, 1.0, 1.0)
+                            obj_meta.rect_params.has_bg_color = 0
+                            label = f"person #{track_id} | {name} {score:.2f}"
+                    else:
+                        # Fire/smoke labels are generated from canonical object metadata.
+                        # Never reuse detector/plugin text here: it can contain stale class
+                        # ids or raw confidence strings and was the source of the opaque
+                        # numeric labels seen on the live safety stream.
+                        display_label = "SMOKE AREA" if object_label == "smoke" else "FIRE"
+                        label = f"{display_label} {float(obj_meta.confidence) * 100:.0f}%"
                     labels.append(
                         (
                             label,
                             int(obj_meta.rect_params.left),
-                            max(0, int(obj_meta.rect_params.top) - 28),
+                            max(0, int(obj_meta.rect_params.top) - 26),
                         )
                     )
+                    # Use one display-meta title layer to avoid duplicate/missing titles.
+                    obj_meta.text_params.display_text = ""
+                    obj_meta.text_params.set_bg_clr = 0
                 if labels:
                     display_meta = pyds.nvds_acquire_display_meta_from_pool(batch_meta)
                     display_meta.num_labels = len(labels)
@@ -968,99 +1179,84 @@ maintain-aspect-ratio=0
                         text_params.x_offset = left
                         text_params.y_offset = top
                         text_params.font_params.font_name = "Sans"
-                        text_params.font_params.font_size = 18
+                        text_params.font_params.font_size = 16
                         text_params.font_params.font_color.set(1.0, 1.0, 1.0, 1.0)
-                        text_params.set_bg_clr = 1
-                        text_params.text_bg_clr.set(0.0, 0.0, 0.0, 0.75)
+                        text_params.set_bg_clr = 0
                     pyds.nvds_add_display_meta_to_frame(frame_meta, display_meta)
-                self._queue_recognition_evidence(
-                    tracks,
-                    face_tracks,
-                    int(frame_meta.frame_num),
-                    int(getattr(buffer, "pts", -1)),
-                )
+                # This is deliberately stamped after inference and before nvdsosd,
+                # so the timestamp is part of RTSP/HLS and not a dashboard-only UI.
+                self._add_live_timestamp(batch_meta, frame_meta)
                 payload = {
-                    "camera": "safety_mock",
+                    "camera": self.config["input"].get("camera", "safety_camera"),
+                    "run_id": self.run_id,
                     "frame_num": int(frame_meta.frame_num),
                     "timestamp": time.time(),
                     "bbox_count": len(boxes),
+                    "fire_smoke_count": len(fire_smoke_detections),
+                    "event_id": self.event_store.active_event_id,
+                    "event_state": self.event_store.state.value,
+                    "fire_smoke_events": [
+                        {
+                            "operation": item.operation,
+                            "event_id": item.event_id,
+                            "label": getattr(item, "label", "smoking"),
+                        }
+                        for item in fire_smoke_transitions
+                    ],
+                    "fire_smoke_active_event_ids": self.fire_smoke_events.active_event_ids,
                     "recognition_enabled": self.recognition.enabled,
                     "tracks": tracks,
                     "face_tracks": list(face_tracks.values()),
                     "boxes": [
-                        {"label": self.config["model"]["label"], "confidence": round(float(box[4]), 5),
-                         "left": round(float(box[0]), 2), "top": round(float(box[1]), 2),
-                         "right": round(float(box[2]), 2), "bottom": round(float(box[3]), 2)}
-                        for box in boxes
+                        {
+                            "label": "person",
+                            "behavior": "smoking",
+                            "track_id": detection.track_id,
+                            "confidence": round(float(detection.score), 5),
+                            "left": round(float(detection.person_bbox[0]), 2),
+                            "top": round(float(detection.person_bbox[1]), 2),
+                            "right": round(float(detection.person_bbox[2]), 2),
+                            "bottom": round(float(detection.person_bbox[3]), 2),
+                            "model_roi": {
+                                "left": round(float(detection.model_roi_bbox[0]), 2),
+                                "top": round(float(detection.model_roi_bbox[1]), 2),
+                                "right": round(float(detection.model_roi_bbox[2]), 2),
+                                "bottom": round(float(detection.model_roi_bbox[3]), 2),
+                            },
+                        }
+                        for detection in detection_results
+                    ],
+                    "fire_smoke": [
+                        {
+                            "label": detection.label,
+                            "confidence": round(float(detection.score), 5),
+                            "left": round(float(detection.bbox[0]), 2),
+                            "top": round(float(detection.bbox[1]), 2),
+                            "right": round(float(detection.bbox[2]), 2),
+                            "bottom": round(float(detection.bbox[3]), 2),
+                        }
+                        for detection in fire_smoke_detections
                     ],
                 }
                 self.socket.send_json(payload, flags=zmq.NOBLOCK)
                 self.frame_count += 1
                 if self.frame_count % 100 == 0:
-                    LOG.info("frames=%d bbox_count=%d", self.frame_count, self.last_bbox_count)
+                    LOG.info(
+                        "frames=%d smoking_bbox_count=%d fire_smoke_count=%d",
+                        self.frame_count,
+                        self.last_bbox_count,
+                        self.last_fire_smoke_count,
+                    )
                 frame_list = frame_list.next
             except StopIteration:
                 break
-            except Exception as exc:  # keep video flowing if one malformed tensor arrives
+            except Exception as exc:  # keep video flowing if one malformed ROI arrives
                 message = str(exc)
-                if message != self.last_tensor_error:
-                    LOG.exception("Tensor decode failed: %s", message)
-                    self.last_tensor_error = message
+                if message != self.last_behavior_error:
+                    LOG.exception("Analysis branch failed: %s", message)
+                    self.last_behavior_error = message
                 break
         return Gst.PadProbeReturn.OK
-
-    def _on_snapshot_sample(self, sink: Gst.Element) -> Gst.FlowReturn:
-        sample = sink.emit("pull-sample")
-        if sample is None:
-            return Gst.FlowReturn.OK
-        buffer = sample.get_buffer()
-        if buffer is None:
-            return Gst.FlowReturn.OK
-        success, mapped = buffer.map(Gst.MapFlags.READ)
-        if not success:
-            return Gst.FlowReturn.OK
-        try:
-            content = bytes(mapped.data)
-            pts = int(getattr(buffer, "pts", -1))
-            self.face_engine.update_jpeg(content, pts)
-            ready: list[dict[str, Any]] = []
-            waiting: list[dict[str, Any]] = []
-            for request in self._pending_output_evidence:
-                source_pts = int(request["source_pts"])
-                if (source_pts < 0 and pts >= 0) or (pts >= 0 and pts >= source_pts):
-                    ready.append(request)
-                else:
-                    waiting.append(request)
-            self._pending_output_evidence = waiting
-            for request in ready:
-                event_id = self.event_store.active_event_id
-                if event_id and event_id not in self._event_snapshot_saved_ids:
-                    self.event_store.save_snapshot(content, time.monotonic())
-                    self._event_snapshot_saved_ids.add(event_id)
-                for name in request["recognized_names"]:
-                    safe_name = "".join(
-                        char if char.isalnum() or char in "-_" else "_" for char in name
-                    )
-                    path = self.snapshot_recognized_dir / (
-                        f"{safe_name}-frame-{int(request['frame']):08d}.jpg"
-                    )
-                    if name not in self._recognized_snapshot_names:
-                        path.write_bytes(content)
-                        self._recognized_snapshot_names.add(name)
-                        self.snapshot_count += 1
-                if request["unknown_track_ids"]:
-                    path = self.snapshot_unrecognized_dir / (
-                        f"frame-{int(request['frame']):08d}-"
-                        f"{self.snapshot_count:06d}.jpg"
-                    )
-                    path.write_bytes(content)
-                    self._unknown_snapshot_frames[path] = set(
-                        request["unknown_track_ids"]
-                    )
-                    self.snapshot_count += 1
-        finally:
-            buffer.unmap(mapped)
-        return Gst.FlowReturn.OK
 
     def _on_bus_message(self, bus: Gst.Bus, message: Gst.Message) -> None:
         if message.type == Gst.MessageType.ERROR:
@@ -1154,6 +1350,8 @@ maintain-aspect-ratio=0
         try:
             self._start_mock_publisher()
             self.pipeline.set_state(Gst.State.PLAYING)
+            self._write_runtime_status()
+            GLib.timeout_add_seconds(2, self._write_runtime_status)
             if str(self.config["input"].get("mode", "rtsp")) == "mock" and not bool(
                 self.config["input"].get("mock_loop", True)
             ):
@@ -1164,12 +1362,36 @@ maintain-aspect-ratio=0
             self.loop.run()
         finally:
             self._stop_mock_publisher()
-            self.face_engine.close()
+            self._stop_analysis_worker()
+            try:
+                self.face_engine.close()
+            except Exception:
+                LOG.exception("face lifecycle close failed; continuing shutdown")
             self.pipeline.set_state(Gst.State.NULL)
-            self.event_store.close()
+            try:
+                self.event_store.close()
+            except Exception:
+                LOG.exception("smoking event close failed; continuing shutdown")
+            try:
+                self.fire_smoke_events.close()
+            except Exception:
+                LOG.exception("fire/smoke event close failed; continuing shutdown")
+            try:
+                self.evidence.close()
+            except Exception:
+                LOG.exception("evidence close failed; continuing shutdown")
             self.socket.close(0)
-            LOG.info("pipeline stopped; frames=%d snapshots=%d uptime=%.1fs", self.frame_count, self.snapshot_count,
-                     time.monotonic() - self.started_at)
+            try:
+                self.status_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            LOG.info(
+                "pipeline stopped; camera=%s run_id=%s frames=%d uptime=%.1fs",
+                self.config["input"].get("camera", "unknown"),
+                self.run_id,
+                self.frame_count,
+                time.monotonic() - self.started_at,
+            )
 
     def _stop_after_duration(self) -> bool:
         self.loop.quit()
@@ -1179,11 +1401,19 @@ maintain-aspect-ratio=0
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=Path, default=Path(__file__).with_name("config.yaml"))
+    parser.add_argument("--camera-id", type=str, default=None)
+    parser.add_argument("--run-id", type=str, default=None)
+    parser.add_argument("--worker-epoch", type=str, default=None)
     parser.add_argument("--duration", type=int, default=None)
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     Gst.init(None)
-    pipeline = SafetyPipeline(load_config(args.config), args.config)
+    run_id = args.run_id or f"{time.strftime('%Y%m%dT%H%M%S', time.gmtime())}-{uuid.uuid4().hex[:8]}"
+    config = load_config(args.config, args.camera_id)
+    config.setdefault("runtime", {})["worker_epoch"] = (
+        args.worker_epoch or f"worker-{uuid.uuid4().hex[:8]}"
+    )
+    pipeline = SafetyPipeline(config, args.config, run_id)
     for signum in (signal.SIGINT, signal.SIGTERM):
         signal.signal(signum, lambda *_: pipeline.loop.quit())
     pipeline.run(args.duration)

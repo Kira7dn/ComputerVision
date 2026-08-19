@@ -3,26 +3,103 @@ runtime:
   mediamtx_config: /opt/camera-deepstream/mediamtx/mediamtx.yml
   mediamtx_binary: /opt/camera-deepstream/mediamtx/mediamtx
 
-input:
-  mode: mock
-  camera: safety_camera
-  rtsp_url: rtsp://127.0.0.1:8554/safety_mock
-  mock_video: /mnt/d/BusinessAnalyze/Camera/assets/fixtures/mock_videos/face-recognition/segments/01_P1E_S1_C1.mp4
-  mock_loop: true
-  width: 1920
-  height: 1080
-  latency_ms: 200
+cameras:
+  - id: camera_face
+    source:
+      type: mock
+      url: rtsp://127.0.0.1:8554/face_mock
+      mock_video: /mnt/d/BusinessAnalyze/Camera/assets/fixtures/mock_videos/face-recognition/segments/01_P1E_S1_C1.mp4
+      loop: true
+      width: 1920
+      height: 1080
+      latency_ms: 200
+    output:
+      rtsp_url: rtsp://127.0.0.1:8554/face_bbox
+    functions:
+      trace: true
+      face_recognition: true
+      smoking_behavior: false
+  - id: camera_safety
+    source:
+      type: mock
+      url: rtsp://127.0.0.1:8554/safety_mock
+      mock_video: /mnt/d/BusinessAnalyze/Camera/assets/fixtures/mock_videos/smoker/samples/part1/bucket11.mp4
+      loop: true
+      width: 1920
+      height: 1080
+      latency_ms: 200
+    output:
+      rtsp_url: rtsp://127.0.0.1:8554/safety_bbox
+    functions:
+      trace: true
+      face_recognition: false
+      smoking_behavior: true
+      fire_smoke: true
+  - id: camera_dahua
+    source:
+      type: rtsp
+      url: rtsp://192.168.100.229:554/cam/realmonitor?channel=3&subtype=0
+      username_env: FRIGATE_DAHUA_USER
+      password_env: FRIGATE_DAHUA_PASSWORD
+      codec: hevc
+      loop: true
+      width: 1920
+      height: 1080
+      latency_ms: 200
+    output:
+      rtsp_url: rtsp://127.0.0.1:8554/dahua_bbox
+    functions:
+      trace: true
+      face_recognition: false
+      smoking_behavior: true
+      fire_smoke: true
 
-output:
-  rtsp_url: rtsp://127.0.0.1:8554/safety_bbox
+smoking_behavior:
+  onnx_path: /mnt/d/BusinessAnalyze/Camera/assets/models/smoking_behavior/model.onnx
+  input_width: 224
+  input_height: 224
+  smoking_threshold: 0.60
+  padding_ratio: 0.20
+  interval_ms: 400
+  confirmation_hits: 2
+  confirmation_window: 4
+  clear_hits: 4
+  track_grace_frames: 30
+  bbox_smoothing_alpha: 0.35
+  providers:
+    - CUDAExecutionProvider
+    - CPUExecutionProvider
+  require_gpu_provider: true
 
-model:
-  onnx_path: /mnt/d/BusinessAnalyze/Camera/assets/models/smoking/best.onnx
+fire_smoke:
+  # Exported from assets/models/fire_smoke/best.pt for the WSL runtime.
+  onnx_path: /mnt/d/BusinessAnalyze/Camera/assets/models/fire_smoke/best.onnx
   input_width: 640
   input_height: 640
-  confidence: 0.10
-  iou: 0.45
-  label: cigarette
+  fire_threshold: 0.25
+  smoke_threshold: 0.20
+  interval_ms: 300
+  detection_hold_seconds: 1.0
+  nms_iou: 0.45
+  max_detections_per_label: 1
+  bbox_smoothing_alpha: 0.35
+  bbox_smoothing_clear_seconds: 3.0
+  confirmation_hits: 2
+  confirmation_window: 4
+  clear_seconds: 3.0
+  trace_interval_ms: 500
+  # camera_safety has a bright lamp at the far left; fire is expected near the
+  # central burner while smoke may occupy a wider plume.
+  class_rois:
+    fire: [0.30, 0.05, 0.70, 0.80]
+    smoke: [0.05, 0.00, 0.80, 0.95]
+  labels:
+    - fire
+    - smoke
+  providers:
+    - CUDAExecutionProvider
+    - CPUExecutionProvider
+  require_gpu_provider: true
 
 person:
   onnx_path: /mnt/d/BusinessAnalyze/Camera/assets/models/yolov9-t-320.onnx
@@ -32,6 +109,8 @@ person:
   confidence: 0.05
   iou: 0.45
   label: person
+  tracking:
+    bbox_smoothing_alpha: 0.30
 
 recognition:
   enabled: true
@@ -48,10 +127,13 @@ recognition:
     detector_model: /mnt/d/BusinessAnalyze/Camera/assets/models/face/facedet.onnx
     recognizer_model: /mnt/d/BusinessAnalyze/Camera/assets/models/face/arcface.onnx
     library_directory: /mnt/d/BusinessAnalyze/Camera/deepstream_safety/face_library
-    trace_directory: /mnt/d/BusinessAnalyze/Camera/.tmp/deepstream-safety/recognition
     detection_threshold: 0.5
     min_area: 1200
-    detect_interval_frames: 15
+    recognition_interval_ms: 400
+    providers:
+      - CUDAExecutionProvider
+      - CPUExecutionProvider
+    require_gpu_provider: true
   lpr:
     detect_fps: 5
     recognition_threshold: 0.9
@@ -62,14 +144,19 @@ recognition:
 metadata:
   zmq_pub_url: tcp://127.0.0.1:5555
 
+evidence:
+  directory: /mnt/d/BusinessAnalyze/Camera/.tmp/deepstream-safety
+  prefix: snapshots-acceptance
+  snapshot_interval_ms: 1000
+
 snapshots:
   enabled: true
-  directory: /mnt/d/BusinessAnalyze/Camera/.tmp/deepstream-safety/snapshots
   min_interval_ms: 1000
 
 events:
   enabled: true
   camera: safety_mock
-  confirm_seconds: 1.0
+  # smoking_behavior already confirms two ROI scores in a four-attempt window.
+  confirm_seconds: 0.0
   clear_seconds: 5.0
-  directory: /mnt/d/BusinessAnalyze/Camera/.tmp/deepstream-safety/events
+  trace_interval_ms: 400

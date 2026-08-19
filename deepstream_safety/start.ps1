@@ -15,11 +15,54 @@ function Invoke-WSL([string]$Command) {
 
 switch ($Action) {
     'start' {
-        Invoke-WSL "mkdir -p $Runtime/logs; if [ ! -x $Runtime/mediamtx/mediamtx ]; then echo 'MediaMTX is not installed. Run the setup command from docs/DeepStream.md.' >&2; exit 2; fi; nohup $Runtime/mediamtx/mediamtx $Root/deepstream_safety/mediamtx.yml >$Runtime/logs/mediamtx.log 2>&1 & nohup python3 $Root/deepstream_safety/dashboard_server.py >$Runtime/logs/dashboard.log 2>&1 & sleep 2; setsid -f bash -c 'exec python3 $Root/deepstream_safety/pipeline.py --config $Root/deepstream_safety/config.yaml >$Runtime/logs/pipeline.log 2>&1 </dev/null'; echo started"
         Write-Output 'Dashboard: http://localhost:8080/dashboard.html'
+        Start-Process 'http://localhost:8080/dashboard.html'
+        $startCommand = @'
+set -e -o pipefail
+mkdir -p __RUNTIME__/logs
+mkdir -p __RUNTIME__/status
+if [ ! -x __RUNTIME__/mediamtx/mediamtx ]; then
+  echo 'MediaMTX is not installed. Run the setup command from docs/DeepStream.md.' >&2
+  exit 2
+fi
+
+__RUNTIME__/mediamtx/mediamtx __ROOT__/deepstream_safety/mediamtx.yml >__RUNTIME__/logs/mediamtx.log 2>&1 &
+python3 __ROOT__/deepstream_safety/dashboard_server.py >__RUNTIME__/logs/dashboard.log 2>&1 &
+
+cleanup() {
+  pkill -f '^python3 /mnt/d/BusinessAnalyze/Camera/deepstream_safety/dashboard_server.py' 2>/dev/null || true
+  pkill -f '^/usr/bin/python3 /mnt/d/BusinessAnalyze/Camera/deepstream_safety/dashboard_server.py' 2>/dev/null || true
+  pkill -f '^python3 /mnt/d/BusinessAnalyze/Camera/deepstream_safety/multi_runner.py' 2>/dev/null || true
+  pkill -f '^/usr/bin/python3 /mnt/d/BusinessAnalyze/Camera/deepstream_safety/multi_runner.py' 2>/dev/null || true
+  pkill -f '^python3 /mnt/d/BusinessAnalyze/Camera/deepstream_safety/pipeline.py' 2>/dev/null || true
+  pkill -f '^/usr/bin/python3 /mnt/d/BusinessAnalyze/Camera/deepstream_safety/pipeline.py' 2>/dev/null || true
+  pkill -f '^ffmpeg .*rtsp://127.0.0.1:8554/face_mock' 2>/dev/null || true
+  pkill -f '^/usr/bin/ffmpeg .*rtsp://127.0.0.1:8554/face_mock' 2>/dev/null || true
+  pkill -f '^ffmpeg .*rtsp://127.0.0.1:8554/safety_mock' 2>/dev/null || true
+  pkill -f '^/usr/bin/ffmpeg .*rtsp://127.0.0.1:8554/safety_mock' 2>/dev/null || true
+  pkill -f '^/opt/camera-deepstream/mediamtx/mediamtx' 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
+
+curl --retry 30 --retry-delay 1 --retry-connrefused -fsS --max-time 2 \
+  http://127.0.0.1:8080/dashboard.html >/dev/null
+echo 'runtime-ready dashboard=http://localhost:8080/dashboard.html'
+export LD_LIBRARY_PATH=/usr/local/lib/python3.10/dist-packages/nvidia/cudnn/lib:/usr/local/lib/python3.10/dist-packages/nvidia/cublas/lib:/usr/local/lib/python3.10/dist-packages/nvidia/cuda_nvrtc/lib:/usr/lib/wsl/lib:/usr/local/cuda/lib64:/usr/local/lib/python3.10/dist-packages/tensorrt_libs
+python3 __ROOT__/deepstream_safety/multi_runner.py --config __ROOT__/deepstream_safety/config.yaml 2>&1 | tee -a __RUNTIME__/logs/pipeline.log
+'@
+        $startCommand = $startCommand.Replace('__RUNTIME__', $Runtime).Replace('__ROOT__', $Root)
+        $startCommand = $startCommand -replace "`r`n", "`n"
+        try {
+            Invoke-WSL $startCommand
+        }
+        finally {
+            & wsl.exe -d $Distro --user root -- bash -lc "pkill -f '^python3 /mnt/d/BusinessAnalyze/Camera/deepstream_safety/dashboard_server.py' 2>/dev/null || true; pkill -f '^/usr/bin/python3 /mnt/d/BusinessAnalyze/Camera/deepstream_safety/dashboard_server.py' 2>/dev/null || true; pkill -f '^python3 /mnt/d/BusinessAnalyze/Camera/deepstream_safety/multi_runner.py' 2>/dev/null || true; pkill -f '^/usr/bin/python3 /mnt/d/BusinessAnalyze/Camera/deepstream_safety/multi_runner.py' 2>/dev/null || true; pkill -f '^python3 /mnt/d/BusinessAnalyze/Camera/deepstream_safety/pipeline.py' 2>/dev/null || true; pkill -f '^/usr/bin/python3 /mnt/d/BusinessAnalyze/Camera/deepstream_safety/pipeline.py' 2>/dev/null || true; pkill -f '^ffmpeg .*rtsp://127.0.0.1:8554/face_mock' 2>/dev/null || true; pkill -f '^ffmpeg .*rtsp://127.0.0.1:8554/face_mock' 2>/dev/null || true; pkill -f '^ffmpeg .*rtsp://127.0.0.1:8554/safety_mock' 2>/dev/null || true; pkill -f '^/usr/bin/ffmpeg .*rtsp://127.0.0.1:8554/safety_mock' 2>/dev/null || true; pkill -f '^/opt/camera-deepstream/mediamtx/mediamtx' 2>/dev/null || true"
+        }
     }
     'stop' {
-        Invoke-WSL "pkill -f 'python3 /mnt/d/BusinessAnalyze/Camera/deepstream_safety/[p]ipeline.py' 2>/dev/null || true; pkill -f '[d]ashboard_server.py' 2>/dev/null || true; pkill -f '[p]ython3 -m http.server 8080' 2>/dev/null || true; pkill -x ffmpeg 2>/dev/null || true; pkill -x mediamtx 2>/dev/null || true; echo stopped"
+        $stopCommand = "pkill -f '^python3 /mnt/d/BusinessAnalyze/Camera/deepstream_safety/pipeline.py' 2>/dev/null || true; pkill -f '^/usr/bin/python3 /mnt/d/BusinessAnalyze/Camera/deepstream_safety/pipeline.py' 2>/dev/null || true; pkill -f '^python3 /mnt/d/BusinessAnalyze/Camera/deepstream_safety/multi_runner.py' 2>/dev/null || true; pkill -f '^/usr/bin/python3 /mnt/d/BusinessAnalyze/Camera/deepstream_safety/multi_runner.py' 2>/dev/null || true; pkill -f '^python3 /mnt/d/BusinessAnalyze/Camera/deepstream_safety/dashboard_server.py' 2>/dev/null || true; pkill -f '^/usr/bin/python3 /mnt/d/BusinessAnalyze/Camera/deepstream_safety/dashboard_server.py' 2>/dev/null || true; pkill -f '^python3 -m http.server 8080' 2>/dev/null || true; pkill -f '^ffmpeg .*rtsp://127.0.0.1:8554/face_mock' 2>/dev/null || true; pkill -f '^/usr/bin/ffmpeg .*rtsp://127.0.0.1:8554/face_mock' 2>/dev/null || true; pkill -f '^ffmpeg .*rtsp://127.0.0.1:8554/safety_mock' 2>/dev/null || true; pkill -f '^/usr/bin/ffmpeg .*rtsp://127.0.0.1:8554/safety_mock' 2>/dev/null || true; pkill -f '^/opt/camera-deepstream/mediamtx/mediamtx' 2>/dev/null || true"
+        & wsl.exe -d $Distro --user root -- bash -lc $stopCommand
+        Write-Output 'stopped'
     }
     'status' {
         Invoke-WSL "pgrep -af '[m]ediamtx|[d]ashboard_server.py|[p]ython3 -m http.server 8080|[f]fmpeg.*safety_mock|[p]ipeline.py' || true; tail -n 20 $Runtime/logs/pipeline.log 2>/dev/null || true"
