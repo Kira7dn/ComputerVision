@@ -1,0 +1,16 @@
+profile: base
+
+runtime:
+  analysis_result_max_age_seconds: 2.0
+  status_directory: /opt/camera-safety/status
+  state_directory: /opt/camera-safety/state
+
+evidence:
+  directory: /opt/camera-safety/evidence
+  prefix: snapshots-acceptance
+
+snapshots:
+  enabled: true
+
+notifications:
+  enabled: false

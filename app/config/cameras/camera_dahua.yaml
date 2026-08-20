@@ -1,0 +1,4 @@
+id: camera_dahua
+functions:
+  smoking_behavior: true
+  fire_smoke: true

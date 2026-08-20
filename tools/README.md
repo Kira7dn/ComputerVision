@@ -5,9 +5,9 @@ Root `tools/` chỉ giữ package marker. Mọi tool được phân loại theo 
 | Folder | Nội dung |
 | --- | --- |
 | `runtime/` | Validator runtime và các validator chuyên biệt/legacy |
-| `tests/unit/` | Unit tests không cần Docker |
-| `tests/integration/` | Quy ước và điểm vào integration test |
-| `tests/e2e/` | Direct-MP4 LPR tracking và runtime enrichment test thực tế |
+| `tests/unit/` | Legacy helper tests only; Camera Safety tests live under `app/tests/unit/` |
+| `tests/integration/` | Legacy helper documentation only |
+| `tests/e2e/` | Removed Frigate-specific runners; Camera Safety E2E lives under `app/tests/e2e/` |
 | `reporting/` | Tổng hợp và xuất report |
 | `fixtures/` | Manifest và fixture builder |
 | `annotations/` | Export/import annotation thủ công |
@@ -17,9 +17,8 @@ Root `tools/` chỉ giữ package marker. Mọi tool được phân loại theo 
 ## Entry point chuẩn
 
 ```powershell
-python tools/tests/e2e/run_platform_runtime_test.py
-python -m pytest tools/tests/unit -q
-python tools/reporting/summarize_platform_runtime.py <run1> <run2> <run3> --output <report>
+python app/tests/e2e/run_camera_safety_e2e.py
+python -m pytest app/tests -q
 ```
 
 Mỗi lần chạy tự ghi vào `.tmp/platform-runtime/<timestamp>/`; không truyền output flag và không

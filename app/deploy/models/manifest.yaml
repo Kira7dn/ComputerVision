@@ -1,0 +1,24 @@
+schema_version: 1
+runtime: ls-vision
+deepstream: "7.1"
+artifacts:
+  - id: person-yolov9-t320
+    path: models/person-yolov9-t320-fixed.engine
+    sha256: ""
+    required: true
+  - id: face-detector
+    path: models/face/facedet.onnx
+    sha256: ""
+    required: true
+  - id: face-recognizer
+    path: models/face/arcface.onnx
+    sha256: ""
+    required: true
+  - id: smoking-behavior
+    path: models/smoking_behavior/model.onnx
+    sha256: ""
+    required: true
+  - id: fire-smoke
+    path: models/fire_smoke/best.onnx
+    sha256: ""
+    required: true

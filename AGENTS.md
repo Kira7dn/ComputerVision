@@ -2,19 +2,19 @@
 
 ## Current architecture boundary
 
-The current Camera runtime is the WSL-hosted DeepStream stack under `deepstream_safety/`:
+The current Camera runtime is the WSL-hosted DeepStream stack under `app/`:
 
-`config.yaml` -> `multi_runner.py` -> one `pipeline.py` worker per camera -> MediaMTX RTSP output
-and `dashboard_server.py` on `http://127.0.0.1:18080`.
+`config/dev.yaml` -> `camera_safety.runner` -> one `camera_worker` per camera -> MediaMTX RTSP output
+and `camera_safety.interfaces.dashboard_api` on `http://127.0.0.1:18080`.
 
-Camera functions are selected from `deepstream_safety/config.yaml` per camera. The current
+Camera functions are selected from `app/config/dev.yaml` or `app/config/production.yaml`. The current
 functions include face recognition, smoking behavior, fire/smoke detection, and trace/evidence.
 `EvidenceStore` owns run evidence under `.tmp/deepstream-safety`.
 
 The nested `frigate/` tree and the old Docker/Frigate tracker architecture are not part of the
 current Camera runtime. Do not use them as a startup path, test gate, media owner, event store, or
 source of truth for DeepStream changes. Do not add Camera guidance that routes media through
-Frigate, `/media/frigate`, Frigate APIs, or `deploy/run.ps1`.
+Frigate, `/media/frigate`, or Frigate APIs.
 
 ## Shell and encoding
 
@@ -45,16 +45,16 @@ only `D:\BusinessAnalyze\Camera\.tmp`.
 
 ## Configuration and runtime ownership
 
-- `deepstream_safety/config.yaml` is the source of truth for camera IDs, sources, outputs, and
+- `app/config/*.yaml` is the source of truth for camera IDs, sources, outputs, and
   enabled functions.
-- `deepstream_safety/multi_runner.py` creates one worker per configured camera and one shared run ID.
-- `deepstream_safety/pipeline.py` owns inference, tracking/annotation, RTSP output, and function
+- `camera_safety.runner` creates one worker per configured camera and one shared run ID.
+- `camera_safety.application.camera_worker` owns inference, tracking/annotation, RTSP output, and function
   dispatch for one camera.
-- `deepstream_safety/start.ps1` is the WSL launcher for MediaMTX, dashboard, mock inputs, and all
+- `app/deploy/powershell/start.ps1` is the operator launcher for native WSL development or Docker production.
   DeepStream workers.
 - `package.json` exposes `npm run camera:start`, `npm run camera:stop`, and
   `npm run camera:status`.
-- `deepstream_safety/dashboard_server.py` serves the dashboard at `http://127.0.0.1:18080`.
+- `camera_safety.interfaces.dashboard_api` serves the dashboard at `http://127.0.0.1:18080`.
 - `.tmp/deepstream-safety/snapshots-acceptance-<run-id>` contains the manifest, SQLite idempotency
   index, event records, traces, and accepted snapshots for a run.
 
@@ -71,20 +71,19 @@ npm run camera:stop
 Equivalent direct launcher commands:
 
 ```powershell
-.\deepstream_safety\start.ps1 start
-.\deepstream_safety\start.ps1 status
-.\deepstream_safety\start.ps1 stop
+ .\app\deploy\powershell\start.ps1 -Action start -Mode Dev
+ .\app\deploy\powershell\start.ps1 -Action status -Mode Dev
+ .\app\deploy\powershell\start.ps1 -Action stop -Mode Dev
 ```
 
-`camera:start` starts WSL services and the configured `camera_face` and `camera_safety` workers in
-the foreground. The terminal remains attached to the worker log and appends the same output to
-`/opt/camera-deepstream/logs/pipeline.log`. `Ctrl+C` ends the foreground client; use
+`camera:start` starts WSL services and the configured workers in native WSL development mode.
+Logs are written under `/opt/camera-safety-dev/logs`. Use
 `npm run camera:stop` to terminate the WSL services reliably. A successful launcher message is not
 sufficient proof of health; verify the process list, dashboard HTTP 200, RTSP output, and recent
 pipeline log activity.
 
-Do not start individual workers in parallel with `multi_runner.py` unless isolating a failure.
-Do not use Docker compose, `deploy/run.ps1`, or Frigate services for this runtime.
+Do not start individual workers in parallel with `camera_safety.runner` unless isolating a failure.
+Do not use the old Frigate deployment or its services for this runtime.
 
 ## Targeted tests
 
@@ -107,12 +106,12 @@ For a failed test, rerun only its file or node with verbose output:
 ## Static checks
 
 ```powershell
-& $python -m ruff check deepstream_safety tools/tests
-& $python -m compileall -q deepstream_safety
+& $python -m ruff check app/src tools/tests
+& $python -m compileall -q app/src
 
 $parseErrors = $null
 [System.Management.Automation.Language.Parser]::ParseFile(
-  (Resolve-Path 'deepstream_safety\start.ps1'),
+  (Resolve-Path 'app\deploy\powershell\start.ps1'),
   [ref]$null,
   [ref]$parseErrors
 ) > $null

@@ -1,0 +1,4 @@
+id: camera_safety
+functions:
+  smoking_behavior: true
+  fire_smoke: true

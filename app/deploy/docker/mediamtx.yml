@@ -1,0 +1,15 @@
+logLevel: info
+rtsp: true
+rtspAddress: :8554
+hls: true
+hlsAddress: :8888
+hlsVariant: mpegts
+hlsSegmentDuration: 3s
+hlsSegmentCount: 6
+hlsAlwaysRemux: true
+hlsAllowOrigin: http://127.0.0.1:18080
+webrtc: true
+webrtcAddress: :8889
+webrtcAllowOrigin: http://127.0.0.1:18080
+paths:
+  all_others: {}

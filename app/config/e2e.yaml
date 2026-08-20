@@ -1,0 +1,28 @@
+extends: production.yaml
+profile: e2e
+
+cameras:
+  - id: camera_face
+    source:
+      type: mock
+      url: rtsp://mediamtx:8554/face_mock
+      mock_video: /opt/camera-safety/e2e-assets/fixtures/mock_videos/face-recognition/segments/01_P1E_S1_C1.mp4
+      loop: true
+    output:
+      rtsp_url: rtsp://mediamtx:8554/face_bbox
+  - id: camera_safety
+    source:
+      type: mock
+      url: rtsp://mediamtx:8554/safety_mock
+      mock_video: /opt/camera-safety/e2e-assets/fixtures/mock_videos/smoker/samples/part1/bucket11.mp4
+      loop: true
+    output:
+      rtsp_url: rtsp://mediamtx:8554/safety_bbox
+  - id: camera_dahua
+    source:
+      type: mock
+      url: rtsp://mediamtx:8554/safety_mock
+      mock_video: /opt/camera-safety/e2e-assets/fixtures/mock_videos/smoker/samples/part1/bucket11.mp4
+      loop: true
+    output:
+      rtsp_url: rtsp://mediamtx:8554/dahua_bbox

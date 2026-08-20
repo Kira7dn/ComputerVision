@@ -30,7 +30,7 @@ Các thành phần đã có và được giữ làm nền tảng:
 
 - Frigate hiện vẫn chạy toàn bộ pipeline trong một container; kiến trúc đích tách lane
   capture/detection/tracking thành `tracker` edge và giữ Event/publication trong Frigate main.
-- `deploy/config.yaml` là cấu hình runtime hiện hành.
+- `app/config/production.yaml` là cấu hình runtime DeepStream hiện hành; `server/` vẫn là boundary ADAS/FTP/archive độc lập.
 - Hai pipeline đang chạy là `car_camera` cho LPR và `face_camera` cho face recognition.
 
 Tối ưu được thực hiện trực tiếp trong pipeline Frigate hiện có; chi tiết vận hành nằm ở tài liệu

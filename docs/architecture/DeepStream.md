@@ -36,7 +36,8 @@ bbox lên live video.
 
 ## 2. Trạng thái audit hiện tại
 
-Thư mục `app/` hiện vẫn là flat script layout, chưa phải production package.
+`app/src/camera_safety/` hiện là production package; implementation DeepStream
+được giữ dưới package boundary để characterization behavior không đổi.
 Các rủi ro bắt buộc xử lý trước khi gọi production-ready:
 
 | Mức | Vấn đề | Hậu quả |
@@ -44,7 +45,7 @@ Các rủi ro bắt buộc xử lý trước khi gọi production-ready:
 | P0 | Working tree đang ở trạng thái move chưa hoàn tất; launcher, package script, test và một số config còn tham chiếu đường dẫn cũ | Có thể commit thiếu runtime hoặc khởi động nhầm source |
 | P0 | `pipeline.py` gần 2.000 dòng, trộn GStreamer, model, tracking, event, evidence, notification, status và shutdown | Khó cô lập lỗi, khó test, dễ làm thay đổi một lane ảnh hưởng lane khác |
 | P0 | Dashboard bind `0.0.0.0`, MediaMTX cho phép origin rộng, chưa có auth/TLS/authorization | Event, evidence và live endpoint có thể bị truy cập ngoài phạm vi |
-| P1 | `app/` chưa có package boundary và chưa có test tree tương ứng | Import phụ thuộc chạy script từ đúng working directory |
+| P1 | DeepStream worker legacy vẫn là compatibility implementation lớn trong package | Tiếp tục tách probe/orchestrator theo bounded change; không đổi event semantics |
 | P1 | Dependency runtime DeepStream/GStreamer/pyds/CUDA chưa có manifest production đầy đủ | Không reproducible khi dựng máy mới |
 | P1 | Config chứa path `/mnt/d`, `/opt`, camera IP và profile mock/prod trong cùng file | Deployment phụ thuộc máy phát triển, khó quản lý environment |
 | P1 | Evidence, SQLite, JPEG annotation và thumbnail nằm chung một service/file layout | API, storage và lifecycle bị kết dính; đọc trên WSL mount dễ chậm |
@@ -57,8 +58,9 @@ Static audit hiện tại của `app/`:
 - Ruff: pass.
 - YAML parse: pass.
 - PowerShell parser: pass.
-- Runtime acceptance của `app/`: chưa được công nhận cho tới khi Phase 0
-  hoàn tất và test/import path chuyển sang package mới.
+- Package/install, config merge, static checks và characterization tests đã pass.
+- Docker và 30-second runtime acceptance vẫn chưa được công nhận khi chưa có
+  Docker daemon/MediaMTX/DeepStream runtime evidence trên máy hiện tại.
 
 ## 3. Folder architecture production
 

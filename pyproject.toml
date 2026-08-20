@@ -104,5 +104,5 @@ extend-select = ["I", "UP", "G", "ASYNC210", "B904"]
 "server/test_sdk_api.py" = ["E402"]
 
 [tool.pytest.ini_options]
-pythonpath = [".", "server", "frigate/src"]
-testpaths = ["server/tests", "tools/tests", "frigate/tests"]
+pythonpath = [".", "app/src", "server"]
+testpaths = ["server/tests", "app/tests"]

@@ -103,11 +103,11 @@ read Frigate configuration, or require Docker.
 Source code:
 
 ```text
-deepstream_safety/pipeline.py
-deepstream_safety/config.yaml
-deepstream_safety/start.ps1
-deepstream_safety/dashboard.html
-deepstream_safety/mediamtx.yml
+app/src/camera_safety/application/camera_worker.py
+app/config/dev.yaml
+app/deploy/powershell/start.ps1
+app/web/dashboard.html
+app/deploy/docker/mediamtx.yml
 ```
 
 The source stays in this workspace. WSL Ubuntu-22.04 provides the DeepStream runtime;
@@ -115,11 +115,11 @@ MediaMTX provides RTSP and WebRTC/HLS transport.
 
 ```powershell
 # Start mock RTSP input, DeepStream inference, MediaMTX and the dashboard
-./deepstream_safety/start.ps1 start
+./app/deploy/powershell/start.ps1 -Action start -Mode Dev
 
 # Check or stop the standalone runtime
-./deepstream_safety/start.ps1 status
-./deepstream_safety/start.ps1 stop
+./app/deploy/powershell/start.ps1 -Action status -Mode Dev
+./app/deploy/powershell/start.ps1 -Action stop -Mode Dev
 ```
 
 Open the dashboard at:
@@ -134,7 +134,7 @@ DeepStream `nvdsosd` on the encoded frame; the dashboard does not draw a second
 Canvas overlay. Detection metadata is also published on ZeroMQ
 `tcp://127.0.0.1:5555` and exposed for monitoring consumers.
 
-Snapshots are enabled in `deepstream_safety/config.yaml` and are written only when
+Snapshots are enabled in `app/config/dev.yaml` and are written only when
 a detection is present, at most once per second:
 
 ```text

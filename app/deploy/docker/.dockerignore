@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+tests/
+.pytest_cache/
+.ruff_cache/
+face_library/
+models/
+evidence/
+state/
+queue/
+logs/

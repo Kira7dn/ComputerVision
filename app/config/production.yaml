@@ -1,0 +1,69 @@
+extends: dev.yaml
+profile: production
+
+runtime:
+  status_directory: /opt/camera-safety/status
+  state_directory: /opt/camera-safety/state
+
+evidence:
+  directory: /opt/camera-safety/evidence
+
+cameras:
+  - id: camera_face
+    source:
+      type: rtsp
+      url: rtsp://camera-face:554/stream
+      username_env: CAMERA_FACE_USER
+      password_env: CAMERA_FACE_PASSWORD
+    output:
+      rtsp_url: rtsp://mediamtx:8554/face_bbox
+    functions:
+      trace: true
+      face_recognition: true
+      smoking_behavior: false
+      fire_smoke: false
+  - id: camera_safety
+    source:
+      type: rtsp
+      url: rtsp://camera-safety:554/stream
+      username_env: CAMERA_SAFETY_USER
+      password_env: CAMERA_SAFETY_PASSWORD
+    output:
+      rtsp_url: rtsp://mediamtx:8554/safety_bbox
+    functions:
+      trace: true
+      face_recognition: false
+      smoking_behavior: true
+      fire_smoke: true
+  - id: camera_dahua
+    source:
+      type: rtsp
+      url: rtsp://camera-dahua:554/stream
+      username_env: CAMERA_DAHUA_USER
+      password_env: CAMERA_DAHUA_PASSWORD
+    output:
+      rtsp_url: rtsp://mediamtx:8554/dahua_bbox
+    functions:
+      trace: true
+      face_recognition: false
+      smoking_behavior: true
+      fire_smoke: true
+
+person:
+  onnx_path: /opt/camera-safety/models/yolov9-t-320.onnx
+  engine_path: /opt/camera-safety/models/person-yolov9-t320-fixed.engine
+
+smoking_behavior:
+  onnx_path: /opt/camera-safety/models/smoking_behavior/model.onnx
+
+fire_smoke:
+  onnx_path: /opt/camera-safety/models/fire_smoke/best.onnx
+
+recognition:
+  face_runtime:
+    detector_model: /opt/camera-safety/models/face/facedet.onnx
+    recognizer_model: /opt/camera-safety/models/face/arcface.onnx
+    library_directory: /opt/camera-safety/face_library
+
+notifications:
+  enabled: true

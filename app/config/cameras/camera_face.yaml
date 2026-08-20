@@ -1,0 +1,3 @@
+id: camera_face
+functions:
+  face_recognition: true
