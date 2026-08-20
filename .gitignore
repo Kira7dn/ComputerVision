@@ -61,3 +61,4 @@ dahua_sdk/
 assets/models/
 runtime/artifacts/
 deepstream_safety/face_library
+output/

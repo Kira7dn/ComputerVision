@@ -23,7 +23,7 @@ def test_config_routes_functions_per_camera() -> None:
     config_path = ROOT / "deepstream_safety" / "config.yaml"
     raw = load_raw_config(config_path)
 
-    assert camera_ids(raw) == ["camera_face", "camera_safety"]
+    assert camera_ids(raw) == ["camera_face", "camera_safety", "camera_dahua"]
     face = resolve_camera_config(raw, "camera_face")
     safety = resolve_camera_config(raw, "camera_safety")
 
@@ -39,6 +39,9 @@ def test_config_routes_functions_per_camera() -> None:
         "smoking_behavior": True,
         "fire_smoke": True,
     }
+    dahua = resolve_camera_config(raw, "camera_dahua")
+    assert "channel=5" in dahua["input"]["rtsp_url"]
+    assert dahua["functions"] == safety["functions"]
 
 
 def test_config_is_valid_yaml_and_has_stable_evidence_contract() -> None:

@@ -24,14 +24,16 @@ bucket11.mp4 --ffmpeg/RTSP--> MediaMTX safety_mock
 The Python process is the only application pipeline. It runs the person detector
 in DeepStream, copies the latest frame/ROI into a bounded analysis queue, and
 keeps model inference and evidence writes out of the GStreamer streaming path.
-It attaches a `smoking` `NvDsObjectMeta` only after temporal confirmation,
-renders the box with `nvdsosd`, and publishes the same metadata on ZeroMQ at
-`tcp://127.0.0.1:5555`.
+It attaches a `smoking` `NvDsObjectMeta` only after temporal confirmation and
+renders bbox/label with `nvdsosd` on the same output buffer that is encoded and
+published. The dashboard does not draw a second Canvas overlay: REST metadata
+is for monitoring/API consumers only. This avoids frame drift between HLS and
+polled metadata.
 
-The WSL2 runtime uses `x264enc` for the final RTSP publish because WSL does not
-expose a usable V4L2 hardware encoder. DeepStream inference and NVOSD remain GPU
-backed; a native Linux deployment can replace only this encoder with
-`nvv4l2h264enc`.
+The output path selects `nvv4l2h264enc` when the DeepStream host exposes it,
+with `x264enc` as an explicit compatibility fallback. The RTSP publisher uses
+TCP transport to avoid UDP packet loss on the local WSL boundary. DeepStream
+inference and NVOSD remain GPU-backed.
 
 ## One-time WSL setup
 
@@ -181,6 +183,7 @@ Each launcher invocation creates one run directory:
   manifest.json
   events.jsonl
   index.sqlite3
+  notifications.sqlite3
   <camera_id>/<function>/<event_id>/
     event.json
     trace.jsonl
@@ -197,3 +200,45 @@ classification is updated in `event.json` and the journal rather than by moving
 directories. `index.sqlite3` claims the idempotency key before writing each
 trace or image, so retries do not duplicate records. Face events start as
 `pending` and finish as `recognized` or `unrecognized` in the same directory.
+
+## Telegram/Zalo notifications
+
+The standalone runtime owns notification delivery in
+`deepstream_safety/notifications.py`. The Telegram and Zalo HTTP contracts are
+adapted from the existing Frigate provider implementation; no Frigate process,
+API, database, or media directory is used at runtime.
+
+Delivery is queued only after an evidence-backed `START` or `END` artifact is
+written. Each worker records provider, recipient, lifecycle, retry attempts,
+status, and error in `notifications.sqlite3` in the same run directory. The
+outbox is idempotent by run, event, lifecycle, provider, and recipient, and a
+cooldown prevents repeated alerts for one camera/function. Provider failures do
+not stop inference or remove event evidence.
+
+The current severity policy is configured in `config.yaml`: fire is `critical`,
+smoke and smoking are `high`, an unrecognized face is `medium`, and a
+recognized face is `info`. Critical/high events go to Telegram and Zalo;
+medium/info face events go to Telegram only. Events without a matching severity
+rule are `low` and are not delivered.
+
+Create `.env.local` from `.env.example`, then enable the channels and global
+notification switch in `deepstream_safety/config.yaml`:
+
+```dotenv
+TELEGRAM_BOT_TOKEN=...
+TELEGRAM_CHAT_ID=...
+ZALO_BOT_TOKEN=...
+ZALO_CHAT_ID=...
+NGROK_URL=https://your-public-https-origin.example
+```
+
+Telegram uploads the local annotated snapshot directly. Zalo sends a snapshot
+only when `NGROK_URL` (or another public HTTPS origin serving this workspace)
+is configured; otherwise it sends a text alert and keeps the event evidence
+locally. Credentials are never written to the run manifest, runtime status, or
+notification payload.
+
+The runtime status JSON exposes only non-secret provider readiness and delivery
+counters under `notifications`. A real provider send still requires an
+explicit end-to-end check with valid credentials; unit tests use an HTTP mock
+and do not prove delivery to an external Telegram/Zalo recipient.

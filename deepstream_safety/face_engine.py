@@ -520,6 +520,235 @@ class FaceRecognitionEngine:
         """Expose the stride-aware CPU frame decoder to other ROI stages."""
         return self._decode_bgrx(buffer, width, height)
 
+    def process_frame(
+        self,
+        frame: np.ndarray,
+        persons: list[tuple[int, float, float, float, float]],
+        frame_number: int,
+    ) -> dict[int, dict[str, Any]]:
+        """Run recognition on a copied frame outside the GStreamer pad probe."""
+        if not self.enabled or frame is None or frame.size == 0:
+            return {}
+        results: dict[int, dict[str, Any]] = {}
+        active_track_ids: set[int] = set()
+        due_track_ids: set[int] = set()
+        now = self.recognition_scheduler.now()
+        for track_id, left, top, right, bottom in persons:
+            track_id = int(track_id)
+            if track_id in {0, _UNTRACKED}:
+                continue
+            active_track_ids.add(track_id)
+            bbox = [int(left), int(top), int(right), int(bottom)]
+            previous_seen = self._track_last_seen.get(track_id)
+            if previous_seen is not None and frame_number - previous_seen > self.max_disappeared:
+                self._finish_track(track_id, frame_number)
+                previous_seen = None
+            if previous_seen is None:
+                self._start_track(track_id, frame_number, bbox)
+            else:
+                self._track_last_seen[track_id] = frame_number
+            self._track_observations[track_id] = self._track_observations.get(track_id, 0) + 1
+            if track_id in self._track_names:
+                self._track_last_confirmed[track_id] = frame_number
+            results[track_id] = {
+                "track_id": track_id,
+                "camera": self.camera_id,
+                "name": self._track_names.get(track_id, "unknown"),
+                "score": self._track_scores.get(track_id, 0.0),
+                "state": (
+                    "recognized"
+                    if track_id in self._track_names
+                    and self._track_names[track_id] != "unknown"
+                    else "unknown"
+                ),
+            }
+            attempt_limit = (
+                self.max_attempts_after_recognition
+                if track_id in self._track_locked
+                else self.max_attempts
+            )
+            if (
+                self._track_attempts.get(track_id, 0) < attempt_limit
+                and self.recognition_scheduler.due(track_id, now)
+            ):
+                due_track_ids.add(track_id)
+        for track_id in list(self._track_last_seen):
+            if (
+                track_id not in active_track_ids
+                and frame_number - self._track_last_seen[track_id] > self.max_disappeared
+            ):
+                self._finish_track(track_id, frame_number)
+        if not due_track_ids:
+            return results
+        for track_id in due_track_ids:
+            self.recognition_scheduler.mark_attempt(track_id, now)
+        self.last_processed_frame = frame
+        self.last_processed_frame_number = frame_number
+        output_width = self.output_width or frame.shape[1]
+        output_height = self.output_height or frame.shape[0]
+        scale_x = frame.shape[1] / output_width if output_width > 0 else 1.0
+        scale_y = frame.shape[0] / output_height if output_height > 0 else 1.0
+        for track_id, left_value, top_value, right_value, bottom_value in persons:
+            track_id = int(track_id)
+            if track_id in {0, _UNTRACKED}:
+                continue
+            result = {
+                "track_id": track_id,
+                "camera": self.camera_id,
+                "name": self._track_names.get(track_id, "unknown"),
+                "score": self._track_scores.get(track_id, 0.0),
+                "state": (
+                    "recognized"
+                    if track_id in self._track_names
+                    and self._track_names[track_id] != "unknown"
+                    else "unknown"
+                ),
+                "attempted": False,
+            }
+            results[track_id] = result
+            if track_id not in due_track_ids:
+                continue
+            self._track_attempts[track_id] = self._track_attempts.get(track_id, 0) + 1
+            result["attempted"] = True
+            raw_left = int(left_value * scale_x)
+            raw_top = int(top_value * scale_y)
+            raw_right = int(right_value * scale_x)
+            raw_bottom = int(bottom_value * scale_y)
+            pad_x = max(16, int((raw_right - raw_left) * 0.20))
+            pad_y = max(16, int((raw_bottom - raw_top) * 0.20))
+            left = max(0, raw_left - pad_x)
+            top = max(0, raw_top - pad_y)
+            right = min(frame.shape[1], raw_right + pad_x)
+            bottom = min(frame.shape[0], raw_bottom + pad_y)
+            person = frame[top:bottom, left:right]
+            if person.size == 0 or person.shape[0] * person.shape[1] < self.min_area:
+                continue
+            detected = self._detect(person)
+            if detected is None:
+                self._trace(
+                    track_id,
+                    {
+                        "event": "attempt",
+                        "frame": frame_number,
+                        "result": "no_face",
+                        "person_bbox": [left, top, right, bottom],
+                    },
+                )
+                self._record_face_miss(track_id, frame_number, "no_face")
+                continue
+            if not self.gallery:
+                self._trace(
+                    track_id,
+                    {
+                        "event": "attempt",
+                        "frame": frame_number,
+                        "result": "unknown",
+                        "reason": "gallery_empty",
+                        "face_bbox": detected[:4].astype(int).tolist(),
+                        "face_score": float(detected[-1]),
+                        "gallery_count": 0,
+                        "person_bbox": [left, top, right, bottom],
+                    },
+                )
+                continue
+            embedding = self._embedding(self._align(person, detected))
+            self._observe_identity(track_id, frame_number, embedding)
+            if (
+                track_id in self._track_locked
+                and self._track_identity_switches.get(track_id, 0)
+                >= self.identity_switch_frames
+            ):
+                self._clear_identity(track_id, frame_number, "persistent_face_mismatch")
+                self._observe_identity(track_id, frame_number, embedding)
+            count = self._track_embedding_counts.get(track_id, 0)
+            mean = self._track_embedding_means.get(track_id)
+            if mean is None or count <= 0:
+                mean = embedding.copy()
+                count = 0
+            else:
+                mean = mean * count + embedding
+            count += 1
+            mean /= max(1, count)
+            mean_norm = float(np.linalg.norm(mean))
+            if mean_norm > 0:
+                mean /= mean_norm
+            self._track_embedding_means[track_id] = mean
+            self._track_embedding_counts[track_id] = count
+            best_label, best_score, best_cosine = "unknown", 0.0, 0.0
+            for entry in self.gallery:
+                cosine = float(np.dot(embedding, entry.embedding))
+                confidence = _similarity_to_confidence(cosine)
+                if confidence > best_score:
+                    best_label, best_score, best_cosine = entry.label, confidence, cosine
+            current_name = self._track_names.get(track_id, "unknown")
+            if best_score <= self.unknown_score:
+                self._record_face_miss(track_id, frame_number, "below_threshold")
+            stable_label, stable_score = "unknown", 0.0
+            if current_name != "unknown":
+                if (
+                    best_label != current_name
+                    and best_score > self.unknown_score
+                    and best_score >= self.threshold
+                ):
+                    if self._track_alternative_names.get(track_id) == best_label:
+                        self._track_alternative_counts[track_id] = (
+                            self._track_alternative_counts.get(track_id, 0) + 1
+                        )
+                    else:
+                        self._track_alternative_names[track_id] = best_label
+                        self._track_alternative_counts[track_id] = 1
+                    if self._track_alternative_counts[track_id] >= self.identity_switch_frames:
+                        self._reset_identity(track_id, frame_number, embedding)
+                        stable_label, stable_score = self._record_candidate(
+                            track_id, best_label, best_score, person.shape[0] * person.shape[1]
+                        )
+                    else:
+                        stable_label, stable_score = (
+                            current_name,
+                            self._track_scores.get(track_id, 0.0),
+                        )
+                else:
+                    self._track_alternative_names.pop(track_id, None)
+                    self._track_alternative_counts[track_id] = 0
+                    stable_label, stable_score = (
+                        current_name,
+                        self._track_scores.get(track_id, 0.0),
+                    )
+            elif best_score > self.unknown_score:
+                stable_label, stable_score = self._record_candidate(
+                    track_id, best_label, best_score, person.shape[0] * person.shape[1]
+                )
+            if stable_label != "unknown":
+                self._track_last_confirmed[track_id] = frame_number
+                self._track_face_misses[track_id] = 0
+            result.update(
+                {
+                    "name": stable_label,
+                    "score": stable_score,
+                    "state": "recognized" if stable_label != "unknown" else "unknown",
+                }
+            )
+            self._trace(
+                track_id,
+                {
+                    "event": "attempt",
+                    "frame": frame_number,
+                    "result": best_label if best_score > self.unknown_score else "unknown",
+                    "best_label": best_label,
+                    "stable_result": stable_label,
+                    "score": best_score,
+                    "stable_score": stable_score,
+                    "cosine": best_cosine,
+                    "face_score": float(detected[-1]),
+                    "face_bbox": detected[:4].astype(int).tolist(),
+                    "gallery_count": len(self.gallery),
+                    "observations": self._track_observations.get(track_id, 0),
+                    "person_bbox": [left, top, right, bottom],
+                },
+            )
+        self._enforce_unique_identities(frame_number, results)
+        return results
+
     def process(self, buffer: Any, frame_meta: Any, frame_number: int) -> dict[int, dict[str, Any]]:
         if not self.enabled:
             return {}

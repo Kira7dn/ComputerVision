@@ -125,12 +125,14 @@ MediaMTX provides RTSP and WebRTC/HLS transport.
 Open the dashboard at:
 
 ```text
-http://localhost:8080/dashboard.html
+http://127.0.0.1:18080/dashboard.html
 ```
 
 The annotated stream is published as `rtsp://127.0.0.1:8554/safety_bbox` and is
-played in the browser through MediaMTX WebRTC. Detection metadata is published on
-ZeroMQ `tcp://127.0.0.1:5555`.
+played in the browser through MediaMTX HLS. Bbox/label rendering is owned by
+DeepStream `nvdsosd` on the encoded frame; the dashboard does not draw a second
+Canvas overlay. Detection metadata is also published on ZeroMQ
+`tcp://127.0.0.1:5555` and exposed for monitoring consumers.
 
 Snapshots are enabled in `deepstream_safety/config.yaml` and are written only when
 a detection is present, at most once per second:

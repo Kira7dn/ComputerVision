@@ -5,7 +5,7 @@
 The current Camera runtime is the WSL-hosted DeepStream stack under `deepstream_safety/`:
 
 `config.yaml` -> `multi_runner.py` -> one `pipeline.py` worker per camera -> MediaMTX RTSP output
-and `dashboard_server.py` on `http://localhost:8080`.
+and `dashboard_server.py` on `http://127.0.0.1:18080`.
 
 Camera functions are selected from `deepstream_safety/config.yaml` per camera. The current
 functions include face recognition, smoking behavior, fire/smoke detection, and trace/evidence.
@@ -54,7 +54,7 @@ only `D:\BusinessAnalyze\Camera\.tmp`.
   DeepStream workers.
 - `package.json` exposes `npm run camera:start`, `npm run camera:stop`, and
   `npm run camera:status`.
-- `deepstream_safety/dashboard_server.py` serves the dashboard at `http://localhost:8080`.
+- `deepstream_safety/dashboard_server.py` serves the dashboard at `http://127.0.0.1:18080`.
 - `.tmp/deepstream-safety/snapshots-acceptance-<run-id>` contains the manifest, SQLite idempotency
   index, event records, traces, and accepted snapshots for a run.
 
@@ -131,7 +131,7 @@ not by itself acceptance evidence.
 After starting the runtime:
 
 ```powershell
-(Invoke-WebRequest -UseBasicParsing -Uri 'http://localhost:8080/dashboard.html').StatusCode
+(Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:18080/dashboard.html').StatusCode
 wsl.exe -d Ubuntu-22.04 -- bash -lc "pgrep -af '[m]ediamtx|[d]ashboard_server.py|[m]ulti_runner.py|[p]ipeline.py|[f]fmpeg.*mock' || true"
 Get-ChildItem '.tmp\deepstream-safety' -Directory |
   Sort-Object LastWriteTimeUtc -Descending |

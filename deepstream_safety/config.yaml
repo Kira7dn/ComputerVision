@@ -38,7 +38,7 @@ cameras:
   - id: camera_dahua
     source:
       type: rtsp
-      url: rtsp://192.168.100.229:554/cam/realmonitor?channel=3&subtype=0
+      url: rtsp://192.168.100.229:554/cam/realmonitor?channel=5&subtype=0
       username_env: FRIGATE_DAHUA_USER
       password_env: FRIGATE_DAHUA_PASSWORD
       codec: hevc
@@ -143,6 +143,61 @@ recognition:
 
 metadata:
   zmq_pub_url: tcp://127.0.0.1:5555
+
+# Notification contract copied from the Frigate provider adapters, but owned
+# by the standalone DeepStream worker. Credentials and recipient chat IDs stay
+# in .env.local.
+notifications:
+  enabled: true
+  public_base_url_env: NGROK_URL
+  cooldown_seconds: 30
+  queue_size: 256
+  retry:
+    max_attempts: 3
+    initial_backoff_seconds: 2
+    max_backoff_seconds: 60
+  # Severity is resolved before notification rules are matched.
+  severity:
+    default: low
+    rules:
+      - severity: critical
+        functions: [fire_smoke]
+        classifications: [fire]
+      - severity: high
+        functions: [fire_smoke]
+        classifications: [smoke]
+      - severity: high
+        functions: [smoking_behavior]
+  channels:
+    telegram:
+      enabled: true
+      token_env: TELEGRAM_BOT_TOKEN
+      recipients:
+        - id: operations
+          chat_id_env: TELEGRAM_CHAT_ID
+    zalo:
+      enabled: true
+      token_env: ZALO_BOT_TOKEN
+      recipients:
+        - id: operations
+          chat_id_env: ZALO_CHAT_ID
+  rules:
+    - id: critical-safety-alerts
+      enabled: true
+      severities: [critical]
+      functions: [fire_smoke]
+      cameras: []
+      destinations:
+        telegram: [operations]
+        zalo: [operations]
+    - id: high-safety-alerts
+      enabled: true
+      severities: [high]
+      functions: [smoking_behavior, fire_smoke]
+      cameras: []
+      destinations:
+        telegram: [operations]
+        zalo: [operations]
 
 evidence:
   directory: /mnt/d/BusinessAnalyze/Camera/.tmp/deepstream-safety

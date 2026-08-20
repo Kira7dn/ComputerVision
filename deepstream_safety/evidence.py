@@ -121,6 +121,11 @@ class EvidenceStore:
             / _slug(str(event["event_id"]))
         )
 
+    def event_directory(self, event_id: str) -> Path | None:
+        """Return the durable directory for an in-memory event."""
+        event = self._events.get(event_id)
+        return self._event_dir(event) if event is not None else None
+
     def _write_event(self, event: dict[str, Any]) -> None:
         event_dir = self._event_dir(event)
         event_dir.mkdir(parents=True, exist_ok=True)

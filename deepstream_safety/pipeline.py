@@ -53,6 +53,7 @@ from events import SafetyDetection, SafetyEventStore  # noqa: E402
 from face_engine import FaceRecognitionEngine  # noqa: E402
 from fire_smoke_engine import FireSmokeEngine  # noqa: E402
 from fire_smoke_events import FireSmokeEventStore  # noqa: E402
+from notifications import NotificationService  # noqa: E402
 from recognition import RecognitionCore, TrackKey  # noqa: E402
 from smoking_behavior_engine import SmokingBehaviorEngine  # noqa: E402
 
@@ -178,6 +179,7 @@ class SafetyPipeline:
         self.person_tensor_logged = False
         self.person_score_logged = False
         self.evidence = EvidenceStore(config, run_id)
+        self.notifications = NotificationService(config, self.evidence.root, run_id)
         self.event_store = SafetyEventStore(config, self.evidence)
         self.fire_smoke_events = FireSmokeEventStore(config, self.evidence)
         self._face_event_ids: dict[int, str] = {}
@@ -222,7 +224,14 @@ class SafetyPipeline:
         self._analysis_fire_smoke: list[Any] = []
         self._analysis_transitions: list[Any] = []
         self._analysis_last_transition: str | None = None
+        self._analysis_frame_num: int | None = None
+        self._analysis_updated_at: float | None = None
+        input_fps = max(1.0, float(config.get("input", {}).get("fps", 5)))
+        self._analysis_max_age_frames = max(2, int(round(input_fps * 0.75)))
         self._analysis_error: str | None = None
+        self._face_tracks: dict[int, dict[str, Any]] = {}
+        self._metadata_write_at = 0.0
+        self.metadata_path = self.status_dir / f"{config.get('input', {}).get('camera', 'camera')}.metadata.json"
         self.socket = zmq.Context.instance().socket(zmq.PUB)
         self.socket.bind(config["metadata"]["zmq_pub_url"])
         self.person_infer_config = self._write_person_infer_config()
@@ -279,6 +288,7 @@ class SafetyPipeline:
                 bbox=tuple(data.get("person_bbox", [])) if data.get("person_bbox") else None,
                 score=float(data.get("score", 0.0)),
             )
+            self._notify_event(event_id, "END")
             self._face_event_ids.pop(track_id, None)
             return
         stable_name = str(data.get("stable_result") or "unknown")
@@ -291,6 +301,20 @@ class SafetyPipeline:
             bbox=tuple(data.get("person_bbox", [])) if data.get("person_bbox") else None,
             score=float(data.get("stable_score", data.get("score", 0.0))),
         )
+
+    def _notify_event(self, event_id: str, lifecycle: str) -> None:
+        """Queue only an artifact-backed lifecycle notification."""
+        self.notifications.notify_event(
+            event_id,
+            lifecycle,
+            self.evidence.event_directory(event_id),
+        )
+
+    def _notify_transitions(self, transitions: list[Any]) -> None:
+        for transition in transitions:
+            operation = str(getattr(transition, "operation", ""))
+            if operation in {"START", "END"}:
+                self._notify_event(str(transition.event_id), operation)
 
     def _write_person_infer_config(self) -> str:
         model = self.config["person"]
@@ -357,6 +381,17 @@ maintain-aspect-ratio=0
 
         self.person_infer = make_element("nvinfer", "person-inference")
         self.person_infer.set_property("config-file-path", self.person_infer_config)
+        analysis_tee = make_element("tee", "analysis-tee")
+        analysis_queue = make_element("queue", "analysis-queue")
+        analysis_queue.set_property("max-size-buffers", 1)
+        analysis_queue.set_property("max-size-bytes", 0)
+        analysis_queue.set_property("max-size-time", 0)
+        analysis_queue.set_property("leaky", 2)
+        output_input_queue = make_element("queue", "output-input-queue")
+        output_input_queue.set_property("max-size-buffers", 2)
+        output_input_queue.set_property("max-size-bytes", 0)
+        output_input_queue.set_property("max-size-time", 0)
+        output_input_queue.set_property("leaky", 2)
         face_cpu_convert = make_element("nvvideoconvert", "face-cpu-convert")
         face_cpu_caps = make_element("capsfilter", "face-cpu-caps")
         face_cpu_caps.set_property("caps", Gst.Caps.from_string("video/x-raw,format=BGRx"))
@@ -367,19 +402,32 @@ maintain-aspect-ratio=0
         osd.set_property("display-bbox", True)
         osd.set_property("display-text", True)
         convert_after_osd = make_element("nvvideoconvert", "convert-after-osd")
-        output_i420_caps = make_element("capsfilter", "output-i420-caps")
-        output_i420_caps.set_property("caps", Gst.Caps.from_string("video/x-raw,format=I420"))
         output_tee = make_element("tee", "output-tee")
         output_queue = make_element("queue", "output-queue")
-        encoder = make_element("x264enc", "output-encoder")
-        encoder.set_property("bitrate", 4_000)
-        encoder.set_property("speed-preset", "ultrafast")
-        encoder.set_property("tune", "zerolatency")
-        encoder.set_property("key-int-max", 30)
+        try:
+            encoder = make_element("nvv4l2h264enc", "output-encoder")
+            encoder.set_property("bitrate", 4_000_000)
+            encoder.set_property("iframeinterval", 30)
+            encoder.set_property("idrinterval", 30)
+            encoder.set_property("preset-id", 1)
+            output_caps = "video/x-raw(memory:NVMM),format=I420"
+            LOG.info("output encoder: nvv4l2h264enc")
+        except RuntimeError:
+            encoder = make_element("x264enc", "output-encoder")
+            encoder.set_property("bitrate", 4_000)
+            encoder.set_property("speed-preset", "ultrafast")
+            encoder.set_property("tune", "zerolatency")
+            encoder.set_property("key-int-max", 30)
+            output_caps = "video/x-raw,format=I420"
+            LOG.warning("output encoder: x264enc fallback")
+        output_i420_caps = make_element("capsfilter", "output-i420-caps")
+        output_i420_caps.set_property("caps", Gst.Caps.from_string(output_caps))
         output_parser = make_element("h264parse", "output-h264-parse")
         output_parser.set_property("config-interval", 1)
         sink = make_element("rtspclientsink", "rtsp-output")
         sink.set_property("location", output_cfg["rtsp_url"])
+        sink.set_property("protocols", 4)
+        sink.set_property("latency", 100)
 
         elements = [
             source,
@@ -388,6 +436,9 @@ maintain-aspect-ratio=0
             decoder,
             mux,
             self.person_infer,
+            analysis_tee,
+            analysis_queue,
+            output_input_queue,
             *(
                 [face_cpu_convert, face_cpu_caps]
                 if self.face_engine.enabled or self.smoking_behavior_enabled or self.fire_smoke_enabled
@@ -414,23 +465,38 @@ maintain-aspect-ratio=0
             raise RuntimeError("Unable to link decoder to nvstreammux")
         if not mux.link(self.person_infer):
             raise RuntimeError("Unable to link nvstreammux to person nvinfer")
-        metadata_source = self.person_infer
+        if not self.person_infer.link(analysis_tee):
+            raise RuntimeError("Unable to link person inference to analysis tee")
+        analysis_tee_pad = analysis_tee.get_request_pad("src_%u")
+        analysis_sink_pad = analysis_queue.get_static_pad("sink")
+        if (
+            analysis_tee_pad is None
+            or analysis_sink_pad is None
+            or analysis_tee_pad.link(analysis_sink_pad) != Gst.PadLinkReturn.OK
+        ):
+            raise RuntimeError("Unable to link analysis tee to analysis queue")
+        output_tee_pad = analysis_tee.get_request_pad("src_%u")
+        output_sink_pad = output_input_queue.get_static_pad("sink")
+        if (
+            output_tee_pad is None
+            or output_sink_pad is None
+            or output_tee_pad.link(output_sink_pad) != Gst.PadLinkReturn.OK
+        ):
+            raise RuntimeError("Unable to link analysis tee to output queue")
         needs_cpu_frame = self.face_engine.enabled or self.smoking_behavior_enabled or self.fire_smoke_enabled
         if needs_cpu_frame:
-            if not metadata_source.link(face_cpu_convert):
+            if not analysis_queue.link(face_cpu_convert):
                 raise RuntimeError("Unable to link analysis source to face converter")
             if not face_cpu_convert.link(face_cpu_caps):
                 raise RuntimeError("Unable to link face converter to CPU caps")
             analysis_src = face_cpu_caps
         else:
-            if not metadata_source.link(convert_before_osd):
-                raise RuntimeError("Unable to link analysis source to OSD converter")
-            analysis_src = metadata_source
-        infer_src = metadata_source.get_static_pad("src")
+            analysis_src = analysis_queue
+        if not output_input_queue.link(convert_before_osd):
+            raise RuntimeError("Unable to link output queue to OSD converter")
+        infer_src = self.person_infer.get_static_pad("src")
         if infer_src is None:
             raise RuntimeError("Person nvinfer has no src pad")
-        if needs_cpu_frame and not face_cpu_caps.link(convert_before_osd):
-            raise RuntimeError("Unable to link face CPU branch to OSD converter")
         if not convert_before_osd.link(face_rgba_caps):
             raise RuntimeError("Unable to link CPU face frame to OSD converter")
         if not face_rgba_caps.link(osd) or not osd.link(convert_after_osd):
@@ -443,6 +509,10 @@ maintain-aspect-ratio=0
             raise RuntimeError("Unable to link output encoder")
         if not output_parser.link(sink):
             raise RuntimeError("Unable to link RTSP output")
+        output_src = output_queue.get_static_pad("src")
+        if output_src is None:
+            raise RuntimeError("Output queue has no src pad")
+        output_src.add_probe(Gst.PadProbeType.BUFFER, self._on_output_buffer)
         person_src = self.person_infer.get_static_pad("src")
         if person_src is None:
             raise RuntimeError("Person nvinfer has no src pad")
@@ -646,6 +716,9 @@ maintain-aspect-ratio=0
                 break
             frame, persons, frame_num, timestamp = sample
             try:
+                face_tracks: dict[int, dict[str, Any]] = {}
+                if self.face_engine.enabled:
+                    face_tracks = self.face_engine.process_frame(frame, persons, int(frame_num))
                 detection_results: list[Any] = []
                 fire_smoke_detections: list[Any] = []
                 if self.smoking_behavior_enabled and self.smoking_behavior_engine is not None:
@@ -685,10 +758,14 @@ maintain-aspect-ratio=0
                             frame=frame,
                         )
                     )
+                self._notify_transitions(transitions)
                 with self._analysis_lock:
+                    self._face_tracks = dict(face_tracks)
                     self._analysis_detections = list(detection_results)
                     self._analysis_fire_smoke = list(fire_smoke_detections)
                     self._analysis_transitions = transitions
+                    self._analysis_frame_num = int(frame_num)
+                    self._analysis_updated_at = time.time()
                     self._analysis_last_transition = (
                         transitions[-1].operation if transitions else None
                     )
@@ -708,6 +785,126 @@ maintain-aspect-ratio=0
                 list(self._analysis_transitions),
                 self._analysis_last_transition,
             )
+
+    def _publish_live_metadata(self, payload: dict[str, Any]) -> None:
+        """Publish latest overlay metadata without putting disk I/O on every frame."""
+        now = time.monotonic()
+        if now - self._metadata_write_at < 0.10:
+            return
+        self._metadata_write_at = now
+        try:
+            self.status_dir.mkdir(parents=True, exist_ok=True)
+            temporary = self.metadata_path.with_suffix(".json.tmp")
+            temporary.write_text(json.dumps(payload), encoding="utf-8")
+            temporary.replace(self.metadata_path)
+        except OSError as exc:
+            LOG.debug("live metadata write failed: %s", exc)
+
+    def _render_output_annotations(
+        self,
+        batch_meta: Any,
+        frame_meta: Any,
+        detection_results: list[Any],
+        fire_smoke_detections: list[Any],
+    ) -> None:
+        """Render cached inference results on the independent live-output branch."""
+        if self.smoking_behavior_enabled:
+            self._attach_objects(frame_meta, detection_results)
+        if self.fire_smoke_enabled:
+            self._attach_fire_smoke_objects(batch_meta, frame_meta, fire_smoke_detections)
+        labels: list[tuple[str, int, int]] = []
+        for obj_meta in self._frame_objects(frame_meta):
+            object_label = str(obj_meta.obj_label)
+            if object_label not in {self.config["person"]["label"], "fire", "smoke"}:
+                continue
+            if object_label == self.config["person"]["label"]:
+                name, score = self.face_engine.current_label(
+                    int(obj_meta.object_id), int(frame_meta.frame_num)
+                )
+                track_id = int(obj_meta.object_id)
+                smoking = self._smoking_by_track.get(track_id)
+                if smoking is not None:
+                    # Keep the current-frame tracker rectangle. The behavior
+                    # result is asynchronous and is used only for the label;
+                    # reusing its older ROI is what causes visible drift.
+                    label = f"person #{track_id} | SMOKING {float(smoking.score) * 100:.0f}%"
+                    obj_meta.rect_params.border_width = 4
+                    obj_meta.rect_params.border_color.set(1.0, 0.0, 0.0, 1.0)
+                else:
+                    if str(self.config["input"].get("camera")) == "camera_safety":
+                        obj_meta.rect_params.border_width = 0
+                        obj_meta.text_params.display_text = ""
+                        obj_meta.text_params.set_bg_clr = 0
+                        continue
+                    obj_meta.rect_params.border_width = 3
+                    obj_meta.rect_params.border_color.set(0.0, 0.65, 1.0, 1.0)
+                    obj_meta.rect_params.has_bg_color = 0
+                    label = f"person #{track_id} | {name} {score:.2f}"
+            else:
+                display_label = "SMOKE AREA" if object_label == "smoke" else "FIRE"
+                label = f"{display_label} {float(obj_meta.confidence) * 100:.0f}%"
+            labels.append(
+                (label, int(obj_meta.rect_params.left), max(0, int(obj_meta.rect_params.top) - 26))
+            )
+            obj_meta.text_params.display_text = ""
+            obj_meta.text_params.set_bg_clr = 0
+        if labels:
+            display_meta = pyds.nvds_acquire_display_meta_from_pool(batch_meta)
+            display_meta.num_labels = len(labels)
+            for index, (label, left, top) in enumerate(labels):
+                text_params = display_meta.text_params[index]
+                text_params.display_text = label
+                text_params.x_offset = left
+                text_params.y_offset = top
+                text_params.font_params.font_name = "Sans"
+                text_params.font_params.font_size = 16
+                text_params.font_params.font_color.set(1.0, 1.0, 1.0, 1.0)
+                text_params.set_bg_clr = 0
+            pyds.nvds_add_display_meta_to_frame(frame_meta, display_meta)
+        self._add_live_timestamp(batch_meta, frame_meta)
+
+    def _on_output_buffer(self, pad: Gst.Pad, info: Gst.PadProbeInfo) -> Gst.PadProbeReturn:
+        """Render backend-owned labels without applying an old ROI to a new frame."""
+        buffer = info.get_buffer()
+        if buffer is None:
+            return Gst.PadProbeReturn.OK
+        batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(buffer))
+        if batch_meta is None:
+            return Gst.PadProbeReturn.OK
+        with self._analysis_lock:
+            analysis_frame_num = self._analysis_frame_num
+            current_frame_num = 0
+            if batch_meta.frame_meta_list is not None:
+                try:
+                    current_frame = pyds.NvDsFrameMeta.cast(batch_meta.frame_meta_list.data)
+                    current_frame_num = int(current_frame.frame_num)
+                except Exception:
+                    current_frame_num = 0
+            analysis_age = (
+                abs(current_frame_num - analysis_frame_num)
+                if analysis_frame_num is not None
+                else self._analysis_max_age_frames + 1
+            )
+            if analysis_age <= self._analysis_max_age_frames:
+                detection_results = list(self._analysis_detections)
+                fire_smoke_detections = list(self._analysis_fire_smoke)
+            else:
+                detection_results = []
+                fire_smoke_detections = []
+        frame_list = batch_meta.frame_meta_list
+        while frame_list is not None:
+            try:
+                frame_meta = pyds.NvDsFrameMeta.cast(frame_list.data)
+                self._render_output_annotations(
+                    batch_meta, frame_meta, detection_results, fire_smoke_detections
+                )
+                frame_list = frame_list.next
+            except StopIteration:
+                break
+            except Exception as exc:
+                LOG.debug("live output annotation failed: %s", exc)
+                break
+        return Gst.PadProbeReturn.OK
 
     def _stop_analysis_worker(self) -> None:
         if self._analysis_thread is None:
@@ -736,6 +933,7 @@ maintain-aspect-ratio=0
             "frame_count": self.frame_count,
             "analysis_queue_depth": self._analysis_queue.qsize(),
             "analysis_error": self._analysis_error,
+            "notifications": self.notifications.status(),
         }
         try:
             self.status_dir.mkdir(parents=True, exist_ok=True)
@@ -1004,6 +1202,119 @@ maintain-aspect-ratio=0
             obj_meta.text_params.text_bg_clr.set(0.0, 0.0, 0.0, 0.65)
             pyds.nvds_add_obj_meta_to_frame(frame_meta, obj_meta, None)
 
+    def _publish_metadata_frame(self, frame_meta: Any) -> None:
+        """Publish lightweight overlay state from the non-blocking DeepStream probe."""
+        tracks = self._recognition_tracks(frame_meta)
+        detection_results, fire_smoke_detections, transitions, _ = self._cached_analysis()
+        with self._analysis_lock:
+            face_tracks = list(self._face_tracks.values())
+        face_by_track = {
+            int(item.get("track_id", -1)): item for item in face_tracks
+        }
+        overlays: list[dict[str, Any]] = []
+        for item in tracks:
+            face_info = face_by_track.get(int(item["track_id"]))
+            name = str(face_info.get("name", "unknown")) if face_info else "unknown"
+            score = float(face_info.get("score", 0.0)) if face_info else 0.0
+            overlays.append(
+                {
+                    "kind": "person",
+                    "track_id": item["track_id"],
+                    "left": item["left"],
+                    "top": item["top"],
+                    "right": item["right"],
+                    "bottom": item["bottom"],
+                    "label": f"person #{item['track_id']} | {name} {score:.2f}",
+                    "score": score,
+                }
+            )
+        for detection in detection_results:
+            overlays.append(
+                {
+                    "kind": "smoking",
+                    "track_id": detection.track_id,
+                    "left": detection.person_bbox[0],
+                    "top": detection.person_bbox[1],
+                    "right": detection.person_bbox[2],
+                    "bottom": detection.person_bbox[3],
+                    "label": f"SMOKING {float(detection.score) * 100:.0f}%",
+                    "score": float(detection.score),
+                }
+            )
+        for detection in fire_smoke_detections:
+            overlays.append(
+                {
+                    "kind": "fire" if detection.label == "fire" else "smoke",
+                    "left": detection.bbox[0],
+                    "top": detection.bbox[1],
+                    "right": detection.bbox[2],
+                    "bottom": detection.bbox[3],
+                    "label": (
+                        f"{'FIRE' if detection.label == 'fire' else 'SMOKE AREA'} "
+                        f"{float(detection.score) * 100:.0f}%"
+                    ),
+                    "score": float(detection.score),
+                }
+            )
+        payload = {
+            "camera": self.config["input"].get("camera", "safety_camera"),
+            "run_id": self.run_id,
+            "width": int(self.config["input"].get("width", 1920)),
+            "height": int(self.config["input"].get("height", 1080)),
+            "frame_num": int(frame_meta.frame_num),
+            "timestamp": time.time(),
+            "bbox_count": len(detection_results),
+            "fire_smoke_count": len(fire_smoke_detections),
+            "event_id": self.event_store.active_event_id,
+            "event_state": self.event_store.state.value,
+            "fire_smoke_events": [
+                {
+                    "operation": item.operation,
+                    "event_id": item.event_id,
+                    "label": getattr(item, "label", "smoking"),
+                }
+                for item in transitions
+            ],
+            "fire_smoke_active_event_ids": self.fire_smoke_events.active_event_ids,
+            "recognition_enabled": self.recognition.enabled,
+            "tracks": tracks,
+            "face_tracks": face_tracks,
+            "overlays": overlays,
+            "boxes": [
+                {
+                    "label": "person",
+                    "behavior": "smoking",
+                    "track_id": detection.track_id,
+                    "confidence": round(float(detection.score), 5),
+                    "left": round(float(detection.person_bbox[0]), 2),
+                    "top": round(float(detection.person_bbox[1]), 2),
+                    "right": round(float(detection.person_bbox[2]), 2),
+                    "bottom": round(float(detection.person_bbox[3]), 2),
+                }
+                for detection in detection_results
+            ],
+            "fire_smoke": [
+                {
+                    "label": detection.label,
+                    "confidence": round(float(detection.score), 5),
+                    "left": round(float(detection.bbox[0]), 2),
+                    "top": round(float(detection.bbox[1]), 2),
+                    "right": round(float(detection.bbox[2]), 2),
+                    "bottom": round(float(detection.bbox[3]), 2),
+                }
+                for detection in fire_smoke_detections
+            ],
+        }
+        self._publish_live_metadata(payload)
+        self.frame_count += 1
+        if self.frame_count % 100 == 0:
+            LOG.info(
+                "frames=%d smoking_bbox_count=%d fire_smoke_count=%d",
+                self.frame_count,
+                len(detection_results),
+                len(fire_smoke_detections),
+            )
+
     def _on_metadata_buffer(self, pad: Gst.Pad, info: Gst.PadProbeInfo) -> Gst.PadProbeReturn:
         buffer = info.get_buffer()
         if buffer is None:
@@ -1016,6 +1327,7 @@ maintain-aspect-ratio=0
             try:
                 frame_meta = pyds.NvDsFrameMeta.cast(frame_list.data)
                 self._assign_person_track_ids(frame_meta)
+                self._publish_metadata_frame(frame_meta)
                 frame_list = frame_list.next
             except StopIteration:
                 break
@@ -1089,10 +1401,6 @@ maintain-aspect-ratio=0
                 else:
                     cached_transitions = []
                     cached_transition = None
-                if self.smoking_behavior_enabled:
-                    self._attach_objects(frame_meta, detection_results)
-                if self.fire_smoke_enabled:
-                    self._attach_fire_smoke_objects(batch_meta, frame_meta, fire_smoke_detections)
                 tracks = self._recognition_tracks(frame_meta)
                 self.last_bbox_count = len(boxes)
                 self.last_fire_smoke_count = len(fire_smoke_detections)
@@ -1121,74 +1429,65 @@ maintain-aspect-ratio=0
                         if self.fire_smoke_enabled
                         else []
                     )
-                face_tracks = self.face_engine.process(buffer, frame_meta, int(frame_meta.frame_num))
-                labels: list[tuple[str, int, int]] = []
-                for obj_meta in self._frame_objects(frame_meta):
-                    object_label = str(obj_meta.obj_label)
-                    if object_label not in {self.config["person"]["label"], "fire", "smoke"}:
-                        continue
-                    if object_label == self.config["person"]["label"]:
-                        name, score = self.face_engine.current_label(
-                            int(obj_meta.object_id), int(frame_meta.frame_num)
-                        )
-                        track_id = int(obj_meta.object_id)
-                        smoking = self._smoking_by_track.get(track_id)
-                        if smoking is not None:
-                            left, top, right, bottom = smoking.person_bbox
-                            obj_meta.rect_params.left = float(left)
-                            obj_meta.rect_params.top = float(top)
-                            obj_meta.rect_params.width = float(right - left)
-                            obj_meta.rect_params.height = float(bottom - top)
-                            label = f"person #{track_id} | SMOKING {float(smoking.score) * 100:.0f}%"
-                            obj_meta.rect_params.border_width = 4
-                            obj_meta.rect_params.border_color.set(1.0, 0.0, 0.0, 1.0)
-                        else:
-                            # camera_safety must not show raw/false person boxes.
-                            if str(self.config["input"].get("camera")) == "camera_safety":
-                                obj_meta.rect_params.border_width = 0
-                                obj_meta.text_params.display_text = ""
-                                obj_meta.text_params.set_bg_clr = 0
-                                continue
-                            obj_meta.rect_params.border_width = 3
-                            obj_meta.rect_params.border_color.set(0.0, 0.65, 1.0, 1.0)
-                            obj_meta.rect_params.has_bg_color = 0
-                            label = f"person #{track_id} | {name} {score:.2f}"
-                    else:
-                        # Fire/smoke labels are generated from canonical object metadata.
-                        # Never reuse detector/plugin text here: it can contain stale class
-                        # ids or raw confidence strings and was the source of the opaque
-                        # numeric labels seen on the live safety stream.
-                        display_label = "SMOKE AREA" if object_label == "smoke" else "FIRE"
-                        label = f"{display_label} {float(obj_meta.confidence) * 100:.0f}%"
-                    labels.append(
+                    if transition is not None:
+                        self._notify_transitions([transition])
+                    self._notify_transitions(fire_smoke_transitions)
+                with self._analysis_lock:
+                    face_tracks = list(self._face_tracks.values())
+                overlays: list[dict[str, Any]] = []
+                for item in tracks:
+                    face_info = next(
                         (
-                            label,
-                            int(obj_meta.rect_params.left),
-                            max(0, int(obj_meta.rect_params.top) - 26),
-                        )
+                            candidate
+                            for candidate in face_tracks
+                            if int(candidate.get("track_id", -1)) == int(item["track_id"])
+                        ),
+                        None,
                     )
-                    # Use one display-meta title layer to avoid duplicate/missing titles.
-                    obj_meta.text_params.display_text = ""
-                    obj_meta.text_params.set_bg_clr = 0
-                if labels:
-                    display_meta = pyds.nvds_acquire_display_meta_from_pool(batch_meta)
-                    display_meta.num_labels = len(labels)
-                    for index, (label, left, top) in enumerate(labels):
-                        text_params = display_meta.text_params[index]
-                        text_params.display_text = label
-                        text_params.x_offset = left
-                        text_params.y_offset = top
-                        text_params.font_params.font_name = "Sans"
-                        text_params.font_params.font_size = 16
-                        text_params.font_params.font_color.set(1.0, 1.0, 1.0, 1.0)
-                        text_params.set_bg_clr = 0
-                    pyds.nvds_add_display_meta_to_frame(frame_meta, display_meta)
-                # This is deliberately stamped after inference and before nvdsosd,
-                # so the timestamp is part of RTSP/HLS and not a dashboard-only UI.
-                self._add_live_timestamp(batch_meta, frame_meta)
+                    name = str(face_info.get("name", "unknown")) if face_info else "unknown"
+                    score = float(face_info.get("score", 0.0)) if face_info else 0.0
+                    overlays.append(
+                        {
+                            "kind": "person",
+                            "track_id": item["track_id"],
+                            "left": item["left"],
+                            "top": item["top"],
+                            "right": item["right"],
+                            "bottom": item["bottom"],
+                            "label": f"person #{item['track_id']} | {name} {score:.2f}",
+                            "score": score,
+                        }
+                    )
+                for detection in detection_results:
+                    overlays.append(
+                        {
+                            "kind": "smoking",
+                            "track_id": detection.track_id,
+                            "left": detection.person_bbox[0],
+                            "top": detection.person_bbox[1],
+                            "right": detection.person_bbox[2],
+                            "bottom": detection.person_bbox[3],
+                            "label": f"SMOKING {float(detection.score) * 100:.0f}%",
+                            "score": float(detection.score),
+                        }
+                    )
+                for detection in fire_smoke_detections:
+                    overlays.append(
+                        {
+                            "kind": "fire" if detection.label == "fire" else "smoke",
+                            "left": detection.bbox[0],
+                            "top": detection.bbox[1],
+                            "right": detection.bbox[2],
+                            "bottom": detection.bbox[3],
+                            "label": f"{'FIRE' if detection.label == 'fire' else 'SMOKE AREA'} {float(detection.score) * 100:.0f}%",
+                            "score": float(detection.score),
+                        }
+                    )
                 payload = {
                     "camera": self.config["input"].get("camera", "safety_camera"),
                     "run_id": self.run_id,
+                    "width": int(self.config["input"].get("width", 1920)),
+                    "height": int(self.config["input"].get("height", 1080)),
                     "frame_num": int(frame_meta.frame_num),
                     "timestamp": time.time(),
                     "bbox_count": len(boxes),
@@ -1206,7 +1505,8 @@ maintain-aspect-ratio=0
                     "fire_smoke_active_event_ids": self.fire_smoke_events.active_event_ids,
                     "recognition_enabled": self.recognition.enabled,
                     "tracks": tracks,
-                    "face_tracks": list(face_tracks.values()),
+                    "face_tracks": face_tracks,
+                    "overlays": overlays,
                     "boxes": [
                         {
                             "label": "person",
@@ -1239,14 +1539,6 @@ maintain-aspect-ratio=0
                     ],
                 }
                 self.socket.send_json(payload, flags=zmq.NOBLOCK)
-                self.frame_count += 1
-                if self.frame_count % 100 == 0:
-                    LOG.info(
-                        "frames=%d smoking_bbox_count=%d fire_smoke_count=%d",
-                        self.frame_count,
-                        self.last_bbox_count,
-                        self.last_fire_smoke_count,
-                    )
                 frame_list = frame_list.next
             except StopIteration:
                 break
@@ -1368,6 +1660,8 @@ maintain-aspect-ratio=0
             except Exception:
                 LOG.exception("face lifecycle close failed; continuing shutdown")
             self.pipeline.set_state(Gst.State.NULL)
+            closing_event_ids = set(self.event_store.active_event_ids)
+            closing_event_ids.update(self.fire_smoke_events.active_event_ids)
             try:
                 self.event_store.close()
             except Exception:
@@ -1376,6 +1670,12 @@ maintain-aspect-ratio=0
                 self.fire_smoke_events.close()
             except Exception:
                 LOG.exception("fire/smoke event close failed; continuing shutdown")
+            for event_id in closing_event_ids:
+                self._notify_event(event_id, "END")
+            try:
+                self.notifications.close()
+            except Exception:
+                LOG.exception("notification service close failed; continuing shutdown")
             try:
                 self.evidence.close()
             except Exception:
@@ -1383,6 +1683,7 @@ maintain-aspect-ratio=0
             self.socket.close(0)
             try:
                 self.status_path.unlink(missing_ok=True)
+                self.metadata_path.unlink(missing_ok=True)
             except OSError:
                 pass
             LOG.info(

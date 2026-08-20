@@ -278,6 +278,7 @@
     function startHls(video, hlsUrl, state) {
       let hls = null;
       let retryTimer = null;
+      let stallTimer = null;
       let destroyed = false;
 
       const scheduleRetry = () => {
@@ -285,6 +286,12 @@
         state.error = true;
         state.live = false;
         setVideoState(video, 'Connecting...', false);
+        if (stallTimer !== null) window.clearTimeout(stallTimer);
+        hls?.destroy();
+        hls = null;
+        video.pause();
+        video.removeAttribute('src');
+        video.load();
         updateOverallStatus();
         retryTimer = window.setTimeout(() => {
           retryTimer = null;
@@ -294,6 +301,10 @@
 
       const onPlaying = () => {
         if (destroyed) return;
+        if (stallTimer !== null) {
+          window.clearTimeout(stallTimer);
+          stallTimer = null;
+        }
         state.live = true;
         state.error = false;
         setVideoState(video, 'Live', true);
@@ -304,13 +315,30 @@
         state.live = false;
         setVideoState(video, 'Buffering...', false);
         updateOverallStatus();
+        if (stallTimer === null) {
+          stallTimer = window.setTimeout(() => {
+            stallTimer = null;
+            scheduleRetry();
+          }, 1500);
+        }
       };
       const onTimeUpdate = () => {
         if (!destroyed && !video.paused && video.readyState >= 3) onPlaying();
       };
+      const onVideoError = () => {
+        if (destroyed) return;
+        state.lastError = {
+          type: 'media',
+          details: video.error ? `code=${video.error.code}` : 'unknown media error',
+          fatal: true,
+        };
+        console.warn('Native HLS playback error', hlsUrl, state.lastError);
+        scheduleRetry();
+      };
       video.addEventListener('playing', onPlaying);
       video.addEventListener('waiting', onWaiting);
       video.addEventListener('timeupdate', onTimeUpdate);
+      video.addEventListener('error', onVideoError);
 
       const attach = async () => {
         if (destroyed) return;
@@ -325,32 +353,51 @@
           if (destroyed) return;
           if (!Hls.isSupported()) throw new Error('HLS is not supported');
           hls?.destroy();
-          hls = new Hls({ liveSyncDurationCount: 3 });
-          hls.loadSource(hlsUrl);
+          hls = new Hls({
+            liveSyncDurationCount: 3,
+            backBufferLength: 0,
+            manifestLoadingMaxRetry: 2,
+            levelLoadingMaxRetry: 2,
+            fragLoadingMaxRetry: 2,
+          });
+          const sourceUrl = state.retryCount
+            ? `${hlsUrl}${hlsUrl.includes('?') ? '&' : '?'}retry=${state.retryCount}`
+            : hlsUrl;
+          state.retryCount = (state.retryCount || 0) + 1;
+          hls.loadSource(sourceUrl);
           hls.attachMedia(video);
           hls.on(Hls.Events.MANIFEST_PARSED, () => {
             video.play().catch(() => scheduleRetry());
           });
           hls.on(Hls.Events.ERROR, (_event, data) => {
+            state.lastError = {
+              type: data.type,
+              details: data.details,
+              fatal: Boolean(data.fatal),
+            };
+            console.warn('HLS playback error', hlsUrl, state.lastError);
             if (data.fatal) {
-              hls?.destroy();
-              hls = null;
               scheduleRetry();
             }
           });
-        } catch (_) {
-          scheduleRetry();
+          } catch (error) {
+            state.lastError = { type: 'attach', details: String(error), fatal: true };
+            console.warn('HLS attach failed', hlsUrl, state.lastError);
+            scheduleRetry();
         }
       };
 
       state.destroy = () => {
         destroyed = true;
         if (retryTimer !== null) window.clearTimeout(retryTimer);
+        if (stallTimer !== null) window.clearTimeout(stallTimer);
+        state.destroyed = true;
         hls?.destroy();
         hls = null;
         video.removeEventListener('playing', onPlaying);
         video.removeEventListener('waiting', onWaiting);
         video.removeEventListener('timeupdate', onTimeUpdate);
+        video.removeEventListener('error', onVideoError);
         video.removeAttribute('src');
         video.load();
       };
@@ -383,7 +430,7 @@
         if (players.has(camera.id)) continue;
         const video = document.getElementById(`video-${camera.id}`);
         if (!video) continue;
-        const state = { live: false, error: false };
+          const state = { live: false, error: false, destroyed: false, retryCount: 0, lastError: null };
         startHls(video, camera.hls_url, state);
         players.set(camera.id, state);
       }
@@ -401,8 +448,8 @@
         text('gpu', !data.gpu.available ? 'unavailable' : `${data.gpu.utilization_percent}% / ${data.gpu.memory_used_mb} MB / ${data.gpu.temperature_c}°C`);
         text('latency', !data.stream.hls_live ? 'offline' : `${data.stream.playlist_latency_ms} ms`);
         const cameraDetails = data.pipeline.camera_details || [];
-        liveCameras = new Set(cameraDetails.filter(camera => camera.running && camera.hls_live).map(camera => camera.id));
-        runtimeReady = Boolean(data.pipeline.running && liveCameras.size > 0);
+        liveCameras = new Set(cameraDetails.filter(camera => camera.running && camera.ready).map(camera => camera.id));
+        runtimeReady = Boolean(data.pipeline.running && cameraDetails.length > 0 && liveCameras.size === cameraDetails.length);
         renderCameras(cameraDetails);
         stream.textContent = liveCameras.size ? `HLS: ${liveCameras.size}/${cameraDetails.length} camera streams` : 'HLS: offline';
         if (!runtimeReady) {

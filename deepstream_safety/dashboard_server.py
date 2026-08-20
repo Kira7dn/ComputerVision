@@ -18,6 +18,7 @@ CLK_TCK = os.sysconf("SC_CLK_TCK")
 CPU_LOCK = Lock()
 PREVIOUS_CPU: tuple[int, int] | None = None
 PREVIOUS_PROCESSES: dict[int, tuple[int, float]] = {}
+DASHBOARD_PORT = 18080
 
 
 def _camera_definitions() -> list[dict[str, object]]:
@@ -119,6 +120,31 @@ def _runtime_status(camera_id: str) -> dict[str, object]:
         return payload if isinstance(payload, dict) else {}
     except (OSError, TypeError, ValueError, json.JSONDecodeError):
         return {}
+
+
+def _live_metadata() -> dict[str, object]:
+    """Read the latest bounded overlay payloads without running GPU metrics."""
+    result: dict[str, object] = {"timestamp": time.time(), "cameras": {}}
+    try:
+        raw_config = load_raw_config(CONFIG_PATH)
+        runtime = raw_config.get("runtime", {}) or {}
+        status_dir = Path(str(runtime.get("status_directory", "/opt/camera-deepstream/status")))
+        cameras: dict[str, object] = {}
+        for camera in _camera_definitions():
+            camera_id = str(camera["id"])
+            path = status_dir / f"{camera_id}.metadata.json"
+            if not path.is_file():
+                continue
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if isinstance(payload, dict):
+                cameras[camera_id] = payload
+        result["cameras"] = cameras
+    except (OSError, TypeError, ValueError):
+        pass
+    return result
 
 
 def _evidence_metrics() -> dict[str, object]:
@@ -414,6 +440,15 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(payload)
             return
+        if path == "/api/live-metadata":
+            payload = json.dumps(_live_metadata()).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
         if path == "/api/events":
             query = parse_qs(parsed.query)
             try:
@@ -439,4 +474,4 @@ class DashboardHandler(SimpleHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    ThreadingHTTPServer(("0.0.0.0", 8080), DashboardHandler).serve_forever()
+    ThreadingHTTPServer(("0.0.0.0", DASHBOARD_PORT), DashboardHandler).serve_forever()

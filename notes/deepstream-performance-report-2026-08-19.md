@@ -3,7 +3,7 @@
 ## Pham vi
 
 - Runtime: `deepstream_safety`
-- Dashboard: `http://localhost:8080/dashboard.html`
+- Dashboard: `http://127.0.0.1:18080/dashboard.html`
 - HLS: `http://localhost:8888/safety_bbox/index.m3u8`
 - Input: mock video face-recognition, chay `mock_loop: false`
 - GPU: NVIDIA GeForce RTX 3050 Laptop GPU
