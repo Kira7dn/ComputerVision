@@ -103,7 +103,7 @@ read Frigate configuration, or require Docker.
 Source code:
 
 ```text
-app/src/camera_safety/application/camera_worker.py
+app/src/application/camera_worker.py
 app/config/dev.yaml
 app/deploy/powershell/start.ps1
 app/web/dashboard.html

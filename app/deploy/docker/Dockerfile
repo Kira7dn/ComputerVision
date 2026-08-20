@@ -20,4 +20,4 @@ COPY web /opt/camera-safety/web
 HEALTHCHECK --interval=10s --timeout=3s --start-period=30s --retries=6 \
   CMD curl -fsS http://127.0.0.1:18080/health/live >/dev/null || exit 1
 
-ENTRYPOINT ["python3", "-m", "camera_safety.container"]
+ENTRYPOINT ["python3", "-m", "container"]

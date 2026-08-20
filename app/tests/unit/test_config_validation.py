@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from camera_safety.bootstrap.config import load_raw_config, validate_config
+from bootstrap.config import load_raw_config, validate_config
 
 
 def test_profiles_merge_and_production_has_no_mock_source() -> None:

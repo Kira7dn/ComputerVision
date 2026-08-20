@@ -1,0 +1,12 @@
+*.egg-info/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+tests/
+face_library/
+models/
+evidence/
+state/
+queue/
+logs/

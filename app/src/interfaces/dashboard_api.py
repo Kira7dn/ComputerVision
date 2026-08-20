@@ -10,9 +10,9 @@ from pathlib import Path
 from threading import Lock
 from urllib.parse import parse_qs, quote, urlparse
 
-from camera_safety.bootstrap.config import camera_ids, load_raw_config, resolve_camera_config
+from bootstrap.config import camera_ids, load_raw_config, resolve_camera_config
 
-APP_ROOT = Path(__file__).resolve().parents[3]
+APP_ROOT = Path(__file__).resolve().parents[2]
 ROOT = APP_ROOT / "web"
 CONFIG_PATH = Path(os.environ.get("CAMERA_CONFIG", APP_ROOT / "config" / "dev.yaml"))
 CLK_TCK = os.sysconf("SC_CLK_TCK")
@@ -84,8 +84,8 @@ def _processes() -> list[dict[str, int | str]]:
             command = (entry / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="ignore").strip()
             parts = command.split()
             if not any(
-                part.endswith("camera_safety/application/camera_worker.py")
-                or part == "camera_safety.application.camera_worker"
+                part.endswith("application/camera_worker.py")
+                or part == "application.camera_worker"
                 for part in parts
             ):
                 continue

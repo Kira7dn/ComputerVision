@@ -6,14 +6,14 @@ from pathlib import Path
 
 import numpy as np
 
-from camera_safety.adapters.models.fire_smoke_engine import (
+from adapters.models.fire_smoke_engine import (
     FireSmokeDetection,
     FireSmokeEngine,
 )
-from camera_safety.adapters.models.smoking_engine import SmokingBehaviorEngine
-from camera_safety.adapters.persistence.evidence_repository import EvidenceStore
-from camera_safety.domain.events import SafetyDetection, SafetyEventStore
-from camera_safety.domain.fire_smoke_events import FireSmokeEventStore
+from adapters.models.smoking_engine import SmokingBehaviorEngine
+from adapters.persistence.evidence_repository import EvidenceStore
+from domain.events import SafetyDetection, SafetyEventStore
+from domain.fire_smoke_events import FireSmokeEventStore
 
 
 def _config(root: Path) -> dict:

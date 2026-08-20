@@ -13,8 +13,8 @@ dependencies = [
 ]
 
 [project.scripts]
-ls-vision = "camera_safety.runner:main"
-ls-vision-dashboard = "camera_safety.interfaces.dashboard_api:main"
+ls-vision = "runner:main"
+ls-vision-dashboard = "interfaces.dashboard_api:main"
 
 [project.optional-dependencies]
 test = ["pytest>=8,<9", "ruff>=0.12,<0.13"]

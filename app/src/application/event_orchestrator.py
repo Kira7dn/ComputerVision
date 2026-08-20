@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from camera_safety.domain.contracts import EventContract, Lifecycle
+from domain.contracts import EventContract, Lifecycle
 
 
 @dataclass

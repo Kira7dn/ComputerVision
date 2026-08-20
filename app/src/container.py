@@ -11,8 +11,8 @@ import sys
 def main() -> int:
     config = os.environ.get("CAMERA_CONFIG", "/opt/camera-safety/config/production.yaml")
     processes = [
-        subprocess.Popen([sys.executable, "-m", "camera_safety.interfaces.dashboard_api"]),
-        subprocess.Popen([sys.executable, "-m", "camera_safety.runner", "--config", config]),
+        subprocess.Popen([sys.executable, "-m", "interfaces.dashboard_api"]),
+        subprocess.Popen([sys.executable, "-m", "runner", "--config", config]),
     ]
 
     def stop(_signum: int, _frame: object) -> None:

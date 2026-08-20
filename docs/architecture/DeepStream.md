@@ -1,261 +1,251 @@
-# Camera DeepStream production architecture
+# LS-Vision DeepStream production architecture
+
+Ngày cập nhật: 21/08/2026
+
+Tài liệu này là source of truth cho kiến trúc và lộ trình của runtime Camera
+DeepStream. `server/` là boundary ADAS/FTP/archive độc lập và không thuộc
+restructure này. `frigate/` không phải startup path, media owner, event store
+hoặc test gate của LS-Vision.
 
 ## 1. Quyết định kiến trúc
 
-`app/` là source duy nhất của Camera DeepStream runtime.
-
-Runtime giữ topology đơn giản và ổn định:
+`app/` là source canonical duy nhất của Camera DeepStream runtime. Python
+runtime modules nằm trực tiếp dưới `app/src`; tên triển khai Docker là
+`ls-vision`.
 
 ```text
-app/config/*.yaml
-        |
-        v
-app runner/supervisor
-        |
-        +-- một worker DeepStream cho mỗi camera
-        |       |
-        |       +-- capture/RTSP
-        |       +-- person detection + application tracking
-        |       +-- face / smoking / fire-smoke inference
-        |       +-- event lifecycle + evidence reference
-        |       +-- NVOSD annotation
-        |       +-- RTSP publish
-        |
-        +-- MediaMTX RTSP/WebRTC/HLS
-        +-- Dashboard API + static web
-        +-- notification outbox worker
+Development (native WSL)
+  app/config/dev.yaml
+        -> runner
+        -> một worker cho mỗi camera
+        -> MediaMTX + dashboard
+
+Production (Docker Desktop / WSL2 / NVIDIA)
+  ls-vision Compose project
+    ├─ ls-vision
+    │   ├─ dashboard/API
+    │   ├─ supervisor
+    │   └─ một worker DeepStream cho mỗi camera
+    └─ mediamtx
+        └─ RTSP / WebRTC / HLS
 ```
 
-Mỗi camera có process worker riêng để cô lập state, model failure, track state
-và restart. Không dùng một global tracker hoặc một event state dùng chung cho
-nhiều camera.
+Một worker sở hữu state của đúng một camera: capture, DeepStream graph,
+tracking, function analysis, event/evidence dispatch, annotation và RTSP
+output. Supervisor sở hữu lifecycle/restart worker; container sở hữu dashboard
+và supervisor. Không dùng một global tracker hoặc event state dùng chung giữa
+các camera.
 
-DeepStream sở hữu inference, tracking, annotation và output frame. Dashboard
-chỉ đọc live metadata, trạng thái runtime và event query; dashboard không tự vẽ
-bbox lên live video.
+Dashboard chỉ đọc runtime status, live metadata và event query. Dashboard không
+tự vẽ bbox lên live video, không glob evidence tree trong request path và không
+đọc trực tiếp từng `event.json`.
 
-## 2. Trạng thái audit hiện tại
+## 2. Audit trạng thái hiện tại
 
-`app/src/camera_safety/` hiện là production package; implementation DeepStream
-được giữ dưới package boundary để characterization behavior không đổi.
-Các rủi ro bắt buộc xử lý trước khi gọi production-ready:
+### Đã hoàn tất và có evidence
 
-| Mức | Vấn đề | Hậu quả |
+| Hạng mục | Trạng thái thực tế |
+|---|---|
+| Canonical source | `app/src/` đã là package runtime; launcher/package scripts/docs/tests đã chuyển sang boundary mới |
+| Test ownership | Test DeepStream hiện hành ở `app/tests`; test Frigate/legacy cũ đã được xóa khỏi gate Camera |
+| Config | Có `base.yaml`, `dev.yaml`, `production.yaml`, `e2e.yaml`; merge/duplicate ID/URL/mock production/model path được validate trước startup |
+| Docker identity | Compose project/service/image dùng `ls-vision`; MediaMTX là service riêng |
+| Docker image | Build pass với DeepStream `7.1-gc-triton-devel` đã pin digest; image tag `ls-vision:deepstream-7.1-gc-triton` |
+| Runtime storage | Models/face library read-only; evidence/state/queue/logs là Docker-managed Linux volumes với prefix `ls-vision_` |
+| Mock E2E | 30-second E2E pass: 3 worker, dashboard live/ready, freshness, restart, event API và evidence API |
+| Media output E2E | HLS manifest thật từ MediaMTX đã trả HTTP 200 cho các output mock; không chỉ kiểm tra process tồn tại |
+| Static/package checks | Root pytest `51 passed`; Ruff, compileall, Compose config và `git diff --check` pass |
+
+Report runtime gần nhất: `.tmp/ls-vision-e2e/final-summary.json` với
+`accepted=true`.
+
+### Còn mở trước khi gọi production-ready
+
+| Mức | Khoảng trống | Gate đóng |
 |---|---|---|
-| P0 | Working tree đang ở trạng thái move chưa hoàn tất; launcher, package script, test và một số config còn tham chiếu đường dẫn cũ | Có thể commit thiếu runtime hoặc khởi động nhầm source |
-| P0 | `pipeline.py` gần 2.000 dòng, trộn GStreamer, model, tracking, event, evidence, notification, status và shutdown | Khó cô lập lỗi, khó test, dễ làm thay đổi một lane ảnh hưởng lane khác |
-| P0 | Dashboard bind `0.0.0.0`, MediaMTX cho phép origin rộng, chưa có auth/TLS/authorization | Event, evidence và live endpoint có thể bị truy cập ngoài phạm vi |
-| P1 | DeepStream worker legacy vẫn là compatibility implementation lớn trong package | Tiếp tục tách probe/orchestrator theo bounded change; không đổi event semantics |
-| P1 | Dependency runtime DeepStream/GStreamer/pyds/CUDA chưa có manifest production đầy đủ | Không reproducible khi dựng máy mới |
-| P1 | Config chứa path `/mnt/d`, `/opt`, camera IP và profile mock/prod trong cùng file | Deployment phụ thuộc máy phát triển, khó quản lý environment |
-| P1 | Evidence, SQLite, JPEG annotation và thumbnail nằm chung một service/file layout | API, storage và lifecycle bị kết dính; đọc trên WSL mount dễ chậm |
-| P1 | `RecognitionCore` và face engine cùng giữ state recognition | Có nguy cơ policy cadence/vote/lifecycle bị lệch |
-| P1 | Face gallery nằm trong source tree | Dữ liệu sinh trắc học có nguy cơ bị commit và không có ACL/backup policy |
-| P2 | `events.py` và `fire_smoke_events.py` có lifecycle riêng | Contract event bị phân mảnh, khó query thống nhất |
+| P0 | Production model volume chưa có checksum đầy đủ; `manifest.yaml` còn `sha256: ""` | Nạp đúng model vào volume, verify checksum và ghi nhận GPU/provider/model loaded |
+| P0 | E2E hiện dùng `profile: e2e` và fixture mock, bỏ qua model validation khi tất cả source là mock | Chạy production profile với model thật và camera RTSP thật |
+| P1 | `application/camera_worker.py` vẫn là compatibility implementation lớn; các adapter/application boundary đã có nhưng chưa tách hết logic | Tách probe/orchestrator/evidence/notification mà không đổi event semantics |
+| P1 | Dashboard/API chưa có authentication/authorization/TLS operator | Bind/reverse proxy/auth/TLS và test endpoint access |
+| P1 | Chưa có acceptance notification provider thật, retry/cooldown/idempotency sau restart | Test outbox với provider sandbox hoặc fake server durable |
+| P1 | Chưa có disk-full, retention, backup và log rotation policy thực thi | Fault/retention acceptance trên Docker volumes |
+| P2 | Chưa xác nhận WebRTC browser flow end-to-end; E2E hiện bắt buộc HLS | Browser/WebRTC acceptance bằng client thật |
+| P2 | Vị trí disk image của Docker Desktop trên Windows không được Docker CLI xác nhận | Operator xác nhận Docker Desktop Disk image location là ổ E |
 
-Static audit hiện tại của `app/`:
+Kết luận audit: migration package + Docker mock runtime đã có evidence; chưa
+được gọi là production-ready cho đến khi các gate production bên trên pass.
 
-- Ruff: pass.
-- YAML parse: pass.
-- PowerShell parser: pass.
-- Package/install, config merge, static checks và characterization tests đã pass.
-- Docker và 30-second runtime acceptance vẫn chưa được công nhận khi chưa có
-  Docker daemon/MediaMTX/DeepStream runtime evidence trên máy hiện tại.
-
-## 3. Folder architecture production
+## 3. Folder architecture hiện hành
 
 ```text
 app/
 ├─ pyproject.toml
 ├─ README.md
 ├─ src/
-│  └─ camera_safety/
-│     ├─ __init__.py
-│     │
-│     ├─ domain/
-│     │  ├─ contracts.py
-│     │  ├─ detections.py
-│     │  ├─ events.py
-│     │  ├─ recognition.py
-│     │  └─ tracking.py
-│     │
-│     ├─ application/
-│     │  ├─ camera_worker.py
-│     │  ├─ inference_orchestrator.py
-│     │  ├─ event_orchestrator.py
-│     │  ├─ evidence_service.py
-│     │  └─ notification_service.py
-│     │
-│     ├─ adapters/
-│     │  ├─ deepstream/
-│     │  │  ├─ pipeline_builder.py
-│     │  │  ├─ probes.py
-│     │  │  ├─ metadata.py
-│     │  │  └─ osd.py
-│     │  ├─ models/
-│     │  │  ├─ face_engine.py
-│     │  │  ├─ smoking_engine.py
-│     │  │  └─ fire_smoke_engine.py
-│     │  ├─ media/
-│     │  │  ├─ mediamtx.py
-│     │  │  └─ mock_input.py
-│     │  ├─ persistence/
-│     │  │  ├─ event_repository.py
-│     │  │  ├─ evidence_repository.py
-│     │  │  └─ notification_outbox.py
-│     │  └─ notifications/
-│     │     ├─ telegram.py
-│     │     └─ zalo.py
-│     │
-│     ├─ interfaces/
-│     │  ├─ dashboard_api.py
-│     │  ├─ event_queries.py
-│     │  └─ health.py
-│     │
-│     └─ bootstrap/
-│        ├─ config.py
-│        ├─ paths.py
-│        ├─ logging.py
-│        └─ lifecycle.py
-│
+│  ├─ domain/
+│  │  ├─ contracts.py
+│  │  ├─ detections.py
+│  │  ├─ events.py
+│  │  ├─ fire_smoke_events.py
+│  │  ├─ recognition.py
+│  │  └─ tracking.py
+│  ├─ application/
+│  │  ├─ camera_worker.py
+│  │  ├─ inference_orchestrator.py
+│  │  ├─ event_orchestrator.py
+│  │  ├─ evidence_service.py
+│  │  └─ notification_service.py
+│  ├─ adapters/
+│  │  ├─ deepstream/
+│  │  │  ├─ pipeline_builder.py
+│  │  │  ├─ probes.py
+│  │  │  ├─ metadata.py
+│  │  │  └─ osd.py
+│  │  ├─ models/
+│  │  │  ├─ contracts.py
+│  │  │  ├─ face_engine.py
+│  │  │  ├─ smoking_engine.py
+│  │  │  └─ fire_smoke_engine.py
+│  │  ├─ media/
+│  │  │  ├─ mock_input.py
+│  │  │  └─ gstreamer_mock_publisher.py
+│  │  └─ persistence/
+│  │     ├─ event_repository.py
+│  │     ├─ evidence_repository.py
+│  │     └─ notification_outbox.py
+│  ├─ interfaces/
+│  │  ├─ dashboard_api.py
+│  │  ├─ event_queries.py
+│  │  └─ health.py
+│  ├─ bootstrap/
+│  │  ├─ config.py
+│  │  ├─ paths.py
+│  │  ├─ logging.py
+│  │  └─ lifecycle.py
+│  ├─ runner.py
+│  └─ container.py
 ├─ web/
 │  ├─ dashboard.html
-│  ├─ dashboard.js
-│  ├─ dashboard.css
 │  └─ mediamtx_reader.js
-│
 ├─ config/
 │  ├─ base.yaml
 │  ├─ dev.yaml
 │  ├─ production.yaml
+│  ├─ e2e.yaml
 │  └─ cameras/
-│     ├─ camera_face.yaml
-│     ├─ camera_safety.yaml
-│     └─ camera_dahua.yaml
-│
 ├─ deploy/
-│  ├─ wsl/
-│  │  ├─ camera-safety.service
-│  │  ├─ dashboard.service
+│  ├─ docker/
+│  │  ├─ Dockerfile
+│  │  ├─ compose.yaml
+│  │  ├─ compose.e2e.yaml
 │  │  └─ mediamtx.yml
 │  ├─ powershell/
-│  │  ├─ start.ps1
-│  │  ├─ stop.ps1
-│  │  └─ status.ps1
-│  └─ models/
-│     └─ manifest.yaml
-│
+│  └─ models/manifest.yaml
 └─ tests/
    ├─ unit/
-   │  ├─ domain/
-   │  ├─ application/
-   │  └─ adapters/
    ├─ integration/
    └─ e2e/
 ```
+
+`camera_worker.py` là vùng cần tiếp tục thu nhỏ. Folder boundary hiện tại
+không có nghĩa mọi policy đã là pure domain; acceptance phải kiểm tra import
+graph và behavior trước khi chuyển tiếp logic.
 
 ## 4. Ownership boundary
 
 ### Domain
 
-Chỉ chứa state và policy thuần, không import GStreamer, `pyds`, HTTP,
-filesystem hoặc SQLite:
+Domain giữ policy/state thuần và không import GStreamer, `pyds`, OpenCV model
+session, HTTP, SQLite hoặc filesystem:
 
-- `PersonTrack`, confirmation gate và geometry;
-- `FaceRecognitionResult`, identity vote và unknown policy;
-- `SafetyEvent`, lifecycle START/UPDATE/END;
-- fire/smoke classification;
-- typed event and evidence contracts.
+- tracking geometry và person confirmation;
+- recognition vote/cadence/unknown policy;
+- safety event lifecycle START/UPDATE/END;
+- fire/smoke lifecycle;
+- typed detection/event/evidence contracts.
 
 ### Application
 
-Điều phối use case, nhưng không biết chi tiết DeepStream:
+Application điều phối:
 
-- nhận detection result từ adapter;
-- cập nhật track state;
-- mở/đóng event;
-- chọn evidence frame;
-- phát event sang repository và outbox;
-- giữ invariant: dashboard/notification chỉ thấy event START hợp lệ.
+```text
+detection result
+  -> track update
+  -> recognition/function decision
+  -> event transition
+  -> evidence reference
+  -> event repository + notification outbox
+```
 
-### DeepStream adapters
+Application quyết định identity confirmation và event lifecycle. Face engine
+chỉ load/process/close model và trả typed result; không tự publish event.
 
-Chỉ sở hữu:
+### DeepStream/model adapters
 
-- GStreamer element graph;
-- pad probe và buffer mapping;
-- tensor metadata;
-- NVOSD object/display metadata;
-- encoded output;
-- GPU/model session lifecycle.
+Adapter sở hữu GStreamer graph, pad probe, tensor metadata, NVOSD, encode/output
+và model session lifecycle. Pad probe không được tự ghi SQLite, evidence JSON,
+Telegram/Zalo hoặc scan evidence directory.
 
-Pad probe không được tự ghi SQLite, gọi Telegram/Zalo hoặc tự scan evidence
-directory.
+### Persistence/evidence
 
-### Persistence adapters
+`EventRepository` sở hữu read model/query index. `EvidenceRepository` sở hữu
+original annotated frame, thumbnail, trace, manifest và idempotency record.
+SQLite production nằm trong Docker volume, không nằm trên `/mnt/d`.
 
-`EventRepository` lưu event index/query model. `EvidenceRepository` lưu:
+### Notification
 
-- original annotated frame;
-- card thumbnail;
-- trace;
-- manifest;
-- idempotency record.
+Notification chỉ nhận event đã có evidence reference từ outbox. Retry,
+cooldown, idempotency và provider status không được nằm trong pad probe.
 
-Dashboard đọc `EventRepository`/query API, không đọc `event.json` của từng thư
-mục trong mỗi lần polling.
+## 5. Runtime data và Docker storage
 
-### Notification outbox
-
-Notification chỉ nhận event đã có evidence reference. Provider adapter Telegram
-hoặc Zalo không được truy cập trực tiếp pipeline state. Retry, cooldown,
-idempotency và provider status nằm trong outbox.
-
-## 5. Runtime data ngoài source
-
-Source package không chứa model, face gallery hoặc evidence production.
+Trong container, runtime root hiện giữ compatibility path `/opt/camera-safety`:
 
 ```text
 /opt/camera-safety/
-├─ models/
-├─ face_library/
-├─ evidence/
-├─ state/
-├─ queue/
-├─ logs/
-└─ status/
+├─ models/          read-only: ls-vision_camera_models
+├─ face_library/    read-only: ls-vision_camera_face_library
+├─ evidence/        writable: ls-vision_camera_evidence
+├─ state/           writable: ls-vision_camera_state
+├─ queue/           writable: ls-vision_camera_queue
+├─ logs/            writable: ls-vision_camera_logs
+└─ status/          worker status
 ```
 
-Các thư mục trên phải có owner, permission, retention và backup policy riêng.
-SQLite production không đặt trên thư mục source hoặc vùng mount dùng cho code.
+Source code vẫn ở `D:\BusinessAnalyze\Camera`. Docker build cache, image
+layers, container filesystem và named volumes phải do Docker Desktop quản lý
+trên disk image đặt tại ổ E; Docker CLI chỉ hiển thị Linux mountpoint nên
+operator phải kiểm tra setting này trong Docker Desktop.
+
+Face gallery/model production không được commit vào source. Dữ liệu sinh trắc
+học phải có permission, retention, backup và access policy riêng.
 
 ## 6. Configuration contract
 
-Config được merge theo thứ tự:
+Precedence:
 
 ```text
 base.yaml
-    + profile dev hoặc production
-    + camera definition
-    + environment variables / secret file
-    -> typed validated runtime config
+  -> dev.yaml hoặc production.yaml
+  -> camera profile / camera override
+  -> environment variables hoặc secret file
+  -> validated per-camera runtime config
 ```
 
-Config không chứa credential plaintext và không hardcode đường dẫn máy phát
-triển. Mỗi camera phải định nghĩa rõ:
+Validation bắt buộc:
 
-- source type và URL;
-- output path;
-- enabled function;
-- model lane;
-- evidence policy;
-- metadata endpoint;
-- health/readiness policy.
+- camera ID không trùng;
+- source/output URL hợp lệ;
+- production không được dùng mock source;
+- model file tồn tại khi production hoặc khi ép `CAMERA_VALIDATE_MODELS=1`;
+- provider GPU phù hợp khi function yêu cầu GPU;
+- evidence/state writable;
+- secret chỉ lấy từ environment/secret file, không ghi vào event/manifest/log.
 
-Mock input chỉ nằm trong `dev.yaml`; production profile không được vô tình
-khởi động mock camera.
+`e2e.yaml` là profile kiểm thử riêng, dùng fixture mock và model-free worker;
+không được dùng làm production config.
 
-## 7. Event and evidence flow
+## 7. Event/evidence contract
 
 ```text
 frame PTS
@@ -269,101 +259,143 @@ frame PTS
   -> dashboard query
 ```
 
-Recognition contract:
+Invariants không được đổi khi tiếp tục refactor:
 
-- recognized event START dùng đúng frame tạo ra identity confirmation;
-- unknown chỉ tạo khi track kết thúc và có face evidence hợp lệ;
-- unknown dùng best face frame trong bounded track state, không dùng end frame;
+- recognized START dùng đúng frame tạo ra identity confirmation;
+- unknown dùng best face evidence trong bounded track state;
 - event list chỉ hiển thị START;
-- END chỉ là lifecycle record nội bộ;
-- thumbnail là bản dẫn xuất nhỏ, original frame giữ nguyên cho modal/report.
+- END là lifecycle record nội bộ;
+- thumbnail tạo tại START và original chỉ tải khi mở detail;
+- event/evidence có idempotency key và đọc lại được sau restart.
 
-## 8. Deployment ownership
+## 8. Deployment và lifecycle
 
-Production process ownership phải thuộc WSL service manager:
+### Production
 
-```text
-camera-safety.service
-  ├─ MediaMTX dependency
-  ├─ dashboard API dependency
-  └─ runner supervisor
-       └─ one worker per camera
+`app/deploy/docker/compose.yaml` là deployment contract:
+
+- service `ls-vision`: dashboard/API, supervisor và toàn bộ camera workers;
+- service `mediamtx`: RTSP/WebRTC/HLS;
+- NVIDIA GPU reservation cho `ls-vision`;
+- image DeepStream tag + digest được pin;
+- healthcheck và `restart: unless-stopped`;
+- dashboard/MediaMTX chỉ bind localhost trong compose hiện tại;
+- model/face library read-only, runtime data read-write volumes.
+
+PowerShell chỉ là operator client:
+
+```powershell
+.\app\deploy\powershell\start.ps1 -Action start -Mode Production
+.\app\deploy\powershell\status.ps1 -Mode Production
+.\app\deploy\powershell\stop.ps1 -Mode Production
 ```
 
-PowerShell chỉ là operator client gọi service `start`, `stop`, `status`; không
-được giữ process ownership bằng foreground shell trap.
+Không dùng foreground shell trap để sở hữu production process.
 
-Readiness phải phân biệt:
+### Development
 
-- process tồn tại;
+Native WSL vẫn được hỗ trợ qua `start.ps1 -Mode Dev`; không dùng Docker Compose
+hoặc Frigate làm startup path development.
+
+### Readiness
+
+Health contract phải phân biệt:
+
+- process alive;
 - model loaded;
 - GPU provider active;
-- input frame mới;
-- output frame mới;
-- analysis result không stale;
-- dashboard/API reachable;
+- input frame fresh;
+- output frame fresh;
+- analysis result fresh;
 - evidence writable;
-- notification outbox healthy.
+- notification outbox healthy;
+- MediaMTX stream ready.
 
-## 9. Lộ trình migration
+## 9. Kế hoạch cập nhật sau audit
 
-### Phase 0 — Canonicalize source
+### Phase 0 — Canonical source: DONE
 
-1. Chốt `app/` là source duy nhất.
-2. Sửa package scripts, launcher, tests, docs và config để cùng dùng `app/`.
-3. Xóa toàn bộ tham chiếu tới thư mục không còn canonical.
-4. Thêm `app/src/camera_safety/__init__.py` và import package chuẩn.
-5. Đưa face gallery và model ra runtime volume.
-6. Chỉ hoàn tất khi clean checkout có thể cài và import package.
+- `app/` là source duy nhất.
+- Flat runtime imports đã chuyển sang các module trực tiếp dưới `app/src`.
+- launcher, package scripts, docs và test path đã cập nhật.
+- face library source tree và Frigate/legacy Camera tests đã loại khỏi source/gate.
 
-### Phase 1 — Package and dependency reproducibility
+### Phase 1 — Config/dependency/Docker: MOSTLY DONE
 
-1. Tạo `app/pyproject.toml` với dependency runtime và test riêng.
-2. Pin Python, DeepStream, GStreamer, CUDA, TensorRT, ONNX Runtime và MediaMTX.
-3. Tạo model manifest có checksum và version.
-4. Thêm config validation trước khi worker khởi động.
+- `app/pyproject.toml`, profile config, validation và model manifest đã có.
+- DeepStream image, MediaMTX image và image digest đã pin.
+- Compose `ls-vision` + named volumes + GPU reservation + healthcheck đã có.
 
-### Phase 2 — Tách domain/application
+Việc còn lại: điền checksum model thật, tạo model-volume manifest release và
+chứng minh production image load model/provider trên máy đích.
 
-1. Tách geometry, tracking, recognition và lifecycle thành pure modules.
-2. Tạo typed contracts thay cho dict tự do giữa pipeline và event store.
-3. Giữ nguyên behavior hiện tại qua characterization tests.
+### Phase 2 — Domain/application: PARTIAL
 
-### Phase 3 — Tách adapters
+- typed contracts, tracking, recognition và event modules đã có.
+- characterization/unit/integration tests đã chuyển sang `app/tests`.
 
-1. Tách DeepStream pipeline builder và pad probes.
-2. Tách từng model engine thành adapter.
-3. Tách MediaMTX/mock input và runtime status.
-4. `camera_worker.py` chỉ compose các adapter và application service.
+Việc còn lại: chuyển business decision còn nằm trong `camera_worker.py` vào
+application/domain service, giữ differential tests cho event/evidence/unknown
+policy và không đổi topology inference.
 
-### Phase 4 — Persistence/API
+### Phase 3 — DeepStream adapters: PARTIAL
 
-1. Tách event repository, evidence repository và notification outbox.
-2. Tạo read model cho dashboard.
-3. Thumbnail/original dùng endpoint riêng với immutable cache.
-4. Không để HTTP handler scan toàn bộ evidence tree trong request path.
+- pipeline builder/probe/metadata/OSD adapter boundary đã được tạo.
+- model adapters có interface load/health/process/close.
+- E2E mock dùng GStreamer publisher thật để kiểm tra HLS qua MediaMTX.
 
-### Phase 5 — Production lifecycle and security
+Việc còn lại: tách implementation legacy khỏi worker theo từng bounded change;
+pad probe chỉ publish typed result/status, không sở hữu persistence/notification.
 
-1. Chuyển runner sang WSL service manager.
-2. Bind dashboard nội bộ và đặt reverse proxy/auth/TLS.
-3. Khóa MediaMTX origin và endpoint access.
-4. Thiết lập retention, backup, disk-full handling và log rotation.
+### Phase 4 — Persistence/API: PARTIAL
 
-## 10. Acceptance bắt buộc
+- event/evidence repository, outbox, event query và health interfaces đã có.
+- dashboard metrics/events/evidence endpoints và thumbnail/original contract đã có.
 
-Không gọi migration hoàn tất chỉ vì unit test hoặc dashboard HTTP 200 pass.
+Việc còn lại: read model hoàn chỉnh, immutable cache headers, auth/authorization,
+concurrency/error policy và integration test với volume/restart thực tế.
 
-Production gate phải có:
+### Phase 5 — Production operations/security: OPEN
 
-- clean checkout và package install pass;
-- toàn bộ unit/integration test chạy trên `app`;
-- config production validation pass;
-- cold start với một worker mỗi camera;
-- GPU provider và model checksum được ghi nhận;
-- input/output frame freshness pass;
-- event/evidence đọc lại được sau restart;
-- thumbnail và original endpoint có cache contract đúng;
-- notification outbox retry/idempotency pass;
-- auth/TLS/network exposure pass;
-- không còn source/test/launcher tham chiếu thư mục không canonical.
+- Compose lifecycle, restart policy, GPU reservation và operator wrappers đã có.
+
+Việc còn lại: TLS/auth, origin policy production, secret handling, log rotation,
+retention/backup, disk-full policy, model rollout/rollback và browser WebRTC
+acceptance.
+
+### Phase 6 — Real-camera acceptance: OPEN
+
+- cold start bằng ba fixture mock đã pass.
+
+Việc còn lại: chạy với RTSP camera thật, production model volume, đúng provider
+GPU, xác nhận inference/event/evidence/notification semantics và giữ artifacts
+failed run để audit.
+
+## 10. Acceptance gates
+
+### Đã pass
+
+- clean package import và root test suite: `51 passed`;
+- Ruff, compileall, Compose config và diff check;
+- Docker image build `ls-vision:deepstream-7.1-gc-triton`;
+- Compose startup và healthcheck của `ls-vision`/MediaMTX;
+- một worker cho mỗi camera trong E2E mock;
+- input/output freshness trong 30 giây;
+- HLS manifest thật từ MediaMTX cho camera outputs;
+- dashboard live/ready, event feed START-only;
+- container restart và state/evidence API sau restart.
+
+### Chưa pass / không được suy diễn
+
+- production model checksum và model-loaded evidence;
+- DeepStream inference thật với camera RTSP thật;
+- accuracy/recall của face, smoking, fire/smoke;
+- WebRTC browser playback;
+- notification provider thật và retry/idempotency sau restart;
+- authentication/authorization/TLS;
+- retention, backup, disk-full và log rotation;
+- xác nhận Docker Desktop disk image thực sự ở ổ E.
+
+Chỉ gọi LS-Vision production-ready khi toàn bộ nhóm gate thứ hai có evidence
+được lưu cùng release report; unit test, HTTP 200, image build hoặc container
+healthy riêng lẻ không đủ.

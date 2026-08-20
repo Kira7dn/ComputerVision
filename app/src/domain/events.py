@@ -10,7 +10,7 @@ from typing import Any
 
 import numpy as np
 
-from camera_safety.adapters.persistence.evidence_repository import EvidenceStore
+from adapters.persistence.evidence_repository import EvidenceStore
 
 
 class EventState(str, Enum):

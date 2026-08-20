@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Protocol
 
-from camera_safety.domain.contracts import DetectionResult
+from domain.contracts import DetectionResult
 
 
 class ModelAdapter(Protocol):

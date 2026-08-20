@@ -8,8 +8,8 @@ from typing import Any
 
 import numpy as np
 
-from camera_safety.adapters.models.fire_smoke_engine import FireSmokeDetection
-from camera_safety.adapters.persistence.evidence_repository import EvidenceStore
+from adapters.models.fire_smoke_engine import FireSmokeDetection
+from adapters.persistence.evidence_repository import EvidenceStore
 
 
 @dataclass(frozen=True)

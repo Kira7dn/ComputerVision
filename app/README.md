@@ -1,6 +1,6 @@
 # LS-Vision package
 
-`app/src/camera_safety` is the canonical DeepStream runtime package. `server/`
+`app/src` is the canonical DeepStream runtime source root. `server/`
 remains the independent ADAS/FTP/archive boundary.
 
 Development uses native WSL:

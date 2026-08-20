@@ -11,8 +11,8 @@ import time
 import uuid
 from pathlib import Path
 
-from camera_safety.adapters.persistence.evidence_repository import run_directory, write_manifest
-from camera_safety.bootstrap.config import camera_ids, load_raw_config, validate_config
+from adapters.persistence.evidence_repository import run_directory, write_manifest
+from bootstrap.config import camera_ids, load_raw_config, validate_config
 
 
 def _environment() -> dict[str, str]:
@@ -54,7 +54,7 @@ def main() -> int:
         return [
             sys.executable,
             "-m",
-            "camera_safety.application.camera_worker",
+            "application.camera_worker",
             "--config",
             str(args.config),
             "--camera-id",
@@ -68,7 +68,7 @@ def main() -> int:
     def start_worker(camera_id: str) -> None:
         worker = subprocess.Popen(
             command_for(camera_id),
-            cwd=str(Path(__file__).resolve().parents[2]),
+            cwd=str(Path(__file__).resolve().parents[1]),
             env=_environment(),
         )
         workers[camera_id] = worker

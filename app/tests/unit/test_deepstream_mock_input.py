@@ -2,7 +2,7 @@ import subprocess
 
 import pytest
 
-from camera_safety.adapters.media import mock_input
+from adapters.media import mock_input
 
 
 def test_wait_for_rtsp_video_requires_a_decodable_video_stream(monkeypatch) -> None:

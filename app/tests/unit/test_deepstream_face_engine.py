@@ -1,11 +1,11 @@
 import numpy as np
 import pytest
 
-from camera_safety.adapters.models.face_engine import (
+from adapters.models.face_engine import (
     TrackRecognitionScheduler,
     _select_onnx_providers,
 )
-from camera_safety.bootstrap.config import camera_ids, resolve_camera_config
+from bootstrap.config import camera_ids, resolve_camera_config
 
 
 def test_track_scheduler_uses_bounded_wall_clock_interval() -> None:
@@ -34,7 +34,7 @@ def test_track_scheduler_clamps_upper_bound() -> None:
 
 
 def test_unknown_evidence_keeps_only_the_highest_quality_frame() -> None:
-    from camera_safety.adapters.models.face_engine import FaceRecognitionEngine
+    from adapters.models.face_engine import FaceRecognitionEngine
 
     engine = FaceRecognitionEngine.__new__(FaceRecognitionEngine)
     engine._track_best_evidence = {}
@@ -53,7 +53,7 @@ def test_unknown_evidence_keeps_only_the_highest_quality_frame() -> None:
 
 
 def test_unknown_evidence_rejects_person_only_frame() -> None:
-    from camera_safety.adapters.models.face_engine import FaceRecognitionEngine
+    from adapters.models.face_engine import FaceRecognitionEngine
 
     engine = FaceRecognitionEngine.__new__(FaceRecognitionEngine)
     engine._track_best_evidence = {}

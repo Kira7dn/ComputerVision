@@ -7,8 +7,8 @@ from pathlib import Path
 import httpx
 import numpy as np
 
-from camera_safety.adapters.persistence.evidence_repository import EvidenceStore
-from camera_safety.application.notification_service import NotificationService
+from adapters.persistence.evidence_repository import EvidenceStore
+from application.notification_service import NotificationService
 
 
 def _config(root: Path) -> dict:

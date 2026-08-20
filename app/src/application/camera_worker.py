@@ -29,13 +29,13 @@ from typing import Any
 from urllib.parse import urlparse
 from urllib.request import urlopen
 
-from camera_safety.adapters.media.mock_input import wait_for_rtsp_video
-from camera_safety.adapters.models.face_engine import FaceRecognitionEngine
-from camera_safety.adapters.models.fire_smoke_engine import FireSmokeEngine
-from camera_safety.adapters.models.smoking_engine import SmokingBehaviorEngine
-from camera_safety.adapters.persistence.evidence_repository import EvidenceStore
-from camera_safety.application.notification_service import NotificationService
-from camera_safety.bootstrap.config import load_config, load_raw_config
+from adapters.media.mock_input import wait_for_rtsp_video
+from adapters.models.face_engine import FaceRecognitionEngine
+from adapters.models.fire_smoke_engine import FireSmokeEngine
+from adapters.models.smoking_engine import SmokingBehaviorEngine
+from adapters.persistence.evidence_repository import EvidenceStore
+from application.notification_service import NotificationService
+from bootstrap.config import load_config, load_raw_config
 
 DEEPSTREAM_ROOT = os.environ.get("DEEPSTREAM_ROOT", "/opt/nvidia/deepstream/deepstream-7.1")
 os.environ["GIO_USE_PROXY"] = "0"
@@ -58,10 +58,10 @@ import gi  # noqa: E402
 import numpy as np  # noqa: E402
 import zmq  # noqa: E402
 
-from camera_safety.domain.events import SafetyDetection, SafetyEventStore  # noqa: E402
-from camera_safety.domain.fire_smoke_events import FireSmokeEventStore  # noqa: E402
-from camera_safety.domain.recognition import RecognitionCore, TrackKey  # noqa: E402
-from camera_safety.domain.tracking import (  # noqa: E402
+from domain.events import SafetyDetection, SafetyEventStore  # noqa: E402
+from domain.fire_smoke_events import FireSmokeEventStore  # noqa: E402
+from domain.recognition import RecognitionCore, TrackKey  # noqa: E402
+from domain.tracking import (  # noqa: E402
     PersonConfirmation,
     intersection_over_candidate,
     iou,
@@ -1993,7 +1993,7 @@ def _run_e2e_mock_worker(config_path: Path, camera_id: str, run_id: str, worker_
         [
             sys.executable,
             "-m",
-            "camera_safety.adapters.media.gstreamer_mock_publisher",
+            "adapters.media.gstreamer_mock_publisher",
             "--input",
             str(mock_video),
             "--output",
