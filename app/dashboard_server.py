@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import time
+from email.utils import formatdate
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Lock
@@ -262,14 +263,20 @@ def _event_feed(after: int = 0, limit: int | None = None) -> dict[str, object]:
             )
             if function == "fire_smoke" and classification == "fire":
                 severity, severity_label = "danger", "Nguy hiểm"
-            score_value = record.get("score", details.get("last_score"))
+            score_value = (
+                None
+                if function == "face_recognition" and classification == "unrecognized"
+                else record.get("score", details.get("last_score"))
+            )
             try:
                 score = round(float(score_value), 4) if score_value is not None else None
             except (TypeError, ValueError):
                 score = None
             timestamp = record.get("started_at") or details.get("started_at")
             thumbnail_url = None
-            thumbnail = latest / event_path / "snapshots" / "start-0001-annotated.jpg"
+            image_url = None
+            thumbnail = latest / event_path / "snapshots" / "start-0001-thumbnail.jpg"
+            original = latest / event_path / "snapshots" / "start-0001-annotated.jpg"
             if (
                 not event_path.is_absolute()
                 and ".." not in event_path.parts
@@ -277,7 +284,16 @@ def _event_feed(after: int = 0, limit: int | None = None) -> dict[str, object]:
             ):
                 thumbnail_url = (
                     "/api/event-thumbnail?run_id="
-                    f"{quote(run_id)}&event_path={quote(event_path.as_posix())}"
+                    f"{quote(run_id)}&event_path={quote(event_path.as_posix())}&variant=thumbnail"
+                )
+            if (
+                not event_path.is_absolute()
+                and ".." not in event_path.parts
+                and original.is_file()
+            ):
+                image_url = (
+                    "/api/event-thumbnail?run_id="
+                    f"{quote(run_id)}&event_path={quote(event_path.as_posix())}&variant=original"
                 )
             events.append(
                 {
@@ -295,6 +311,7 @@ def _event_feed(after: int = 0, limit: int | None = None) -> dict[str, object]:
                     "state": "started",
                     "record_type": record_type,
                     "thumbnail_url": thumbnail_url,
+                    "image_url": image_url,
                     "details": details,
                     "start_record": record,
                 }
@@ -304,7 +321,9 @@ def _event_feed(after: int = 0, limit: int | None = None) -> dict[str, object]:
         return {"run_id": None, "cursor": 0, "events": []}
 
 
-def _event_thumbnail(run_id: str, event_path: str) -> Path | None:
+def _event_thumbnail(
+    run_id: str, event_path: str, variant: str = "thumbnail"
+) -> Path | None:
     """Resolve only a START thumbnail inside the configured latest run."""
     try:
         raw_config = load_raw_config(CONFIG_PATH)
@@ -322,7 +341,12 @@ def _event_thumbnail(run_id: str, event_path: str) -> Path | None:
         relative = Path(event_path)
         if latest is None or relative.is_absolute() or ".." in relative.parts:
             return None
-        candidate = (latest / relative / "snapshots" / "start-0001-annotated.jpg").resolve()
+        filename = (
+            "start-0001-thumbnail.jpg"
+            if variant == "thumbnail"
+            else "start-0001-annotated.jpg"
+        )
+        candidate = (latest / relative / "snapshots" / filename).resolve()
         latest_root = latest.resolve()
         if latest_root not in candidate.parents or not candidate.is_file():
             return None
@@ -506,14 +530,19 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             query = parse_qs(parsed.query)
             run_id = query.get("run_id", [""])[0]
             event_path = query.get("event_path", [""])[0]
-            thumbnail = _event_thumbnail(run_id, event_path)
+            variant = query.get("variant", ["thumbnail"])[0]
+            thumbnail = _event_thumbnail(run_id, event_path, variant)
             if thumbnail is None:
                 self.send_error(404)
                 return
             payload = thumbnail.read_bytes()
             self.send_response(200)
             self.send_header("Content-Type", "image/jpeg")
-            self.send_header("Cache-Control", "no-store")
+            # Event evidence paths are immutable after START.
+            self.send_header("Cache-Control", "public, max-age=31536000, immutable")
+            stat = thumbnail.stat()
+            self.send_header("ETag", f'"{stat.st_size:x}-{stat.st_mtime_ns:x}"')
+            self.send_header("Last-Modified", formatdate(stat.st_mtime, usegmt=True))
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
             self.wfile.write(payload)

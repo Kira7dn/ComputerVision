@@ -7,8 +7,8 @@
     "ftp": "python media/ftp_receiver.py --public-host 192.168.100.108",
     "mediamtx": "mediamtx",
     "dev": "concurrently \"npm run media\" \"npm run control\" \"npm run ftp\" \"npm run mediamtx\"",
-    "camera:start": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\deepstream_safety\\start.ps1 start",
-    "camera:stop": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\deepstream_safety\\start.ps1 stop",
-    "camera:status": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\deepstream_safety\\start.ps1 status"
+    "camera:start": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\app\\start.ps1 start",
+    "camera:stop": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\app\\start.ps1 stop",
+    "camera:status": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\app\\start.ps1 status"
   }
 }

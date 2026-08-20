@@ -325,6 +325,25 @@ class EvidenceStore:
                     )
                 if cv2.imwrite(str(annotated_path), annotated):
                     evidence.append(str(annotated_path.relative_to(self.root)))
+                    # Keep the report image at its original resolution, but
+                    # write a small immutable derivative for dashboard cards.
+                    thumbnail_width = 320
+                    thumbnail_height = max(
+                        1,
+                        int(round(annotated.shape[0] * thumbnail_width / annotated.shape[1])),
+                    )
+                    thumbnail = cv2.resize(
+                        annotated,
+                        (thumbnail_width, thumbnail_height),
+                        interpolation=cv2.INTER_AREA,
+                    )
+                    thumbnail_path = image_dir / f"{stem}-thumbnail.jpg"
+                    if cv2.imwrite(
+                        str(thumbnail_path),
+                        thumbnail,
+                        [int(cv2.IMWRITE_JPEG_QUALITY), 72],
+                    ):
+                        evidence.append(str(thumbnail_path.relative_to(self.root)))
                     event["snapshot_count"] = sequence
 
         trace = {

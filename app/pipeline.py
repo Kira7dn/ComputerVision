@@ -271,6 +271,61 @@ class SafetyPipeline:
             self._face_event_ids[track_id] = event_id
             self._notify_event(event_id, "START")
             return
+        if event_name == "track_end" and event_id is None:
+            final_name = str(data.get("name") or "unknown")
+            evidence_frame = data.get("evidence_frame")
+            evidence_person_bbox = data.get("evidence_person_bbox")
+            if (
+                final_name == "unknown"
+                and frame is not None
+                and evidence_frame is not None
+                and data.get("evidence_face_bbox")
+                and float(data.get("evidence_face_score") or 0.0)
+                >= float(self.face_engine.detector_threshold)
+            ):
+                event_id = (
+                    f"face-unknown-{self.run_id}-{self.config['input']['camera']}"
+                    f"-{self.evidence.worker_epoch}-{track_id}-{evidence_frame}-"
+                    f"{uuid.uuid4().hex[:8]}"
+                )
+                self.evidence.start_event(
+                    event_id=event_id,
+                    function="face_recognition",
+                    classification="unrecognized",
+                    camera_id=str(self.config["input"]["camera"]),
+                    person_track_id=track_id,
+                    metadata={
+                        "identity": "unknown",
+                        "recognition_frame_number": evidence_frame,
+                        "recognition_source_timestamp": data.get(
+                            "evidence_source_timestamp"
+                        ),
+                        "evidence_quality": data.get("evidence_quality"),
+                        "evidence_face_score": data.get("evidence_face_score"),
+                        "face_bbox": data.get("evidence_face_bbox"),
+                        "person_bbox": evidence_person_bbox,
+                    },
+                    frame=frame,
+                    frame_number=int(evidence_frame),
+                    bbox=tuple(evidence_person_bbox)
+                    if evidence_person_bbox
+                    else None,
+                    score=None,
+                )
+                self._notify_event(event_id, "START")
+                self.evidence.finish_event(
+                    event_id,
+                    classification="unrecognized",
+                    identity="unknown",
+                    payload={"event": "unknown_track_end", **data},
+                    frame=None,
+                    frame_number=int(evidence_frame),
+                    bbox=tuple(evidence_person_bbox)
+                    if evidence_person_bbox
+                    else None,
+                    score=None,
+                )
+            return
         if event_name == "track_start" or event_id is None:
             return
         if event_name == "track_end":
@@ -280,7 +335,7 @@ class SafetyPipeline:
                 classification="recognized" if final_name != "unknown" else "unrecognized",
                 identity=None if final_name == "unknown" else final_name,
                 payload=data,
-                frame=frame,
+                frame=None,
                 frame_number=int(data.get("frame", -1)),
                 bbox=tuple(data.get("person_bbox", [])) if data.get("person_bbox") else None,
                 score=float(data.get("score", 0.0)),

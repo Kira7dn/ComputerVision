@@ -70,7 +70,7 @@ def test_event_lifecycle_is_classified_and_deduplicated(tmp_path: Path) -> None:
     trace_rows = [json.loads(line) for line in (event_dir / "trace.jsonl").read_text(encoding="utf-8").splitlines()]
     assert [row["record_type"] for row in trace_rows] == ["START", "END"]
     assert all(row["idempotency_key"].startswith("run-001|worker-0|") for row in trace_rows)
-    assert len(list((event_dir / "snapshots").glob("*.jpg"))) == 2
+    assert len(list((event_dir / "snapshots").glob("*.jpg"))) == 4
     assert len(list((event_dir / "snapshots").glob("*-annotated.jpg"))) == 2
     assert not list((event_dir / "snapshots").glob("*-full.jpg"))
     assert not list((event_dir / "snapshots").glob("*-roi.jpg"))
@@ -194,8 +194,11 @@ def test_evidence_keeps_only_start_peak_and_end_images(tmp_path: Path) -> None:
     )
     assert sorted(path.name for path in snapshots.glob("*.jpg")) == [
         "end-0003-annotated.jpg",
+        "end-0003-thumbnail.jpg",
         "peak-0002-annotated.jpg",
+        "peak-0002-thumbnail.jpg",
         "start-0001-annotated.jpg",
+        "start-0001-thumbnail.jpg",
     ]
 
 

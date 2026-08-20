@@ -162,6 +162,10 @@ def test_event_feed_is_start_only_and_recognition_starts_on_exact_frame() -> Non
 
     assert 'if record_type != "START":' in dashboard_server
     assert '"thumbnail_url": thumbnail_url' in dashboard_server
+    assert '"image_url": image_url' in dashboard_server
+    assert "variant=thumbnail" in dashboard_server
+    assert "max-age=31536000, immutable" in dashboard_server
+    assert 'classification == "unrecognized"' in dashboard_server
     assert 'lifecycle != "START"' in notifications
     assert 'stable_name != "unknown"' in pipeline
     assert '"recognition_frame_number": recognition_frame' in pipeline
@@ -179,3 +183,20 @@ def test_event_items_open_a_full_detail_modal() -> None:
     assert 'eventModal.addEventListener' in dashboard
     assert 'JSON.stringify(modalData, null, 2)' in dashboard
     assert 'event.details?.recognition_frame_number' in dashboard
+
+
+def test_unknown_recognition_event_uses_best_frame_after_track_end() -> None:
+    pipeline = (ROOT / "deepstream_safety" / "pipeline.py").read_text(
+        encoding="utf-8"
+    )
+    face_engine = (ROOT / "deepstream_safety" / "face_engine.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert "_track_best_evidence" in face_engine
+    assert '"evidence_frame": best["frame_number"]' in face_engine
+    assert "frame=best[\"frame\"] if best else None" in face_engine
+    assert 'event_name == "track_end" and event_id is None' in pipeline
+    assert 'f"face-unknown-{self.run_id}' in pipeline
+    assert '"identity": "unknown"' in pipeline
+    assert '"evidence_quality": data.get("evidence_quality")' in pipeline

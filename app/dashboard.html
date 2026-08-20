@@ -201,8 +201,8 @@
       };
       eventModalTitle.textContent = `${event.camera || 'unknown'} · ${event.event_name || 'Event'}`;
       eventModalBody.innerHTML = `
-        ${event.thumbnail_url
-          ? `<img class="event-modal-thumb" src="${escapeHtml(event.thumbnail_url)}" alt="Event thumbnail">`
+        ${(event.image_url || event.thumbnail_url)
+          ? `<img class="event-modal-thumb" src="${escapeHtml(event.image_url || event.thumbnail_url)}" alt="Event thumbnail" decoding="async">`
           : '<div class="event-modal-empty-thumb">Không có thumbnail</div>'}
         <div class="event-modal-facts">
           <div class="event-modal-fact"><small>Camera</small><strong>${escapeHtml(event.camera || 'unknown')}</strong></div>
@@ -278,7 +278,7 @@
           <span class="toast-time">${escapeHtml(formatEventTime(event.timestamp))}</span>
         </div>
         <div class="toast-body">
-          ${event.thumbnail_url ? `<img class="toast-thumb" src="${escapeHtml(event.thumbnail_url)}" alt="" loading="lazy">` : ''}
+          ${event.thumbnail_url ? `<img class="toast-thumb" src="${escapeHtml(event.thumbnail_url)}" alt="" loading="lazy" decoding="async">` : ''}
           <div class="toast-details">
             <div class="toast-event">${escapeHtml(event.event_name || 'Event')}</div>
             <div class="toast-meta"><span>${escapeHtml(confidence)}</span></div>
@@ -313,7 +313,10 @@
       const existing = toastEntries.get(eventId);
       if (existing) {
         existing.event = event;
-        renderToast(existing.toast, event);
+        const currentThumbnail = existing.toast.querySelector('.toast-thumb')?.getAttribute('src') || '';
+        if (currentThumbnail !== String(event.thumbnail_url || '')) {
+          renderToast(existing.toast, event);
+        }
         reorderEventList();
         return;
       }

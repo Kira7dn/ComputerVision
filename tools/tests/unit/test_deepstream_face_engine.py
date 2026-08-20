@@ -1,3 +1,4 @@
+import numpy as np
 import pytest
 
 from deepstream_safety.config import camera_ids, resolve_camera_config
@@ -30,6 +31,38 @@ def test_track_scheduler_clamps_upper_bound() -> None:
 
     assert scheduler.interval_ms == 500.0
     assert scheduler.interval_seconds == 0.5
+
+
+def test_unknown_evidence_keeps_only_the_highest_quality_frame() -> None:
+    from deepstream_safety.face_engine import FaceRecognitionEngine
+
+    engine = FaceRecognitionEngine.__new__(FaceRecognitionEngine)
+    engine._track_best_evidence = {}
+    engine.detector_threshold = 0.5
+    flat = np.full((48, 64, 3), 128, dtype=np.uint8)
+    sharp = np.indices((48, 64)).sum(axis=0).astype(np.uint8) * 120
+    sharp = np.repeat(sharp[:, :, None], 3, axis=2)
+
+    engine._consider_best_evidence(7, flat, 10, [0, 0, 64, 48], [8, 8, 20, 20], 0.70)
+    engine._consider_best_evidence(7, sharp, 20, [0, 0, 64, 48], [8, 8, 20, 20], 0.90)
+
+    candidate = engine._track_best_evidence[7]
+    assert candidate["frame_number"] == 20
+    assert candidate["face_score"] == 0.90
+    assert candidate["quality"] > 0.0
+
+
+def test_unknown_evidence_rejects_person_only_frame() -> None:
+    from deepstream_safety.face_engine import FaceRecognitionEngine
+
+    engine = FaceRecognitionEngine.__new__(FaceRecognitionEngine)
+    engine._track_best_evidence = {}
+    engine.detector_threshold = 0.5
+    frame = np.full((48, 64, 3), 128, dtype=np.uint8)
+
+    engine._consider_best_evidence(7, frame, 10, [0, 0, 64, 48])
+
+    assert engine._track_best_evidence == {}
 
 
 def test_provider_selection_prefers_available_gpu_and_keeps_cpu_fallback() -> None:

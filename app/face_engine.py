@@ -142,6 +142,7 @@ class FaceRecognitionEngine:
         self._track_embedding_counts: dict[int, int] = {}
         self._track_last_confirmed: dict[int, int] = {}
         self._track_face_misses: dict[int, int] = {}
+        self._track_best_evidence: dict[int, dict[str, Any]] = {}
         self.max_disappeared = max(2, int((config.get("input", {}) or {}).get("fps", 5)) * 2)
         self.latest_frame: np.ndarray | None = None
         self.last_processed_frame: np.ndarray | None = None
@@ -290,10 +291,81 @@ class FaceRecognitionEngine:
         norm = float(np.linalg.norm(result))
         return result / norm if norm > 0 else result
 
-    def _trace(self, track_id: int, data: dict[str, Any]) -> None:
+    def _trace(
+        self,
+        track_id: int,
+        data: dict[str, Any],
+        frame: np.ndarray | None = None,
+    ) -> None:
         if not self.trace_enabled or self.trace_sink is None:
             return
-        self.trace_sink(track_id, {"ts": time.time(), **data}, self.last_processed_frame)
+        self.trace_sink(
+            track_id,
+            {"ts": time.time(), **data},
+            self.last_processed_frame if frame is None else frame,
+        )
+
+    @staticmethod
+    def _evidence_quality(
+        person: np.ndarray,
+        face_bbox: list[int] | None,
+        face_score: float,
+    ) -> float:
+        """Rank a bounded evidence candidate without another model pass."""
+        if person.size == 0:
+            return 0.0
+        roi = person
+        face_area = 0
+        if face_bbox:
+            left, top, width, height = [int(value) for value in face_bbox]
+            right = min(person.shape[1], max(left + 1, left + width))
+            bottom = min(person.shape[0], max(top + 1, top + height))
+            left = max(0, min(left, right - 1))
+            top = max(0, min(top, bottom - 1))
+            roi = person[top:bottom, left:right]
+            face_area = max(0, (right - left) * (bottom - top))
+        if roi.size == 0:
+            return 0.0
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        sharpness = min(1.0, float(cv2.Laplacian(gray, cv2.CV_64F).var()) / 400.0)
+        area_ratio = face_area / max(1, person.shape[0] * person.shape[1])
+        framing = min(1.0, area_ratio * 4.0) if face_area else 0.25
+        detector_score = min(1.0, max(0.0, float(face_score)))
+        return 0.50 * detector_score + 0.30 * sharpness + 0.20 * framing
+
+    def _consider_best_evidence(
+        self,
+        track_id: int,
+        frame: np.ndarray,
+        frame_number: int,
+        person_bbox: list[int],
+        face_bbox: list[int] | None = None,
+        face_score: float = 0.0,
+    ) -> None:
+        # A person-only frame is not recognition evidence.  Keeping it as a
+        # fallback allowed a late tracker false-positive (or an empty end
+        # frame) to replace the last frame that actually contained a face.
+        # Unknown events must be based on a face detector observation.
+        if face_bbox is None or float(face_score) < float(
+            getattr(self, "detector_threshold", 0.5)
+        ):
+            return
+        quality = self._evidence_quality(frame[
+            max(0, person_bbox[1]):max(0, person_bbox[3]),
+            max(0, person_bbox[0]):max(0, person_bbox[2]),
+        ], face_bbox, face_score)
+        previous = self._track_best_evidence.get(track_id)
+        if previous is not None and quality <= float(previous["quality"]):
+            return
+        self._track_best_evidence[track_id] = {
+            "frame": frame.copy(),
+            "frame_number": int(frame_number),
+            "person_bbox": list(person_bbox),
+            "face_bbox": list(face_bbox) if face_bbox else None,
+            "face_score": float(face_score),
+            "quality": float(quality),
+            "source_timestamp": time.time(),
+        }
 
     def _start_track(self, track_id: int, frame_number: int, bbox: list[int]) -> None:
         self._track_last_seen[track_id] = frame_number
@@ -306,6 +378,7 @@ class FaceRecognitionEngine:
         self._track_alternative_names.pop(track_id, None)
         self._track_alternative_counts[track_id] = 0
         self._track_face_misses[track_id] = 0
+        self._track_best_evidence.pop(track_id, None)
         self._track_embedding_means.pop(track_id, None)
         self._track_embedding_counts[track_id] = 0
         self._trace(track_id, {"event": "track_start", "frame": frame_number, "track_id": track_id, "person_bbox": bbox})
@@ -400,7 +473,26 @@ class FaceRecognitionEngine:
                 final_name, final_score = candidate_name, candidate_score
             else:
                 final_name, final_score = "unknown", candidate_score
-        self._trace(track_id, {"event": "track_end", "frame": frame_number, "track_id": track_id, "name": final_name, "score": final_score, "observations": self._track_observations.get(track_id, 0), "candidates": counts})
+        best = self._track_best_evidence.get(track_id)
+        self._trace(
+            track_id,
+            {
+                "event": "track_end",
+                "frame": frame_number,
+                "track_id": track_id,
+                "name": final_name,
+                "score": final_score,
+                "observations": self._track_observations.get(track_id, 0),
+                "candidates": counts,
+                "evidence_frame": best["frame_number"] if best else None,
+                "evidence_person_bbox": best["person_bbox"] if best else None,
+                "evidence_face_bbox": best["face_bbox"] if best else None,
+                "evidence_face_score": best["face_score"] if best else None,
+                "evidence_quality": best["quality"] if best else None,
+                "evidence_source_timestamp": best["source_timestamp"] if best else None,
+            },
+            frame=best["frame"] if best else None,
+        )
         self._track_last_seen.pop(track_id, None)
         self._track_observations.pop(track_id, None)
         self._track_candidate_scores.pop(track_id, None)
@@ -418,6 +510,7 @@ class FaceRecognitionEngine:
         self._track_embedding_counts.pop(track_id, None)
         self._track_last_confirmed.pop(track_id, None)
         self._track_face_misses.pop(track_id, None)
+        self._track_best_evidence.pop(track_id, None)
         self._started_tracks.discard(track_id)
         self.recognition_scheduler.forget(track_id)
 
@@ -655,6 +748,14 @@ class FaceRecognitionEngine:
                 )
                 self._record_face_miss(track_id, frame_number, "no_face")
                 continue
+            self._consider_best_evidence(
+                track_id,
+                frame,
+                frame_number,
+                [left, top, right, bottom],
+                detected[:4].astype(int).tolist(),
+                float(detected[-1]),
+            )
             if not self.gallery:
                 self._trace(
                     track_id,
@@ -887,6 +988,14 @@ class FaceRecognitionEngine:
                 self._trace(track_id, {"event": "attempt", "frame": frame_number, "result": "no_face", "person_bbox": [left, top, right, bottom]})
                 self._record_face_miss(track_id, frame_number, "no_face")
                 continue
+            self._consider_best_evidence(
+                track_id,
+                frame,
+                frame_number,
+                [raw_left, raw_top, raw_right, raw_bottom],
+                detected[:4].astype(int).tolist(),
+                float(detected[-1]),
+            )
             if not self.gallery:
                 face_box = detected[:4].astype(int).tolist()
                 self._trace(track_id, {"event": "attempt", "frame": frame_number, "result": "unknown", "reason": "gallery_empty", "face_bbox": face_box, "face_score": float(detected[-1]), "gallery_count": 0, "person_bbox": [left, top, right, bottom]})
