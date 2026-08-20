@@ -2,6 +2,9 @@ runtime:
   wsl_distro: Ubuntu-22.04
   mediamtx_config: /opt/camera-deepstream/mediamtx/mediamtx.yml
   mediamtx_binary: /opt/camera-deepstream/mediamtx/mediamtx
+  # Hold confirmed overlays between asynchronous inference cycles. Use wall
+  # clock time because the RTSP frame rate differs between cameras.
+  analysis_result_max_age_seconds: 2.0
 
 cameras:
   - id: camera_face

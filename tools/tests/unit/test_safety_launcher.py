@@ -28,6 +28,10 @@ def test_cpu_analysis_branch_has_a_terminal_sink() -> None:
     assert "analysis_src.link(analysis_sink)" in pipeline
     assert "self.fire_smoke_engine.last_inference_ran" in pipeline
     assert "self.fire_smoke_engine.last_fresh_detections" in pipeline
+    assert "analysis_age_seconds" in pipeline
+    assert "_analysis_max_age_frames" not in pipeline
+    assert "detection_results = list(self._analysis_detections)" in pipeline
+    assert "fire_smoke_detections = []" in pipeline
 
 
 def test_config_routes_functions_per_camera() -> None:
@@ -65,9 +69,21 @@ def test_config_is_valid_yaml_and_has_stable_evidence_contract() -> None:
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
 
     assert isinstance(config["cameras"], list)
+    assert config["runtime"]["analysis_result_max_age_seconds"] >= 1.0
     assert config["evidence"]["prefix"] == "snapshots-acceptance"
     assert config["evidence"]["snapshot_interval_ms"] >= 100
     assert config["fire_smoke"]["onnx_path"].endswith("best.onnx")
     assert config["smoking_behavior"]["onnx_path"].endswith(
         "smoking_behavior/model.onnx"
     )
+
+
+def test_runtime_can_disable_notifications_for_acceptance(monkeypatch) -> None:
+    monkeypatch.setenv("DEEPSTREAM_NOTIFICATIONS_ENABLED", "false")
+
+    resolved = resolve_camera_config(
+        load_raw_config(ROOT / "deepstream_safety" / "config.yaml"),
+        "camera_safety",
+    )
+
+    assert resolved["notifications"]["enabled"] is False

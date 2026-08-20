@@ -53,9 +53,15 @@ from events import SafetyDetection, SafetyEventStore  # noqa: E402
 from face_engine import FaceRecognitionEngine  # noqa: E402
 from fire_smoke_engine import FireSmokeEngine  # noqa: E402
 from fire_smoke_events import FireSmokeEventStore  # noqa: E402
+from mock_input import wait_for_rtsp_video  # noqa: E402
 from notifications import NotificationService  # noqa: E402
 from recognition import RecognitionCore, TrackKey  # noqa: E402
 from smoking_behavior_engine import SmokingBehaviorEngine  # noqa: E402
+from tracking import (  # noqa: E402
+    frigate_track_distance,
+    iou,
+    opposite_frame_edge_transition,
+)
 
 gi.require_version("Gst", "1.0")
 gi.require_version("GLib", "2.0")
@@ -69,70 +75,6 @@ def make_element(factory: str, name: str) -> Gst.Element:
     if element is None:
         raise RuntimeError(f"GStreamer element is unavailable: {factory}")
     return element
-
-
-def iou(left: np.ndarray, right: np.ndarray) -> float:
-    x1 = max(float(left[0]), float(right[0]))
-    y1 = max(float(left[1]), float(right[1]))
-    x2 = min(float(left[2]), float(right[2]))
-    y2 = min(float(left[3]), float(right[3]))
-    intersection = max(0.0, x2 - x1) * max(0.0, y2 - y1)
-    area_left = max(0.0, float(left[2] - left[0])) * max(0.0, float(left[3] - left[1]))
-    area_right = max(0.0, float(right[2] - right[0])) * max(0.0, float(right[3] - right[1]))
-    union = area_left + area_right - intersection
-    return intersection / union if union > 0 else 0.0
-
-
-def frigate_track_distance(detection: np.ndarray, estimate: np.ndarray) -> float:
-    """Normalize position and size changes like Frigate's Norfair tracker."""
-    estimate_dim = np.diff(estimate.reshape(2, 2), axis=0).flatten()
-    detection_dim = np.diff(detection.reshape(2, 2), axis=0).flatten()
-    if (
-        not np.all(np.isfinite(estimate_dim))
-        or not np.all(np.isfinite(detection_dim))
-        or np.any(estimate_dim <= 0)
-        or np.any(detection_dim <= 0)
-    ):
-        return float("inf")
-
-    detection_position = np.array(
-        [(detection[0] + detection[2]) / 2.0, detection[3]], dtype=np.float32
-    )
-    estimate_position = np.array(
-        [(estimate[0] + estimate[2]) / 2.0, estimate[3]], dtype=np.float32
-    )
-    position_delta = detection_position - estimate_position
-    position_delta[0] /= estimate_dim[0]
-    position_delta[1] /= estimate_dim[1]
-    widths = np.sort([estimate_dim[0], detection_dim[0]])
-    heights = np.sort([estimate_dim[1], detection_dim[1]])
-    change = np.append(
-        position_delta,
-        np.array([widths[1] / widths[0] - 1.0, heights[1] / heights[0] - 1.0]),
-    )
-    return float(np.linalg.norm(change))
-
-
-def opposite_frame_edge_transition(
-    previous: np.ndarray, current: np.ndarray, width: float, height: float
-) -> bool:
-    """Reject a stale prediction that wraps into a new passage at another edge."""
-    x_margin = width * 0.025
-    y_margin = height * 0.025
-    previous_left = previous[0] <= x_margin
-    previous_top = previous[1] <= y_margin
-    previous_right = previous[2] >= width - x_margin
-    previous_bottom = previous[3] >= height - y_margin
-    current_left = current[0] <= x_margin
-    current_top = current[1] <= y_margin
-    current_right = current[2] >= width - x_margin
-    current_bottom = current[3] >= height - y_margin
-    return (
-        (previous_left and current_right)
-        or (previous_right and current_left)
-        or (previous_top and current_bottom)
-        or (previous_bottom and current_top)
-    )
 
 
 def nms(boxes: list[np.ndarray], threshold: float) -> list[np.ndarray]:
@@ -230,8 +172,6 @@ class SafetyPipeline:
         self._analysis_last_transition: str | None = None
         self._analysis_frame_num: int | None = None
         self._analysis_updated_at: float | None = None
-        input_fps = max(1.0, float(config.get("input", {}).get("fps", 5)))
-        self._analysis_max_age_frames = max(2, int(round(input_fps * 0.75)))
         analysis_intervals = [
             float(engine.interval_seconds)
             for engine in (self.smoking_behavior_engine, self.fire_smoke_engine)
@@ -242,6 +182,15 @@ class SafetyPipeline:
                 self.face_engine.recognition_scheduler.interval_seconds
             )
         self._analysis_interval_seconds = min(analysis_intervals, default=0.5)
+        self._analysis_result_max_age_seconds = max(
+            1.0,
+            float(
+                runtime.get(
+                    "analysis_result_max_age_seconds",
+                    max(2.0, self._analysis_interval_seconds * 4.0),
+                )
+            ),
+        )
         self._next_analysis_at = 0.0
         self._analysis_error: str | None = None
         self._analysis_probe_count = 0
@@ -822,7 +771,7 @@ maintain-aspect-ratio=0
                     self._analysis_fire_smoke = list(fire_smoke_detections)
                     self._analysis_transitions = transitions
                     self._analysis_frame_num = int(frame_num)
-                    self._analysis_updated_at = time.time()
+                    self._analysis_updated_at = time.monotonic()
                     self._analysis_last_transition = (
                         transitions[-1].operation if transitions else None
                     )
@@ -924,24 +873,19 @@ maintain-aspect-ratio=0
         if batch_meta is None:
             return Gst.PadProbeReturn.OK
         with self._analysis_lock:
-            analysis_frame_num = self._analysis_frame_num
-            current_frame_num = 0
-            if batch_meta.frame_meta_list is not None:
-                try:
-                    current_frame = pyds.NvDsFrameMeta.cast(batch_meta.frame_meta_list.data)
-                    current_frame_num = int(current_frame.frame_num)
-                except Exception:
-                    current_frame_num = 0
-            analysis_age = (
-                abs(current_frame_num - analysis_frame_num)
-                if analysis_frame_num is not None
-                else self._analysis_max_age_frames + 1
+            analysis_age_seconds = (
+                time.monotonic() - self._analysis_updated_at
+                if self._analysis_updated_at is not None
+                else self._analysis_result_max_age_seconds + 1.0
             )
-            if analysis_age <= self._analysis_max_age_frames:
-                detection_results = list(self._analysis_detections)
+            # Smoking is a temporal state owned by SmokingBehaviorEngine and
+            # attached to the current track_id. Keep that confirmed state until
+            # the engine clears it; a renderer TTL must not turn a confirmed
+            # smoking track back into a plain person between slow analysis runs.
+            detection_results = list(self._analysis_detections)
+            if analysis_age_seconds <= self._analysis_result_max_age_seconds:
                 fire_smoke_detections = list(self._analysis_fire_smoke)
             else:
-                detection_results = []
                 fire_smoke_detections = []
         frame_list = batch_meta.frame_meta_list
         while frame_list is not None:
@@ -992,6 +936,12 @@ maintain-aspect-ratio=0
                 "processed_count": self._analysis_processed_count,
                 "last_enqueued_frame": self._analysis_last_enqueued_frame,
                 "last_processed_frame": self._analysis_last_processed_frame,
+                "result_age_seconds": (
+                    round(time.monotonic() - self._analysis_updated_at, 3)
+                    if self._analysis_updated_at is not None
+                    else None
+                ),
+                "result_max_age_seconds": self._analysis_result_max_age_seconds,
             },
             "analysis_decode": getattr(self.face_engine, "_last_decode_info", None),
             "analysis_debug": {
@@ -1726,20 +1676,29 @@ maintain-aspect-ratio=0
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        # MediaMTX registers the publisher asynchronously. Let rtspsrc perform
-        # the actual connection after a short registration window, but fail if
-        # ffmpeg itself has already exited.
-        time.sleep(4.0)
-        if self.mock_publisher.poll() is not None:
-            raise RuntimeError("mock publisher exited before pipeline startup")
+        # FFmpeg can remain alive for tens of seconds before its first encoded
+        # frame reaches MediaMTX while all camera models initialize together.
+        # Do not start rtspsrc until the path contains a readable video stream.
+        wait_for_rtsp_video(
+            str(input_cfg["rtsp_url"]),
+            publisher_alive=lambda: (
+                self.mock_publisher is not None
+                and self.mock_publisher.poll() is None
+            ),
+        )
         LOG.info("mock input started: %s", mock_video)
 
     def _check_mock_publisher(self) -> bool:
         input_cfg = self.config["input"]
-        if self.mock_publisher is None or bool(input_cfg.get("mock_loop", True)):
+        if self.mock_publisher is None:
             return GLib.SOURCE_REMOVE
         if self.mock_publisher.poll() is not None:
-            LOG.info("mock input reached EOF; stopping pipeline")
+            reason = (
+                "exited unexpectedly"
+                if bool(input_cfg.get("mock_loop", True))
+                else "reached EOF"
+            )
+            LOG.warning("mock input %s; stopping worker for supervised recovery", reason)
             self.loop.quit()
             return GLib.SOURCE_REMOVE
         return GLib.SOURCE_CONTINUE
@@ -1765,9 +1724,7 @@ maintain-aspect-ratio=0
             self.pipeline.set_state(Gst.State.PLAYING)
             self._write_runtime_status()
             GLib.timeout_add_seconds(2, self._write_runtime_status)
-            if str(self.config["input"].get("mode", "rtsp")) == "mock" and not bool(
-                self.config["input"].get("mock_loop", True)
-            ):
+            if str(self.config["input"].get("mode", "rtsp")) == "mock":
                 GLib.timeout_add_seconds(1, self._check_mock_publisher)
             if duration:
                 GLib.timeout_add_seconds(duration, self._stop_after_duration)

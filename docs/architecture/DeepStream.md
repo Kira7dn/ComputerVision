@@ -4,6 +4,10 @@
 > Camera workspace. `docs/architecture/Platform.md` describes the legacy Frigate
 > integration direction and is not used by `deepstream_safety/start.ps1`.
 
+Investigation findings, unresolved accuracy risks, and the prioritized handover
+plan from 20/08/2026 are documented in
+[`docs/DeepStream-Stability-Handover-2026-08-20.md`](../DeepStream-Stability-Handover-2026-08-20.md).
+
 This experiment is independent from Frigate and Docker. It runs in the WSL2
 `Ubuntu-22.04` distro, whose VHDX is stored on `E:\WSL\Ubuntu-22.04`.
 

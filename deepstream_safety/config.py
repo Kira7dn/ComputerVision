@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from copy import deepcopy
 import os
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
@@ -65,6 +65,18 @@ def _runtime_environment() -> dict[str, str]:
     values = _dotenv_values(Path(__file__).resolve().parents[1] / ".env.local")
     values.update({key: value for key, value in os.environ.items() if value})
     return values
+
+
+def _environment_bool(environment: dict[str, str], key: str) -> bool | None:
+    value = environment.get(key)
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{key} must be a boolean value")
 
 
 def _camera_metadata_url(config: dict[str, Any], camera_id: str, index: int) -> str | None:
@@ -156,6 +168,14 @@ def resolve_camera_config(config: dict[str, Any], camera_id: str | None = None) 
     face_runtime["trace_enabled"] = bool(functions["trace"])
     recognition["face_runtime"] = face_runtime
     resolved["recognition"] = recognition
+
+    notifications = deepcopy(resolved.get("notifications", {}) or {})
+    notification_override = _environment_bool(
+        runtime_environment, "DEEPSTREAM_NOTIFICATIONS_ENABLED"
+    )
+    if notification_override is not None:
+        notifications["enabled"] = notification_override
+    resolved["notifications"] = notifications
 
     smoking_behavior = deepcopy(resolved.get("smoking_behavior", {}) or {})
     smoking_behavior["enabled"] = bool(functions["smoking_behavior"])
