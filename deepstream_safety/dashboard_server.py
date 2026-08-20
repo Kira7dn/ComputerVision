@@ -8,7 +8,6 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Lock
 from urllib.parse import parse_qs, urlparse
-from urllib.request import urlopen
 
 from config import camera_ids, load_raw_config, resolve_camera_config
 
@@ -349,28 +348,22 @@ def collect_metrics() -> dict[str, object]:
     configured_cameras = _camera_definitions()
     processes_by_camera = {str(item["camera"]): item for item in processes}
     camera_metrics: list[dict[str, object]] = []
-    latencies: list[float] = []
     for camera in configured_cameras:
         camera_id = str(camera["id"])
         process = processes_by_camera.get(camera_id)
         runtime_status = _runtime_status(camera_id)
-        hls_live = False
-        playlist_latency = None
-        try:
-            started = time.perf_counter()
-            with urlopen(str(camera["hls_url"]), timeout=2) as response:
-                hls_live = response.status == 200
-                response.read(128)
-            playlist_latency = round((time.perf_counter() - started) * 1000, 1)
-            latencies.append(playlist_latency)
-        except OSError:
-            pass
         last_frame_at = runtime_status.get("last_frame_at")
         try:
             last_frame_age = round(max(0.0, time.time() - float(last_frame_at)), 1)
         except (TypeError, ValueError):
             last_frame_age = None
-        ready = bool(process and hls_live and last_frame_age is not None and last_frame_age <= 5.0)
+        # Do not probe every HLS playlist from the metrics endpoint. Each
+        # probe creates and closes a MediaMTX HLS session, which competes with
+        # the browser player and makes all live tiles jitter. The HLS player
+        # owns playback health; the dashboard readiness gate only needs the
+        # worker and its fresh output heartbeat.
+        hls_live = bool(process and last_frame_age is not None and last_frame_age <= 5.0)
+        ready = hls_live
         camera_metrics.append(
             {
                 **camera,
@@ -380,7 +373,7 @@ def collect_metrics() -> dict[str, object]:
                 "rss_mb": process["rss_mb"] if process else None,
                 "hls_live": hls_live,
                 "ready": ready,
-                "playlist_latency_ms": playlist_latency,
+                "playlist_latency_ms": None,
                 "last_frame_age_seconds": last_frame_age,
                 "frame_count": runtime_status.get("frame_count"),
                 "analysis_queue_depth": runtime_status.get("analysis_queue_depth"),
@@ -412,7 +405,7 @@ def collect_metrics() -> dict[str, object]:
         },
         "stream": {
             "hls_live": any(bool(camera["hls_live"]) for camera in camera_metrics),
-            "playlist_latency_ms": round(sum(latencies) / len(latencies), 1) if latencies else None,
+            "playlist_latency_ms": None,
             "hls_url": default_stream.get("hls_url"),
         },
         "evidence": _evidence_metrics(),

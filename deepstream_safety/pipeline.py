@@ -215,7 +215,11 @@ class SafetyPipeline:
             max(0.05, float(tracking_config.get("bbox_smoothing_alpha", 0.30))),
         )
         self.last_behavior_error: str | None = None
-        self.analysis_enabled = self.smoking_behavior_enabled or self.fire_smoke_enabled
+        self.analysis_enabled = (
+            self.face_engine.enabled
+            or self.smoking_behavior_enabled
+            or self.fire_smoke_enabled
+        )
         self._analysis_queue: queue.Queue = queue.Queue(maxsize=1)
         self._analysis_stop = threading.Event()
         self._analysis_thread: threading.Thread | None = None
@@ -228,8 +232,30 @@ class SafetyPipeline:
         self._analysis_updated_at: float | None = None
         input_fps = max(1.0, float(config.get("input", {}).get("fps", 5)))
         self._analysis_max_age_frames = max(2, int(round(input_fps * 0.75)))
+        analysis_intervals = [
+            float(engine.interval_seconds)
+            for engine in (self.smoking_behavior_engine, self.fire_smoke_engine)
+            if engine is not None
+        ]
+        if self.face_engine.enabled:
+            analysis_intervals.append(
+                self.face_engine.recognition_scheduler.interval_seconds
+            )
+        self._analysis_interval_seconds = min(analysis_intervals, default=0.5)
+        self._next_analysis_at = 0.0
         self._analysis_error: str | None = None
+        self._analysis_probe_count = 0
+        self._analysis_due_count = 0
+        self._analysis_enqueued_count = 0
+        self._analysis_processed_count = 0
+        self._analysis_last_enqueued_frame: int | None = None
+        self._analysis_last_processed_frame: int | None = None
         self._face_tracks: dict[int, dict[str, Any]] = {}
+        self._latest_person_frame_num: int | None = None
+        self._latest_person_rois: list[tuple[int, float, float, float, float]] = []
+        self._latest_person_updated_at: float | None = None
+        self._last_metadata_person_count = 0
+        self._last_behavior_person_count = 0
         self._metadata_write_at = 0.0
         self.metadata_path = self.status_dir / f"{config.get('input', {}).get('camera', 'camera')}.metadata.json"
         self.socket = zmq.Context.instance().socket(zmq.PUB)
@@ -395,6 +421,9 @@ maintain-aspect-ratio=0
         face_cpu_convert = make_element("nvvideoconvert", "face-cpu-convert")
         face_cpu_caps = make_element("capsfilter", "face-cpu-caps")
         face_cpu_caps.set_property("caps", Gst.Caps.from_string("video/x-raw,format=BGRx"))
+        analysis_sink = make_element("fakesink", "analysis-sink")
+        analysis_sink.set_property("sync", False)
+        analysis_sink.set_property("async", False)
         convert_before_osd = make_element("nvvideoconvert", "convert-before-osd")
         face_rgba_caps = make_element("capsfilter", "face-rgba-caps")
         face_rgba_caps.set_property("caps", Gst.Caps.from_string("video/x-raw(memory:NVMM),format=RGBA"))
@@ -402,13 +431,17 @@ maintain-aspect-ratio=0
         osd.set_property("display-bbox", True)
         osd.set_property("display-text", True)
         convert_after_osd = make_element("nvvideoconvert", "convert-after-osd")
+        output_rate = make_element("videorate", "output-rate")
+        output_rate.set_property("max-duplication-time", 100_000_000)
         output_tee = make_element("tee", "output-tee")
         output_queue = make_element("queue", "output-queue")
         try:
             encoder = make_element("nvv4l2h264enc", "output-encoder")
             encoder.set_property("bitrate", 4_000_000)
-            encoder.set_property("iframeinterval", 30)
-            encoder.set_property("idrinterval", 30)
+            # Keep HLS MPEG-TS segments close to the configured 2s target
+            # even when an input camera delivers a variable frame cadence.
+            encoder.set_property("iframeinterval", 15)
+            encoder.set_property("idrinterval", 15)
             encoder.set_property("preset-id", 1)
             output_caps = "video/x-raw(memory:NVMM),format=I420"
             LOG.info("output encoder: nvv4l2h264enc")
@@ -417,11 +450,15 @@ maintain-aspect-ratio=0
             encoder.set_property("bitrate", 4_000)
             encoder.set_property("speed-preset", "ultrafast")
             encoder.set_property("tune", "zerolatency")
-            encoder.set_property("key-int-max", 30)
+            encoder.set_property("key-int-max", 15)
             output_caps = "video/x-raw,format=I420"
             LOG.warning("output encoder: x264enc fallback")
         output_i420_caps = make_element("capsfilter", "output-i420-caps")
-        output_i420_caps.set_property("caps", Gst.Caps.from_string(output_caps))
+        output_fps = int(input_cfg.get("output_fps", 15))
+        output_i420_caps.set_property(
+            "caps",
+            Gst.Caps.from_string(f"{output_caps},framerate={output_fps}/1"),
+        )
         output_parser = make_element("h264parse", "output-h264-parse")
         output_parser.set_property("config-interval", 1)
         sink = make_element("rtspclientsink", "rtsp-output")
@@ -444,10 +481,12 @@ maintain-aspect-ratio=0
                 if self.face_engine.enabled or self.smoking_behavior_enabled or self.fire_smoke_enabled
                 else []
             ),
+            analysis_sink,
             convert_before_osd,
             face_rgba_caps,
             osd,
             convert_after_osd,
+            output_rate,
             output_i420_caps,
             output_tee,
             output_queue,
@@ -492,6 +531,8 @@ maintain-aspect-ratio=0
             analysis_src = face_cpu_caps
         else:
             analysis_src = analysis_queue
+        if not analysis_src.link(analysis_sink):
+            raise RuntimeError("Unable to terminate analysis branch")
         if not output_input_queue.link(convert_before_osd):
             raise RuntimeError("Unable to link output queue to OSD converter")
         infer_src = self.person_infer.get_static_pad("src")
@@ -501,7 +542,9 @@ maintain-aspect-ratio=0
             raise RuntimeError("Unable to link CPU face frame to OSD converter")
         if not face_rgba_caps.link(osd) or not osd.link(convert_after_osd):
             raise RuntimeError("Unable to link OSD branch")
-        if not convert_after_osd.link(output_i420_caps) or not output_i420_caps.link(output_tee):
+        if not convert_after_osd.link(output_rate) or not output_rate.link(output_i420_caps):
+            raise RuntimeError("Unable to link output rate normalizer")
+        if not output_i420_caps.link(output_tee):
             raise RuntimeError("Unable to link output tee")
         if not output_tee.link(output_queue):
             raise RuntimeError("Unable to link output branches")
@@ -509,10 +552,14 @@ maintain-aspect-ratio=0
             raise RuntimeError("Unable to link output encoder")
         if not output_parser.link(sink):
             raise RuntimeError("Unable to link RTSP output")
-        output_src = output_queue.get_static_pad("src")
-        if output_src is None:
-            raise RuntimeError("Output queue has no src pad")
-        output_src.add_probe(Gst.PadProbeType.BUFFER, self._on_output_buffer)
+        # Attach output metadata immediately before nvdsosd.  Display metadata
+        # added after nvdsosd has already rendered is invisible in the encoded
+        # stream, even though the same coordinates remain available to API
+        # consumers.
+        osd_input_src = face_rgba_caps.get_static_pad("src")
+        if osd_input_src is None:
+            raise RuntimeError("OSD input has no src pad")
+        osd_input_src.add_probe(Gst.PadProbeType.BUFFER, self._on_output_buffer)
         person_src = self.person_infer.get_static_pad("src")
         if person_src is None:
             raise RuntimeError("Person nvinfer has no src pad")
@@ -705,6 +752,8 @@ maintain-aspect-ratio=0
                 self._analysis_queue.put_nowait(sample)
             except queue.Full:
                 pass
+        self._analysis_enqueued_count += 1
+        self._analysis_last_enqueued_frame = int(frame_num)
 
     def _analysis_loop(self) -> None:
         while not self._analysis_stop.is_set():
@@ -715,6 +764,8 @@ maintain-aspect-ratio=0
             if sample is None:
                 break
             frame, persons, frame_num, timestamp = sample
+            self._analysis_processed_count += 1
+            self._analysis_last_processed_frame = int(frame_num)
             try:
                 face_tracks: dict[int, dict[str, Any]] = {}
                 if self.face_engine.enabled:
@@ -750,14 +801,20 @@ maintain-aspect-ratio=0
                 if transition is not None:
                     transitions.append(transition)
                 if self.fire_smoke_enabled:
-                    transitions.extend(
-                        self.fire_smoke_events.observe(
-                            frame_num=int(frame_num),
-                            timestamp=timestamp,
-                            detections=fire_smoke_detections,
-                            frame=frame,
+                    if (
+                        self.fire_smoke_engine is not None
+                        and self.fire_smoke_engine.last_inference_ran
+                    ):
+                        transitions.extend(
+                            self.fire_smoke_events.observe(
+                                frame_num=int(frame_num),
+                                timestamp=timestamp,
+                                detections=list(
+                                    self.fire_smoke_engine.last_fresh_detections
+                                ),
+                                frame=frame,
+                            )
                         )
-                    )
                 self._notify_transitions(transitions)
                 with self._analysis_lock:
                     self._face_tracks = dict(face_tracks)
@@ -831,11 +888,6 @@ maintain-aspect-ratio=0
                     obj_meta.rect_params.border_width = 4
                     obj_meta.rect_params.border_color.set(1.0, 0.0, 0.0, 1.0)
                 else:
-                    if str(self.config["input"].get("camera")) == "camera_safety":
-                        obj_meta.rect_params.border_width = 0
-                        obj_meta.text_params.display_text = ""
-                        obj_meta.text_params.set_bg_clr = 0
-                        continue
                     obj_meta.rect_params.border_width = 3
                     obj_meta.rect_params.border_color.set(0.0, 0.65, 1.0, 1.0)
                     obj_meta.rect_params.has_bg_color = 0
@@ -933,6 +985,38 @@ maintain-aspect-ratio=0
             "frame_count": self.frame_count,
             "analysis_queue_depth": self._analysis_queue.qsize(),
             "analysis_error": self._analysis_error,
+            "analysis_flow": {
+                "probe_count": self._analysis_probe_count,
+                "due_count": self._analysis_due_count,
+                "enqueued_count": self._analysis_enqueued_count,
+                "processed_count": self._analysis_processed_count,
+                "last_enqueued_frame": self._analysis_last_enqueued_frame,
+                "last_processed_frame": self._analysis_last_processed_frame,
+            },
+            "analysis_decode": getattr(self.face_engine, "_last_decode_info", None),
+            "analysis_debug": {
+                "smoking_person_count": getattr(self.smoking_behavior_engine, "last_person_count", 0),
+                "smoking_scores": getattr(self.smoking_behavior_engine, "last_scores", {}),
+                "smoking_score_histories": getattr(
+                    self.smoking_behavior_engine, "last_histories", {}
+                ),
+                "smoking_roi_bboxes": getattr(
+                    self.smoking_behavior_engine, "last_roi_bboxes", {}
+                ),
+                "smoking_confirmed_tracks": getattr(
+                    self.smoking_behavior_engine, "last_confirmed_tracks", []
+                ),
+                "fire_smoke_raw_scores": getattr(self.fire_smoke_engine, "last_raw_scores", {}),
+                "person_detector_count": self.last_person_count,
+                "metadata_person_count": self._last_metadata_person_count,
+                "behavior_person_count": self._last_behavior_person_count,
+                "latest_person_count": len(self._latest_person_rois),
+                "latest_person_age_seconds": (
+                    round(time.monotonic() - self._latest_person_updated_at, 3)
+                    if self._latest_person_updated_at is not None
+                    else None
+                ),
+            },
             "notifications": self.notifications.status(),
         }
         try:
@@ -1327,6 +1411,18 @@ maintain-aspect-ratio=0
             try:
                 frame_meta = pyds.NvDsFrameMeta.cast(frame_list.data)
                 self._assign_person_track_ids(frame_meta)
+                person_rois = self._person_rois(frame_meta)
+                self._last_metadata_person_count = len(person_rois)
+                with self._analysis_lock:
+                    # The CPU analysis branch can lag the inference branch by
+                    # more than a couple of frame numbers after a leaky tee.
+                    # Keep the latest non-empty tracker ROI with a wall-clock
+                    # age so recognition/behavior never loses all objects just
+                    # because NvDs metadata was not copied through conversion.
+                    if person_rois:
+                        self._latest_person_frame_num = int(frame_meta.frame_num)
+                        self._latest_person_rois = person_rois
+                        self._latest_person_updated_at = time.monotonic()
                 self._publish_metadata_frame(frame_meta)
                 frame_list = frame_list.next
             except StopIteration:
@@ -1362,20 +1458,43 @@ maintain-aspect-ratio=0
         while frame_list is not None:
             try:
                 frame_meta = pyds.NvDsFrameMeta.cast(frame_list.data)
+                self._analysis_probe_count += 1
                 frame: np.ndarray | None = None
                 boxes: list[np.ndarray] = []
                 detections: list[SafetyDetection] = []
                 detection_results: list[Any] = []
                 fire_smoke_detections: list[Any] = []
                 if self.analysis_enabled:
-                    frame = self._decode_bgrx_buffer(
-                        buffer,
-                        int(getattr(frame_meta, "source_frame_width", 0) or 0),
-                        int(getattr(frame_meta, "source_frame_height", 0) or 0),
-                    )
-                    self._queue_analysis_sample(
-                        int(frame_meta.frame_num), frame, self._person_rois(frame_meta)
-                    )
+                    frame_num = int(frame_meta.frame_num)
+                    now = time.monotonic()
+                    if now >= self._next_analysis_at:
+                        self._analysis_due_count += 1
+                        self._next_analysis_at = now + self._analysis_interval_seconds
+                        frame_width = int(
+                            getattr(frame_meta, "source_frame_width", 0)
+                            or self.config["input"]["width"]
+                        )
+                        frame_height = int(
+                            getattr(frame_meta, "source_frame_height", 0)
+                            or self.config["input"]["height"]
+                        )
+                        frame = self._decode_bgrx_buffer(
+                            buffer,
+                            frame_width,
+                            frame_height,
+                        )
+                        persons = self._person_rois(frame_meta)
+                        if not persons:
+                            with self._analysis_lock:
+                                cache_age = (
+                                    time.monotonic() - self._latest_person_updated_at
+                                    if self._latest_person_updated_at is not None
+                                    else None
+                                )
+                                if cache_age is not None and cache_age <= 1.0:
+                                    persons = list(self._latest_person_rois)
+                        self._last_behavior_person_count = len(persons)
+                        self._queue_analysis_sample(frame_num, frame, persons)
                     (
                         detection_results,
                         fire_smoke_detections,
@@ -1582,6 +1701,8 @@ maintain-aspect-ratio=0
             [
                 "-i",
                 str(mock_video),
+                "-r",
+                "15",
                 "-an",
                 "-c:v",
                 "libx264",

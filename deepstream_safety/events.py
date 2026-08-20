@@ -151,8 +151,8 @@ class SafetyEventStore:
             },
             frame=frame,
             frame_number=frame_num,
-            bbox=item.last_bbox,
-            score=item.last_score,
+            bbox=None,
+            score=None,
         )
         return EventTransition(
             "END",

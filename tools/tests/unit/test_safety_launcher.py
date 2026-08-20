@@ -19,6 +19,17 @@ def test_launcher_uses_the_current_deepstream_runtime() -> None:
     assert "docker" not in launcher.lower()
 
 
+def test_cpu_analysis_branch_has_a_terminal_sink() -> None:
+    pipeline = (ROOT / "deepstream_safety" / "pipeline.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'make_element("fakesink", "analysis-sink")' in pipeline
+    assert "analysis_src.link(analysis_sink)" in pipeline
+    assert "self.fire_smoke_engine.last_inference_ran" in pipeline
+    assert "self.fire_smoke_engine.last_fresh_detections" in pipeline
+
+
 def test_config_routes_functions_per_camera() -> None:
     config_path = ROOT / "deepstream_safety" / "config.yaml"
     raw = load_raw_config(config_path)
@@ -41,7 +52,12 @@ def test_config_routes_functions_per_camera() -> None:
     }
     dahua = resolve_camera_config(raw, "camera_dahua")
     assert "channel=5" in dahua["input"]["rtsp_url"]
-    assert dahua["functions"] == safety["functions"]
+    assert dahua["functions"] == {
+        "trace": True,
+        "face_recognition": False,
+        "smoking_behavior": True,
+        "fire_smoke": True,
+    }
 
 
 def test_config_is_valid_yaml_and_has_stable_evidence_contract() -> None:
@@ -52,3 +68,6 @@ def test_config_is_valid_yaml_and_has_stable_evidence_contract() -> None:
     assert config["evidence"]["prefix"] == "snapshots-acceptance"
     assert config["evidence"]["snapshot_interval_ms"] >= 100
     assert config["fire_smoke"]["onnx_path"].endswith("best.onnx")
+    assert config["smoking_behavior"]["onnx_path"].endswith(
+        "smoking_behavior/model.onnx"
+    )

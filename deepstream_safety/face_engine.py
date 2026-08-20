@@ -495,21 +495,40 @@ class FaceRecognitionEngine:
             if not success:
                 return None
             try:
-                expected = width * height * 4
-                if mapped.size < expected or height <= 0:
+                if width <= 0 or height <= 0:
                     return None
-                pixels = mapped.size // 4
                 if mapped.size % 4:
                     return None
+                pixel_count = mapped.size // 4
                 aspect = width / height
-                actual_height = max(1, int(round((pixels / aspect) ** 0.5)))
-                actual_width = pixels // actual_height
-                if actual_width * actual_height != pixels:
-                    return None
-                self._last_decode_info = {"mapped_size": int(mapped.size), "width": actual_width, "height": actual_height, "metadata_width": width, "metadata_height": height}
+                inferred_height = max(1, int(round((pixel_count / aspect) ** 0.5)))
+                inferred_width = pixel_count // inferred_height
+                if (
+                    inferred_width * inferred_height == pixel_count
+                    and inferred_width >= width
+                    and inferred_height >= height
+                ):
+                    frame_width = inferred_width
+                    frame_height = inferred_height
+                    stride_pixels = frame_width
+                else:
+                    row_bytes = mapped.size // height
+                    if row_bytes * height != mapped.size or row_bytes % 4:
+                        return None
+                    frame_width = width
+                    frame_height = height
+                    stride_pixels = row_bytes // 4
+                    if stride_pixels < width:
+                        return None
+                self._last_decode_info = {
+                    "mapped_size": int(mapped.size),
+                    "width": int(frame_width),
+                    "height": int(frame_height),
+                    "stride_pixels": int(stride_pixels),
+                }
                 raw = np.frombuffer(mapped.data, dtype=np.uint8, count=mapped.size)
-                bgrx = raw.reshape((actual_height, actual_width, 4))
-                return bgrx[:, :, :3].copy()
+                bgrx = raw.reshape((frame_height, stride_pixels, 4))
+                return bgrx[:, :frame_width, :3].copy()
             finally:
                 buffer.unmap(mapped)
         except Exception as exc:

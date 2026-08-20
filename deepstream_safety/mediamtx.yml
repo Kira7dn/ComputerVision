@@ -3,6 +3,9 @@ rtsp: true
 rtspAddress: :8554
 hls: true
 hlsAddress: :8888
+hlsVariant: mpegts
+hlsSegmentDuration: 3s
+hlsSegmentCount: 6
 hlsAlwaysRemux: true
 hlsAllowOrigins: ['*']
 webrtc: true

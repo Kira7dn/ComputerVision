@@ -110,8 +110,8 @@ class FireSmokeEventStore:
             payload={"label": state.label},
             frame=frame,
             frame_number=frame_num,
-            bbox=state.last_bbox,
-            score=state.last_score,
+            bbox=None,
+            score=None,
         )
         return FireSmokeTransition("END", event_id, state.label, frame_num, state.last_score, state.last_bbox)
 

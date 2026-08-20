@@ -68,18 +68,15 @@ class EvidenceStore:
         self.camera_id = str((config.get("input", {}) or {}).get("camera", "camera"))
         self.root = run_directory(config, run_id)
         self.root.mkdir(parents=True, exist_ok=True)
-        self.image_interval = max(
-            0.1,
-            float(
-                (config.get("evidence", {}) or {}).get(
-                    "snapshot_interval_ms",
-                    (config.get("snapshots", {}) or {}).get("min_interval_ms", 1000),
-                )
-            )
-            / 1000.0,
+        evidence_config = config.get("evidence", {}) or {}
+        self.max_snapshots_per_event = max(
+            2, int(evidence_config.get("max_snapshots_per_event", 3))
+        )
+        self.peak_score_delta = max(
+            0.0, float(evidence_config.get("peak_score_delta", 0.05))
         )
         self._events: dict[str, dict[str, Any]] = {}
-        self._last_image_at: dict[str, float] = {}
+        self._pending_peaks: dict[str, dict[str, Any]] = {}
         self._lock = threading.RLock()
         self.db = sqlite3.connect(
             str(self.root / "index.sqlite3"),
@@ -210,6 +207,8 @@ class EvidenceStore:
             "started_at": time.time(),
             "ended_at": None,
             "last_score": 0.0,
+            "peak_score": 0.0,
+            "image_baseline_score": 0.0,
             "last_bbox": None,
             "snapshot_count": 0,
             **(metadata or {}),
@@ -256,59 +255,74 @@ class EvidenceStore:
 
         evidence: list[str] = []
         now = time.time()
+        snapshot_count = int(event.get("snapshot_count", 0))
+        previous_peak = float(event.get("peak_score", 0.0) or 0.0)
+        image_baseline = float(event.get("image_baseline_score", 0.0) or 0.0)
+        is_peak_candidate = (
+            record_type == "UPDATE"
+            and score is not None
+            and score >= image_baseline + self.peak_score_delta
+            and frame is not None
+        )
+        if is_peak_candidate:
+            pending = self._pending_peaks.get(event_id)
+            if pending is None or score > float(pending["score"]):
+                self._pending_peaks[event_id] = {
+                    "frame": frame.copy(),
+                    "frame_number": frame_number,
+                    "bbox": bbox,
+                    "score": score,
+                    "payload": dict(payload),
+                }
         should_image = frame is not None and (
-            force_image
-            or record_type in {"START", "END"}
-            or now - self._last_image_at.get(event_id, 0.0) >= self.image_interval
+            record_type in {"START", "END"}
+            or (
+                record_type == "PEAK"
+                and snapshot_count < self.max_snapshots_per_event - 1
+            )
+            or (
+                force_image
+                and record_type not in {"UPDATE", "PEAK"}
+                and snapshot_count < self.max_snapshots_per_event - 1
+            )
         )
         if should_image:
             event_dir = self._event_dir(event)
             image_dir = event_dir / "snapshots"
             image_dir.mkdir(parents=True, exist_ok=True)
-            sequence = int(event.get("snapshot_count", 0)) + 1
-            stem = f"{record_type.lower()}-{sequence:04d}"
-            full_path = image_dir / f"{stem}-full.jpg"
+            sequence = snapshot_count + 1
+            image_role = record_type.lower()
+            stem = f"{image_role}-{sequence:04d}"
             annotated_path = image_dir / f"{stem}-annotated.jpg"
-            roi_path = image_dir / f"{stem}-roi.jpg"
             image_key = f"{key}|image"
-            if self._claim(image_key, full_path, "image"):
-                if cv2.imwrite(str(full_path), frame):
-                    evidence.append(str(full_path.relative_to(self.root)))
-                    if bbox is not None:
-                        annotated = frame.copy()
-                        height, width = annotated.shape[:2]
-                        left, top, right, bottom = [
-                            int(max(0, value)) for value in bbox
-                        ]
-                        left = min(left, max(0, width - 1))
-                        right = min(max(left + 1, right), width)
-                        top = min(top, max(0, height - 1))
-                        bottom = min(max(top + 1, bottom), height)
-                        color = self._annotation_color(event)
-                        cv2.rectangle(annotated, (left, top), (right, bottom), color, 3)
-                        text = self._annotation_label(event, payload, score)
-                        text_y = max(24, top - 8)
-                        cv2.putText(
-                            annotated,
-                            text,
-                            (left, text_y),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.75,
-                            color,
-                            2,
-                            cv2.LINE_AA,
-                        )
-                        annotated_key = f"{key}|annotated-image"
-                        if self._claim(annotated_key, annotated_path, "annotated-image"):
-                            if cv2.imwrite(str(annotated_path), annotated):
-                                evidence.append(str(annotated_path.relative_to(self.root)))
-                    if bbox is not None:
-                        left, top, right, bottom = [int(max(0, value)) for value in bbox]
-                        crop = frame[top:bottom, left:right]
-                        if crop.size and cv2.imwrite(str(roi_path), crop):
-                            evidence.append(str(roi_path.relative_to(self.root)))
+            if self._claim(image_key, annotated_path, "annotated-image"):
+                annotated = frame.copy()
+                if bbox is not None:
+                    height, width = annotated.shape[:2]
+                    left, top, right, bottom = [
+                        int(max(0, value)) for value in bbox
+                    ]
+                    left = min(left, max(0, width - 1))
+                    right = min(max(left + 1, right), width)
+                    top = min(top, max(0, height - 1))
+                    bottom = min(max(top + 1, bottom), height)
+                    color = self._annotation_color(event)
+                    cv2.rectangle(annotated, (left, top), (right, bottom), color, 3)
+                    text = self._annotation_label(event, payload, score)
+                    text_y = max(24, top - 8)
+                    cv2.putText(
+                        annotated,
+                        text,
+                        (left, text_y),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.75,
+                        color,
+                        2,
+                        cv2.LINE_AA,
+                    )
+                if cv2.imwrite(str(annotated_path), annotated):
+                    evidence.append(str(annotated_path.relative_to(self.root)))
                     event["snapshot_count"] = sequence
-                    self._last_image_at[event_id] = now
 
         trace = {
             "record_type": record_type,
@@ -330,6 +344,9 @@ class EvidenceStore:
             stream.write(json.dumps(trace, separators=(",", ":")) + "\n")
         if score is not None:
             event["last_score"] = score
+            event["peak_score"] = max(previous_peak, score)
+            if record_type == "START":
+                event["image_baseline_score"] = score
         if bbox is not None:
             event["last_bbox"] = list(bbox)
         for field in ("person_bbox", "model_roi_bbox", "bbox_semantics", "label"):
@@ -337,6 +354,21 @@ class EvidenceStore:
                 event[field] = payload[field]
         self._write_event(event)
         return True
+
+    def _flush_peak(self, event_id: str) -> None:
+        peak = self._pending_peaks.pop(event_id, None)
+        if peak is None:
+            return
+        self.record(
+            event_id,
+            "PEAK",
+            peak["payload"],
+            frame=peak["frame"],
+            frame_number=peak["frame_number"],
+            bbox=peak["bbox"],
+            score=peak["score"],
+            force_image=True,
+        )
 
     def finish_event(
         self,
@@ -353,6 +385,7 @@ class EvidenceStore:
         event = self._events.get(event_id)
         if event is None:
             return
+        self._flush_peak(event_id)
         event["status"] = "ended"
         event["ended_at"] = time.time()
         if identity is not None:

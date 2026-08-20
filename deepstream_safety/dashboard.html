@@ -139,6 +139,15 @@
       }
     }
 
+    function setVideoMessage(video, message, visible) {
+      const frame = video.closest('.frame');
+      const label = frame?.querySelector('.stream-state');
+      if (label) {
+        label.textContent = message;
+        label.hidden = !visible;
+      }
+    }
+
     function clearToasters() {
       toastEntries.clear();
       seenEventIds.clear();
@@ -279,6 +288,8 @@
       let hls = null;
       let retryTimer = null;
       let stallTimer = null;
+      let bufferingTimer = null;
+      let waitingSince = null;
       let destroyed = false;
 
       const scheduleRetry = () => {
@@ -287,6 +298,9 @@
         state.live = false;
         setVideoState(video, 'Connecting...', false);
         if (stallTimer !== null) window.clearTimeout(stallTimer);
+        if (bufferingTimer !== null) window.clearTimeout(bufferingTimer);
+        bufferingTimer = null;
+        waitingSince = null;
         hls?.destroy();
         hls = null;
         video.pause();
@@ -305,6 +319,11 @@
           window.clearTimeout(stallTimer);
           stallTimer = null;
         }
+        if (bufferingTimer !== null) {
+          window.clearTimeout(bufferingTimer);
+          bufferingTimer = null;
+        }
+        waitingSince = null;
         state.live = true;
         state.error = false;
         setVideoState(video, 'Live', true);
@@ -312,14 +331,23 @@
       };
       const onWaiting = () => {
         if (destroyed) return;
-        state.live = false;
-        setVideoState(video, 'Buffering...', false);
-        updateOverallStatus();
+        // HLS/MSE emits short waiting events at part/segment boundaries. Keep
+        // the stream live during the grace period so the dashboard does not
+        // flicker every second while the video element is still progressing.
+        if (waitingSince === null) waitingSince = performance.now();
+        if (bufferingTimer === null) {
+          bufferingTimer = window.setTimeout(() => {
+            bufferingTimer = null;
+            if (!destroyed && waitingSince !== null) {
+              setVideoMessage(video, 'Buffering...', true);
+            }
+          }, 1500);
+        }
         if (stallTimer === null) {
           stallTimer = window.setTimeout(() => {
             stallTimer = null;
             scheduleRetry();
-          }, 1500);
+          }, 5000);
         }
       };
       const onTimeUpdate = () => {
@@ -343,44 +371,58 @@
       const attach = async () => {
         if (destroyed) return;
         try {
+          let Hls = null;
+          try {
+            Hls = await loadHls();
+          } catch (_) {
+            // Native HLS remains a fallback for Safari/iOS or a CDN outage.
+          }
+          if (!destroyed && Hls?.isSupported()) {
+            hls?.destroy();
+            hls = new Hls({
+              lowLatencyMode: false,
+              // Keep a few complete MPEG-TS segments behind the live edge.
+              // The encoder cadence is variable under DeepStream load; a
+              // larger cushion is intentional because this dashboard values
+              // continuous playback over sub-second latency.
+              liveSyncDurationCount: 3,
+              liveMaxLatencyDurationCount: 8,
+              maxBufferLength: 15,
+              backBufferLength: 0,
+              manifestLoadingMaxRetry: 2,
+              levelLoadingMaxRetry: 2,
+              fragLoadingMaxRetry: 2,
+            });
+            const sourceUrl = state.retryCount
+              ? `${hlsUrl}${hlsUrl.includes('?') ? '&' : '?'}retry=${state.retryCount}`
+              : hlsUrl;
+            state.retryCount = (state.retryCount || 0) + 1;
+            hls.loadSource(sourceUrl);
+            hls.attachMedia(video);
+            hls.on(Hls.Events.MANIFEST_PARSED, () => {
+              video.play().catch(() => scheduleRetry());
+            });
+            hls.on(Hls.Events.ERROR, (_event, data) => {
+              state.lastError = {
+                type: data.type,
+                details: data.details,
+                fatal: Boolean(data.fatal),
+              };
+              console.warn('HLS playback error', hlsUrl, state.lastError);
+              if (data.fatal) {
+                scheduleRetry();
+              }
+            });
+            return;
+          }
           if (video.canPlayType('application/vnd.apple.mpegurl')) {
             video.src = hlsUrl;
             video.load();
             video.play().catch(() => scheduleRetry());
             return;
           }
-          const Hls = await loadHls();
-          if (destroyed) return;
-          if (!Hls.isSupported()) throw new Error('HLS is not supported');
-          hls?.destroy();
-          hls = new Hls({
-            liveSyncDurationCount: 3,
-            backBufferLength: 0,
-            manifestLoadingMaxRetry: 2,
-            levelLoadingMaxRetry: 2,
-            fragLoadingMaxRetry: 2,
-          });
-          const sourceUrl = state.retryCount
-            ? `${hlsUrl}${hlsUrl.includes('?') ? '&' : '?'}retry=${state.retryCount}`
-            : hlsUrl;
-          state.retryCount = (state.retryCount || 0) + 1;
-          hls.loadSource(sourceUrl);
-          hls.attachMedia(video);
-          hls.on(Hls.Events.MANIFEST_PARSED, () => {
-            video.play().catch(() => scheduleRetry());
-          });
-          hls.on(Hls.Events.ERROR, (_event, data) => {
-            state.lastError = {
-              type: data.type,
-              details: data.details,
-              fatal: Boolean(data.fatal),
-            };
-            console.warn('HLS playback error', hlsUrl, state.lastError);
-            if (data.fatal) {
-              scheduleRetry();
-            }
-          });
-          } catch (error) {
+          throw new Error('HLS is not supported');
+        } catch (error) {
             state.lastError = { type: 'attach', details: String(error), fatal: true };
             console.warn('HLS attach failed', hlsUrl, state.lastError);
             scheduleRetry();
@@ -391,6 +433,9 @@
         destroyed = true;
         if (retryTimer !== null) window.clearTimeout(retryTimer);
         if (stallTimer !== null) window.clearTimeout(stallTimer);
+        if (bufferingTimer !== null) window.clearTimeout(bufferingTimer);
+        bufferingTimer = null;
+        waitingSince = null;
         state.destroyed = true;
         hls?.destroy();
         hls = null;
@@ -446,7 +491,11 @@
         text('pipelineCpu', !data.pipeline.running ? 'stopped' : data.pipeline.cpu_percent == null ? '--' : `${data.pipeline.cpu_percent}%`);
         text('pipelineRam', !data.pipeline.running ? 'stopped' : `${data.pipeline.rss_mb} MB`);
         text('gpu', !data.gpu.available ? 'unavailable' : `${data.gpu.utilization_percent}% / ${data.gpu.memory_used_mb} MB / ${data.gpu.temperature_c}°C`);
-        text('latency', !data.stream.hls_live ? 'offline' : `${data.stream.playlist_latency_ms} ms`);
+        text('latency', !data.stream.hls_live
+          ? 'offline'
+          : data.stream.playlist_latency_ms == null
+            ? 'runtime-ready'
+            : `${data.stream.playlist_latency_ms} ms`);
         const cameraDetails = data.pipeline.camera_details || [];
         liveCameras = new Set(cameraDetails.filter(camera => camera.running && camera.ready).map(camera => camera.id));
         runtimeReady = Boolean(data.pipeline.running && cameraDetails.length > 0 && liveCameras.size === cameraDetails.length);

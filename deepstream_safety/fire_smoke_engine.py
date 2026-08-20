@@ -20,7 +20,6 @@ class FireSmokeDetection:
     score: float
     bbox: tuple[float, float, float, float]
 
-
 class FireSmokeEngine:
     """Run the exported YOLO fire/smoke model on the complete camera frame."""
 
@@ -39,6 +38,10 @@ class FireSmokeEngine:
         )
         self.nms_iou = float(runtime.get("nms_iou", 0.45))
         self.max_detections_per_label = max(1, int(runtime.get("max_detections_per_label", 1)))
+        self.max_bbox_area_ratio = {
+            str(label): min(1.0, max(0.01, float(value)))
+            for label, value in (runtime.get("max_bbox_area_ratio", {}) or {}).items()
+        }
         self.smoothing_alpha = min(1.0, max(0.05, float(runtime.get("bbox_smoothing_alpha", 0.35))))
         self.smoothing_clear_seconds = max(
             1.0, float(runtime.get("bbox_smoothing_clear_seconds", runtime.get("clear_seconds", 3.0)))
@@ -51,6 +54,9 @@ class FireSmokeEngine:
         self._smoothed: dict[str, tuple[tuple[float, float, float, float], float]] = {}
         self._cached_detections: list[FireSmokeDetection] = []
         self._last_nonempty_at = 0.0
+        self.last_raw_scores: dict[str, float] = {}
+        self.last_inference_ran = False
+        self.last_fresh_detections: list[FireSmokeDetection] = []
         self.session = None
         self.input_name = ""
         self.active_providers: list[str] = []
@@ -132,6 +138,20 @@ class FireSmokeEngine:
         center_y = (bbox[1] + bbox[3]) / 2.0
         return roi_left <= center_x <= roi_right and roi_top <= center_y <= roi_bottom
 
+    def _valid_geometry(
+        self,
+        label: str,
+        bbox: tuple[float, float, float, float],
+        frame: np.ndarray,
+    ) -> bool:
+        limit = self.max_bbox_area_ratio.get(label)
+        if limit is None:
+            return True
+        frame_height, frame_width = frame.shape[:2]
+        frame_area = max(1.0, float(frame_width * frame_height))
+        bbox_area = max(0.0, bbox[2] - bbox[0]) * max(0.0, bbox[3] - bbox[1])
+        return bbox_area / frame_area <= limit
+
     def _decode(self, output: np.ndarray, frame: np.ndarray, ratio: float, pad_x: float, pad_y: float) -> list[FireSmokeDetection]:
         predictions = np.asarray(output)
         if predictions.ndim == 3:
@@ -144,6 +164,7 @@ class FireSmokeEngine:
             raise RuntimeError(f"fire/smoke model returned invalid prediction width: {predictions.shape}")
 
         frame_height, frame_width = frame.shape[:2]
+        self.last_raw_scores = {label: 0.0 for label in self.labels}
         by_label: dict[str, list[tuple[list[float], float]]] = {label: [] for label in self.labels}
         for row in predictions:
             class_scores = row[4:]
@@ -152,6 +173,7 @@ class FireSmokeEngine:
                 continue
             label = self.labels[class_index]
             score = float(class_scores[class_index])
+            self.last_raw_scores[label] = max(self.last_raw_scores.get(label, 0.0), score)
             if score < self._threshold(label):
                 continue
             center_x, center_y, box_width, box_height = [float(value) for value in row[:4]]
@@ -160,7 +182,12 @@ class FireSmokeEngine:
             right = min(float(frame_width), (center_x + box_width / 2.0 - pad_x) / ratio)
             bottom = min(float(frame_height), (center_y + box_height / 2.0 - pad_y) / ratio)
             bbox = (left, top, right, bottom)
-            if right > left and bottom > top and self._in_class_roi(label, bbox, frame):
+            if (
+                right > left
+                and bottom > top
+                and self._in_class_roi(label, bbox, frame)
+                and self._valid_geometry(label, bbox, frame)
+            ):
                 by_label[label].append(([left, top, right - left, bottom - top], score))
 
         detections: list[FireSmokeDetection] = []
@@ -189,15 +216,21 @@ class FireSmokeEngine:
 
     def process(self, frame: np.ndarray) -> list[FireSmokeDetection]:
         if not self.enabled or self.session is None or frame.size == 0:
+            self.last_inference_ran = False
+            self.last_fresh_detections = []
             return []
         now = time.monotonic()
         if now - self._last_attempt < self.interval_seconds:
+            self.last_inference_ran = False
+            self.last_fresh_detections = []
             return list(self._cached_detections)
         self._last_attempt = now
         image, ratio, pad_x, pad_y = self._letterbox(frame)
         tensor = cv2.cvtColor(image, cv2.COLOR_BGR2RGB).astype(np.float32).transpose(2, 0, 1)[None] / 255.0
         output = self.session.run(None, {self.input_name: tensor})[0]
         detections = self._decode(output, frame, ratio, pad_x, pad_y)
+        self.last_inference_ran = True
+        self.last_fresh_detections = list(detections)
         now = time.monotonic()
         current_labels = {detection.label for detection in detections}
         for label in tuple(self._smoothed):

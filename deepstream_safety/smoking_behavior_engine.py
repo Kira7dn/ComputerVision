@@ -57,6 +57,11 @@ class SmokingBehaviorEngine:
         self._smoothed_person_bbox: dict[int, tuple[float, float, float, float]] = {}
         self._active_tracks: set[int] = set()
         self._below_threshold: dict[int, int] = {}
+        self.last_person_count = 0
+        self.last_scores: dict[int, float] = {}
+        self.last_histories: dict[int, list[float]] = {}
+        self.last_roi_bboxes: dict[int, tuple[int, int, int, int]] = {}
+        self.last_confirmed_tracks: list[int] = []
         self.session = None
         self.active_providers: list[str] = []
 
@@ -92,7 +97,7 @@ class SmokingBehaviorEngine:
         ):
             raise RuntimeError(
                 "GPU smoking behavior provider was not active; "
-                f"requested={requested} available={self.active_providers}"
+                f"requested={requested} active={self.active_providers}"
             )
         LOG.info(
             "smoking behavior active: camera=%s model=%s providers=%s threshold=%.2f interval=%.0fms",
@@ -139,6 +144,7 @@ class SmokingBehaviorEngine:
         frame_height, frame_width = frame.shape[:2]
         now = time.monotonic()
         result: list[SmokingDetection] = []
+        self.last_person_count = len(persons)
         seen: set[int] = set()
         for track_id, raw_left, raw_top, raw_right, raw_bottom in persons:
             seen.add(track_id)
@@ -158,10 +164,13 @@ class SmokingBehaviorEngine:
             if due:
                 self._last_attempt[track_id] = now
                 score = self._score(crop)
+                self.last_scores[track_id] = float(score)
                 history = self._history.setdefault(track_id, [])
                 history.append(score)
                 del history[:-self.confirmation_window]
                 self._cached[track_id] = (score, (left, top, right, bottom))
+                self.last_histories[track_id] = list(history)
+                self.last_roi_bboxes[track_id] = (left, top, right, bottom)
             cached = self._cached.get(track_id)
             if cached is None:
                 continue
@@ -208,4 +217,8 @@ class SmokingBehaviorEngine:
             self._active_tracks.discard(track_id)
             self._below_threshold.pop(track_id, None)
             self._missing_frames.pop(track_id, None)
+            self.last_scores.pop(track_id, None)
+            self.last_histories.pop(track_id, None)
+            self.last_roi_bboxes.pop(track_id, None)
+        self.last_confirmed_tracks = sorted(self._active_tracks)
         return result

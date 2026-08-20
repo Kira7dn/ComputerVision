@@ -8,8 +8,9 @@ import numpy as np
 
 from deepstream_safety.events import SafetyDetection, SafetyEventStore
 from deepstream_safety.evidence import EvidenceStore
-from deepstream_safety.fire_smoke_engine import FireSmokeDetection
+from deepstream_safety.fire_smoke_engine import FireSmokeDetection, FireSmokeEngine
 from deepstream_safety.fire_smoke_events import FireSmokeEventStore
+from deepstream_safety.smoking_behavior_engine import SmokingBehaviorEngine
 
 
 def _config(root: Path) -> dict:
@@ -69,8 +70,10 @@ def test_event_lifecycle_is_classified_and_deduplicated(tmp_path: Path) -> None:
     trace_rows = [json.loads(line) for line in (event_dir / "trace.jsonl").read_text(encoding="utf-8").splitlines()]
     assert [row["record_type"] for row in trace_rows] == ["START", "END"]
     assert all(row["idempotency_key"].startswith("run-001|worker-0|") for row in trace_rows)
-    assert len(list((event_dir / "snapshots").glob("*.jpg"))) == 6
+    assert len(list((event_dir / "snapshots").glob("*.jpg"))) == 2
     assert len(list((event_dir / "snapshots").glob("*-annotated.jpg"))) == 2
+    assert not list((event_dir / "snapshots").glob("*-full.jpg"))
+    assert not list((event_dir / "snapshots").glob("*-roi.jpg"))
 
     index = sqlite3.connect(str(tmp_path / "snapshots-acceptance-run-001" / "index.sqlite3"))
     try:
@@ -117,6 +120,75 @@ def test_smoking_lifecycle_uses_function_path(tmp_path: Path) -> None:
     assert observed_bboxes == {(3.0, 4.0, 22.0, 23.0), (5.0, 6.0, 24.0, 23.0)}
 
 
+def test_evidence_keeps_only_start_peak_and_end_images(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    config["evidence"].update(
+        max_snapshots_per_event=3,
+        peak_score_delta=0.05,
+    )
+    store = EvidenceStore(config, "run-retention")
+    frame = np.full((24, 32, 3), 90, dtype=np.uint8)
+    event_id = store.start_event(
+        event_id="retention-event",
+        function="smoking_behavior",
+        classification="smoking",
+        frame=frame,
+        frame_number=1,
+        bbox=(2, 3, 20, 22),
+        score=0.60,
+    )
+
+    store.record(
+        event_id,
+        "UPDATE",
+        {},
+        frame=frame,
+        frame_number=2,
+        bbox=(2, 3, 20, 22),
+        score=0.62,
+    )
+    store.record(
+        event_id,
+        "UPDATE",
+        {},
+        frame=frame,
+        frame_number=3,
+        bbox=(2, 3, 20, 22),
+        score=0.68,
+    )
+    store.record(
+        event_id,
+        "UPDATE",
+        {},
+        frame=frame,
+        frame_number=4,
+        bbox=(2, 3, 20, 22),
+        score=0.80,
+    )
+    store.finish_event(
+        event_id,
+        frame=frame,
+        frame_number=5,
+        bbox=(2, 3, 20, 22),
+        score=0.55,
+    )
+    store.close()
+
+    snapshots = (
+        tmp_path
+        / "snapshots-acceptance-run-retention"
+        / "camera_face"
+        / "smoking_behavior"
+        / event_id
+        / "snapshots"
+    )
+    assert sorted(path.name for path in snapshots.glob("*.jpg")) == [
+        "end-0003-annotated.jpg",
+        "peak-0002-annotated.jpg",
+        "start-0001-annotated.jpg",
+    ]
+
+
 def test_fire_smoke_has_independent_class_events(tmp_path: Path) -> None:
     config = _config(tmp_path)
     config["input"]["camera"] = "camera_safety"
@@ -140,3 +212,46 @@ def test_fire_smoke_has_independent_class_events(tmp_path: Path) -> None:
     event_dirs = list((tmp_path / "snapshots-acceptance-run-003" / "camera_safety" / "fire_smoke").glob("*"))
     assert {json.loads((path / "event.json").read_text(encoding="utf-8"))["classification"] for path in event_dirs} == {"fire", "smoke"}
     assert all(json.loads((path / "event.json").read_text(encoding="utf-8"))["status"] == "ended" for path in event_dirs)
+
+
+def test_fire_geometry_rejects_implausibly_large_bbox() -> None:
+    engine = FireSmokeEngine.__new__(FireSmokeEngine)
+    engine.max_bbox_area_ratio = {"fire": 0.20}
+    frame = np.zeros((100, 100, 3), dtype=np.uint8)
+
+    assert engine._valid_geometry("fire", (0.0, 0.0, 40.0, 40.0), frame)
+    assert not engine._valid_geometry("fire", (0.0, 0.0, 50.0, 50.0), frame)
+    assert engine._valid_geometry("smoke", (0.0, 0.0, 100.0, 100.0), frame)
+
+
+def test_smoking_behavior_confirms_scores_per_person_track() -> None:
+    engine = SmokingBehaviorEngine(
+        {
+            "input": {"camera": "camera_dahua"},
+            "smoking_behavior": {
+                "enabled": False,
+                "smoking_threshold": 0.60,
+                "confirmation_hits": 2,
+                "confirmation_window": 4,
+            },
+        }
+    )
+    scores = iter((0.63, 0.67))
+
+    def next_score(_crop: np.ndarray) -> float:
+        return next(scores)
+
+    engine.enabled = True
+    engine.session = object()
+    engine.interval_seconds = 0.0
+    engine._score = next_score  # type: ignore[method-assign]
+    frame = np.full((100, 100, 3), 80, dtype=np.uint8)
+    person = [(11, 20.0, 10.0, 80.0, 95.0)]
+
+    assert engine.process(frame, person, 1) == []
+    detections = engine.process(frame, person, 2)
+
+    assert len(detections) == 1
+    assert detections[0].track_id == 11
+    assert engine.last_histories[11] == [0.63, 0.67]
+    assert engine.last_confirmed_tracks == [11]
