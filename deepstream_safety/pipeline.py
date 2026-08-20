@@ -58,7 +58,9 @@ from notifications import NotificationService  # noqa: E402
 from recognition import RecognitionCore, TrackKey  # noqa: E402
 from smoking_behavior_engine import SmokingBehaviorEngine  # noqa: E402
 from tracking import (  # noqa: E402
+    PersonConfirmation,
     frigate_track_distance,
+    intersection_over_candidate,
     iou,
     opposite_frame_edge_transition,
 )
@@ -102,6 +104,8 @@ class SafetyPipeline:
         self.status_dir = Path(str(runtime.get("status_directory", "/opt/camera-deepstream/status")))
         self.status_path = self.status_dir / f"{config.get('input', {}).get('camera', 'camera')}.json"
         self.last_frame_at: float | None = None
+        self.last_output_at: float | None = None
+        self.last_output_pts_ns: int | None = None
         functions = config.get("functions", {}) or {}
         self.smoking_behavior_enabled = bool(functions.get("smoking_behavior", False))
         self.fire_smoke_enabled = bool(functions.get("fire_smoke", False))
@@ -156,6 +160,15 @@ class SafetyPipeline:
             1.0,
             max(0.05, float(tracking_config.get("bbox_smoothing_alpha", 0.30))),
         )
+        self._person_confirmation_hits = int(
+            tracking_config.get("confirmation_hits", 2)
+        )
+        self._person_confirmation_window = int(
+            tracking_config.get("confirmation_window", 4)
+        )
+        self._person_fire_smoke_overlap_ratio = float(
+            tracking_config.get("fire_smoke_exclusion_overlap_ratio", 0.25)
+        )
         self.last_behavior_error: str | None = None
         self.analysis_enabled = (
             self.face_engine.enabled
@@ -205,6 +218,7 @@ class SafetyPipeline:
         self._latest_person_updated_at: float | None = None
         self._last_metadata_person_count = 0
         self._last_behavior_person_count = 0
+        self._last_person_fire_smoke_excluded_count = 0
         self._metadata_write_at = 0.0
         self.metadata_path = self.status_dir / f"{config.get('input', {}).get('camera', 'camera')}.metadata.json"
         self.socket = zmq.Context.instance().socket(zmq.PUB)
@@ -224,33 +238,41 @@ class SafetyPipeline:
     ) -> None:
         event_name = str(data.get("event", "update"))
         event_id = self._face_event_ids.get(track_id)
-        if event_name == "track_start":
+        stable_name = str(data.get("stable_result") or "unknown")
+        # A tracked person is not a recognition event. Create the event only
+        # when the identity becomes stable, using the exact frame that
+        # produced that recognition result as the START report image.
+        if event_id is None and stable_name != "unknown":
+            recognition_frame = data.get("frame")
+            person_bbox = data.get("person_bbox")
             event_id = self.evidence.start_event(
                 event_id=(
                     f"face-{self.run_id}-{self.config['input']['camera']}"
                     f"-{self.evidence.worker_epoch}-{track_id}"
                 ),
                 function="face_recognition",
-                classification="pending",
+                classification="recognized",
                 camera_id=str(self.config["input"]["camera"]),
                 person_track_id=track_id,
-                pending=True,
+                metadata={
+                    "identity": stable_name,
+                    "recognition_frame_number": recognition_frame,
+                    "recognition_source_timestamp": data.get("ts"),
+                    "face_bbox": data.get("face_bbox"),
+                    "person_bbox": person_bbox,
+                },
+                frame=frame,
+                frame_number=(
+                    int(recognition_frame) if recognition_frame is not None else None
+                ),
+                bbox=tuple(person_bbox) if person_bbox else None,
+                score=float(data.get("stable_score", data.get("score", 0.0)) or 0.0),
             )
             self._face_event_ids[track_id] = event_id
+            self._notify_event(event_id, "START")
             return
-        if event_id is None:
-            event_id = self.evidence.start_event(
-                event_id=(
-                    f"face-{self.run_id}-{self.config['input']['camera']}"
-                    f"-{self.evidence.worker_epoch}-{track_id}"
-                ),
-                function="face_recognition",
-                classification="pending",
-                camera_id=str(self.config["input"]["camera"]),
-                person_track_id=track_id,
-                pending=True,
-            )
-            self._face_event_ids[track_id] = event_id
+        if event_name == "track_start" or event_id is None:
+            return
         if event_name == "track_end":
             final_name = str(data.get("name") or "unknown")
             self.evidence.finish_event(
@@ -263,10 +285,8 @@ class SafetyPipeline:
                 bbox=tuple(data.get("person_bbox", [])) if data.get("person_bbox") else None,
                 score=float(data.get("score", 0.0)),
             )
-            self._notify_event(event_id, "END")
             self._face_event_ids.pop(track_id, None)
             return
-        stable_name = str(data.get("stable_result") or "unknown")
         self.evidence.record(
             event_id,
             "UPDATE",
@@ -277,8 +297,12 @@ class SafetyPipeline:
             score=float(data.get("stable_score", data.get("score", 0.0))),
         )
 
+        return
+
     def _notify_event(self, event_id: str, lifecycle: str) -> None:
-        """Queue only an artifact-backed lifecycle notification."""
+        """Queue only an artifact-backed event-start notification."""
+        if lifecycle != "START":
+            return
         self.notifications.notify_event(
             event_id,
             lifecycle,
@@ -288,7 +312,7 @@ class SafetyPipeline:
     def _notify_transitions(self, transitions: list[Any]) -> None:
         for transition in transitions:
             operation = str(getattr(transition, "operation", ""))
-            if operation in {"START", "END"}:
+            if operation == "START":
                 self._notify_event(str(transition.event_id), operation)
 
     def _write_person_infer_config(self) -> str:
@@ -380,18 +404,25 @@ maintain-aspect-ratio=0
         osd.set_property("display-bbox", True)
         osd.set_property("display-text", True)
         convert_after_osd = make_element("nvvideoconvert", "convert-after-osd")
-        output_rate = make_element("videorate", "output-rate")
-        output_rate.set_property("max-duplication-time", 100_000_000)
         output_tee = make_element("tee", "output-tee")
         output_queue = make_element("queue", "output-queue")
+        # Keep the output branch latest-frame bounded so a slow network reader
+        # cannot turn the live RTSP publication into historical playback.
+        output_queue.set_property("max-size-buffers", 2)
+        output_queue.set_property("max-size-bytes", 0)
+        output_queue.set_property("max-size-time", 0)
+        output_queue.set_property("leaky", 2)
         try:
             encoder = make_element("nvv4l2h264enc", "output-encoder")
             encoder.set_property("bitrate", 4_000_000)
-            # Keep HLS MPEG-TS segments close to the configured 2s target
-            # even when an input camera delivers a variable frame cadence.
             encoder.set_property("iframeinterval", 15)
             encoder.set_property("idrinterval", 15)
             encoder.set_property("preset-id", 1)
+            for property_name, property_value in (("insert-sps-pps", 1), ("num-B-Frames", 0)):
+                try:
+                    encoder.set_property(property_name, property_value)
+                except (TypeError, AttributeError):
+                    LOG.debug("output encoder does not expose property=%s", property_name)
             output_caps = "video/x-raw(memory:NVMM),format=I420"
             LOG.info("output encoder: nvv4l2h264enc")
         except RuntimeError:
@@ -400,13 +431,13 @@ maintain-aspect-ratio=0
             encoder.set_property("speed-preset", "ultrafast")
             encoder.set_property("tune", "zerolatency")
             encoder.set_property("key-int-max", 15)
+            encoder.set_property("bframes", 0)
             output_caps = "video/x-raw,format=I420"
             LOG.warning("output encoder: x264enc fallback")
         output_i420_caps = make_element("capsfilter", "output-i420-caps")
-        output_fps = int(input_cfg.get("output_fps", 15))
         output_i420_caps.set_property(
             "caps",
-            Gst.Caps.from_string(f"{output_caps},framerate={output_fps}/1"),
+            Gst.Caps.from_string(output_caps),
         )
         output_parser = make_element("h264parse", "output-h264-parse")
         output_parser.set_property("config-interval", 1)
@@ -435,7 +466,6 @@ maintain-aspect-ratio=0
             face_rgba_caps,
             osd,
             convert_after_osd,
-            output_rate,
             output_i420_caps,
             output_tee,
             output_queue,
@@ -491,8 +521,8 @@ maintain-aspect-ratio=0
             raise RuntimeError("Unable to link CPU face frame to OSD converter")
         if not face_rgba_caps.link(osd) or not osd.link(convert_after_osd):
             raise RuntimeError("Unable to link OSD branch")
-        if not convert_after_osd.link(output_rate) or not output_rate.link(output_i420_caps):
-            raise RuntimeError("Unable to link output rate normalizer")
+        if not convert_after_osd.link(output_i420_caps):
+            raise RuntimeError("Unable to link post-OSD output caps")
         if not output_i420_caps.link(output_tee):
             raise RuntimeError("Unable to link output tee")
         if not output_tee.link(output_queue):
@@ -824,6 +854,20 @@ maintain-aspect-ratio=0
             if object_label not in {self.config["person"]["label"], "fire", "smoke"}:
                 continue
             if object_label == self.config["person"]["label"]:
+                if not self._person_track_confirmed(int(obj_meta.object_id)):
+                    continue
+                rect = obj_meta.rect_params
+                box = np.array(
+                    [
+                        float(rect.left),
+                        float(rect.top),
+                        float(rect.left + rect.width),
+                        float(rect.top + rect.height),
+                    ],
+                    dtype=np.float32,
+                )
+                if self._person_box_overlaps_fresh_fire_smoke(box):
+                    continue
                 name, score = self.face_engine.current_label(
                     int(obj_meta.object_id), int(frame_meta.frame_num)
                 )
@@ -869,6 +913,10 @@ maintain-aspect-ratio=0
         buffer = info.get_buffer()
         if buffer is None:
             return Gst.PadProbeReturn.OK
+        self.last_output_at = time.time()
+        self.last_output_pts_ns = (
+            None if buffer.pts == Gst.CLOCK_TIME_NONE else int(buffer.pts)
+        )
         batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(buffer))
         if batch_meta is None:
             return Gst.PadProbeReturn.OK
@@ -926,6 +974,8 @@ maintain-aspect-ratio=0
             "started_at": self.started_at,
             "updated_at": time.time(),
             "last_frame_at": self.last_frame_at,
+            "last_output_at": self.last_output_at,
+            "last_output_pts_ns": self.last_output_pts_ns,
             "frame_count": self.frame_count,
             "analysis_queue_depth": self._analysis_queue.qsize(),
             "analysis_error": self._analysis_error,
@@ -958,6 +1008,23 @@ maintain-aspect-ratio=0
                 ),
                 "fire_smoke_raw_scores": getattr(self.fire_smoke_engine, "last_raw_scores", {}),
                 "person_detector_count": self.last_person_count,
+                "person_track_count": len(self._person_tracks),
+                "person_candidate_count": sum(
+                    1
+                    for track in self._person_tracks.values()
+                    if not track["confirmation"].confirmed
+                ),
+                "person_fire_smoke_excluded_count": sum(
+                    1
+                    for track in self._person_tracks.values()
+                    if track.get("environment_excluded", False)
+                ),
+                "person_fire_smoke_excluded_last_frame": self._last_person_fire_smoke_excluded_count,
+                "person_confirmed_count": sum(
+                    1
+                    for track in self._person_tracks.values()
+                    if track["confirmation"].confirmed
+                ),
                 "metadata_person_count": self._last_metadata_person_count,
                 "behavior_person_count": self._last_behavior_person_count,
                 "latest_person_count": len(self._latest_person_rois),
@@ -986,12 +1053,41 @@ maintain-aspect-ratio=0
             track_id = int(obj_meta.object_id)
             if track_id in {0, 18446744073709551615}:
                 continue
+            if not self._person_track_confirmed(track_id):
+                continue
             left = float(obj_meta.rect_params.left)
             top = float(obj_meta.rect_params.top)
             right = left + float(obj_meta.rect_params.width)
             bottom = top + float(obj_meta.rect_params.height)
+            box = np.array([left, top, right, bottom], dtype=np.float32)
+            if self._person_box_overlaps_fresh_fire_smoke(box):
+                continue
             persons.append((track_id, left, top, right, bottom))
         return persons
+
+    def _person_track_confirmed(self, track_id: int) -> bool:
+        track = self._person_tracks.get(int(track_id))
+        confirmation = track.get("confirmation") if track is not None else None
+        return bool(confirmation is not None and confirmation.confirmed)
+
+    def _person_box_overlaps_fresh_fire_smoke(self, box: np.ndarray) -> bool:
+        with self._analysis_lock:
+            if self._analysis_updated_at is None:
+                return False
+            age_seconds = time.monotonic() - self._analysis_updated_at
+            if age_seconds > self._analysis_result_max_age_seconds:
+                return False
+            detections = list(self._analysis_fire_smoke)
+        for detection in detections:
+            if str(getattr(detection, "label", "")) not in {"fire", "smoke"}:
+                continue
+            other = np.asarray(detection.bbox, dtype=np.float32)
+            if (
+                intersection_over_candidate(box, other)
+                >= self._person_fire_smoke_overlap_ratio
+            ):
+                return True
+        return False
 
     def _on_person_buffer(self, pad: Gst.Pad, info: Gst.PadProbeInfo) -> Gst.PadProbeReturn:
         buffer = info.get_buffer()
@@ -1094,6 +1190,7 @@ maintain-aspect-ratio=0
 
         matched_tracks: set[int] = set()
         matched_detections: set[int] = set()
+        environment_excluded_count = 0
         for _, _, track_id, index in pairs:
             if track_id in matched_tracks or index in matched_detections:
                 continue
@@ -1118,6 +1215,11 @@ maintain-aspect-ratio=0
                 last_frame=frame_number,
                 frames_seen=int(track.get("frames_seen", 0)) + 1,
             )
+            environment_excluded = self._person_box_overlaps_fresh_fire_smoke(box)
+            track["environment_excluded"] = environment_excluded
+            environment_excluded_count += int(environment_excluded)
+            if not environment_excluded:
+                track["confirmation"].observe(frame_number)
             detections[index][0].rect_params.left = float(smoothed_box[0])
             detections[index][0].rect_params.top = float(smoothed_box[1])
             detections[index][0].rect_params.width = float(smoothed_box[2] - smoothed_box[0])
@@ -1137,6 +1239,8 @@ maintain-aspect-ratio=0
                 continue
             track_id = self._next_person_track_id
             self._next_person_track_id += 1
+            environment_excluded = self._person_box_overlaps_fresh_fire_smoke(box)
+            environment_excluded_count += int(environment_excluded)
             self._person_tracks[track_id] = {
                 "box": box,
                 "center": center,
@@ -1144,8 +1248,16 @@ maintain-aspect-ratio=0
                 "disappeared": 0,
                 "last_frame": frame_number,
                 "frames_seen": 1,
+                "environment_excluded": environment_excluded,
+                "confirmation": PersonConfirmation(
+                    required_hits=self._person_confirmation_hits,
+                    window_frames=self._person_confirmation_window,
+                ),
             }
+            if not self._person_tracks[track_id]["environment_excluded"]:
+                self._person_tracks[track_id]["confirmation"].observe(frame_number)
             obj.object_id = track_id
+        self._last_person_fire_smoke_excluded_count = environment_excluded_count
 
     def _recognition_tracks(self, frame_meta: Any) -> list[dict[str, Any]]:
         frame_num = int(frame_meta.frame_num)
@@ -1158,7 +1270,21 @@ maintain-aspect-ratio=0
             track_id = str(getattr(obj_meta, "object_id", "0"))
             if track_id in {"0", "18446744073709551615"}:
                 continue
+            if label == "person" and not self._person_track_confirmed(int(track_id)):
+                continue
             rect = obj_meta.rect_params
+            if label == "person":
+                box = np.array(
+                    [
+                        float(rect.left),
+                        float(rect.top),
+                        float(rect.left + rect.width),
+                        float(rect.top + rect.height),
+                    ],
+                    dtype=np.float32,
+                )
+                if self._person_box_overlaps_fresh_fire_smoke(box):
+                    continue
             key = TrackKey(
                 str(self.config["input"].get("camera", "safety_camera")),
                 self.recognition.stream_epoch,
@@ -1738,8 +1864,6 @@ maintain-aspect-ratio=0
             except Exception:
                 LOG.exception("face lifecycle close failed; continuing shutdown")
             self.pipeline.set_state(Gst.State.NULL)
-            closing_event_ids = set(self.event_store.active_event_ids)
-            closing_event_ids.update(self.fire_smoke_events.active_event_ids)
             try:
                 self.event_store.close()
             except Exception:
@@ -1748,8 +1872,6 @@ maintain-aspect-ratio=0
                 self.fire_smoke_events.close()
             except Exception:
                 LOG.exception("fire/smoke event close failed; continuing shutdown")
-            for event_id in closing_event_ids:
-                self._notify_event(event_id, "END")
             try:
                 self.notifications.close()
             except Exception:

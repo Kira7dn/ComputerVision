@@ -83,6 +83,16 @@ def test_event_lifecycle_is_classified_and_deduplicated(tmp_path: Path) -> None:
     assert len((tmp_path / "snapshots-acceptance-run-001" / "events.jsonl").read_text(encoding="utf-8").splitlines()) == 2
 
 
+def test_recognition_annotation_uses_identity_not_classification() -> None:
+    event = {
+        "function": "face_recognition",
+        "classification": "recognized",
+        "identity": "Daisy",
+    }
+
+    assert EvidenceStore._annotation_label(event, {}, 0.9962) == "DAISY 100%"
+
+
 def test_smoking_lifecycle_uses_function_path(tmp_path: Path) -> None:
     config = _config(tmp_path)
     config["input"]["camera"] = "camera_safety"

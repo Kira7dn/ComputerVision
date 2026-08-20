@@ -2,7 +2,38 @@
 
 from __future__ import annotations
 
+from collections import deque
+from dataclasses import dataclass, field
+
 import numpy as np
+
+
+@dataclass
+class PersonConfirmation:
+    """Temporal confirmation state for one application-level person track."""
+
+    required_hits: int = 2
+    window_frames: int = 4
+    hit_frames: deque[int] = field(default_factory=deque)
+    confirmed: bool = False
+
+    def __post_init__(self) -> None:
+        if self.required_hits < 1:
+            raise ValueError("required_hits must be at least 1")
+        if self.window_frames < self.required_hits:
+            raise ValueError("window_frames must be at least required_hits")
+
+    def observe(self, frame_number: int) -> bool:
+        """Record one detection and return whether the track is confirmed."""
+        if self.confirmed:
+            return True
+        if not self.hit_frames or self.hit_frames[-1] != frame_number:
+            self.hit_frames.append(int(frame_number))
+        while self.hit_frames and frame_number - self.hit_frames[0] >= self.window_frames:
+            self.hit_frames.popleft()
+        if len(self.hit_frames) >= self.required_hits:
+            self.confirmed = True
+        return self.confirmed
 
 
 def iou(left: np.ndarray, right: np.ndarray) -> float:
@@ -19,6 +50,19 @@ def iou(left: np.ndarray, right: np.ndarray) -> float:
     )
     union = area_left + area_right - intersection
     return intersection / union if union > 0 else 0.0
+
+
+def intersection_over_candidate(candidate: np.ndarray, other: np.ndarray) -> float:
+    """Return the part of candidate covered by another bbox."""
+    x1 = max(float(candidate[0]), float(other[0]))
+    y1 = max(float(candidate[1]), float(other[1]))
+    x2 = min(float(candidate[2]), float(other[2]))
+    y2 = min(float(candidate[3]), float(other[3]))
+    intersection = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+    candidate_area = max(0.0, float(candidate[2] - candidate[0])) * max(
+        0.0, float(candidate[3] - candidate[1])
+    )
+    return intersection / candidate_area if candidate_area > 0 else 0.0
 
 
 def frigate_track_distance(detection: np.ndarray, estimate: np.ndarray) -> float:

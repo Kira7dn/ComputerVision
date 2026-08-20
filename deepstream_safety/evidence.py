@@ -156,6 +156,9 @@ class EvidenceStore:
 
     @staticmethod
     def _annotation_label(event: dict[str, Any], payload: dict[str, Any], score: float | None) -> str:
+        if event.get("function") == "face_recognition":
+            identity = str(payload.get("identity") or event.get("identity") or "recognized")
+            return f"{identity.upper()} {score * 100:.0f}%" if score is not None else identity.upper()
         label = str(payload.get("label") or event.get("classification") or event.get("function"))
         if event.get("function") == "fire_smoke" and label == "smoke":
             label = "smoke area"

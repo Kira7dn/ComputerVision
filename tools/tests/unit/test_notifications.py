@@ -84,6 +84,9 @@ def test_notification_outbox_sends_telegram_and_zalo_without_blocking(
         service.notify_event(event_id, "START", evidence.event_directory(event_id))
         time.sleep(0.05)
         assert len(requests) == 2
+        service.notify_event(event_id, "END", evidence.event_directory(event_id))
+        time.sleep(0.05)
+        assert len(requests) == 2
         rows = json.loads(
             json.dumps(
                 service.db.execute(

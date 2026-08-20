@@ -48,6 +48,8 @@ curl --retry 30 --retry-delay 1 --retry-connrefused -fsS --max-time 2 \
   http://127.0.0.1:18080/dashboard.html >/dev/null
 echo 'runtime-ready dashboard=http://127.0.0.1:18080/dashboard.html'
 export LD_LIBRARY_PATH=/usr/local/lib/python3.10/dist-packages/nvidia/cudnn/lib:/usr/local/lib/python3.10/dist-packages/nvidia/cublas/lib:/usr/local/lib/python3.10/dist-packages/nvidia/cuda_nvrtc/lib:/usr/lib/wsl/lib:/usr/local/cuda/lib64:/usr/local/lib/python3.10/dist-packages/tensorrt_libs
+export NVDS_ENABLE_LATENCY_MEASUREMENT=1
+export NVDS_ENABLE_COMPONENT_LATENCY_MEASUREMENT=1
 python3 __ROOT__/deepstream_safety/multi_runner.py --config __ROOT__/deepstream_safety/config.yaml 2>&1 | tee -a __RUNTIME__/logs/pipeline.log
 '@
         $startCommand = $startCommand.Replace('__RUNTIME__', $Runtime).Replace('__ROOT__', $Root)

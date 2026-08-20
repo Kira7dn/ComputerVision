@@ -185,6 +185,29 @@ def resolve_camera_config(config: dict[str, Any], camera_id: str | None = None) 
     fire_smoke["enabled"] = bool(functions["fire_smoke"])
     resolved["fire_smoke"] = fire_smoke
 
+    person = deepcopy(resolved.get("person", {}) or {})
+    person_tracking = deepcopy(person.get("tracking", {}) or {})
+    confirmation_hits = int(person_tracking.get("confirmation_hits", 2))
+    confirmation_window = int(person_tracking.get("confirmation_window", 4))
+    fire_smoke_overlap_ratio = float(
+        person_tracking.get("fire_smoke_exclusion_overlap_ratio", 0.25)
+    )
+    if confirmation_hits < 1:
+        raise ValueError("person.tracking.confirmation_hits must be at least 1")
+    if confirmation_window < confirmation_hits:
+        raise ValueError(
+            "person.tracking.confirmation_window must be at least confirmation_hits"
+        )
+    if not 0.0 < fire_smoke_overlap_ratio <= 1.0:
+        raise ValueError(
+            "person.tracking.fire_smoke_exclusion_overlap_ratio must be in (0, 1]"
+        )
+    person_tracking["confirmation_hits"] = confirmation_hits
+    person_tracking["confirmation_window"] = confirmation_window
+    person_tracking["fire_smoke_exclusion_overlap_ratio"] = fire_smoke_overlap_ratio
+    person["tracking"] = person_tracking
+    resolved["person"] = person
+
     events = deepcopy(resolved.get("events", {}) or {})
     events.update(camera.get("events", {}) or {})
     events["camera"] = camera_id

@@ -17,8 +17,10 @@
     .cameras { display: grid; min-height: 0; flex: 1; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); align-content: start; gap: 12px; overflow-y: auto; }
     .camera { overflow: hidden; background: #0b0f12; border: 1px solid #2a333b; border-radius: 10px; }
     .camera header { padding: 12px 14px; margin: 0; border-bottom: 1px solid #2a333b; }
+    .camera header > div { display: flex; align-items: center; gap: 10px; }
     .camera h2 { margin: 0; font-size: 17px; }
     .camera small { color: #9da9b2; }
+    .camera-live-latency { color: #39d98a !important; font-variant-numeric: tabular-nums; }
     .frame { position: relative; overflow: hidden; aspect-ratio: 16 / 9; background: #050607; }
     video { display: block; width: 100%; height: 100%; object-fit: contain; }
     .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(135px, 1fr)); gap: 6px; margin-top: 10px; }
@@ -42,13 +44,29 @@
     .toast.event { border-left-color: #64a8ff; }
     .toast-head, .toast-meta { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
     .toast-head { color: #d8e1e8; font-size: 11px; }
-    .toast-kind { font-weight: 700; text-transform: uppercase; }
-    .toast.danger .toast-kind { color: #ff7885; }
-    .toast.warning .toast-kind { color: #ffca62; }
-    .toast.event .toast-kind { color: #8fc2ff; }
+    .toast-camera { font-weight: 700; }
     .toast-time, .toast-meta { color: #9da9b2; font-size: 11px; }
-    .toast-event { margin: 5px 0; color: #fff; font-size: 13px; font-weight: 700; }
-    .toast-state { color: #9da9b2; font-size: 10px; }
+    .toast-body { display: flex; align-items: flex-start; gap: 8px; margin-top: 7px; }
+    .toast-thumb { width: 92px; aspect-ratio: 16 / 9; flex: 0 0 auto; object-fit: cover; background: #050607; border-radius: 5px; }
+    .toast-details { min-width: 0; }
+    .toast-event { color: #fff; font-size: 13px; font-weight: 700; }
+    .toast-details .toast-meta { justify-content: flex-start; margin-top: 5px; }
+    .toast { cursor: pointer; }
+    .toast:focus-visible { outline: 2px solid #8fc2ff; outline-offset: 2px; }
+    .event-modal[hidden] { display: none; }
+    .event-modal { position: fixed; inset: 0; z-index: 20; display: grid; place-items: center; padding: 20px; background: #000b; }
+    .event-modal-card { display: flex; width: min(720px, 100%); max-height: min(840px, 94vh); flex-direction: column; overflow: hidden; background: #10171d; border: 1px solid #46525d; border-radius: 12px; box-shadow: 0 20px 60px #000c; }
+    .event-modal-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 16px; border-bottom: 1px solid #2a333b; }
+    .event-modal-header h2 { margin: 0; font-size: 17px; }
+    .event-modal-close { width: 30px; height: 30px; border: 1px solid #46525d; border-radius: 6px; background: #182027; color: #eef2f5; font-size: 20px; line-height: 1; cursor: pointer; }
+    .event-modal-body { overflow-y: auto; padding: 16px; }
+    .event-modal-thumb { display: block; width: 100%; max-height: 430px; object-fit: contain; background: #050607; border-radius: 7px; }
+    .event-modal-empty-thumb { display: grid; min-height: 120px; place-items: center; color: #9da9b2; background: #050607; border-radius: 7px; }
+    .event-modal-facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 8px; margin: 14px 0; }
+    .event-modal-fact { padding: 8px 10px; background: #182027; border: 1px solid #2a333b; border-radius: 6px; }
+    .event-modal-fact small { display: block; color: #9da9b2; font-size: 10px; }
+    .event-modal-fact strong { display: block; margin-top: 3px; overflow-wrap: anywhere; font-size: 13px; }
+    .event-modal-json { margin: 0; padding: 10px; overflow: auto; color: #cbd5dc; background: #080b0e; border-radius: 6px; font: 11px/1.45 ui-monospace, SFMono-Regular, Consolas, monospace; white-space: pre-wrap; }
     .stream-state { position: absolute; inset: 0; display: grid; place-items: center; color: #9da9b2; font-size: 14px; }
     video[hidden], .stream-state[hidden] { display: none; }
     @media (max-width: 900px) {
@@ -77,11 +95,11 @@
           <div class="metric"><small>DeepStream CPU</small><strong id="pipelineCpu">--</strong></div>
           <div class="metric"><small>DeepStream RAM (all cameras)</small><strong id="pipelineRam">--</strong></div>
           <div class="metric"><small>GPU</small><strong id="gpu">--</strong></div>
-          <div class="metric"><small>HLS latency</small><strong id="latency">--</strong></div>
+          <div class="metric"><small>WebRTC status</small><strong id="latency">--</strong></div>
         </section>
         <footer>
           <span>DeepStream outputs</span>
-          <span id="stream">HLS: connecting</span>
+          <span id="stream">WebRTC: connecting</span>
         </footer>
       </div>
       <aside class="event-panel" aria-label="Danh sách sự kiện">
@@ -93,6 +111,16 @@
       </aside>
     </div>
   </main>
+  <div id="eventModal" class="event-modal" hidden role="dialog" aria-modal="true" aria-labelledby="eventModalTitle">
+    <section class="event-modal-card">
+      <header class="event-modal-header">
+        <h2 id="eventModalTitle">Event details</h2>
+        <button id="eventModalClose" class="event-modal-close" type="button" aria-label="Đóng">×</button>
+      </header>
+      <div id="eventModalBody" class="event-modal-body"></div>
+    </section>
+  </div>
+  <script src="/mediamtx_reader.js"></script>
   <script>
     const status = document.getElementById('status');
     const stream = document.getElementById('stream');
@@ -102,6 +130,10 @@
     let cameraSignature = '';
     let hlsLoader = null;
     const eventToaster = document.getElementById('eventToaster');
+    const eventModal = document.getElementById('eventModal');
+    const eventModalTitle = document.getElementById('eventModalTitle');
+    const eventModalBody = document.getElementById('eventModalBody');
+    const eventModalClose = document.getElementById('eventModalClose');
     const toastEntries = new Map();
     const seenEventIds = new Set();
     const maxEventRows = 10;
@@ -155,17 +187,85 @@
       eventCount.textContent = '0';
     }
 
+    function closeEventModal() {
+      eventModal.hidden = true;
+      eventModalBody.replaceChildren();
+    }
+
+    function openEventModal(event) {
+      const confidence = event.confidence == null ? '--' : `${(Number(event.confidence) * 100).toFixed(2)}%`;
+      const modalData = {
+        event: event,
+        details: event.details || {},
+        start_record: event.start_record || {},
+      };
+      eventModalTitle.textContent = `${event.camera || 'unknown'} · ${event.event_name || 'Event'}`;
+      eventModalBody.innerHTML = `
+        ${event.thumbnail_url
+          ? `<img class="event-modal-thumb" src="${escapeHtml(event.thumbnail_url)}" alt="Event thumbnail">`
+          : '<div class="event-modal-empty-thumb">Không có thumbnail</div>'}
+        <div class="event-modal-facts">
+          <div class="event-modal-fact"><small>Camera</small><strong>${escapeHtml(event.camera || 'unknown')}</strong></div>
+          <div class="event-modal-fact"><small>Thời gian</small><strong>${escapeHtml(formatEventTime(event.timestamp))}</strong></div>
+          <div class="event-modal-fact"><small>Phân loại</small><strong>${escapeHtml(event.classification || '--')}</strong></div>
+          <div class="event-modal-fact"><small>Danh tính</small><strong>${escapeHtml(event.name || '--')}</strong></div>
+          <div class="event-modal-fact"><small>Độ tin cậy</small><strong>${escapeHtml(confidence)}</strong></div>
+          <div class="event-modal-fact"><small>Frame bắt đầu</small><strong>${escapeHtml(event.details?.recognition_frame_number ?? event.start_record?.frame ?? '--')}</strong></div>
+        </div>
+        <pre class="event-modal-json">${escapeHtml(JSON.stringify(modalData, null, 2))}</pre>`;
+      eventModal.hidden = false;
+      eventModalClose.focus();
+    }
+
+    function eventFromToast(toast) {
+      const entry = toastEntries.get(toast?.dataset.eventId || '');
+      return entry?.event || null;
+    }
+
+    eventToaster.addEventListener('click', event => {
+      const toast = event.target.closest('.toast');
+      const item = eventFromToast(toast);
+      if (item) openEventModal(item);
+    });
+    eventToaster.addEventListener('keydown', event => {
+      if (event.key !== 'Enter' && event.key !== ' ') return;
+      const item = eventFromToast(event.target.closest('.toast'));
+      if (!item) return;
+      event.preventDefault();
+      openEventModal(item);
+    });
+    eventModalClose.addEventListener('click', closeEventModal);
+    eventModal.addEventListener('click', event => {
+      if (event.target === eventModal) closeEventModal();
+    });
+    document.addEventListener('keydown', event => {
+      if (event.key === 'Escape' && !eventModal.hidden) closeEventModal();
+    });
+
     function updateOverallStatus() {
       const states = [...players.values()];
       const liveCount = states.filter(state => state.live).length;
       if (liveCount > 0) {
-        setStatus(liveCount === states.length ? 'LIVE' : `LIVE (${liveCount}/${states.length})`, true);
-        stream.textContent = `HLS: ${liveCount}/${states.length} camera streams`;
+        setStatus(liveCount === states.length ? 'LIVE' : `LIVE (${liveCount}/${states.length})`, liveCount === states.length);
+        const fallbackCount = states.filter(state => state.transport === 'hls-fallback').length;
+        stream.textContent = fallbackCount
+          ? `WebRTC: ${liveCount - fallbackCount}/${states.length}; HLS fallback: ${fallbackCount}`
+          : `WebRTC: ${liveCount}/${states.length} camera streams`;
       } else if (states.some(state => !state.error)) {
         setStatus('Connecting...', false);
       } else {
         setStatus('Runtime offline', false);
       }
+    }
+
+    function updateBrowserLatency() {
+      const states = [...players.values()].filter(state => state.live);
+      const jitterValues = states
+        .map(state => state.stats?.jitterBufferDelayMs)
+        .filter(value => Number.isFinite(value));
+      text('latency', states.length === 0
+        ? runtimeReady ? 'connecting' : 'offline'
+        : jitterValues.length ? `jitter ${Math.max(...jitterValues).toFixed(0)} ms` : 'connected');
     }
 
     function renderToast(toast, event) {
@@ -174,15 +274,16 @@
       toast.className = `toast ${severity}`;
       toast.innerHTML = `
         <div class="toast-head">
-          <span class="toast-kind">${escapeHtml(event.severity_label || 'Sự kiện')}</span>
+          <span class="toast-camera">${escapeHtml(event.camera || 'unknown')}</span>
           <span class="toast-time">${escapeHtml(formatEventTime(event.timestamp))}</span>
         </div>
-        <div class="toast-event">${escapeHtml(event.event_name || 'Event')}</div>
-        <div class="toast-meta">
-          <span>Camera: ${escapeHtml(event.camera || 'unknown')}</span>
-          <span>${escapeHtml(confidence)}</span>
-        </div>
-        <div class="toast-state">${event.state === 'active' ? 'Đang xử lý' : 'Đã kết thúc'}</div>`;
+        <div class="toast-body">
+          ${event.thumbnail_url ? `<img class="toast-thumb" src="${escapeHtml(event.thumbnail_url)}" alt="" loading="lazy">` : ''}
+          <div class="toast-details">
+            <div class="toast-event">${escapeHtml(event.event_name || 'Event')}</div>
+            <div class="toast-meta"><span>${escapeHtml(confidence)}</span></div>
+          </div>
+        </div>`;
     }
 
     function eventTimestamp(event) {
@@ -220,6 +321,10 @@
       seenEventIds.add(eventId);
       const toast = document.createElement('article');
       toast.classList.add('new-event');
+      toast.dataset.eventId = eventId;
+      toast.tabIndex = 0;
+      toast.setAttribute('role', 'button');
+      toast.setAttribute('aria-label', `Mở chi tiết ${event.camera || 'event'}`);
       const entry = { event, toast };
       renderToast(toast, event);
       toastEntries.set(eventId, entry);
@@ -284,199 +389,204 @@
       return hlsLoader;
     }
 
-    function startHls(video, hlsUrl, state) {
+    function startHlsFallback(video, hlsUrl, state) {
       let hls = null;
-      let retryTimer = null;
-      let stallTimer = null;
-      let bufferingTimer = null;
-      let waitingSince = null;
       let destroyed = false;
-
-      const scheduleRetry = () => {
-        if (destroyed || retryTimer !== null) return;
-        state.error = true;
-        state.live = false;
-        setVideoState(video, 'Connecting...', false);
-        if (stallTimer !== null) window.clearTimeout(stallTimer);
-        if (bufferingTimer !== null) window.clearTimeout(bufferingTimer);
-        bufferingTimer = null;
-        waitingSince = null;
-        hls?.destroy();
-        hls = null;
-        video.pause();
-        video.removeAttribute('src');
-        video.load();
-        updateOverallStatus();
-        retryTimer = window.setTimeout(() => {
-          retryTimer = null;
-          attach();
-        }, 2000);
+      const attach = async () => {
+        try {
+          const Hls = await loadHls();
+          if (destroyed) return;
+          if (!Hls.isSupported()) throw new Error('HLS fallback is not supported');
+          hls = new Hls({
+            lowLatencyMode: true,
+            liveSyncDurationCount: 1,
+            liveMaxLatencyDurationCount: 3,
+            maxBufferLength: 3,
+            backBufferLength: 0,
+            manifestLoadingMaxRetry: 2,
+            levelLoadingMaxRetry: 2,
+            fragLoadingMaxRetry: 2,
+          });
+          hls.loadSource(hlsUrl);
+          hls.attachMedia(video);
+          hls.on(Hls.Events.MANIFEST_PARSED, () => {
+            video.play().catch(() => {});
+          });
+          hls.on(Hls.Events.ERROR, (_event, data) => {
+            if (data.fatal && !destroyed) {
+              state.error = true;
+              state.live = false;
+              setVideoState(video, 'HLS fallback unavailable', false);
+              updateOverallStatus();
+            }
+          });
+        } catch (error) {
+          if (destroyed) return;
+          state.error = true;
+          state.live = false;
+          state.lastError = { type: 'hls-fallback', details: String(error), fatal: true };
+          setVideoState(video, 'WebRTC unavailable; HLS fallback failed', false);
+          updateOverallStatus();
+        }
       };
-
       const onPlaying = () => {
         if (destroyed) return;
-        if (stallTimer !== null) {
-          window.clearTimeout(stallTimer);
-          stallTimer = null;
-        }
-        if (bufferingTimer !== null) {
-          window.clearTimeout(bufferingTimer);
-          bufferingTimer = null;
-        }
-        waitingSince = null;
         state.live = true;
         state.error = false;
-        setVideoState(video, 'Live', true);
+        const label = document.getElementById(`latency-${state.cameraId}`);
+        if (label) label.textContent = 'HLS fallback';
+        setVideoState(video, 'HLS fallback', true);
+        updateBrowserLatency();
         updateOverallStatus();
       };
-      const onWaiting = () => {
-        if (destroyed) return;
-        // HLS/MSE emits short waiting events at part/segment boundaries. Keep
-        // the stream live during the grace period so the dashboard does not
-        // flicker every second while the video element is still progressing.
-        if (waitingSince === null) waitingSince = performance.now();
-        if (bufferingTimer === null) {
-          bufferingTimer = window.setTimeout(() => {
-            bufferingTimer = null;
-            if (!destroyed && waitingSince !== null) {
-              setVideoMessage(video, 'Buffering...', true);
-            }
-          }, 1500);
-        }
-        if (stallTimer === null) {
-          stallTimer = window.setTimeout(() => {
-            stallTimer = null;
-            scheduleRetry();
-          }, 5000);
-        }
-      };
-      const onTimeUpdate = () => {
-        if (!destroyed && !video.paused && video.readyState >= 3) onPlaying();
-      };
-      const onVideoError = () => {
-        if (destroyed) return;
-        state.lastError = {
-          type: 'media',
-          details: video.error ? `code=${video.error.code}` : 'unknown media error',
-          fatal: true,
-        };
-        console.warn('Native HLS playback error', hlsUrl, state.lastError);
-        scheduleRetry();
-      };
       video.addEventListener('playing', onPlaying);
-      video.addEventListener('waiting', onWaiting);
-      video.addEventListener('timeupdate', onTimeUpdate);
-      video.addEventListener('error', onVideoError);
-
-      const attach = async () => {
-        if (destroyed) return;
-        try {
-          let Hls = null;
-          try {
-            Hls = await loadHls();
-          } catch (_) {
-            // Native HLS remains a fallback for Safari/iOS or a CDN outage.
-          }
-          if (!destroyed && Hls?.isSupported()) {
-            hls?.destroy();
-            hls = new Hls({
-              lowLatencyMode: false,
-              // Keep a few complete MPEG-TS segments behind the live edge.
-              // The encoder cadence is variable under DeepStream load; a
-              // larger cushion is intentional because this dashboard values
-              // continuous playback over sub-second latency.
-              liveSyncDurationCount: 3,
-              liveMaxLatencyDurationCount: 8,
-              maxBufferLength: 15,
-              backBufferLength: 0,
-              manifestLoadingMaxRetry: 2,
-              levelLoadingMaxRetry: 2,
-              fragLoadingMaxRetry: 2,
-            });
-            const sourceUrl = state.retryCount
-              ? `${hlsUrl}${hlsUrl.includes('?') ? '&' : '?'}retry=${state.retryCount}`
-              : hlsUrl;
-            state.retryCount = (state.retryCount || 0) + 1;
-            hls.loadSource(sourceUrl);
-            hls.attachMedia(video);
-            hls.on(Hls.Events.MANIFEST_PARSED, () => {
-              video.play().catch(() => scheduleRetry());
-            });
-            hls.on(Hls.Events.ERROR, (_event, data) => {
-              state.lastError = {
-                type: data.type,
-                details: data.details,
-                fatal: Boolean(data.fatal),
-              };
-              console.warn('HLS playback error', hlsUrl, state.lastError);
-              if (data.fatal) {
-                scheduleRetry();
-              }
-            });
-            return;
-          }
-          if (video.canPlayType('application/vnd.apple.mpegurl')) {
-            video.src = hlsUrl;
-            video.load();
-            video.play().catch(() => scheduleRetry());
-            return;
-          }
-          throw new Error('HLS is not supported');
-        } catch (error) {
-            state.lastError = { type: 'attach', details: String(error), fatal: true };
-            console.warn('HLS attach failed', hlsUrl, state.lastError);
-            scheduleRetry();
-        }
-      };
-
-      state.destroy = () => {
+      attach();
+      return () => {
         destroyed = true;
-        if (retryTimer !== null) window.clearTimeout(retryTimer);
-        if (stallTimer !== null) window.clearTimeout(stallTimer);
-        if (bufferingTimer !== null) window.clearTimeout(bufferingTimer);
-        bufferingTimer = null;
-        waitingSince = null;
-        state.destroyed = true;
         hls?.destroy();
         hls = null;
         video.removeEventListener('playing', onPlaying);
-        video.removeEventListener('waiting', onWaiting);
-        video.removeEventListener('timeupdate', onTimeUpdate);
-        video.removeEventListener('error', onVideoError);
+        video.pause();
         video.removeAttribute('src');
         video.load();
       };
-      attach();
+    }
+
+    function updateWebRtcStats(state) {
+      if (!state.reader || !state.live || typeof state.reader.getStats !== 'function') return;
+      state.reader.getStats().then(stats => {
+        let inbound = null;
+        stats.forEach(report => {
+          if (report.type === 'inbound-rtp' && (report.kind === 'video' || report.mediaType === 'video')) {
+            inbound = report;
+          }
+        });
+        if (!inbound) return;
+        const emitted = Number(inbound.jitterBufferEmittedCount);
+        const delay = Number(inbound.jitterBufferDelay);
+        state.stats = {
+          framesDecoded: Number(inbound.framesDecoded || 0),
+          packetsLost: Number(inbound.packetsLost || 0),
+          jitterBufferDelayMs: emitted > 0 && Number.isFinite(delay) ? delay * 1000 / emitted : null,
+        };
+        const label = document.getElementById(`latency-${state.cameraId}`);
+        if (label) label.textContent = 'WebRTC';
+        updateBrowserLatency();
+      }).catch(() => {});
+    }
+
+    function startWebRtc(video, webrtcUrl, hlsUrl, state) {
+      let reader = null;
+      let fallbackDestroy = null;
+      let fallbackTimer = null;
+      let statsTimer = null;
+      let destroyed = false;
+
+      const activateFallback = () => {
+        if (destroyed || state.live || fallbackDestroy !== null) return;
+        reader?.close();
+        reader = null;
+        state.transport = 'hls-fallback';
+        state.connecting = true;
+        setVideoState(video, 'WebRTC unavailable; connecting HLS fallback', false);
+        fallbackDestroy = startHlsFallback(video, hlsUrl, state);
+      };
+
+      const onTrack = event => {
+        if (destroyed || event.track?.kind !== 'video') return;
+        if (fallbackTimer !== null) {
+          window.clearTimeout(fallbackTimer);
+          fallbackTimer = null;
+        }
+        fallbackDestroy?.();
+        fallbackDestroy = null;
+        state.transport = 'webrtc';
+        state.connecting = false;
+        state.live = true;
+        state.error = false;
+        const label = document.getElementById(`latency-${state.cameraId}`);
+        if (label) label.textContent = 'WebRTC';
+        video.srcObject = event.streams[0];
+        video.play().catch(() => {});
+        setVideoState(video, 'Live / WebRTC', true);
+        updateBrowserLatency();
+        updateOverallStatus();
+      };
+
+      const onError = error => {
+        if (destroyed) return;
+        state.lastError = { type: 'webrtc', details: String(error), fatal: false };
+        state.connecting = true;
+        state.live = false;
+        state.error = false;
+        setVideoState(video, 'WebRTC reconnecting...', false);
+        updateOverallStatus();
+      };
+
+      try {
+        if (typeof window.MediaMTXWebRTCReader !== 'function') {
+          throw new Error('MediaMTXWebRTCReader unavailable');
+        }
+        reader = new window.MediaMTXWebRTCReader({
+          url: webrtcUrl,
+          user: '',
+          pass: '',
+          token: '',
+          onError,
+          onTrack,
+        });
+        state.reader = reader;
+        statsTimer = window.setInterval(() => updateWebRtcStats(state), 1000);
+        fallbackTimer = window.setTimeout(activateFallback, 10000);
+      } catch (error) {
+        state.lastError = { type: 'webrtc-init', details: String(error), fatal: true };
+        state.error = false;
+        state.connecting = true;
+        setVideoState(video, 'WebRTC unavailable; connecting HLS fallback', false);
+        fallbackTimer = window.setTimeout(activateFallback, 0);
+      }
+
+      state.destroy = () => {
+        destroyed = true;
+        if (fallbackTimer !== null) window.clearTimeout(fallbackTimer);
+        if (statsTimer !== null) window.clearInterval(statsTimer);
+        fallbackDestroy?.();
+        fallbackDestroy = null;
+        reader?.close();
+        reader = null;
+        state.reader = null;
+        video.srcObject = null;
+        video.pause();
+        video.load();
+      };
     }
 
     function renderCameras(cameraDetails) {
       // Rebuild a player when MediaMTX becomes available after dashboard startup.
-      // The first metrics poll can happen before the mock RTSP publisher is online;
-      // using hls_live in the signature lets a failed initial HLS attach recover.
+      // The first metrics poll can happen before the publisher is online.
       const signature = cameraDetails
-        .map(camera => `${camera.id}:${camera.hls_url}:${camera.hls_live ? 'live' : 'offline'}`)
+        .map(camera => `${camera.id}:${camera.webrtc_url}:${(camera.worker_ready ?? camera.ready) ? 'ready' : 'offline'}`)
         .join('|');
       if (signature === cameraSignature) return;
       cameraSignature = signature;
-      // Replacing the video DOM also replaces the media element that HLS was
-      // attached to. Destroy all existing players before rebuilding it; the
-      // old `players.has(id)` entry must not suppress the new attachment.
+      // Replacing the video DOM also replaces the media element that owns the
+      // WebRTC track. Destroy all existing readers before rebuilding it.
       for (const [id, player] of players) {
         player.destroy?.();
         players.delete(id);
       }
       cameras.innerHTML = cameraDetails.map(camera => {
         return `<article class="camera">
-          <header><h2>${camera.id}</h2><small>${camera.running ? `worker ${camera.pid}` : 'worker stopped'}</small></header>
-          <div class="frame"><video id="video-${camera.id}" hidden controls autoplay muted playsinline></video><div class="stream-state">${camera.running ? 'Connecting...' : 'Runtime offline'}</div></div>
+          <header><h2>${camera.id}</h2><div><small>${camera.running ? `worker ${camera.pid}` : 'worker stopped'}</small><small id="latency-${camera.id}" class="camera-live-latency">WebRTC</small></div></header>
+          <div class="frame"><video id="video-${camera.id}" hidden autoplay muted playsinline></video><div class="stream-state">${camera.running ? 'Connecting...' : 'Runtime offline'}</div></div>
         </article>`;
       }).join('');
       for (const camera of cameraDetails) {
         if (players.has(camera.id)) continue;
         const video = document.getElementById(`video-${camera.id}`);
         if (!video) continue;
-          const state = { live: false, error: false, destroyed: false, retryCount: 0, lastError: null };
-        startHls(video, camera.hls_url, state);
+          const state = { cameraId: camera.id, live: false, error: false, connecting: true, destroyed: false, transport: 'webrtc', stats: null, reader: null, lastError: null };
+        startWebRtc(video, camera.webrtc_url, camera.hls_url, state);
         players.set(camera.id, state);
       }
     }
@@ -491,19 +601,18 @@
         text('pipelineCpu', !data.pipeline.running ? 'stopped' : data.pipeline.cpu_percent == null ? '--' : `${data.pipeline.cpu_percent}%`);
         text('pipelineRam', !data.pipeline.running ? 'stopped' : `${data.pipeline.rss_mb} MB`);
         text('gpu', !data.gpu.available ? 'unavailable' : `${data.gpu.utilization_percent}% / ${data.gpu.memory_used_mb} MB / ${data.gpu.temperature_c}°C`);
-        text('latency', !data.stream.hls_live
-          ? 'offline'
-          : data.stream.playlist_latency_ms == null
-            ? 'runtime-ready'
-            : `${data.stream.playlist_latency_ms} ms`);
         const cameraDetails = data.pipeline.camera_details || [];
-        liveCameras = new Set(cameraDetails.filter(camera => camera.running && camera.ready).map(camera => camera.id));
+        liveCameras = new Set(cameraDetails.filter(camera => camera.running && (camera.worker_ready ?? camera.ready)).map(camera => camera.id));
         runtimeReady = Boolean(data.pipeline.running && cameraDetails.length > 0 && liveCameras.size === cameraDetails.length);
         renderCameras(cameraDetails);
-        stream.textContent = liveCameras.size ? `HLS: ${liveCameras.size}/${cameraDetails.length} camera streams` : 'HLS: offline';
+        updateBrowserLatency();
+        updateOverallStatus();
+        if (players.size === 0) {
+          stream.textContent = liveCameras.size ? `WebRTC: connecting ${liveCameras.size}/${cameraDetails.length} camera streams` : 'WebRTC: offline';
+        }
         if (!runtimeReady) {
           setStatus('Runtime offline', false);
-          stream.textContent = 'HLS: offline';
+          stream.textContent = 'WebRTC: offline';
           for (const video of document.querySelectorAll('video')) {
             setVideoState(video, 'Runtime offline', false);
           }
@@ -514,7 +623,7 @@
         runtimeReady = false;
         liveCameras = new Set();
         setStatus('Runtime offline', false);
-        stream.textContent = 'HLS: offline';
+        stream.textContent = 'WebRTC: offline';
         for (const video of document.querySelectorAll('video')) {
           setVideoState(video, 'Runtime offline', false);
         }

@@ -117,6 +117,9 @@ person:
   label: person
   tracking:
     bbox_smoothing_alpha: 0.30
+    confirmation_hits: 2
+    confirmation_window: 4
+    fire_smoke_exclusion_overlap_ratio: 0.25
 
 recognition:
   enabled: true

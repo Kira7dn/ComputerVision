@@ -4,6 +4,42 @@ Ngày: 20/08/2026
 Workspace: `D:\BusinessAnalyze\Camera`  
 Runtime đang áp dụng: standalone WSL DeepStream trong `deepstream_safety/`
 
+## 0. Mục tiêu bắt buộc của phiên phát triển tiếp theo
+
+Phiên tiếp theo là **implementation session**, không phải phiên chạy lại acceptance
+cho các sửa cũ.
+
+Mục tiêu duy nhất: triển khai person confirmation gate tối thiểu trong application
+tracker hiện tại để raw person detection chập chờn trên thùng rác
+`camera_safety` không được công bố, đồng thời person đã xác nhận không nháy khi
+detector hụt ngắn. Patch này không tuyên bố xử lý ghế hoặc thùng rác bị model
+nhận liên tục; các trường hợp persistent đó thuộc patch per-camera calibration
+kế tiếp.
+
+Baseline đã kiểm tra tại `main` commit `2b4fcbc`:
+
+- Worktree sạch.
+- Tracker edge-transition, mock RTSP readiness và smoking overlay ownership đã có
+  trong HEAD; chỉ cần giữ regression, không lấy việc kiểm tra lại chúng làm mục
+  tiêu phiên.
+- Person confirmation gate **chưa có**. Các `confirmation_hits` hiện có trong
+  `config.yaml` thuộc smoking và fire/smoke, không xác nhận person track.
+
+Source bắt buộc phải thay đổi trong phiên:
+
+- `deepstream_safety/pipeline.py`: thêm `confirmed`, `hit_times`, `last_seen_at`
+  vào `_person_tracks`; filter consumer theo confirmed/current/render view.
+- `deepstream_safety/tracking.py`: thêm helper time-window hit nhỏ, không tạo
+  tracker framework mới.
+- `deepstream_safety/config.yaml` và `config.py`: thêm đúng ba cấu hình
+  `confirmation_hits`, `confirmation_window_seconds`, `render_grace_seconds`.
+- `tools/tests/unit/test_deepstream_tracking.py`: thêm bốn regression case đã chốt.
+
+Kết thúc phiên bằng targeted unit/static checks và một runtime acceptance chạy
+đúng 30 giây. Không thêm soak test, không chỉ restart/xem dashboard, không đổi
+Frigate/model/topology và không gọi phiên hoàn tất khi source person confirmation
+gate chưa được triển khai.
+
 ## 1. Mục tiêu và ranh giới
 
 Tài liệu này bàn giao kết quả điều tra các hiện tượng live không ổn định, bbox
@@ -25,20 +61,123 @@ config.yaml
 
 Nested `frigate/`, Docker và Frigate API không tham gia runtime này.
 
-## 2. Tóm tắt kết luận
+### 1.1 Kiến trúc duy nhất
 
-| Vấn đề | Nguyên nhân đã xác nhận | Trạng thái |
-| --- | --- | --- |
-| Dahua tạo ID người mới gần như mỗi frame | Hàm chống chuyển mép coi bbox cao gần toàn khung là chuyển từ mép trên sang mép dưới | Đã sửa và có regression test |
-| Mock face/safety chết ở epoch 1 | FFmpeg còn sống nhưng RTSP chưa có video; launcher chỉ sleep cố định 4 giây | Đã thay bằng readiness probe và giám sát publisher |
-| Bbox Dahua nháy xanh/đỏ | Renderer tự hết hạn smoking result theo bốn frame dựa trên FPS mặc định 5 | Đã bỏ frame-based TTL |
-| Vẫn mất nhãn đỏ sau khi đổi TTL thành 2 giây | Analysis có lúc trễ 3,8 giây dù smoking engine vẫn confirmed | Đã giao ownership smoking overlay cho temporal state của track; TTL chỉ còn cho fire/smoke camera-level |
-| “Đang hút nhưng không nhận diện” trong lần kiểm tra cuối | Năm frame thực tế không có người; detector nhận nhầm ghế thành person và classifier nhận ROI chứa ghế | Chưa sửa person false positive; cần calibration/model gate |
-| Thùng rác trên `camera_safety` nháy thành person | Person detector tạo candidate false positive không liên tục; raw detector output đang được đưa quá gần renderer, chưa có verified-track activation gate | Người dùng đã quan sát trực tiếp; artifact hiện chưa có dedicated person-candidate trace để định lượng |
-| Vật trên tường/tai bị nhận thành fire | Fire model cho score thấp nhưng vượt threshold; thiếu hard-negative calibration và profile ROI riêng từng camera | Chưa sửa; không được che bằng bypass |
-| Analysis cadence không đều | Smoking và fire/smoke chạy tuần tự trong một analysis worker của camera | Chưa sửa; đã chốt tách thành hai bounded latest-sample lane |
-| Live trễ dần 30–40 giây | HLS có target latency nhưng dashboard không đo freshness thực tế, không có watchdog đưa playback về live edge; output queue cũng chưa áp latest-frame contract rõ ràng | Đã xác nhận khoảng trống kiến trúc; 30–40 giây là quan sát thực tế, nguy cơ kéo dài nhiều ngày chưa được đo nhưng hiện không có invariant để loại trừ |
-| Toàn runtime dừng khi foreground launcher kết thúc | `start.ps1` gắn ownership MediaMTX/dashboard/workers vào một shell và cleanup trap | Đúng với runbook dev, chưa đạt process ownership production |
+Không có nhiều phương án kiến trúc trong tài liệu này. Bảng dưới đây là nguồn sự
+thật duy nhất; `CURRENT` là phần đang chạy trong HEAD, `TARGET` là thay đổi đã chốt
+nhưng chưa triển khai.
+
+| ID | Trạng thái | Quyết định kiến trúc | Liên quan |
+| --- | --- | --- | --- |
+| `A-01` | **CURRENT — giữ nguyên** | Runtime chỉ là `config.yaml -> multi_runner.py -> một pipeline.py worker/camera -> MediaMTX -> dashboard` | Toàn hệ thống |
+| `A-02` | **CURRENT — giữ nguyên** | Mỗi camera worker sở hữu inference, application tracker, annotation và function dispatch của camera đó | Toàn hệ thống |
+| `A-03` | **CURRENT — giữ nguyên** | `EvidenceStore` là owner duy nhất của event trace, SQLite idempotency và annotated snapshot dưới `.tmp/deepstream-safety` | Event/evidence |
+| `A-04` | **TARGET — phiên hiện tại** | Application tracker hiện có vẫn là authority duy nhất cấp person `track_id`; chỉ thêm `confirmed`, `hit_times`, `last_seen_at`, confirmation gate và render grace | `I-06` |
+| `A-05` | **TARGET** | Một camera worker có đúng hai bounded latest-sample analysis lane: person behavior và environmental fire/smoke; không tạo queue history | `I-08` |
+| `A-06` | **TARGET** | Output GStreamer dùng latest-frame/leaky queue; dashboard HLS đo freshness và tự seek/recreate khi vượt hard limit | `I-09` |
+| `A-07` | **TARGET** | WSL systemd sở hữu vòng đời `multi_runner.py`; PowerShell launcher chỉ gọi start/stop/status | `I-10` |
+| `A-08` | **TARGET** | Threshold và ROI của person/fire/smoke nằm trong camera profile; không dùng một global policy để che khác biệt camera | `I-05`, `I-07` |
+| `A-09` | **CURRENT — policy cố định** | Danh sách event giữ đầy đủ event chức năng; Telegram/Zalo chỉ nhận fire, smoke và smoking | Notification |
+
+Luồng target duy nhất sau khi hoàn thành roadmap:
+
+```text
+config.yaml
+  -> multi_runner.py
+  -> one pipeline.py worker per camera
+       -> person detector
+       -> existing application tracker + confirmation gate
+       -> confirmed current person -> face/smoking lane
+       -> full frame -> fire/smoke lane
+       -> event/evidence + notification policy
+       -> canonical annotation
+       -> bounded latest-frame RTSP output
+  -> MediaMTX HLS
+  -> dashboard freshness watchdog
+```
+
+Ràng buộc không được thay đổi:
+
+- Không đưa Frigate, Docker, `/media/frigate` hoặc Frigate API vào runtime.
+- Không thêm NvDCF, tracker service, event bus hoặc media owner thứ hai.
+- Không chạy inference trên bbox render grace/cache.
+- Không để frontend trở thành owner của detection/event; frontend chỉ render
+  canonical metadata và giám sát freshness.
+- Mỗi patch chỉ triển khai đúng một kiến trúc `TARGET` theo thứ tự mục 8.
+
+### 1.2 Contract bắt buộc cho `I-06`
+
+Phần này trả lời dứt điểm các câu hỏi triển khai; không có lựa chọn khác.
+
+**Bằng chứng xác nhận person candidate**
+
+- Confirmation chỉ dùng temporal detection hits: cùng track có ít nhất
+  `confirmation_hits: 3` detection match trong
+  `confirmation_window_seconds: 1.5`.
+- Mỗi hit đã phải vượt `person.confidence` và được association vào cùng track bằng
+  geometry matcher hiện có.
+- Motion không tham gia confirmation.
+- Không thêm geometry gate, score threshold thứ hai, person verifier hoặc model
+  mới trong `I-06`.
+- Bbox geometry chỉ dùng để association, không phải một phiếu xác nhận person độc
+  lập.
+
+Temporal hits chủ động chỉ giải quyết candidate chập chờn đã quan sát ở thùng rác.
+Một thùng rác được detector nhận ổn định đủ ba hit vẫn có thể được confirmed; đó
+là `I-05`/per-camera detector calibration ở patch kế tiếp, không được kéo thêm
+logic vào `I-06` để che model false positive.
+
+**Boundary của candidate chưa confirmed**
+
+Candidate chưa confirmed bị chặn hoàn toàn khỏi:
+
+- canonical/person overlay và dashboard overlay;
+- public/live metadata;
+- face recognition;
+- smoking inference;
+- event list, event lifecycle và evidence snapshot;
+- Telegram/Zalo notification.
+
+Candidate chỉ được tồn tại trong `_person_tracks` nội bộ và transition log/counter
+chẩn đoán. Không có candidate overlay, candidate public metadata hoặc candidate
+event riêng.
+
+**Boundary sau confirmation**
+
+- Confirmed track có detection thật ở frame hiện tại được dùng cho face/smoking
+  analysis và canonical metadata theo policy camera hiện có.
+- Confirmed track bị miss ngắn chỉ được giữ trong render view tối đa
+  `render_grace_seconds: 1.0`; bbox cache không được dùng cho inference hay event
+  update.
+- Hết grace/lifecycle timeout, track biến mất theo owner hiện có; không tạo queue
+  hoặc event bus mới.
+
+## 2. Danh mục vấn đề duy nhất
+
+Quy tắc đếm cố định:
+
+- Có **10 hiện tượng** (`I-01` đến `I-10`).
+- Mười hiện tượng thuộc **8 nhóm nguyên nhân** (`G-01` đến `G-08`).
+- Có **3 nhóm đã xử lý** và **5 nhóm chưa xử lý**.
+- Phiên kế tiếp chỉ thực hiện `I-06`, không có nghĩa toàn hệ thống chỉ còn một vấn
+  đề.
+
+| ID | Nhóm | Hiện tượng | Trạng thái | Phạm vi xử lý |
+| --- | --- | --- | --- | --- |
+| `I-01` | `G-01` Tracker ID | Dahua tạo ID person mới gần như mỗi frame do logic chuyển mép đối diện | **DONE** | Đã sửa trong HEAD và có regression test |
+| `I-02` | `G-02` Mock readiness | Mock face/safety chết ở epoch 1 vì FFmpeg sống nhưng RTSP chưa đọc được video | **DONE** | Đã có `ffprobe` readiness và publisher monitoring |
+| `I-03` | `G-03` Smoking overlay | Bbox Dahua nháy xanh/đỏ vì renderer dùng TTL bốn frame | **DONE** | Đã bỏ frame-based TTL |
+| `I-04` | `G-03` Smoking overlay | TTL hai giây vẫn làm mất nhãn khi analysis trễ khoảng 3,8 giây | **DONE** | Smoking overlay đã theo temporal state của `track_id` |
+| `I-05` | `G-04` Person false positive | Ghế Dahua bị detector nhận thành person và tạo sai smoking ROI | **OPEN** | Per-camera person calibration sau confirmation patch |
+| `I-06` | `G-04` Person false positive | Thùng rác `camera_safety` bị nhận thành person chập chờn và bbox nháy | **OPEN — CURRENT SESSION** | Person confirmation gate + render grace tối thiểu |
+| `I-07` | `G-05` Fire false positive | Tai/vật màu vàng bị nhận thành fire vì score vượt threshold global thấp | **OPEN** | Fire/smoke threshold và ROI riêng từng camera |
+| `I-08` | `G-06` Analysis scheduling | Smoking và fire/smoke chạy tuần tự làm result age không đều | **OPEN** | Hai bounded latest-sample analysis lane |
+| `I-09` | `G-07` Live latency | Live tích lũy trễ 30–40 giây nhưng dashboard vẫn báo `Live` | **OPEN** | HLS freshness watchdog và bounded output queue |
+| `I-10` | `G-08` Process ownership | Foreground launcher kết thúc làm toàn runtime dừng | **OPEN** | Systemd service ownership |
+
+Không được dùng số “4 vấn đề” cho tài liệu này. Số 4 chỉ từng xuất hiện do lấy ba
+vấn đề cũ đã hoàn thành cộng với một mục tiêu phiên hiện tại, và không phản ánh
+toàn bộ danh mục.
 
 ## 3. Nghiên cứu và bằng chứng
 

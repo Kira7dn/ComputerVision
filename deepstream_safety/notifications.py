@@ -379,7 +379,7 @@ class NotificationService:
         return title, "\n".join(details)
 
     def notify_event(self, event_id: str, lifecycle: str, event_directory: Path | None) -> None:
-        if not self.enabled or lifecycle not in {"START", "END"} or event_directory is None:
+        if not self.enabled or lifecycle != "START" or event_directory is None:
             return
         event_path = event_directory / "event.json"
         try:

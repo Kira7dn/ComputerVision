@@ -16,6 +16,39 @@ Ba lỗi được xử lý:
 3. Bbox Dahua nháy xanh/đỏ giữa `person` và `SMOKING` dù smoking track vẫn đang
    confirmed.
 
+## Mục tiêu phát triển tiếp theo — I-06
+
+I-06 xử lý false positive trên `camera_safety` trong cảnh thùng rác đứng yên cùng
+vị trí với đám cháy. Đây là mục tiêu phát triển riêng, không phải chạy lại
+acceptance của ba lỗi lịch sử ở trên.
+
+### Contract của person gate
+
+- Person detector tạo application track candidate; candidate chưa được coi là
+  person hợp lệ cho downstream.
+- Person bình thường cần đạt `2 hits trong cửa sổ 4 frame` để confirmed.
+- Candidate chồng tối thiểu 25% diện tích bbox person với detection `fire` hoặc
+  `smoke` còn fresh không được tích confirmation và không được đi vào
+  recognition, smoking ROI, metadata, overlay hoặc person event.
+- Track vẫn được giữ cho matching; fire/smoke detection và event không bị chặn.
+- Không dùng motion gate vì target là thùng rác đứng yên; không thay model,
+  topology, NvDCF hoặc đưa Frigate vào pipeline.
+
+### Implementation I-06
+
+Đã cập nhật:
+
+- `deepstream_safety/tracking.py`: `PersonConfirmation` và helper tính overlap
+  theo diện tích candidate.
+- `deepstream_safety/config.yaml`: `person.tracking.confirmation_hits`,
+  `confirmation_window` và `fire_smoke_exclusion_overlap_ratio: 0.25`.
+- `deepstream_safety/config.py`: resolve và validate person gate config.
+- `deepstream_safety/pipeline.py`: chặn candidate tại confirmation, ROI,
+  recognition, metadata và output renderer; thêm counters candidate/confirmed/
+  fire-smoke-excluded.
+- `tools/tests/unit/test_deepstream_tracking.py`: test temporal confirmation,
+  reset/window validation và fire/smoke overlap.
+
 ## Nguyên nhân đã xác nhận
 
 ### 1. Điều kiện chống nhảy mép từ chối chính bbox hợp lệ
@@ -125,11 +158,68 @@ Run sau bản sửa overlay `20260820T093352-93dd0e01`:
   giây vẫn có thể xóa nhầm overlay. Bản sửa cuối loại TTL khỏi smoking track state;
   chỉ fire/smoke camera-level còn dùng TTL.
 
+## Kết quả kiểm chứng I-06
+
+Unit/static sau implementation:
+
+- 26 unit tests pass.
+- Ruff pass.
+- Python compileall pass.
+- PowerShell parser, `package.json` parse và `git diff --check` pass.
+
+Runtime acceptance `20260820T115837-c5249c57`:
+
+- Ba worker khởi động ở epoch 1 và chạy quá 30 giây.
+- `camera_safety` có fire event active và metadata thật với `FIRE 27%` cùng
+  `SMOKE AREA 22%`.
+- Fire/smoke vẫn được xuất trong `overlays`/`fire_smoke`; `boxes` person tại
+  sample cuối là rỗng.
+- Không có `analysis_error` và dashboard trả HTTP 200.
+
+Trạng thái bằng chứng:
+
+- Implementation đã có spatial exclusion cho candidate chồng vùng fire/smoke.
+- Runtime sample chứng minh fire/smoke không bị chặn và person downstream rỗng ở
+  sample cuối.
+- Chưa có sample runtime ghi trực tiếp một frame đồng thời có person candidate,
+  fire/smoke overlap và `person_fire_smoke_excluded_last_frame > 0`; không gọi
+  đây là bằng chứng hoàn tất false-positive rejection cho tới khi có sample đó.
+- Notification override từ PowerShell không truyền qua launcher sang WSL; run
+  runtime dùng notification cấu hình thật.
+
 ## Những việc không được coi là đã giải quyết trong đợt này
 
 - Chất lượng model fire/smoke và các false positive như tai bị nhận thành fire là
   vấn đề model/dataset/threshold riêng, không được che bằng bypass trong thay đổi
   ổn định này.
-- Zalo đang trả lỗi hết quota ngày; đây không phải lỗi pipeline hoặc retry runtime.
-- Acceptance trình duyệt ở trên chứng minh một cửa sổ phát liên tục ngắn, chưa phải
-  soak test nhiều giờ.
+
+## Phương án xử lý chất lượng fire/smoke model
+
+Đây là workstream riêng, không gộp vào I-06 và không thay model trong phiên ổn
+định runtime này.
+
+### 1. Audit threshold và ROI
+
+- Đánh giá riêng `fire_threshold` và `smoke_threshold`, không tăng threshold chung
+  làm mất smoke thật.
+- Rà lại `class_rois` theo vùng thực tế của `camera_safety`.
+- Kiểm tra `max_bbox_area_ratio` để loại bbox fire/smoke vô lý.
+- Dùng một tập clip có nhãn để đo precision/recall trước khi đổi config.
+
+### 2. Bổ sung hard-negative dataset — hướng chính
+
+Thu thập và gán nhãn các mẫu dễ nhầm trong camera thực tế: thùng rác, tai/người,
+đèn và vùng sáng, hơi nước, khói không cháy, vật thể đỏ/cam và nền không có
+fire/smoke. Fine-tune model với các hard negative này và đánh giá confusion matrix
+riêng cho từng class.
+
+### 3. Cải thiện lifecycle sau model
+
+- Temporal confirmation riêng cho fire và smoke.
+- Kiểm tra độ ổn định vị trí/kích thước bbox.
+- Calibration score hoặc threshold riêng theo class.
+- Không dùng bypass kiểu bỏ fire khi có person để che lỗi model.
+
+Thứ tự khuyến nghị là audit threshold/ROI trên tập clip có nhãn, sau đó fine-tune
+với hard negatives. Chỉ gọi workstream này hoàn tất khi precision/recall và các
+case false positive mục tiêu đều có số liệu đối chiếu.

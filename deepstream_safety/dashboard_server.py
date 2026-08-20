@@ -7,7 +7,7 @@ import time
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Lock
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 from config import camera_ids, load_raw_config, resolve_camera_config
 
@@ -33,6 +33,7 @@ def _camera_definitions() -> list[dict[str, object]]:
                     "id": camera_id,
                     "source": config["input"].get("mock_video") or config["input"].get("rtsp_url"),
                     "output": output_url,
+                    "webrtc_url": f"http://localhost:8889/{output_path}/whep",
                     "hls_url": f"http://localhost:8888/{output_path}/index.m3u8",
                     "functions": config.get("functions", {}),
                 }
@@ -180,10 +181,10 @@ def _evidence_metrics() -> dict[str, object]:
 
 
 def _event_feed(after: int = 0, limit: int | None = None) -> dict[str, object]:
-    """Return event lifecycle records after an events.jsonl cursor.
+    """Return one dashboard record per event start.
 
-    START is emitted immediately so the dashboard can show an active event;
-    END carries the same event_id and lets the dashboard update that row.
+    END records remain internal evidence for lifecycle closure, but are not a
+    dashboard event and never become a user notification.
     """
     try:
         raw_config = load_raw_config(CONFIG_PATH)
@@ -217,7 +218,7 @@ def _event_feed(after: int = 0, limit: int | None = None) -> dict[str, object]:
             except json.JSONDecodeError:
                 continue
             record_type = str(record.get("record_type") or "").upper()
-            if record_type not in {"START", "END"}:
+            if record_type != "START":
                 continue
 
             event_file: Path | None = None
@@ -240,7 +241,7 @@ def _event_feed(after: int = 0, limit: int | None = None) -> dict[str, object]:
                 record.get("classification") or details.get("classification") or function
             )
             identity_value = record.get("identity")
-            if identity_value is None and record_type == "END":
+            if identity_value is None:
                 identity_value = details.get("identity")
             identity = str(identity_value or "").strip()
             if function == "face_recognition":
@@ -261,16 +262,23 @@ def _event_feed(after: int = 0, limit: int | None = None) -> dict[str, object]:
             )
             if function == "fire_smoke" and classification == "fire":
                 severity, severity_label = "danger", "Nguy hiểm"
-            score_value = details.get("last_score") if record_type == "END" else None
+            score_value = record.get("score", details.get("last_score"))
             try:
                 score = round(float(score_value), 4) if score_value is not None else None
             except (TypeError, ValueError):
                 score = None
-            timestamp = (
-                record.get("ended_at") or details.get("ended_at")
-                if record_type == "END"
-                else record.get("started_at") or details.get("started_at")
-            )
+            timestamp = record.get("started_at") or details.get("started_at")
+            thumbnail_url = None
+            thumbnail = latest / event_path / "snapshots" / "start-0001-annotated.jpg"
+            if (
+                not event_path.is_absolute()
+                and ".." not in event_path.parts
+                and thumbnail.is_file()
+            ):
+                thumbnail_url = (
+                    "/api/event-thumbnail?run_id="
+                    f"{quote(run_id)}&event_path={quote(event_path.as_posix())}"
+                )
             events.append(
                 {
                     "sequence": sequence,
@@ -284,13 +292,43 @@ def _event_feed(after: int = 0, limit: int | None = None) -> dict[str, object]:
                     "severity_label": severity_label,
                     "timestamp": timestamp,
                     "confidence": score,
-                    "state": "ended" if record_type == "END" else "active",
+                    "state": "started",
                     "record_type": record_type,
+                    "thumbnail_url": thumbnail_url,
+                    "details": details,
+                    "start_record": record,
                 }
             )
         return {"run_id": run_id, "cursor": len(lines), "events": events}
     except (OSError, TypeError, ValueError):
         return {"run_id": None, "cursor": 0, "events": []}
+
+
+def _event_thumbnail(run_id: str, event_path: str) -> Path | None:
+    """Resolve only a START thumbnail inside the configured latest run."""
+    try:
+        raw_config = load_raw_config(CONFIG_PATH)
+        evidence = raw_config.get("evidence", {}) or {}
+        root = Path(str(evidence.get("directory", ".tmp/deepstream-safety")))
+        prefix = str(evidence.get("prefix", "snapshots-acceptance"))
+        latest = next(
+            (
+                path
+                for path in root.glob(f"{prefix}-*")
+                if path.is_dir() and path.name == f"{prefix}-{run_id}"
+            ),
+            None,
+        )
+        relative = Path(event_path)
+        if latest is None or relative.is_absolute() or ".." in relative.parts:
+            return None
+        candidate = (latest / relative / "snapshots" / "start-0001-annotated.jpg").resolve()
+        latest_root = latest.resolve()
+        if latest_root not in candidate.parents or not candidate.is_file():
+            return None
+        return candidate
+    except (OSError, TypeError, ValueError):
+        return None
 
 
 def _gpu() -> dict[str, object]:
@@ -353,17 +391,20 @@ def collect_metrics() -> dict[str, object]:
         process = processes_by_camera.get(camera_id)
         runtime_status = _runtime_status(camera_id)
         last_frame_at = runtime_status.get("last_frame_at")
+        last_output_at = runtime_status.get("last_output_at")
         try:
             last_frame_age = round(max(0.0, time.time() - float(last_frame_at)), 1)
         except (TypeError, ValueError):
             last_frame_age = None
-        # Do not probe every HLS playlist from the metrics endpoint. Each
-        # probe creates and closes a MediaMTX HLS session, which competes with
-        # the browser player and makes all live tiles jitter. The HLS player
-        # owns playback health; the dashboard readiness gate only needs the
-        # worker and its fresh output heartbeat.
-        hls_live = bool(process and last_frame_age is not None and last_frame_age <= 5.0)
-        ready = hls_live
+        try:
+            output_age = round(max(0.0, time.time() - float(last_output_at)), 1)
+        except (TypeError, ValueError):
+            output_age = None
+        # This is a worker readiness signal only. The browser owns WebRTC
+        # playback state; the metrics endpoint must not pretend that a worker
+        # heartbeat proves a live frame reached a browser.
+        worker_ready = bool(process and output_age is not None and output_age <= 5.0)
+        ready = worker_ready
         camera_metrics.append(
             {
                 **camera,
@@ -371,10 +412,11 @@ def collect_metrics() -> dict[str, object]:
                 "pid": process["pid"] if process else None,
                 "run_id": process["run_id"] if process else None,
                 "rss_mb": process["rss_mb"] if process else None,
-                "hls_live": hls_live,
+                "worker_ready": worker_ready,
                 "ready": ready,
-                "playlist_latency_ms": None,
                 "last_frame_age_seconds": last_frame_age,
+                "last_output_age_seconds": output_age,
+                "last_output_pts_ns": runtime_status.get("last_output_pts_ns"),
                 "frame_count": runtime_status.get("frame_count"),
                 "analysis_queue_depth": runtime_status.get("analysis_queue_depth"),
                 "worker_epoch": runtime_status.get("worker_epoch"),
@@ -404,8 +446,8 @@ def collect_metrics() -> dict[str, object]:
             "camera_details": camera_metrics,
         },
         "stream": {
-            "hls_live": any(bool(camera["hls_live"]) for camera in camera_metrics),
-            "playlist_latency_ms": None,
+            "worker_ready": any(bool(camera["worker_ready"]) for camera in camera_metrics),
+            "webrtc_url": default_stream.get("webrtc_url"),
             "hls_url": default_stream.get("hls_url"),
         },
         "evidence": _evidence_metrics(),
@@ -455,6 +497,22 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             payload = json.dumps(_event_feed(after, limit if limit > 0 else None)).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+        if path == "/api/event-thumbnail":
+            query = parse_qs(parsed.query)
+            run_id = query.get("run_id", [""])[0]
+            event_path = query.get("event_path", [""])[0]
+            thumbnail = _event_thumbnail(run_id, event_path)
+            if thumbnail is None:
+                self.send_error(404)
+                return
+            payload = thumbnail.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "image/jpeg")
             self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
