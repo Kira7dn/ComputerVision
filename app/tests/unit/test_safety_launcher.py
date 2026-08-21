@@ -15,6 +15,8 @@ def test_launcher_uses_the_current_deepstream_runtime() -> None:
     launcher = (ROOT / "app" / "deploy" / "powershell" / "start.ps1").read_text(encoding="utf-8")
     assert "runner" in launcher
     assert "interfaces.dashboard_api" in launcher
+    assert "hot_reload.py" in launcher
+    assert "backend hot reload" in launcher
     assert "deploy/run.ps1" not in launcher
     assert "docker compose" in launcher
 
@@ -47,18 +49,18 @@ def test_live_output_drops_backlog_before_encoding() -> None:
 
 
 def test_dashboard_uses_webrtc_as_the_primary_live_transport() -> None:
-    dashboard = (ROOT / "app" / "web" / "dashboard.html").read_text(
-        encoding="utf-8"
-    )
+    dashboard = (ROOT / "app" / "web" / "dashboard.html").read_text(encoding="utf-8")
+    app = (ROOT / "app" / "web" / "src" / "App.tsx").read_text(encoding="utf-8")
+    camera = (ROOT / "app" / "web" / "src" / "components" / "camera-card.tsx").read_text(encoding="utf-8")
+    stream = (ROOT / "app" / "web" / "src" / "hooks" / "use-media-stream.ts").read_text(encoding="utf-8")
 
-    assert '<video id="video-${camera.id}" hidden autoplay muted playsinline></video>' in dashboard
-    assert " controls autoplay" not in dashboard
     assert '<script src="/mediamtx_reader.js"></script>' in dashboard
-    assert "MediaMTXWebRTCReader" in dashboard
-    assert "startWebRtc(video, camera.webrtc_url, camera.hls_url, state)" in dashboard
-    assert "startHlsFallback" in dashboard
-    assert "startHls(video" not in dashboard
-    assert "LIVE_HARD_LATENCY_SECONDS" not in dashboard
+    assert '<script type="module" src="/src/main.tsx"></script>' in dashboard
+    assert "<video ref={videoRef}" in camera
+    assert "MediaMTXWebRTCReader" in stream
+    assert "transport: 'hls-fallback'" in stream
+    assert "autoPlay muted playsInline" in camera
+    assert "LIVE_HARD_LATENCY_SECONDS" not in app
 
 
 def test_mediamtx_reader_exposes_stats_and_dashboard_api_exposes_webrtc() -> None:
@@ -174,15 +176,13 @@ def test_event_feed_is_start_only_and_recognition_starts_on_exact_frame() -> Non
 
 
 def test_event_items_open_a_full_detail_modal() -> None:
-    dashboard = (ROOT / "app" / "web" / "dashboard.html").read_text(
+    panel = (ROOT / "app" / "web" / "src" / "components" / "event-panel.tsx").read_text(
         encoding="utf-8"
     )
 
-    assert 'id="eventModal"' in dashboard
-    assert 'function openEventModal(event)' in dashboard
-    assert 'eventModal.addEventListener' in dashboard
-    assert 'JSON.stringify(modalData, null, 2)' in dashboard
-    assert 'event.details?.recognition_frame_number' in dashboard
+    assert '<Dialog open={selected !== null}' in panel
+    assert 'JSON.stringify({ event: selected' in panel
+    assert 'selected.details?.recognition_frame_number' in panel
 
 
 def test_unknown_recognition_event_uses_best_frame_after_track_end() -> None:

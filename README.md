@@ -114,19 +114,26 @@ The source stays in this workspace. WSL Ubuntu-22.04 provides the DeepStream run
 MediaMTX provides RTSP and WebRTC/HLS transport.
 
 ```powershell
-# Start mock RTSP input, DeepStream inference, MediaMTX and the dashboard
-./app/deploy/powershell/start.ps1 -Action start -Mode Dev
+# Start Vite HMR, backend hot reload, mock RTSP input, DeepStream inference, MediaMTX and the API
+npm run wsl:start
 
 # Check or stop the standalone runtime
-./app/deploy/powershell/start.ps1 -Action status -Mode Dev
-./app/deploy/powershell/start.ps1 -Action stop -Mode Dev
+npm run wsl:status
+npm run wsl:stop
 ```
 
 Open the dashboard at:
 
 ```text
-http://127.0.0.1:18080/dashboard.html
+http://127.0.0.1:5173/dashboard.html
 ```
+
+The WSL dashboard API and health endpoints remain available at
+`http://127.0.0.1:18080`; production serves the built dashboard bundle there.
+
+During native WSL development, Vite hot reloads `app/web`. The backend supervisor watches
+`app/src`, `app/config`, `.env.local` and the MediaMTX development config, restarting only the
+affected runtime processes when those files change.
 
 The annotated stream is published as `rtsp://127.0.0.1:8554/safety_bbox` and is
 played in the browser through MediaMTX HLS. Bbox/label rendering is owned by

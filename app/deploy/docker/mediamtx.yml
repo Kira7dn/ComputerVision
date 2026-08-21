@@ -7,9 +7,9 @@ hlsVariant: mpegts
 hlsSegmentDuration: 3s
 hlsSegmentCount: 6
 hlsAlwaysRemux: true
-hlsAllowOrigin: http://127.0.0.1:18080
+hlsAllowOrigins: ['http://127.0.0.1:18080', 'http://localhost:18080', 'http://127.0.0.1:5173', 'http://localhost:5173']
 webrtc: true
 webrtcAddress: :8889
-webrtcAllowOrigin: http://127.0.0.1:18080
+webrtcAllowOrigins: ['http://127.0.0.1:18080', 'http://localhost:18080', 'http://127.0.0.1:5173', 'http://localhost:5173']
 paths:
   all_others: {}

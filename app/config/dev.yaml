@@ -82,8 +82,8 @@ fire_smoke:
   onnx_path: /mnt/d/BusinessAnalyze/Camera/assets/models/fire_smoke/best.onnx
   input_width: 640
   input_height: 640
-  fire_threshold: 0.25
-  smoke_threshold: 0.20
+  fire_threshold: 0.30
+  smoke_threshold: 0.40
   interval_ms: 300
   detection_hold_seconds: 1.0
   nms_iou: 0.45
@@ -128,8 +128,8 @@ recognition:
   enabled: true
   stream_epoch: deepstream-safety
   face:
-    unknown_score: 0.8
-    recognition_threshold: 0.8
+    unknown_score: 0.7
+    recognition_threshold: 0.7
     min_faces: 2
     identity_switch_similarity: 0.65
     max_attempts: 24
@@ -188,7 +188,7 @@ notifications:
         - id: operations
           chat_id_env: TELEGRAM_CHAT_ID
     zalo:
-      enabled: true
+      enabled: false
       token_env: ZALO_BOT_TOKEN
       recipients:
         - id: operations

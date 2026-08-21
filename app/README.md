@@ -6,16 +6,20 @@ remains the independent ADAS/FTP/archive boundary.
 Development uses native WSL:
 
 ```powershell
-.\deploy\powershell\start.ps1 -Action start -Mode Dev
-.\deploy\powershell\status.ps1 -Mode Dev
-.\deploy\powershell\stop.ps1 -Mode Dev
+npm run wsl:start
+npm run wsl:status
+npm run wsl:stop
 ```
+
+Native WSL development includes Vite HMR for `app/web` and backend hot reload for `app/src`,
+`app/config`, `.env.local` and the development MediaMTX configuration.
 
 Production uses Docker Compose on WSL2 with NVIDIA Container Toolkit:
 
 ```powershell
-docker compose -f .\deploy\docker\compose.yaml config
-.\deploy\powershell\start.ps1 -Action start -Mode Production
+npm run docker:config
+npm run docker:build
+npm run docker:start
 ```
 
 Run the package test suite and the real Compose E2E separately:

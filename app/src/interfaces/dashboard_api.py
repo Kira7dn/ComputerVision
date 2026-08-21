@@ -13,7 +13,7 @@ from urllib.parse import parse_qs, quote, urlparse
 from bootstrap.config import camera_ids, load_raw_config, resolve_camera_config
 
 APP_ROOT = Path(__file__).resolve().parents[2]
-ROOT = APP_ROOT / "web"
+ROOT = Path(os.environ.get("CAMERA_WEB_ROOT", APP_ROOT / "web"))
 CONFIG_PATH = Path(os.environ.get("CAMERA_CONFIG", APP_ROOT / "config" / "dev.yaml"))
 CLK_TCK = os.sysconf("SC_CLK_TCK")
 CPU_LOCK = Lock()

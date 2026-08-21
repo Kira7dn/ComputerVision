@@ -99,3 +99,19 @@ def test_notification_outbox_sends_telegram_and_zalo_without_blocking(
     finally:
         service.close()
         evidence.close()
+
+
+def test_notification_header_is_compact_and_contains_no_details(tmp_path: Path) -> None:
+    title, message = NotificationService._message(
+        {
+            "function": "smoking_behavior",
+            "classification": "smoking",
+            "camera_id": "camera_safety",
+            "last_score": 0.65,
+            "identity": "ignored",
+        },
+        "high",
+    )
+
+    assert title == "[HIGH] Hút thuốc - Camera_safety 65%"
+    assert message == ""

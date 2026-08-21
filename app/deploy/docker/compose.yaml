@@ -13,6 +13,7 @@ services:
     environment:
       CAMERA_CONFIG: /opt/camera-safety/config/production.yaml
       CAMERA_RUNTIME_ROOT: /opt/camera-safety
+      CAMERA_WEB_ROOT: /opt/camera-safety/web
       CAMERA_DASHBOARD_HOST: 0.0.0.0
       CAMERA_MODELS_DIR: /opt/camera-safety/models
       CAMERA_FACE_LIBRARY_DIR: /opt/camera-safety/face_library

@@ -2,16 +2,14 @@
   "name": "dahua-local-poc",
   "private": true,
   "scripts": {
-    "media": "python media/server.py --public-host 192.168.100.108",
-    "control": "python control/server.py --host 0.0.0.0 --port 8081",
-    "ftp": "python media/ftp_receiver.py --public-host 192.168.100.108",
-    "mediamtx": "mediamtx",
-    "dev": "concurrently \"npm run media\" \"npm run control\" \"npm run ftp\" \"npm run mediamtx\"",
-    "camera:start": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\app\\deploy\\powershell\\start.ps1 -Action start -Mode Dev",
-    "camera:stop": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\app\\deploy\\powershell\\start.ps1 -Action stop -Mode Dev",
-    "camera:status": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\app\\deploy\\powershell\\start.ps1 -Action status -Mode Dev",
-    "camera:prod:start": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\app\\deploy\\powershell\\start.ps1 -Action start -Mode Production",
-    "camera:prod:stop": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\app\\deploy\\powershell\\start.ps1 -Action stop -Mode Production",
-    "camera:prod:status": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\app\\deploy\\powershell\\start.ps1 -Action status -Mode Production"
+    "wsl:start": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\app\\deploy\\powershell\\start.ps1 -Action start -Mode Dev",
+    "wsl:stop": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\app\\deploy\\powershell\\start.ps1 -Action stop -Mode Dev",
+    "wsl:status": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\app\\deploy\\powershell\\start.ps1 -Action status -Mode Dev",
+    "docker:config": "docker compose -f .\\app\\deploy\\docker\\compose.yaml config --quiet",
+    "docker:build": "docker compose -f .\\app\\deploy\\docker\\compose.yaml build ls-vision",
+    "docker:start": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\app\\deploy\\powershell\\start.ps1 -Action start -Mode Production",
+    "docker:stop": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\app\\deploy\\powershell\\start.ps1 -Action stop -Mode Production",
+    "docker:status": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\app\\deploy\\powershell\\start.ps1 -Action status -Mode Production",
+    "docker:logs": "docker compose -f .\\app\\deploy\\docker\\compose.yaml logs --no-color --tail 200 ls-vision"
   }
 }

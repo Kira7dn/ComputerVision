@@ -121,10 +121,8 @@ def _response_result(response: httpx.Response) -> DeliveryResult:
 
 
 def _text(title: str, message: str, snapshot_url: str | None) -> str:
-    result = f"{title}\n{message}"[:4096]
-    if snapshot_url:
-        result += f"\n{snapshot_url}"
-    return result[:4096]
+    del snapshot_url
+    return "\n".join(part.strip() for part in (title, message) if part and part.strip())[:4096]
 
 
 def _deliver_telegram(
@@ -361,23 +359,15 @@ class NotificationService:
         camera = str(event.get("camera_id", "camera"))
         score = float(event.get("last_score", 0) or 0)
         if function == "smoking_behavior":
-            title = "Cảnh báo hút thuốc"
+            label = "Hút thuốc"
         elif function == "fire_smoke":
-            title = "Cảnh báo cháy" if classification == "fire" else "Cảnh báo khói"
+            label = "Lửa" if classification == "fire" else "Khói"
         elif function == "face_recognition":
-            title = "Nhận diện khuôn mặt"
+            label = "Nhận diện khuôn mặt"
         else:
-            title = "Cảnh báo camera"
-        details = [
-            f"Mức độ: {severity.upper()}",
-            f"Camera: {camera}",
-            f"Loại: {classification}",
-        ]
-        if event.get("identity"):
-            details.append(f"Danh tính: {event['identity']}")
-        if score:
-            details.append(f"Độ tin cậy: {score * 100:.0f}%")
-        return title, "\n".join(details)
+            label = "Cảnh báo camera"
+        camera_label = camera[:1].upper() + camera[1:]
+        return f"[{severity.upper()}] {label} - {camera_label} {score * 100:.0f}%", ""
 
     def notify_event(self, event_id: str, lifecycle: str, event_directory: Path | None) -> None:
         if not self.enabled or lifecycle != "START" or event_directory is None:
