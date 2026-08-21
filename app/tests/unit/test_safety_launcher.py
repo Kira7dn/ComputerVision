@@ -112,8 +112,7 @@ def test_live_output_follows_rtsp_sample_contract() -> None:
     assert 'make_element("nvv4l2h264enc", "output-encoder")' in pipeline
     assert 'make_element("rtspclientsink", "rtsp-output")' in pipeline
     assert 'output_queue.set_property("leaky", 2)' in pipeline
-    assert "NVDS_ENABLE_LATENCY_MEASUREMENT=1" in launcher
-    assert "NVDS_ENABLE_COMPONENT_LATENCY_MEASUREMENT=1" in launcher
+    assert "unset NVDS_ENABLE_LATENCY_MEASUREMENT NVDS_ENABLE_COMPONENT_LATENCY_MEASUREMENT" in launcher
 
 
 def test_config_routes_functions_per_camera() -> None:
@@ -205,10 +204,14 @@ def test_event_items_open_a_full_detail_modal() -> None:
     panel = (ROOT / "app" / "web" / "src" / "components" / "event-panel.tsx").read_text(
         encoding="utf-8"
     )
+    metadata = (ROOT / "app" / "web" / "src" / "components" / "event-detail-metadata.tsx").read_text(
+        encoding="utf-8"
+    )
 
     assert '<Dialog open={selected !== null}' in panel
-    assert 'JSON.stringify({ event: selected' in panel
-    assert 'selected.details?.recognition_frame_number' in panel
+    assert '<EventDetailMetadata event={selected} />' in panel
+    assert 'JSON.stringify({ event, details: event.details' in metadata
+    assert "event.best_frame_number" in metadata
 
 
 def test_unknown_recognition_event_uses_best_frame_after_track_end() -> None:

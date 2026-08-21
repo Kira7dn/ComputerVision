@@ -1,8 +1,8 @@
 import { useCallback } from 'react'
-import { Badge } from '@/components/ui/badge'
+import { Activity, BrainCircuit, Clock3, Cpu, Flame, ScanFace, Cigarette } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
-import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { useMediaStream } from '@/hooks/use-media-stream'
+import { CameraStatusBadge } from '@/components/camera-status-badge'
 import type { CameraDetail, PlayerState } from '@/types'
 
 interface CameraCardProps {
@@ -15,39 +15,71 @@ export function CameraCard({ camera, onStateChange }: CameraCardProps) {
   }, [camera.id, onStateChange])
   const { videoRef, state } = useMediaStream(camera, handleStateChange)
   const ready = Boolean(camera.worker_ready ?? camera.ready)
+  const displayName = camera.display_name ?? friendlyCameraName(camera.id)
+  const functions = Object.entries(camera.functions ?? {}).filter(([, enabled]) => enabled)
 
   return (
-    <Card className="overflow-hidden bg-card/80">
-      <CardHeader className="flex-row items-center justify-between space-y-0 border-b px-4 py-3">
-        <div className="min-w-0">
-          <CardTitle className="truncate text-base">{camera.id}</CardTitle>
-          <p className="text-xs text-muted-foreground">
-            {camera.running ? `worker ${camera.pid ?? '--'}` : 'worker stopped'}
-          </p>
+    <Card className="group gap-0 overflow-hidden bg-card/80 transition hover:-translate-y-px hover:border-healthy/35 hover:shadow-[0_15px_38px_rgba(0,0,0,0.23)] md:min-h-0 py-1">
+      <CardHeader className="flex flex-row flex-nowrap items-center justify-between gap-1 space-y-0 overflow-hidden border-b px-2 pt-2 pb-2!">
+        <div className="flex h-full min-w-0 flex-1 items-center gap-2">
+          <CardTitle className="min-w-0 truncate text-sm leading-none">{displayName}</CardTitle>
+          <span className="max-w-28 truncate font-mono text-[0.62rem] leading-none text-muted-foreground max-[430px]:hidden">{camera.id}</span>
+          <span className="inline-flex shrink-0 items-center gap-[0.2rem] whitespace-nowrap font-mono text-[0.6rem] leading-none text-muted-foreground"><Cpu size={11} /> {camera.running ? `worker ${camera.pid ?? '--'}` : 'worker offline'}</span>
+          {camera.analysis_error && <span className="shrink-0 whitespace-nowrap text-[0.62rem] leading-none text-danger" title={camera.analysis_error}>detector lỗi</span>}
         </div>
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <Badge variant={state.live ? 'default' : ready ? 'secondary' : 'outline'}>
-              {state.live ? state.transport === 'webrtc' ? 'LIVE' : 'HLS' : ready ? 'CONNECTING' : 'OFFLINE'}
-            </Badge>
-          </TooltipTrigger>
-          <TooltipContent>{state.message}</TooltipContent>
-        </Tooltip>
+        <div className="flex h-full shrink-0 items-center"><CameraStatusBadge camera={camera} state={state} /></div>
       </CardHeader>
-      <CardContent className="p-0">
-        <div className="relative aspect-video bg-black">
-          <video ref={videoRef} className="h-full w-full object-contain" hidden={!state.live} autoPlay muted playsInline />
-          {!state.live && (
-            <div className="absolute inset-0 grid place-items-center px-4 text-center text-sm text-muted-foreground">
-              {camera.running && ready ? state.message : 'Runtime offline'}
+      <CardContent className="p-0 md:flex md:min-h-0 md:flex-1 md:flex-col">
+        <div className="relative aspect-video overflow-hidden bg-[linear-gradient(135deg,_#0d1117,_#151b24)] p-0 md:min-h-0 md:flex-1 md:aspect-auto">
+          <video ref={videoRef} className="h-full w-full object-cover p-0" hidden={!state.live} autoPlay muted playsInline aria-label={`Luồng video ${displayName}`} />
+          {!state.live && <CameraEmptyState camera={camera} state={state} ready={ready} />}
+          <div className="absolute inset-x-0 bottom-0 z-[2] flex min-w-0 items-center justify-between gap-[0.7rem] text-[0.66rem] [text-shadow:0_1px_3px_#000] max-[430px]:flex-col max-[430px]:items-end max-[430px]:gap-[0.35rem]">
+            <div className="flex min-w-0 flex-wrap gap-[0.3rem]" aria-label="Chức năng camera">
+              {functions.length ? functions.map(([name]) => <span className="inline-flex items-center gap-1 whitespace-nowrap rounded-full border border-white/20 bg-black/50 px-[0.38rem] py-[0.2rem] text-white/90" key={name}>{functionIcon(name)} {functionLabel(name)}</span>) : <span className="text-muted-foreground">Chưa khai báo chức năng</span>}
             </div>
-          )}
-        </div>
-        <div className="flex items-center justify-between px-4 py-2 text-xs text-muted-foreground">
-          <span>{state.transport === 'hls-fallback' ? 'HLS fallback' : 'WebRTC'}</span>
-          <span>{state.jitterBufferDelayMs == null ? '--' : `${state.jitterBufferDelayMs.toFixed(0)} ms`}</span>
+            <span className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap font-mono text-white/90"><Clock3 size={12} /> {state.jitterBufferDelayMs == null ? '--' : `${state.jitterBufferDelayMs.toFixed(0)} ms`}</span>
+          </div>
         </div>
       </CardContent>
     </Card>
+  )
+}
+
+function friendlyCameraName(id: string) {
+  const names: Record<string, string> = {
+    camera_face: 'Cổng nhận diện',
+    camera_safety: 'Khu vực an toàn',
+    camera_dahua: 'Camera Dahua',
+  }
+  return names[id] ?? id.replace(/^camera_/, '').replaceAll('_', ' ')
+}
+
+function functionLabel(name: string) {
+  const labels: Record<string, string> = {
+    face_recognition: 'Khuôn mặt',
+    smoking_behavior: 'Hút thuốc',
+    fire_smoke: 'Lửa / khói',
+    lpr: 'Biển số',
+  }
+  return labels[name] ?? name.replaceAll('_', ' ')
+}
+
+function functionIcon(name: string) {
+  if (name.includes('face')) return <ScanFace size={12} />
+  if (name.includes('smok')) return <Cigarette size={12} />
+  if (name.includes('fire')) return <Flame size={12} />
+  return <BrainCircuit size={12} />
+}
+
+function CameraEmptyState({ camera, state, ready }: { camera: CameraDetail; state: PlayerState; ready: boolean }) {
+  const title = !camera.running ? 'Worker đang offline' : state.error ? 'Không nhận được luồng' : ready ? 'Đang kết nối video' : 'Đang chờ worker'
+  const message = !camera.running ? 'Kiểm tra runtime hoặc cấu hình camera.' : state.message
+  return (
+    <div className="absolute inset-0 grid place-items-center content-center gap-[0.35rem] p-0 text-center text-muted-foreground" role="status">
+      <div className={`grid size-10 place-items-center rounded-xl bg-white/5 ${state.error || !camera.running ? 'text-danger' : 'text-warning'}`}><Activity size={22} /></div>
+      <strong className="text-sm text-foreground">{title}</strong>
+      <span className="max-w-72 text-[0.72rem]">{message}</span>
+      {ready && !state.error && camera.running && <span className="mt-[0.3rem] h-[0.22rem] w-28 animate-pulse rounded-full bg-warning/50" aria-hidden="true" />}
+    </div>
   )
 }

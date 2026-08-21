@@ -1680,7 +1680,9 @@ maintain-aspect-ratio=0
             f"{self.config['input'].get('camera', 'camera')} | "
             f"LIVE {dt.datetime.now().astimezone().strftime('%H:%M:%S.%f')[:-3]}"
         )
-        text_params.x_offset = 24
+        # Keep the live label clear of the left crop edge in the dashboard's
+        # object-cover viewport.
+        text_params.x_offset = 48
         text_params.y_offset = 50
         text_params.font_params.font_name = "Sans"
         text_params.font_params.font_size = 32

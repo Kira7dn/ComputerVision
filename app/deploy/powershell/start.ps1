@@ -102,8 +102,9 @@ set -euo pipefail
 export PYTHONPATH=$root/app/src
 export CAMERA_CONFIG=$config
 if [ -f $root/.env.local ]; then export CAMERA_ENV_FILE=$root/.env.local; fi
-export NVDS_ENABLE_LATENCY_MEASUREMENT=1
-export NVDS_ENABLE_COMPONENT_LATENCY_MEASUREMENT=1
+# DeepStream prints one latency line per encoded frame when these flags exist.
+# Remove them from the child environment; diagnostics stay opt-in.
+unset NVDS_ENABLE_LATENCY_MEASUREMENT NVDS_ENABLE_COMPONENT_LATENCY_MEASUREMENT
 export LD_LIBRARY_PATH=/usr/local/lib/python3.10/dist-packages/nvidia/cudnn/lib:/usr/local/lib/python3.10/dist-packages/nvidia/cublas/lib:`${LD_LIBRARY_PATH:-}
 mkdir -p $runtime/logs $runtime/status $runtime/state $runtime/evidence
 pkill -TERM -f '^python3 -m runner --config /mnt/d/BusinessAnalyze/Camera/app/config/dev.yaml$' || true

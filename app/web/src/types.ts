@@ -1,5 +1,6 @@
 export interface CameraDetail {
   id: string
+  display_name?: string
   running: boolean
   pid: number | null
   ready: boolean
@@ -7,6 +8,10 @@ export interface CameraDetail {
   webrtc_url: string
   hls_url: string
   functions?: Record<string, boolean>
+  last_frame_age_seconds?: number | null
+  last_output_age_seconds?: number | null
+  rss_mb?: number | null
+  analysis_error?: string | null
 }
 export interface MetricsResponse {
   timestamp: number
@@ -53,10 +58,29 @@ export interface EventRecord {
   sequence?: number
   confidence?: number | null
   severity?: string
+  severity_label?: string
   thumbnail_url?: string | null
   image_url?: string | null
   classification?: string
   name?: string
+  function?: string
+  state?: string
+  region_track_id?: number | string | null
+  confirmation_state?: string | null
+  best_frame_number?: number | null
+  best_bbox?: number[] | null
+  person_track_id?: number | string | null
+  best_person_bbox?: number[] | null
+  best_model_roi_bbox?: number[] | null
+  detector_hits?: number | null
+  positive_votes?: number | null
+  observation_window?: number | null
+  dynamic_votes?: number | null
+  dynamic_score?: number | null
+  best_score?: number | null
+  classifier_score?: number | null
+  object_score?: number | null
+  notification_emitted?: boolean | null
   details?: Record<string, unknown>
   start_record?: Record<string, unknown>
   [key: string]: unknown

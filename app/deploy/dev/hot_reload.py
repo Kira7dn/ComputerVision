@@ -124,13 +124,15 @@ def main() -> int:
     args.pid_file.write_text(f"{os.getpid()}\n", encoding="ascii")
 
     environment = os.environ.copy()
+    # DeepStream treats the presence of these variables as enabled, including
+    # when their value is "0". Remove inherited flags to avoid per-frame logs.
+    environment.pop("NVDS_ENABLE_LATENCY_MEASUREMENT", None)
+    environment.pop("NVDS_ENABLE_COMPONENT_LATENCY_MEASUREMENT", None)
     environment.update(
         {
             "PYTHONPATH": str(root / "app" / "src"),
             "CAMERA_CONFIG": str(args.config),
             "CAMERA_WEB_ROOT": str(root / "app" / "web"),
-            "NVDS_ENABLE_LATENCY_MEASUREMENT": "1",
-            "NVDS_ENABLE_COMPONENT_LATENCY_MEASUREMENT": "1",
         }
     )
     env_file = root / ".env.local"

@@ -1,14 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Badge } from '@/components/ui/badge'
-import { Separator } from '@/components/ui/separator'
 import { TooltipProvider } from '@/components/ui/tooltip'
 import { CameraCard } from '@/components/camera-card'
+import { DashboardHeader } from '@/components/dashboard-header'
 import { EventPanel } from '@/components/event-panel'
-import { MetricsGrid } from '@/components/metrics-grid'
 import { fetchEvents, fetchMetrics } from '@/lib/api'
 import type { CameraDetail, EventRecord, MetricsResponse, PlayerState } from '@/types'
 
-const MAX_EVENTS = 10
+const MAX_EVENTS = 50
 const EVENT_POLL_MS = 1000
 const METRICS_POLL_MS = 2000
 
@@ -32,6 +30,8 @@ function App() {
   const [events, setEvents] = useState<EventRecord[]>([])
   const [playerStates, setPlayerStates] = useState<Record<string, PlayerState>>({})
   const [apiError, setApiError] = useState(false)
+  const [eventsLoading, setEventsLoading] = useState(true)
+  const [eventsError, setEventsError] = useState(false)
   const eventCursor = useRef<number | null>(null)
   const eventRunId = useRef<string | null>(null)
   const eventsRequestInFlight = useRef(false)
@@ -59,6 +59,8 @@ function App() {
     try {
       const cursor = eventCursor.current
       const data = await fetchEvents(cursor ?? 0, cursor === null ? MAX_EVENTS * 2 : undefined)
+      setEventsLoading(false)
+      setEventsError(false)
       if (cursor === null) {
         eventRunId.current = data.run_id
         eventCursor.current = data.cursor
@@ -83,6 +85,8 @@ function App() {
       }
     } catch {
       // Keep existing events visible while the API is unavailable.
+      setEventsLoading(false)
+      setEventsError(true)
     } finally {
       eventsRequestInFlight.current = false
     }
@@ -110,17 +114,11 @@ function App() {
 
   const cameras: CameraDetail[] = metrics?.pipeline.camera_details ?? []
   const liveCount = cameras.filter((camera) => playerStates[camera.id]?.live).length
-  const fallbackCount = cameras.filter((camera) => playerStates[camera.id]?.live && playerStates[camera.id]?.transport === 'hls-fallback').length
   const jitterValues = cameras.map((camera) => playerStates[camera.id]?.jitterBufferDelayMs).filter((value): value is number => value != null)
   const browserLatency = liveCount === 0 ? (runtimeReady.current ? 'connecting' : 'offline') : jitterValues.length ? `jitter ${Math.max(...jitterValues).toFixed(0)} ms` : 'connected'
   const status = liveCount > 0
     ? liveCount === cameras.length ? 'LIVE' : `LIVE (${liveCount}/${cameras.length})`
     : apiError || !metrics?.pipeline.running ? 'Runtime offline' : 'Connecting...'
-  const streamText = liveCount > 0
-    ? fallbackCount ? `WebRTC: ${liveCount - fallbackCount}/${cameras.length}; HLS fallback: ${fallbackCount}` : `WebRTC: ${liveCount}/${cameras.length} camera streams`
-    : 'WebRTC: offline'
-  const ready = Boolean(metrics?.pipeline.ready && cameras.length > 0)
-  const statusVariant = status === 'LIVE' ? 'default' : status.startsWith('LIVE') ? 'secondary' : 'outline'
   const cameraKey = useMemo(() => cameras.map((camera) => camera.id).join('|'), [cameras])
 
   useEffect(() => {
@@ -130,29 +128,17 @@ function App() {
 
   return (
     <TooltipProvider>
-      <main className="mx-auto flex min-h-screen w-full max-w-[1440px] flex-col gap-4 px-4 py-5 lg:px-6">
-        <header className="flex items-center justify-between gap-4">
-          <div>
-            <h1 className="text-xl font-semibold tracking-tight">Camera live dashboard</h1>
-            <p className="text-sm text-muted-foreground">DeepStream outputs</p>
-          </div>
-          <Badge variant={statusVariant}>{status}</Badge>
-        </header>
-        <Separator />
-        <div className="grid min-h-0 flex-1 gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(320px,380px)]">
-          <section className="flex min-h-0 min-w-0 flex-col gap-4">
-            <div className="grid min-h-0 flex-1 grid-cols-1 content-start gap-3 md:grid-cols-2">
+      <main className="dashboard-shell mx-auto flex min-h-screen w-full max-w-[1600px] flex-col gap-2 px-3 py-4 sm:px-4 md:h-[100dvh] md:overflow-hidden lg:px-6">
+        <DashboardHeader metrics={metrics} status={status} apiError={apiError} browserLatency={browserLatency} />
+        <div className="dashboard-content grid min-h-0 flex-1 gap-4 md:overflow-hidden lg:grid-cols-[minmax(0,1fr)_minmax(320px,380px)]">
+          <section className="flex min-h-0 min-w-0 flex-col gap-4 md:overflow-hidden">
+            <div className="camera-wall grid min-h-0 flex-1 grid-cols-1 content-start gap-3 md:grid-rows-2 md:overflow-hidden md:grid-cols-2">
               {cameras.map((camera) => <CameraCard key={camera.id} camera={camera} onStateChange={handlePlayerState} />)}
-              {cameras.length === 0 && <div className="rounded-lg border border-dashed p-8 text-center text-sm text-muted-foreground">{ready ? 'No cameras configured' : 'Runtime offline'}</div>}
+              {cameras.length === 0 && <div className="camera-wall-empty"><span>{apiError ? 'Không thể đọc trạng thái camera' : 'Chưa có camera cấu hình'}</span><small>{apiError ? 'Dữ liệu cuối cùng sẽ được giữ lại khi kết nối lại.' : 'Runtime chưa cung cấp camera detail.'}</small></div>}
             </div>
-            <MetricsGrid metrics={metrics} browserLatency={browserLatency} />
-            <footer className="flex justify-between gap-4 text-xs text-muted-foreground">
-              <span>DeepStream outputs</span>
-              <span>{streamText}</span>
-            </footer>
           </section>
-          <aside className="flex min-h-[420px] min-w-0 lg:min-h-0">
-            <EventPanel events={events} />
+          <aside className="event-rail flex min-h-[420px] min-w-0 lg:min-h-0">
+            <EventPanel events={events} loading={eventsLoading} error={eventsError} />
           </aside>
         </div>
       </main>

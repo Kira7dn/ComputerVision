@@ -34,6 +34,11 @@ export function useMediaStream(camera: CameraDetail, onStateChange: (state: Play
     const video = videoRef.current
     if (!video) return
 
+    if (!camera.running) {
+      setState({ ...initialState, connecting: false, error: true, message: 'Worker offline' })
+      return
+    }
+
     let reader: MediaMTXReader | null = null
     let hls: HlsInstance | null = null
     let fallbackCleanup: (() => void) | null = null
@@ -48,7 +53,7 @@ export function useMediaStream(camera: CameraDetail, onStateChange: (state: Play
     const startFallback = async () => {
       try {
         const Hls = await loadHls()
-        if (destroyed || !Hls.isSupported()) throw new Error('HLS fallback is not supported')
+        if (destroyed || !Hls.isSupported()) throw new Error('HLS không được hỗ trợ')
         hls = new Hls({
           lowLatencyMode: true,
           liveSyncDurationCount: 1,
@@ -64,17 +69,17 @@ export function useMediaStream(camera: CameraDetail, onStateChange: (state: Play
         hls.on(Hls.Events.MANIFEST_PARSED, () => { void video.play().catch(() => undefined) })
         hls.on(Hls.Events.ERROR, (_event: string, data: { fatal?: boolean }) => {
           if (data.fatal && !destroyed) {
-            update({ error: true, live: false, connecting: false, message: 'HLS fallback unavailable' })
+            update({ error: true, live: false, connecting: false, message: 'HLS không khả dụng' })
           }
         })
       } catch (error) {
         if (!destroyed) {
-          update({ error: true, live: false, connecting: false, message: `HLS fallback failed: ${String(error)}` })
+          update({ error: true, live: false, connecting: false, message: `Kết nối HLS lỗi: ${String(error)}` })
         }
       }
     }
 
-    const onPlaying = () => update({ live: true, error: false, connecting: false, transport: 'hls-fallback', message: 'HLS fallback' })
+    const onPlaying = () => update({ live: true, error: false, connecting: false, transport: 'hls-fallback', message: 'HLS' })
     video.addEventListener('playing', onPlaying)
 
     const activateFallback = () => {
@@ -82,7 +87,7 @@ export function useMediaStream(camera: CameraDetail, onStateChange: (state: Play
       reader?.close()
       reader = null
       readerRef.current = null
-      update({ transport: 'hls-fallback', connecting: true, message: 'WebRTC unavailable; connecting HLS fallback' })
+      update({ transport: 'hls-fallback', connecting: true, message: 'Đang kết nối HLS' })
       void startFallback()
     }
 
