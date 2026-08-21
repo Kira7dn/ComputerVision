@@ -73,6 +73,14 @@ def validate_config(config: dict[str, Any], path: Path | None = None) -> dict[st
         (config.get("smoking_behavior", {}) or {}).get("onnx_path"),
         (config.get("fire_smoke", {}) or {}).get("onnx_path"),
     ]
+    smoking_object = (
+        (config.get("smoking_behavior", {}) or {}).get("object_detection", {}) or {}
+    )
+    if smoking_object.get("enabled", False):
+        model_paths.extend(
+            (model or {}).get("onnx_path")
+            for model in (smoking_object.get("models", {}) or {}).values()
+        )
     if validate_models:
         missing = [str(item) for item in model_paths if item and not Path(str(item)).is_file()]
         if missing:
@@ -176,6 +184,265 @@ def _camera_metadata_url(config: dict[str, Any], camera_id: str, index: int) -> 
     )
 
 
+def _normalize_camera_analysis(
+    resolved: dict[str, Any], camera: dict[str, Any], camera_id: str
+) -> None:
+    """Apply the public per-camera analysis schema to legacy model sections."""
+    analysis = _merge_config(
+        deepcopy(resolved.get("analysis", {}) or {}),
+        deepcopy(camera.get("analysis", {}) or {}),
+    )
+    max_age_ms = int(analysis.get("result_max_age_ms", 2000))
+    if max_age_ms < 100:
+        raise ValueError(f"camera {camera_id} analysis.result_max_age_ms must be at least 100")
+    analysis["result_max_age_ms"] = max_age_ms
+    resolved["analysis"] = analysis
+    resolved.setdefault("runtime", {})["analysis_result_max_age_seconds"] = (
+        max_age_ms / 1000.0
+    )
+
+    functions = analysis.get("functions", {}) or {}
+    if not isinstance(functions, dict):
+        raise ValueError(f"camera {camera_id} analysis.functions must be a mapping")
+
+    fire_override = functions.get("fire_smoke", {}) or {}
+    if not isinstance(fire_override, dict):
+        raise ValueError(
+            f"camera {camera_id} analysis.functions.fire_smoke must be a mapping"
+        )
+    fire_smoke = deepcopy(resolved.get("fire_smoke", {}) or {})
+    if "interval_ms" in fire_override:
+        fire_smoke["interval_ms"] = int(fire_override["interval_ms"])
+    thresholds = fire_override.get("thresholds", {}) or {}
+    if not isinstance(thresholds, dict):
+        raise ValueError(f"camera {camera_id} fire_smoke.thresholds must be a mapping")
+    for label in ("fire", "smoke"):
+        if label in thresholds:
+            fire_smoke[f"{label}_threshold"] = float(thresholds[label])
+    if "rois" in fire_override:
+        rois = fire_override.get("rois") or {}
+        if not isinstance(rois, dict):
+            raise ValueError(f"camera {camera_id} fire_smoke.rois must be a mapping")
+        fire_smoke["class_rois"] = deepcopy(rois)
+    for nested_name in ("tracking", "dynamics"):
+        nested_override = fire_override.get(nested_name, {}) or {}
+        if not isinstance(nested_override, dict):
+            raise ValueError(
+                f"camera {camera_id} fire_smoke.{nested_name} must be a mapping"
+            )
+        fire_smoke[nested_name] = _merge_config(
+            deepcopy(fire_smoke.get(nested_name, {}) or {}),
+            deepcopy(nested_override),
+        )
+
+    smoking_override = functions.get("smoking", {}) or {}
+    if not isinstance(smoking_override, dict):
+        raise ValueError(f"camera {camera_id} analysis.functions.smoking must be a mapping")
+    smoking = deepcopy(resolved.get("smoking_behavior", {}) or {})
+    if "interval_ms" in smoking_override:
+        smoking["interval_ms"] = int(smoking_override["interval_ms"])
+    if "threshold" in smoking_override:
+        smoking["smoking_threshold"] = float(smoking_override["threshold"])
+    crop = smoking_override.get("crop", {}) or {}
+    if not isinstance(crop, dict):
+        raise ValueError(f"camera {camera_id} smoking.crop must be a mapping")
+    strategy = str(crop.get("strategy", "person_padded"))
+    if strategy != "person_padded":
+        raise ValueError(
+            f"camera {camera_id} smoking.crop.strategy must be person_padded"
+        )
+    smoking["crop_strategy"] = strategy
+    if "padding_ratio" in crop:
+        smoking["padding_ratio"] = float(crop["padding_ratio"])
+    confirmation = smoking_override.get("confirmation", {}) or {}
+    if not isinstance(confirmation, dict):
+        raise ValueError(f"camera {camera_id} smoking.confirmation must be a mapping")
+    temporal = deepcopy(smoking.get("temporal", {}) or {})
+    for public_key, temporal_key in (
+        ("hits", "confirmation_hits"),
+        ("attempts", "confirmation_window"),
+        ("clear_hits", "clear_negative_observations"),
+    ):
+        if public_key in confirmation:
+            temporal[temporal_key] = int(confirmation[public_key])
+    temporal_override = smoking_override.get("temporal", {}) or {}
+    if not isinstance(temporal_override, dict):
+        raise ValueError(f"camera {camera_id} smoking.temporal must be a mapping")
+    smoking["temporal"] = _merge_config(temporal, temporal_override)
+    lifecycle_override = smoking_override.get("lifecycle", {}) or {}
+    if not isinstance(lifecycle_override, dict):
+        raise ValueError(f"camera {camera_id} smoking.lifecycle must be a mapping")
+    smoking["lifecycle"] = _merge_config(
+        deepcopy(smoking.get("lifecycle", {}) or {}), lifecycle_override
+    )
+
+    for section_name, section in (("fire_smoke", fire_smoke), ("smoking", smoking)):
+        interval_ms = int(section.get("interval_ms", 300))
+        if not 50 <= interval_ms <= 60_000:
+            raise ValueError(
+                f"camera {camera_id} {section_name}.interval_ms must be in [50, 60000]"
+            )
+    for key in ("fire_threshold", "smoke_threshold"):
+        value = float(fire_smoke.get(key, 0.0))
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"camera {camera_id} fire_smoke.{key} must be in [0, 1]")
+    smoking_threshold = float(smoking.get("smoking_threshold", 0.0))
+    if not 0.0 <= smoking_threshold <= 1.0:
+        raise ValueError(f"camera {camera_id} smoking.threshold must be in [0, 1]")
+    padding_ratio = float(smoking.get("padding_ratio", 0.20))
+    if not 0.0 <= padding_ratio <= 1.0:
+        raise ValueError(f"camera {camera_id} smoking.padding_ratio must be in [0, 1]")
+    smoking_object = smoking.get("object_detection", {}) or {}
+    if smoking_object.get("enabled", False):
+        confidence = float(smoking_object.get("confidence", 0.35))
+        nms_iou = float(smoking_object.get("nms_iou", 0.50))
+        person_match_iou = float(smoking_object.get("person_match_iou", 0.10))
+        if not 0.0 < confidence <= 1.0:
+            raise ValueError(
+                f"camera {camera_id} smoking.object_detection.confidence must be in (0, 1]"
+            )
+        if not 0.0 < nms_iou <= 1.0 or not 0.0 <= person_match_iou <= 1.0:
+            raise ValueError(
+                f"camera {camera_id} smoking object detection IoU values are invalid"
+            )
+        object_models = smoking_object.get("models", {}) or {}
+        if not isinstance(object_models, dict) or not object_models:
+            raise ValueError(
+                f"camera {camera_id} smoking.object_detection.models must be a non-empty mapping"
+            )
+        for source, model in object_models.items():
+            labels = [str(label) for label in (model or {}).get("labels", ())]
+            positive_labels = [
+                str(label) for label in (model or {}).get("positive_labels", ())
+            ]
+            if not labels or not positive_labels or not set(positive_labels).issubset(labels):
+                raise ValueError(
+                    f"camera {camera_id} smoking object model {source} has invalid labels"
+                )
+    for label, roi in (fire_smoke.get("class_rois", {}) or {}).items():
+        if (
+            not isinstance(roi, list | tuple)
+            or len(roi) != 4
+            or not all(0.0 <= float(value) <= 1.0 for value in roi)
+            or float(roi[0]) >= float(roi[2])
+            or float(roi[1]) >= float(roi[3])
+        ):
+            raise ValueError(
+                f"camera {camera_id} fire_smoke.rois.{label} must be [left, top, right, bottom] in [0, 1]"
+            )
+    tracking = fire_smoke.get("tracking", {}) or {}
+    tracking_hits = int(tracking.get("confirmation_hits", 4))
+    tracking_window = int(tracking.get("confirmation_window", 6))
+    if tracking_hits < 1 or tracking_window < tracking_hits:
+        raise ValueError(
+            f"camera {camera_id} fire_smoke tracking must satisfy confirmation_hits >= 1 and confirmation_window >= confirmation_hits"
+        )
+    for key, default in (
+        ("match_iou", 0.10),
+        ("match_center_distance", 0.20),
+        ("bbox_smoothing_alpha", 0.35),
+    ):
+        value = float(tracking.get(key, default))
+        if not 0.0 < value <= 1.0:
+            raise ValueError(f"camera {camera_id} fire_smoke.tracking.{key} must be in (0, 1]")
+    min_area_ratio = float(tracking.get("min_area_ratio", 0.25))
+    max_area_ratio = float(tracking.get("max_area_ratio", 4.0))
+    if min_area_ratio <= 0.0 or max_area_ratio < min_area_ratio:
+        raise ValueError(
+            f"camera {camera_id} fire_smoke tracking area ratio bounds are invalid"
+        )
+    if float(tracking.get("minimum_duration_seconds", 1.5)) < 0.0:
+        raise ValueError(
+            f"camera {camera_id} fire_smoke.tracking.minimum_duration_seconds must be non-negative"
+        )
+    notification_min_duration = float(
+        tracking.get("notification_min_duration_seconds", 3.0)
+    )
+    if notification_min_duration < float(
+        tracking.get("minimum_duration_seconds", 1.5)
+    ):
+        raise ValueError(
+            f"camera {camera_id} fire_smoke.tracking.notification_min_duration_seconds must be at least minimum_duration_seconds"
+        )
+    if float(tracking.get("clear_seconds", 3.0)) <= 0.0:
+        raise ValueError(
+            f"camera {camera_id} fire_smoke.tracking.clear_seconds must be positive"
+        )
+    dynamics = fire_smoke.get("dynamics", {}) or {}
+    if dynamics.get("enforce") is True:
+        raise ValueError(
+            f"camera {camera_id} fire_smoke dynamics hard enforcement is unsupported; use mode: advisory"
+        )
+    if str(dynamics.get("mode", "advisory")) != "advisory":
+        raise ValueError(
+            f"camera {camera_id} fire_smoke.dynamics.mode must be advisory"
+        )
+    crop_size = int(dynamics.get("crop_size", 96))
+    if crop_size < 16 or crop_size > 512:
+        raise ValueError(f"camera {camera_id} fire_smoke.dynamics.crop_size must be in [16, 512]")
+    for key in (
+        "crop_padding_ratio",
+        "changed_pixel_ratio",
+        "edge_change_ratio",
+        "flow_circular_variance",
+        "context_padding_ratio",
+    ):
+        value = float(dynamics.get(key, 0.0))
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"camera {camera_id} fire_smoke.dynamics.{key} must be in [0, 1]")
+    if float(dynamics.get("changed_pixel_delta", 15.0)) <= 0.0:
+        raise ValueError(f"camera {camera_id} fire_smoke.dynamics.changed_pixel_delta must be positive")
+    if float(dynamics.get("flow_q75", 0.5)) < 0.0:
+        raise ValueError(f"camera {camera_id} fire_smoke.dynamics.flow_q75 must be non-negative")
+    required_conditions = int(dynamics.get("required_conditions", 2))
+    dynamic_votes = int(dynamics.get("confirmation_votes", 3))
+    dynamic_window = int(dynamics.get("confirmation_window", 5))
+    if required_conditions not in {1, 2, 3}:
+        raise ValueError(f"camera {camera_id} fire_smoke.dynamics.required_conditions must be in [1, 3]")
+    if dynamic_votes < 1 or dynamic_window < dynamic_votes:
+        raise ValueError(
+            f"camera {camera_id} fire_smoke dynamics must satisfy confirmation_votes >= 1 and confirmation_window >= confirmation_votes"
+        )
+    canny_low = int(dynamics.get("canny_low", 50))
+    canny_high = int(dynamics.get("canny_high", 150))
+    if canny_low < 0 or canny_high <= canny_low:
+        raise ValueError(f"camera {camera_id} fire_smoke dynamics Canny thresholds are invalid")
+    temporal = smoking.get("temporal", {}) or {}
+    lifecycle = smoking.get("lifecycle", {}) or {}
+    hits = int(temporal.get("confirmation_hits", 2))
+    attempts = int(temporal.get("confirmation_window", 4))
+    clear_hits = int(temporal.get("clear_negative_observations", 4))
+    if hits < 1 or attempts < hits or clear_hits < 1:
+        raise ValueError(
+            f"camera {camera_id} smoking confirmation must satisfy hits >= 1, attempts >= hits, clear_hits >= 1"
+        )
+    minimum_duration = float(temporal.get("minimum_duration_seconds", 0.4))
+    candidate_timeout = float(lifecycle.get("candidate_timeout_seconds", 3.0))
+    clearing_seconds = float(lifecycle.get("clearing_seconds", 3.0))
+    notification_min_duration = float(
+        lifecycle.get("notification_min_duration_seconds", 3.0)
+    )
+    trace_interval_ms = int(lifecycle.get("trace_interval_ms", 400))
+    if minimum_duration < 0.0:
+        raise ValueError(
+            f"camera {camera_id} smoking.temporal.minimum_duration_seconds must be non-negative"
+        )
+    if candidate_timeout <= 0.0 or clearing_seconds <= 0.0:
+        raise ValueError(
+            f"camera {camera_id} smoking lifecycle timeouts must be positive"
+        )
+    if notification_min_duration < minimum_duration:
+        raise ValueError(
+            f"camera {camera_id} smoking.lifecycle.notification_min_duration_seconds must be at least minimum_duration_seconds"
+        )
+    if trace_interval_ms < 50:
+        raise ValueError(
+            f"camera {camera_id} smoking.lifecycle.trace_interval_ms must be at least 50"
+        )
+    resolved["fire_smoke"] = fire_smoke
+    resolved["smoking_behavior"] = smoking
+
+
 def resolve_camera_config(config: dict[str, Any], camera_id: str | None = None) -> dict[str, Any]:
     """Normalize legacy single-input or new multi-camera config to one worker."""
     ids = camera_ids(config)
@@ -263,38 +530,26 @@ def resolve_camera_config(config: dict[str, Any], camera_id: str | None = None) 
     fire_smoke["enabled"] = bool(functions["fire_smoke"])
     resolved["fire_smoke"] = fire_smoke
 
+    _normalize_camera_analysis(resolved, camera, camera_id)
+
     person = deepcopy(resolved.get("person", {}) or {})
     person_tracking = deepcopy(person.get("tracking", {}) or {})
     confirmation_hits = int(person_tracking.get("confirmation_hits", 2))
     confirmation_window = int(person_tracking.get("confirmation_window", 4))
-    fire_smoke_overlap_ratio = float(
-        person_tracking.get("fire_smoke_exclusion_overlap_ratio", 0.25)
-    )
     if confirmation_hits < 1:
         raise ValueError("person.tracking.confirmation_hits must be at least 1")
     if confirmation_window < confirmation_hits:
         raise ValueError(
             "person.tracking.confirmation_window must be at least confirmation_hits"
         )
-    if not 0.0 < fire_smoke_overlap_ratio <= 1.0:
-        raise ValueError(
-            "person.tracking.fire_smoke_exclusion_overlap_ratio must be in (0, 1]"
-        )
     person_tracking["confirmation_hits"] = confirmation_hits
     person_tracking["confirmation_window"] = confirmation_window
-    person_tracking["fire_smoke_exclusion_overlap_ratio"] = fire_smoke_overlap_ratio
     person["tracking"] = person_tracking
     resolved["person"] = person
 
-    events = deepcopy(resolved.get("events", {}) or {})
-    events.update(camera.get("events", {}) or {})
-    events["camera"] = camera_id
-    events["enabled"] = bool(functions["smoking_behavior"]) and bool(
-        events.get("enabled", True)
-    )
-    events["trace_enabled"] = bool(functions["trace"])
-    events.pop("directory", None)
-    resolved["events"] = events
+    # SmokingEpisodeStore is the only owner of smoking temporal/event state.
+    # Do not reintroduce the former generic camera-level events gate here.
+    resolved.pop("events", None)
 
     snapshots = deepcopy(resolved.get("snapshots", {}) or {})
     snapshots.pop("directory", None)

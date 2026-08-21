@@ -315,6 +315,27 @@ def _event_feed(after: int = 0, limit: int | None = None) -> dict[str, object]:
                     "confidence": score,
                     "state": "started",
                     "record_type": record_type,
+                    "region_track_id": details.get("region_track_id"),
+                    "confirmation_state": details.get("confirmation_state"),
+                    "detector_hits": details.get("detector_hits"),
+                    "dynamic_votes": details.get("dynamic_votes"),
+                    "dynamic_score": details.get("dynamic_score"),
+                    "best_bbox": details.get("best_bbox"),
+                    "best_frame_number": details.get("best_frame_number"),
+                    "episode_sequence": details.get("episode_sequence"),
+                    "person_track_id": details.get("person_track_id"),
+                    "positive_votes": details.get("positive_votes"),
+                    "observation_window": details.get("observation_window"),
+                    "best_score": details.get("best_score"),
+                    "best_person_bbox": details.get("best_person_bbox"),
+                    "best_model_roi_bbox": details.get("best_model_roi_bbox"),
+                    "classifier_score": details.get("classifier_score"),
+                    "object_score": details.get("object_score"),
+                    "signal_sources": details.get("signal_sources"),
+                    "notification_emitted": details.get("notification_emitted"),
+                    "notification_min_duration_seconds": details.get(
+                        "notification_min_duration_seconds"
+                    ),
                     "thumbnail_url": thumbnail_url,
                     "image_url": image_url,
                     "details": details,
@@ -434,6 +455,7 @@ def collect_metrics() -> dict[str, object]:
         # heartbeat proves a live frame reached a browser.
         worker_ready = bool(process and output_age is not None and output_age <= 5.0)
         ready = worker_ready
+        analysis_debug = runtime_status.get("analysis_debug") or {}
         camera_metrics.append(
             {
                 **camera,
@@ -450,6 +472,7 @@ def collect_metrics() -> dict[str, object]:
                 "analysis_queue_depth": runtime_status.get("analysis_queue_depth"),
                 "worker_epoch": runtime_status.get("worker_epoch"),
                 "analysis_error": runtime_status.get("analysis_error"),
+                "smoking_episodes": analysis_debug.get("smoking_episodes", {}),
             }
         )
 

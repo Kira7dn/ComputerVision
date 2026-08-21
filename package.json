@@ -2,7 +2,9 @@
   "name": "dahua-local-poc",
   "private": true,
   "scripts": {
-    "wsl:start": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\app\\deploy\\powershell\\start.ps1 -Action start -Mode Dev",
+    "wsl:start": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\app\\deploy\\powershell\\start.ps1 -Action start -Mode Dev -FollowLogs",
+    "wsl:logs": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\app\\deploy\\powershell\\start.ps1 -Action logs -Mode Dev",
+    "wsl:pause": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\app\\deploy\\powershell\\start.ps1 -Action pause -Mode Dev",
     "wsl:stop": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\app\\deploy\\powershell\\start.ps1 -Action stop -Mode Dev",
     "wsl:status": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\app\\deploy\\powershell\\start.ps1 -Action status -Mode Dev",
     "docker:config": "docker compose -f .\\app\\deploy\\docker\\compose.yaml config --quiet",

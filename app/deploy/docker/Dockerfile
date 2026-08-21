@@ -16,7 +16,8 @@ ENV PYTHONUNBUFFERED=1 \
     CAMERA_CONFIG=/opt/camera-safety/config/production.yaml \
     CAMERA_RUNTIME_ROOT=/opt/camera-safety \
     CAMERA_WEB_ROOT=/opt/camera-safety/web \
-    GST_PLUGIN_PATH=/opt/nvidia/deepstream/deepstream-7.1/lib/gst-plugins
+    GST_PLUGIN_PATH=/opt/nvidia/deepstream/deepstream-7.1/lib/gst-plugins \
+    LD_LIBRARY_PATH=/usr/local/lib/python3.10/dist-packages/nvidia/cudnn/lib:/usr/local/lib/python3.10/dist-packages/nvidia/cublas/lib:/opt/nvidia/deepstream/deepstream-7.1/lib
 
 WORKDIR /opt/camera-safety/app
 COPY requirements-runtime.txt ./requirements-runtime.txt

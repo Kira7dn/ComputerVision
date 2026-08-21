@@ -1,8 +1,9 @@
 param(
-    [ValidateSet('start', 'stop', 'status')]
+    [ValidateSet('start', 'pause', 'stop', 'status', 'logs')]
     [string]$Action = 'start',
     [ValidateSet('Dev', 'Production')]
-    [string]$Mode = 'Production'
+    [string]$Mode = 'Production',
+    [switch]$FollowLogs
 )
 
 $ErrorActionPreference = 'Stop'
@@ -64,6 +65,7 @@ if ($Mode -eq 'Production') {
         'start' { docker compose -f $compose up -d --remove-orphans }
         'stop' { docker compose -f $compose down }
         'status' { docker compose -f $compose ps }
+        'logs' { docker compose -f $compose logs --no-color --tail 200 --follow ls-vision mediamtx }
     }
     exit $LASTEXITCODE
 }
@@ -79,6 +81,20 @@ function Invoke-DevWsl([string]$Command) {
     if ($LASTEXITCODE -ne 0) { throw "WSL command failed: $Command" }
 }
 
+function Follow-DevLogs {
+    Write-Output 'Following WSL runtime logs; press Ctrl+C to stop following logs. Runtime remains active.'
+    $command = @"
+mkdir -p $runtime/logs
+touch $runtime/logs/pipeline.log $runtime/logs/dashboard.log $runtime/logs/mediamtx.log $runtime/logs/hot-reload.log $runtime/logs/vite.stdout.log $runtime/logs/vite.stderr.log
+exec tail -n 100 -F $runtime/logs/pipeline.log $runtime/logs/dashboard.log $runtime/logs/mediamtx.log $runtime/logs/hot-reload.log $runtime/logs/vite.stdout.log $runtime/logs/vite.stderr.log
+"@
+    & wsl.exe -d $distro --user root -- bash -lc ($command -replace "`r`n", "`n")
+    $tailExitCode = $LASTEXITCODE
+    if ($tailExitCode -notin @(0, 1, 2, 130)) {
+        throw "WSL log follower failed with exit code $tailExitCode"
+    }
+}
+
 switch ($Action) {
     'start' {
         $command = @"
@@ -88,6 +104,7 @@ export CAMERA_CONFIG=$config
 if [ -f $root/.env.local ]; then export CAMERA_ENV_FILE=$root/.env.local; fi
 export NVDS_ENABLE_LATENCY_MEASUREMENT=1
 export NVDS_ENABLE_COMPONENT_LATENCY_MEASUREMENT=1
+export LD_LIBRARY_PATH=/usr/local/lib/python3.10/dist-packages/nvidia/cudnn/lib:/usr/local/lib/python3.10/dist-packages/nvidia/cublas/lib:`${LD_LIBRARY_PATH:-}
 mkdir -p $runtime/logs $runtime/status $runtime/state $runtime/evidence
 pkill -TERM -f '^python3 -m runner --config /mnt/d/BusinessAnalyze/Camera/app/config/dev.yaml$' || true
 pkill -TERM -f '^python3 -m interfaces.dashboard_api$' || true
@@ -103,6 +120,40 @@ echo 'native WSL development runtime started with backend hot reload'
         Invoke-DevWsl ($command -replace "`r`n", "`n")
         Start-ViteDev
         Write-Output "Vite development server started on http://127.0.0.1:$VitePort/dashboard.html"
+        if ($FollowLogs) { Follow-DevLogs }
+    }
+    'pause' {
+        Stop-ViteDev
+        Stop-WslPidFile $HotReloadPidPath
+        Stop-WslPidFile '/opt/camera-safety-dev/status/runner.pid'
+        Stop-WslPidFile '/opt/camera-safety-dev/status/dashboard.pid'
+        Stop-WslPidFile '/opt/camera-safety-dev/status/mediamtx.pid'
+        $command = @'
+set -euo pipefail
+pkill -TERM -f '^(/usr/bin/)?python3 -m runner --config /mnt/d/BusinessAnalyze/Camera/app/config/dev.yaml$' || true
+pkill -TERM -f '^(/usr/bin/)?python3 /mnt/d/BusinessAnalyze/Camera/app/deploy/dev/hot_reload.py ' || true
+pkill -TERM -f '^(/usr/bin/)?python3 -m application.camera_worker' || true
+pkill -TERM -f '^(/usr/bin/)?python3 -m interfaces.dashboard_api$' || true
+pkill -TERM -f '^/opt/camera-safety/mediamtx/mediamtx .*mediamtx.yml$' || true
+pkill -TERM -f '^ffmpeg .*rtsp://127.0.0.1:8554/(face_mock|safety_mock)$' || true
+for attempt in {1..60}; do
+    if ! pgrep -f '^(/usr/bin/)?python3 -m runner --config /mnt/d/BusinessAnalyze/Camera/app/config/dev.yaml$' >/dev/null && \
+       ! pgrep -f '^(/usr/bin/)?python3 /mnt/d/BusinessAnalyze/Camera/app/deploy/dev/hot_reload.py ' >/dev/null && \
+       ! pgrep -f '^(/usr/bin/)?python3 -m application.camera_worker' >/dev/null && \
+       ! pgrep -f '^(/usr/bin/)?python3 -m interfaces.dashboard_api$' >/dev/null && \
+       ! pgrep -f '^/opt/camera-safety/mediamtx/mediamtx .*mediamtx.yml$' >/dev/null && \
+       ! pgrep -x mediamtx >/dev/null && \
+       ! pgrep -f '^ffmpeg .*rtsp://127.0.0.1:8554/(face_mock|safety_mock)$' >/dev/null; then
+        exit 0
+    fi
+    sleep 0.5
+done
+echo 'native WSL development runtime did not stop within 30 seconds'
+ps -eo pid,args | grep -E 'hot_reload|mediamtx|runner|application.camera_worker|interfaces.dashboard_api|ffmpeg.*mock' | grep -v grep || true
+exit 1
+'@
+        Invoke-DevWsl ($command -replace "`r`n", "`n")
+        Write-Output 'native WSL development runtime paused; WSL remains running'
     }
     'stop' {
         Stop-ViteDev
@@ -112,22 +163,27 @@ echo 'native WSL development runtime started with backend hot reload'
         Stop-WslPidFile '/opt/camera-safety-dev/status/mediamtx.pid'
         $command = @'
 set -euo pipefail
-        pkill -TERM -f '^python3 -m runner --config /mnt/d/BusinessAnalyze/Camera/app/config/dev.yaml$' || true
-        pkill -TERM -f '^python3 /mnt/d/BusinessAnalyze/Camera/app/deploy/dev/hot_reload.py ' || true
-        pkill -TERM -f '^/usr/bin/python3 -m application.camera_worker' || true
-        pkill -TERM -f '^python3 -m interfaces.dashboard_api$' || true
+        pkill -TERM -f '^(/usr/bin/)?python3 -m runner --config /mnt/d/BusinessAnalyze/Camera/app/config/dev.yaml$' || true
+        pkill -TERM -f '^(/usr/bin/)?python3 /mnt/d/BusinessAnalyze/Camera/app/deploy/dev/hot_reload.py ' || true
+        pkill -TERM -f '^(/usr/bin/)?python3 -m application.camera_worker' || true
+        pkill -TERM -f '^(/usr/bin/)?python3 -m interfaces.dashboard_api$' || true
         pkill -TERM -f '^/opt/camera-safety/mediamtx/mediamtx .*mediamtx.yml$' || true
         pkill -TERM -f '^ffmpeg .*rtsp://127.0.0.1:8554/(face_mock|safety_mock)$' || true
         sleep 2
-        pkill -KILL -f '^python3 -m runner --config /mnt/d/BusinessAnalyze/Camera/app/config/dev.yaml$' || true
-        pkill -KILL -f '^python3 /mnt/d/BusinessAnalyze/Camera/app/deploy/dev/hot_reload.py ' || true
-        pkill -KILL -f '^/usr/bin/python3 -m application.camera_worker' || true
-        pkill -KILL -f '^python3 -m interfaces.dashboard_api$' || true
+        pkill -KILL -f '^(/usr/bin/)?python3 -m runner --config /mnt/d/BusinessAnalyze/Camera/app/config/dev.yaml$' || true
+        pkill -KILL -f '^(/usr/bin/)?python3 /mnt/d/BusinessAnalyze/Camera/app/deploy/dev/hot_reload.py ' || true
+        pkill -KILL -f '^(/usr/bin/)?python3 -m application.camera_worker' || true
+        pkill -KILL -f '^(/usr/bin/)?python3 -m interfaces.dashboard_api$' || true
         pkill -KILL -f '^/opt/camera-safety/mediamtx/mediamtx .*mediamtx.yml$' || true
 pkill -KILL -f '^ffmpeg .*rtsp://127.0.0.1:8554/(face_mock|safety_mock)$' || true
 '@
         Invoke-DevWsl ($command -replace "`r`n", "`n")
+        & wsl.exe --shutdown
+        if ($LASTEXITCODE -ne 0) {
+            throw 'Unable to shut down WSL'
+        }
         Write-Output 'native WSL development runtime stopped'
+        Write-Output 'WSL shut down'
     }
     'status' {
         Invoke-DevWsl "ps -eo pid,args | grep -E 'hot_reload|mediamtx|runner|application.camera_worker|interfaces.dashboard_api|ffmpeg.*mock' | grep -v grep || true"
@@ -137,5 +193,8 @@ pkill -KILL -f '^ffmpeg .*rtsp://127.0.0.1:8554/(face_mock|safety_mock)$' || tru
         Write-Output "vite_http=$viteHttp"
         $vitePid = if (Test-Path -LiteralPath $VitePidFile) { (Get-Content -LiteralPath $VitePidFile -Raw -Encoding utf8).Trim() } else { 'stopped' }
         Write-Output "vite_pid=$vitePid"
+    }
+    'logs' {
+        Follow-DevLogs
     }
 }

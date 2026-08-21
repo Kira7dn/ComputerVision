@@ -21,6 +21,24 @@ def test_launcher_uses_the_current_deepstream_runtime() -> None:
     assert "docker compose" in launcher
 
 
+def test_wsl_pause_keeps_distro_running_while_stop_shuts_wsl_down() -> None:
+    launcher = (ROOT / "app" / "deploy" / "powershell" / "start.ps1").read_text(
+        encoding="utf-8"
+    )
+    package = (ROOT / "package.json").read_text(encoding="utf-8")
+
+    dev_actions = launcher.split("'pause' {", 1)[1]
+    pause_branch = dev_actions.split("'stop' {", 1)[0]
+    stop_branch = dev_actions.split("'stop' {", 1)[1].split("'status' {", 1)[0]
+    assert '"wsl:pause"' in package
+    assert "pkill -TERM" in pause_branch
+    assert "pkill -KILL" not in pause_branch
+    assert "wsl.exe --shutdown" not in pause_branch
+    assert "for attempt in {1..60}" in pause_branch
+    assert "did not stop within 30 seconds" in pause_branch
+    assert "wsl.exe --shutdown" in stop_branch
+
+
 def test_cpu_analysis_branch_has_a_terminal_sink() -> None:
     pipeline = (ROOT / "app" / "src" / "application" / "camera_worker.py").read_text(
         encoding="utf-8"
@@ -30,7 +48,9 @@ def test_cpu_analysis_branch_has_a_terminal_sink() -> None:
     assert "analysis_src.link(analysis_sink)" in pipeline
     assert "self.fire_smoke_engine.last_inference_ran" in pipeline
     assert "self.fire_smoke_engine.last_fresh_detections" in pipeline
-    assert "analysis_age_seconds" in pipeline
+    assert "self.fire_smoke_events.visible_detections" in pipeline
+    assert 'if raw_result["inference_ran"]:' in pipeline
+    assert "fire_smoke_age_seconds" in pipeline
     assert "_analysis_max_age_frames" not in pipeline
     assert "detection_results = list(self._analysis_detections)" in pipeline
     assert "fire_smoke_detections = []" in pipeline
@@ -116,6 +136,8 @@ def test_config_routes_functions_per_camera() -> None:
         "smoking_behavior": True,
         "fire_smoke": True,
     }
+    assert face["person"]["confidence"] == 0.05
+    assert face["person"]["tracking"]["confirmation_hits"] == 2
     dahua = resolve_camera_config(raw, "camera_dahua")
     assert "channel=5" in dahua["input"]["rtsp_url"]
     assert dahua["functions"] == {
@@ -168,11 +190,15 @@ def test_event_feed_is_start_only_and_recognition_starts_on_exact_frame() -> Non
     assert "variant=thumbnail" in dashboard_server
     assert "max-age=31536000, immutable" in dashboard_server
     assert 'classification == "unrecognized"' in dashboard_server
+    assert '"region_track_id": details.get("region_track_id")' in dashboard_server
+    assert '"best_frame_number": details.get("best_frame_number")' in dashboard_server
     assert 'lifecycle != "START"' in notifications
     assert 'stable_name != "unknown"' in pipeline
     assert '"recognition_frame_number": recognition_frame' in pipeline
     assert 'self._notify_event(event_id, "START")' in pipeline
     assert 'self._notify_event(event_id, "END")' not in pipeline
+    assert 'operation == "NOTIFY"' in pipeline
+    assert 'operation == "START" and not hasattr(transition, "region_track_id")' not in pipeline
 
 
 def test_event_items_open_a_full_detail_modal() -> None:

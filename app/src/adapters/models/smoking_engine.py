@@ -1,34 +1,22 @@
-"""Run smoking-behavior classification on tracked person ROIs."""
+"""Stateless smoking-behavior scoring for frame-aligned person ROIs."""
 
 from __future__ import annotations
 
 import logging
-import time
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import cv2
 import numpy as np
 
+from adapters.models.smoking_object_detector import SmokingObjectDetector
+from domain.smoking_events import SmokingInferenceBatch, SmokingObservation
+
 LOG = logging.getLogger("deepstream.smoking_behavior")
 
 
-@dataclass(frozen=True)
-class SmokingDetection:
-    track_id: int
-    person_bbox: tuple[float, float, float, float]
-    model_roi_bbox: tuple[float, float, float, float]
-    score: float
-
-    @property
-    def box(self) -> np.ndarray:
-        """Backward-compatible person bbox plus score for legacy callers."""
-        return np.array([*self.person_bbox, self.score], dtype=np.float32)
-
-
 class SmokingBehaviorEngine:
-    """Classify each person ROI and expose temporally confirmed smoking boxes."""
+    """Score every valid person crop; temporal state belongs to the domain."""
 
     def __init__(self, config: dict[str, Any]) -> None:
         runtime = config.get("smoking_behavior", {}) or {}
@@ -41,29 +29,16 @@ class SmokingBehaviorEngine:
         self.interval_seconds = max(
             0.3, min(0.5, float(runtime.get("interval_ms", 400)) / 1000.0)
         )
-        self.confirmation_hits = max(1, int(runtime.get("confirmation_hits", 2)))
-        self.confirmation_window = max(
-            self.confirmation_hits, int(runtime.get("confirmation_window", 4))
-        )
-        self.clear_hits = max(1, int(runtime.get("clear_hits", 4)))
-        self._last_attempt: dict[int, float] = {}
-        self._history: dict[int, list[float]] = {}
-        self._cached: dict[int, tuple[float, tuple[int, int, int, int]]] = {}
-        self.track_grace_frames = max(1, int(runtime.get("track_grace_frames", 30)))
-        self.bbox_smoothing_alpha = min(
-            1.0, max(0.05, float(runtime.get("bbox_smoothing_alpha", 0.35)))
-        )
-        self._missing_frames: dict[int, int] = {}
-        self._smoothed_person_bbox: dict[int, tuple[float, float, float, float]] = {}
-        self._active_tracks: set[int] = set()
-        self._below_threshold: dict[int, int] = {}
         self.last_person_count = 0
         self.last_scores: dict[int, float] = {}
-        self.last_histories: dict[int, list[float]] = {}
         self.last_roi_bboxes: dict[int, tuple[int, int, int, int]] = {}
-        self.last_confirmed_tracks: list[int] = []
+        self.last_invalid_crop_track_ids: list[int] = []
+        self.last_object_scores: dict[int, float] = {}
+        self.last_signal_sources: dict[int, list[str]] = {}
         self.session = None
+        self.input_name = ""
         self.active_providers: list[str] = []
+        self.object_detector = SmokingObjectDetector(config)
 
         if not self.enabled:
             return
@@ -91,6 +66,7 @@ class SmokingBehaviorEngine:
                 f"requested={requested} available={available}"
             )
         self.session = ort.InferenceSession(str(model_path), providers=selected)
+        self.input_name = self.session.get_inputs()[0].name
         self.active_providers = list(self.session.get_providers())
         if bool(runtime.get("require_gpu_provider", False)) and not gpu_providers.intersection(
             self.active_providers
@@ -99,8 +75,17 @@ class SmokingBehaviorEngine:
                 "GPU smoking behavior provider was not active; "
                 f"requested={requested} active={self.active_providers}"
             )
+        if bool(runtime.get("warmup", True)):
+            self.session.run(
+                None,
+                {
+                    self.input_name: np.zeros(
+                        (1, 3, self.input_height, self.input_width), dtype=np.float32
+                    )
+                },
+            )
         LOG.info(
-            "smoking behavior active: camera=%s model=%s providers=%s threshold=%.2f interval=%.0fms",
+            "smoking scorer active: camera=%s model=%s providers=%s threshold=%.2f interval=%.0fms",
             self.camera_id,
             model_path,
             self.active_providers,
@@ -121,16 +106,16 @@ class SmokingBehaviorEngine:
             crop, (self.input_width, self.input_height), interpolation=cv2.INTER_AREA
         )
         rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-        # ViTImageProcessor for this model uses mean/std=(0.5, 0.5, 0.5).
         tensor = ((rgb - 0.5) / 0.5).transpose(2, 0, 1)[None, ...]
-        input_name = self.session.get_inputs()[0].name
-        logits = np.asarray(self.session.run(None, {input_name: tensor})[0], dtype=np.float32)
+        logits = np.asarray(
+            self.session.run(None, {self.input_name: tensor})[0], dtype=np.float32
+        )
         if logits.ndim == 2:
             logits = logits[0]
         if logits.size < 2:
-            raise RuntimeError(f"smoking behavior model returned invalid logits: {logits.shape}")
-        # The Transformers image-classification pipeline uses independent sigmoid
-        # scores for this binary checkpoint, so keep the benchmark score identical.
+            raise RuntimeError(
+                f"smoking behavior model returned invalid logits: {logits.shape}"
+            )
         return self._sigmoid(float(logits[1]))
 
     def process(
@@ -138,17 +123,42 @@ class SmokingBehaviorEngine:
         frame: np.ndarray,
         persons: list[tuple[int, float, float, float, float]],
         frame_number: int,
-    ) -> list[SmokingDetection]:
+    ) -> SmokingInferenceBatch:
+        del frame_number
+        observed_track_ids = tuple(sorted({int(person[0]) for person in persons}))
         if not self.enabled or self.session is None or frame.size == 0:
-            return []
+            return SmokingInferenceBatch((), observed_track_ids)
         frame_height, frame_width = frame.shape[:2]
-        now = time.monotonic()
-        result: list[SmokingDetection] = []
+        observations: list[SmokingObservation] = []
+        invalid: list[int] = []
+        object_detections = self.object_detector.process(frame)
+        person_bboxes = {
+            int(track_id): (
+                float(raw_left),
+                float(raw_top),
+                float(raw_right),
+                float(raw_bottom),
+            )
+            for track_id, raw_left, raw_top, raw_right, raw_bottom in persons
+        }
+        assigned_objects: dict[int, list[Any]] = {track_id: [] for track_id in person_bboxes}
+        for detection in object_detections:
+            candidates = [
+                (
+                    self.object_detector.person_match_score(detection, person_bbox),
+                    track_id,
+                )
+                for track_id, person_bbox in person_bboxes.items()
+            ]
+            score, track_id = max(candidates, default=(0.0, -1), key=lambda item: (item[0], -item[1]))
+            if score > 0.0:
+                assigned_objects[track_id].append(detection)
         self.last_person_count = len(persons)
-        seen: set[int] = set()
+        self.last_scores = {}
+        self.last_roi_bboxes = {}
+        self.last_object_scores = {}
+        self.last_signal_sources = {}
         for track_id, raw_left, raw_top, raw_right, raw_bottom in persons:
-            seen.add(track_id)
-            self._missing_frames[track_id] = 0
             width = max(1.0, raw_right - raw_left)
             height = max(1.0, raw_bottom - raw_top)
             pad_x = width * self.padding_ratio
@@ -158,67 +168,43 @@ class SmokingBehaviorEngine:
             right = min(frame_width, int(raw_right + pad_x))
             bottom = min(frame_height, int(raw_bottom + pad_y))
             crop = frame[top:bottom, left:right]
-            if crop.size == 0:
+            if crop.size == 0 or right <= left or bottom <= top:
+                invalid.append(int(track_id))
                 continue
-            due = now - self._last_attempt.get(track_id, 0.0) >= self.interval_seconds
-            if due:
-                self._last_attempt[track_id] = now
-                score = self._score(crop)
-                self.last_scores[track_id] = float(score)
-                history = self._history.setdefault(track_id, [])
-                history.append(score)
-                del history[:-self.confirmation_window]
-                self._cached[track_id] = (score, (left, top, right, bottom))
-                self.last_histories[track_id] = list(history)
-                self.last_roi_bboxes[track_id] = (left, top, right, bottom)
-            cached = self._cached.get(track_id)
-            if cached is None:
-                continue
-            score, roi_bbox = cached
-            history = self._history.get(track_id, [])
-            confirmed = sum(value >= self.threshold for value in history) >= self.confirmation_hits
-            if confirmed:
-                self._active_tracks.add(track_id)
-                self._below_threshold[track_id] = 0
-            elif due and track_id in self._active_tracks:
-                self._below_threshold[track_id] = self._below_threshold.get(track_id, 0) + 1
-                if self._below_threshold[track_id] >= self.clear_hits:
-                    self._active_tracks.discard(track_id)
-            if track_id not in self._active_tracks:
-                continue
-            current_person_bbox = np.asarray(
-                [raw_left, raw_top, raw_right, raw_bottom], dtype=np.float32
+            score = float(self._score(crop))
+            person_bbox = person_bboxes[int(track_id)]
+            matched = assigned_objects[int(track_id)]
+            object_score = max((detection.score for detection in matched), default=0.0)
+            sources = tuple(
+                sorted({f"tbox:{detection.source}:{detection.label}" for detection in matched})
             )
-            previous_person_bbox = self._smoothed_person_bbox.get(track_id)
-            if previous_person_bbox is not None:
-                current_person_bbox = (
-                    np.asarray(previous_person_bbox, dtype=np.float32)
-                    * (1.0 - self.bbox_smoothing_alpha)
-                    + current_person_bbox * self.bbox_smoothing_alpha
-                )
-            person_bbox = tuple(float(value) for value in current_person_bbox)
-            self._smoothed_person_bbox[track_id] = person_bbox
-            result.append(
-                SmokingDetection(
-                    track_id=track_id,
+            classifier_positive = score >= self.threshold
+            object_positive = bool(matched)
+            decision_score = max(
+                score,
+                self.threshold if object_positive else 0.0,
+            )
+            self.last_scores[int(track_id)] = score
+            self.last_roi_bboxes[int(track_id)] = (left, top, right, bottom)
+            self.last_object_scores[int(track_id)] = object_score
+            self.last_signal_sources[int(track_id)] = list(sources)
+            observations.append(
+                SmokingObservation(
+                    track_id=int(track_id),
+                    score=decision_score,
                     person_bbox=person_bbox,
-                    model_roi_bbox=tuple(float(value) for value in roi_bbox),
-                    score=score,
+                    model_roi_bbox=(
+                        float(left), float(top), float(right), float(bottom)
+                    ),
+                    positive=classifier_positive or object_positive,
+                    classifier_score=score,
+                    object_score=object_score,
+                    signal_sources=("person_classifier",) + sources
+                    if classifier_positive
+                    else sources,
                 )
             )
-        for track_id in set(self._history) - seen:
-            self._missing_frames[track_id] = self._missing_frames.get(track_id, 0) + 1
-            if self._missing_frames[track_id] <= self.track_grace_frames:
-                continue
-            self._history.pop(track_id, None)
-            self._cached.pop(track_id, None)
-            self._last_attempt.pop(track_id, None)
-            self._smoothed_person_bbox.pop(track_id, None)
-            self._active_tracks.discard(track_id)
-            self._below_threshold.pop(track_id, None)
-            self._missing_frames.pop(track_id, None)
-            self.last_scores.pop(track_id, None)
-            self.last_histories.pop(track_id, None)
-            self.last_roi_bboxes.pop(track_id, None)
-        self.last_confirmed_tracks = sorted(self._active_tracks)
-        return result
+        self.last_invalid_crop_track_ids = sorted(invalid)
+        return SmokingInferenceBatch(
+            tuple(observations), observed_track_ids, tuple(sorted(invalid))
+        )

@@ -371,7 +371,33 @@ class EvidenceStore:
                 event["image_baseline_score"] = score
         if bbox is not None:
             event["last_bbox"] = list(bbox)
-        for field in ("person_bbox", "model_roi_bbox", "bbox_semantics", "label"):
+        for field in (
+            "person_bbox",
+            "model_roi_bbox",
+            "bbox_semantics",
+            "label",
+            "region_track_id",
+            "confirmation_state",
+            "detector_hits",
+            "dynamic_votes",
+            "dynamic_score",
+            "best_bbox",
+            "best_frame_number",
+            "notification_emitted",
+            "notification_min_duration_seconds",
+            "episode_sequence",
+            "positive_votes",
+            "observation_window",
+            "best_score",
+            "best_person_bbox",
+            "best_model_roi_bbox",
+            "classifier_score",
+            "object_score",
+            "signal_sources",
+            "best_classifier_score",
+            "best_object_score",
+            "best_signal_sources",
+        ):
             if field in payload:
                 event[field] = payload[field]
         self._write_event(event)

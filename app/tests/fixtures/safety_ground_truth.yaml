@@ -1,0 +1,14 @@
+version: 1
+annotation_file: assets/fixtures/mock_videos/smoker/markup.json
+sampling:
+  max_frames_per_video: 60
+cases:
+  - id: bucket11
+    video: assets/fixtures/mock_videos/smoker/samples/part1/bucket11.mp4
+    annotation_key: bucket11
+  - id: roomfire41
+    video: assets/fixtures/mock_videos/smoker/samples/part2/roomfire41.mp4
+    annotation_key: roomfire41
+  - id: printer31
+    video: assets/fixtures/mock_videos/smoker/samples/part3/printer31.mp4
+    annotation_key: printer31

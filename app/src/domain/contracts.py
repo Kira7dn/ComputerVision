@@ -3,8 +3,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import StrEnum
 from typing import Any
+
+try:
+    from enum import StrEnum
+except ImportError:  # Python 3.10 in the native WSL development runtime.
+    from enum import Enum
+
+    class StrEnum(str, Enum):
+        def __str__(self) -> str:
+            return str(self.value)
 
 
 class Lifecycle(StrEnum):
@@ -22,6 +30,52 @@ class EvidenceReference:
     idempotency_key: str | None = None
 
 
+@dataclass(frozen=True, order=True)
+class FrameKey:
+    """Stable identity for one decoded source frame within a worker run."""
+
+    run_id: str
+    camera_id: str
+    source_id: int
+    frame_number: int
+    buffer_pts_ns: int | None = field(default=None, compare=False)
+
+    @property
+    def ordering_value(self) -> tuple[int, int]:
+        if self.buffer_pts_ns is not None:
+            return (1, self.buffer_pts_ns)
+        return (0, self.frame_number)
+
+
+@dataclass(frozen=True)
+class AnalysisSample:
+    """Immutable frame and person tracks shared by independent analyzers."""
+
+    key: FrameKey
+    source_timestamp: float
+    captured_monotonic: float
+    frame: Any
+    persons: tuple[tuple[int, float, float, float, float], ...] = ()
+
+
+@dataclass(frozen=True)
+class FunctionResult:
+    """Frame-correlated result produced by one analysis function."""
+
+    function: str
+    key: FrameKey
+    detections: tuple[Any, ...]
+    transitions: tuple[Any, ...] = ()
+    started_monotonic: float = 0.0
+    finished_monotonic: float = 0.0
+    model_revision: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def inference_seconds(self) -> float:
+        return max(0.0, self.finished_monotonic - self.started_monotonic)
+
+
 @dataclass(frozen=True)
 class DetectionResult:
     function: str
@@ -30,6 +84,10 @@ class DetectionResult:
     bbox: tuple[float, float, float, float] | None = None
     track_id: int | None = None
     frame_number: int | None = None
+    frame_key: FrameKey | None = None
+    started_monotonic: float | None = None
+    finished_monotonic: float | None = None
+    model_revision: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
 

@@ -16,7 +16,6 @@ import importlib
 import json
 import logging
 import os
-import queue
 import signal
 import subprocess
 import sys
@@ -34,6 +33,11 @@ from adapters.models.face_engine import FaceRecognitionEngine
 from adapters.models.fire_smoke_engine import FireSmokeEngine
 from adapters.models.smoking_engine import SmokingBehaviorEngine
 from adapters.persistence.evidence_repository import EvidenceStore
+from application.analysis_scheduler import (
+    FrameResultGate,
+    LatestSampleExecutor,
+    as_function_result,
+)
 from application.notification_service import NotificationService
 from bootstrap.config import load_config, load_raw_config
 
@@ -46,6 +50,8 @@ _library_paths = [
     os.path.join(DEEPSTREAM_ROOT, "lib"),
     _plugin_path,
     "/usr/local/lib/python3.10/dist-packages/tensorrt_libs",
+    "/usr/local/lib/python3.10/dist-packages/nvidia/cudnn/lib",
+    "/usr/local/lib/python3.10/dist-packages/nvidia/cublas/lib",
 ]
 os.environ["GST_PLUGIN_PATH"] = os.pathsep.join(
     _library_paths[1:] + ([os.environ["GST_PLUGIN_PATH"]] if os.environ.get("GST_PLUGIN_PATH") else [])
@@ -58,9 +64,10 @@ import gi  # noqa: E402
 import numpy as np  # noqa: E402
 import zmq  # noqa: E402
 
-from domain.events import SafetyDetection, SafetyEventStore  # noqa: E402
+from domain.contracts import AnalysisSample, FrameKey, FunctionResult  # noqa: E402
 from domain.fire_smoke_events import FireSmokeEventStore  # noqa: E402
 from domain.recognition import RecognitionCore, TrackKey  # noqa: E402
+from domain.smoking_events import SmokingEpisodeStore, SmokingInferenceBatch  # noqa: E402
 from domain.tracking import (  # noqa: E402
     PersonConfirmation,
     intersection_over_candidate,
@@ -135,7 +142,7 @@ class SafetyPipeline:
         self.person_score_logged = False
         self.evidence = EvidenceStore(config, run_id)
         self.notifications = NotificationService(config, self.evidence.root, run_id)
-        self.event_store = SafetyEventStore(config, self.evidence)
+        self.event_store = SmokingEpisodeStore(config, self.evidence)
         self.fire_smoke_events = FireSmokeEventStore(config, self.evidence)
         self._face_event_ids: dict[int, str] = {}
         self._smoking_by_track: dict[int, Any] = {}
@@ -175,25 +182,21 @@ class SafetyPipeline:
         self._person_confirmation_window = int(
             tracking_config.get("confirmation_window", 4)
         )
-        self._person_fire_smoke_overlap_ratio = float(
-            tracking_config.get("fire_smoke_exclusion_overlap_ratio", 0.25)
-        )
         self.last_behavior_error: str | None = None
         self.analysis_enabled = (
             self.face_engine.enabled
             or self.smoking_behavior_enabled
             or self.fire_smoke_enabled
         )
-        self._analysis_queue: queue.Queue = queue.Queue(maxsize=1)
-        self._analysis_stop = threading.Event()
-        self._analysis_thread: threading.Thread | None = None
         self._analysis_lock = threading.RLock()
         self._analysis_detections: list[Any] = []
         self._analysis_fire_smoke: list[Any] = []
         self._analysis_transitions: list[Any] = []
+        self._analysis_transitions_by_function: dict[str, list[Any]] = {}
+        self._analysis_results_by_function: dict[str, FunctionResult] = {}
         self._analysis_last_transition: str | None = None
         self._analysis_frame_num: int | None = None
-        self._analysis_updated_at: float | None = None
+        self._analysis_updated_at_by_function: dict[str, float] = {}
         analysis_intervals = [
             float(engine.interval_seconds)
             for engine in (self.smoking_behavior_engine, self.fire_smoke_engine)
@@ -213,8 +216,11 @@ class SafetyPipeline:
                 )
             ),
         )
-        self._next_analysis_at = 0.0
+        self._analysis_gate = FrameResultGate(self._analysis_result_max_age_seconds)
+        self._analysis_executors: dict[str, LatestSampleExecutor] = {}
         self._analysis_error: str | None = None
+        self._analysis_stale_drops = 0
+        self._analysis_out_of_order_drops = 0
         self._analysis_probe_count = 0
         self._analysis_due_count = 0
         self._analysis_enqueued_count = 0
@@ -227,7 +233,7 @@ class SafetyPipeline:
         self._latest_person_updated_at: float | None = None
         self._last_metadata_person_count = 0
         self._last_behavior_person_count = 0
-        self._last_person_fire_smoke_excluded_count = 0
+        self._last_person_fire_smoke_overlap_count = 0
         self._metadata_write_at = 0.0
         self.metadata_path = self.status_dir / f"{config.get('input', {}).get('camera', 'camera')}.metadata.json"
         self.socket = zmq.Context.instance().socket(zmq.PUB)
@@ -235,12 +241,7 @@ class SafetyPipeline:
         self.person_infer_config = self._write_person_infer_config()
         self._build()
         if self.analysis_enabled:
-            self._analysis_thread = threading.Thread(
-                target=self._analysis_loop,
-                name=f"analysis-{config['input'].get('camera', 'camera')}",
-                daemon=True,
-            )
-            self._analysis_thread.start()
+            self._start_analysis_workers()
 
     def _on_face_trace(
         self, track_id: int, data: dict[str, Any], frame: np.ndarray | None
@@ -376,8 +377,8 @@ class SafetyPipeline:
     def _notify_transitions(self, transitions: list[Any]) -> None:
         for transition in transitions:
             operation = str(getattr(transition, "operation", ""))
-            if operation == "START":
-                self._notify_event(str(transition.event_id), operation)
+            if operation == "NOTIFY":
+                self._notify_event(str(transition.event_id), "START")
 
     def _write_person_infer_config(self) -> str:
         model = self.config["person"]
@@ -775,107 +776,213 @@ maintain-aspect-ratio=0
         """Map the CPU BGRx analysis surface using the stride-aware decoder."""
         return self.face_engine.decode_bgrx_frame(buffer, width, height)
 
+    def _start_analysis_workers(self) -> None:
+        camera_id = str(self.config["input"].get("camera", "camera"))
+        definitions: list[tuple[str, float, Any]] = []
+        if self.face_engine.enabled:
+            definitions.append(
+                (
+                    "face_recognition",
+                    self.face_engine.recognition_scheduler.interval_seconds,
+                    self._process_face_sample,
+                )
+            )
+        if self.smoking_behavior_enabled and self.smoking_behavior_engine is not None:
+            definitions.append(
+                (
+                    "smoking_behavior",
+                    self.smoking_behavior_engine.interval_seconds,
+                    self._process_smoking_sample,
+                )
+            )
+        if self.fire_smoke_enabled and self.fire_smoke_engine is not None:
+            definitions.append(
+                (
+                    "fire_smoke",
+                    self.fire_smoke_engine.interval_seconds,
+                    self._process_fire_smoke_sample,
+                )
+            )
+        for function, interval, processor in definitions:
+            executor = LatestSampleExecutor(
+                name=function,
+                interval_seconds=interval,
+                processor=processor,
+                on_result=self._on_analysis_result,
+                on_error=self._on_analysis_error,
+            )
+            self._analysis_executors[function] = executor
+            executor.start()
+        LOG.info(
+            "analysis executors started: camera=%s functions=%s",
+            camera_id,
+            sorted(self._analysis_executors),
+        )
+
+    def _process_face_sample(self, sample: AnalysisSample) -> dict[int, dict[str, Any]]:
+        return self.face_engine.process_frame(
+            sample.frame,
+            list(sample.persons),
+            sample.key.frame_number,
+        )
+
+    def _process_smoking_sample(self, sample: AnalysisSample) -> SmokingInferenceBatch:
+        if self.smoking_behavior_engine is None:
+            return SmokingInferenceBatch((), ())
+        return self.smoking_behavior_engine.process(
+            sample.frame,
+            list(sample.persons),
+            sample.key.frame_number,
+        )
+
+    def _process_fire_smoke_sample(self, sample: AnalysisSample) -> dict[str, Any]:
+        if self.fire_smoke_engine is None:
+            return {"detections": [], "fresh": [], "inference_ran": False}
+        detections = self.fire_smoke_engine.process(sample.frame)
+        return {
+            "detections": list(detections),
+            "fresh": list(self.fire_smoke_engine.last_fresh_detections),
+            "inference_ran": bool(self.fire_smoke_engine.last_inference_ran),
+        }
+
+    def _on_analysis_error(self, function: str, exc: Exception) -> None:
+        message = f"{function}: {exc}"
+        if message != self._analysis_error:
+            LOG.exception("background analysis failed: %s", message, exc_info=exc)
+            self._analysis_error = message
+
+    def _on_analysis_result(
+        self,
+        function: str,
+        sample: AnalysisSample,
+        raw_result: Any,
+        started: float,
+        finished: float,
+    ) -> None:
+        decision = self._analysis_gate.evaluate(function, sample, finished)
+        if not decision.accepted:
+            if decision.reason == "stale":
+                self._analysis_stale_drops += 1
+            else:
+                self._analysis_out_of_order_drops += 1
+            LOG.warning(
+                "analysis result dropped: camera=%s function=%s frame=%d reason=%s age=%.3fs",
+                sample.key.camera_id,
+                function,
+                sample.key.frame_number,
+                decision.reason,
+                decision.age_seconds,
+            )
+            return
+
+        detections: list[Any] = []
+        transitions: list[Any] = []
+        metadata: dict[str, Any] = {"result_age_seconds": decision.age_seconds}
+        if function == "face_recognition":
+            face_tracks = dict(raw_result)
+            detections = list(face_tracks.values())
+            with self._analysis_lock:
+                self._face_tracks = face_tracks
+        elif function == "smoking_behavior":
+            metadata["raw_observation_count"] = len(raw_result.observations)
+            metadata["invalid_crop_count"] = len(raw_result.invalid_crop_track_ids)
+            transitions.extend(self.event_store.observe(
+                frame_num=sample.key.frame_number,
+                timestamp=sample.source_timestamp,
+                observations=list(raw_result.observations),
+                observed_track_ids=set(raw_result.observed_track_ids),
+                frame=sample.frame,
+                invalid_crop_track_ids=set(raw_result.invalid_crop_track_ids),
+            ))
+            detections = list(self.event_store.visible_detections)
+        elif function == "fire_smoke":
+            metadata["inference_ran"] = bool(raw_result["inference_ran"])
+            metadata["raw_detection_count"] = len(raw_result["fresh"])
+            if raw_result["inference_ran"]:
+                transitions.extend(
+                    self.fire_smoke_events.observe(
+                        frame_num=sample.key.frame_number,
+                        timestamp=sample.source_timestamp,
+                        detections=list(raw_result["fresh"]),
+                        frame=sample.frame,
+                    )
+                )
+            # Raw/cached detector output is diagnostic only. Only a verified
+            # region may reach NVOSD, live metadata, events, or notifications.
+            detections = list(self.fire_smoke_events.visible_detections)
+
+        self._notify_transitions(transitions)
+        model_section = (
+            "smoking_behavior" if function == "smoking_behavior" else function
+        )
+        model_revision = str(
+            (self.config.get(model_section, {}) or {}).get("onnx_path", "")
+        ) or None
+        result = as_function_result(
+            function,
+            sample,
+            detections,
+            started,
+            finished,
+            transitions=transitions,
+            model_revision=model_revision,
+            metadata=metadata,
+        )
+        with self._analysis_lock:
+            self._analysis_results_by_function[function] = result
+            self._analysis_transitions_by_function[function] = transitions
+            self._analysis_transitions = [
+                transition
+                for function_transitions in self._analysis_transitions_by_function.values()
+                for transition in function_transitions
+            ]
+            if function == "smoking_behavior":
+                self._analysis_detections = detections
+                self.last_bbox_count = len(detections)
+            elif function == "fire_smoke":
+                self._analysis_fire_smoke = detections
+                self.last_fire_smoke_count = len(detections)
+            self._analysis_frame_num = sample.key.frame_number
+            self._analysis_updated_at_by_function[function] = finished
+            self._analysis_last_transition = (
+                transitions[-1].operation if transitions else self._analysis_last_transition
+            )
+            self._analysis_processed_count += 1
+            self._analysis_last_processed_frame = sample.key.frame_number
+
     def _queue_analysis_sample(
         self,
-        frame_num: int,
+        frame_meta: Any,
         frame: np.ndarray | None,
         persons: list[tuple[int, float, float, float, float]],
+        now: float,
     ) -> None:
-        if frame is None or not self.analysis_enabled:
+        if frame is None or not self._analysis_executors:
             return
-        sample = (frame.copy(), persons, frame_num, time.time())
-        try:
-            self._analysis_queue.put_nowait(sample)
-        except queue.Full:
-            try:
-                self._analysis_queue.get_nowait()
-            except queue.Empty:
-                pass
-            try:
-                self._analysis_queue.put_nowait(sample)
-            except queue.Full:
-                pass
-        self._analysis_enqueued_count += 1
-        self._analysis_last_enqueued_frame = int(frame_num)
-
-    def _analysis_loop(self) -> None:
-        while not self._analysis_stop.is_set():
-            try:
-                sample = self._analysis_queue.get(timeout=0.5)
-            except queue.Empty:
-                continue
-            if sample is None:
-                break
-            frame, persons, frame_num, timestamp = sample
-            self._analysis_processed_count += 1
-            self._analysis_last_processed_frame = int(frame_num)
-            try:
-                face_tracks: dict[int, dict[str, Any]] = {}
-                if self.face_engine.enabled:
-                    face_tracks = self.face_engine.process_frame(frame, persons, int(frame_num))
-                detection_results: list[Any] = []
-                fire_smoke_detections: list[Any] = []
-                if self.smoking_behavior_enabled and self.smoking_behavior_engine is not None:
-                    detection_results = self.smoking_behavior_engine.process(
-                        frame, persons, int(frame_num)
-                    )
-                if self.fire_smoke_enabled and self.fire_smoke_engine is not None:
-                    fire_smoke_detections = self.fire_smoke_engine.process(frame)
-                detections = [
-                    SafetyDetection(
-                        track_id=detection.track_id,
-                        score=float(detection.score),
-                        bbox=detection.person_bbox,
-                        model_roi_bbox=detection.model_roi_bbox,
-                    )
-                    for detection in detection_results
-                ]
-                transitions: list[Any] = []
-                transition = (
-                    self.event_store.observe(
-                        frame_num=int(frame_num),
-                        timestamp=timestamp,
-                        detections=detections,
-                        frame=frame,
-                    )
-                    if self.smoking_behavior_enabled
-                    else None
-                )
-                if transition is not None:
-                    transitions.append(transition)
-                if self.fire_smoke_enabled:
-                    if (
-                        self.fire_smoke_engine is not None
-                        and self.fire_smoke_engine.last_inference_ran
-                    ):
-                        transitions.extend(
-                            self.fire_smoke_events.observe(
-                                frame_num=int(frame_num),
-                                timestamp=timestamp,
-                                detections=list(
-                                    self.fire_smoke_engine.last_fresh_detections
-                                ),
-                                frame=frame,
-                            )
-                        )
-                self._notify_transitions(transitions)
-                with self._analysis_lock:
-                    self._face_tracks = dict(face_tracks)
-                    self._analysis_detections = list(detection_results)
-                    self._analysis_fire_smoke = list(fire_smoke_detections)
-                    self._analysis_transitions = transitions
-                    self._analysis_frame_num = int(frame_num)
-                    self._analysis_updated_at = time.monotonic()
-                    self._analysis_last_transition = (
-                        transitions[-1].operation if transitions else None
-                    )
-                    self.last_bbox_count = len(detection_results)
-                    self.last_fire_smoke_count = len(fire_smoke_detections)
-            except Exception as exc:
-                message = str(exc)
-                if message != self._analysis_error:
-                    LOG.exception("background analysis failed: %s", message)
-                    self._analysis_error = message
+        frame_copy = frame.copy()
+        frame_copy.setflags(write=False)
+        raw_pts = int(getattr(frame_meta, "buf_pts", -1))
+        buffer_pts_ns = raw_pts if 0 <= raw_pts < 2**63 - 1 else None
+        ntp_timestamp = int(getattr(frame_meta, "ntp_timestamp", 0) or 0)
+        sample = AnalysisSample(
+            key=FrameKey(
+                run_id=self.run_id,
+                camera_id=str(self.config["input"].get("camera", "camera")),
+                source_id=int(getattr(frame_meta, "source_id", 0)),
+                frame_number=int(frame_meta.frame_num),
+                buffer_pts_ns=buffer_pts_ns,
+            ),
+            source_timestamp=(ntp_timestamp / 1_000_000_000 if ntp_timestamp > 0 else time.time()),
+            captured_monotonic=now,
+            frame=frame_copy,
+            persons=tuple(persons),
+        )
+        submitted = 0
+        for executor in self._analysis_executors.values():
+            submitted += int(executor.submit(sample, now))
+        if submitted:
+            self._analysis_enqueued_count += submitted
+            self._analysis_last_enqueued_frame = sample.key.frame_number
 
     def _cached_analysis(self) -> tuple[list[Any], list[Any], list[Any], str | None]:
         with self._analysis_lock:
@@ -919,18 +1026,6 @@ maintain-aspect-ratio=0
                 continue
             if object_label == self.config["person"]["label"]:
                 if not self._person_track_confirmed(int(obj_meta.object_id)):
-                    continue
-                rect = obj_meta.rect_params
-                box = np.array(
-                    [
-                        float(rect.left),
-                        float(rect.top),
-                        float(rect.left + rect.width),
-                        float(rect.top + rect.height),
-                    ],
-                    dtype=np.float32,
-                )
-                if self._person_box_overlaps_fresh_fire_smoke(box):
                     continue
                 name, score = self.face_engine.current_label(
                     int(obj_meta.object_id), int(frame_meta.frame_num)
@@ -985,9 +1080,12 @@ maintain-aspect-ratio=0
         if batch_meta is None:
             return Gst.PadProbeReturn.OK
         with self._analysis_lock:
-            analysis_age_seconds = (
-                time.monotonic() - self._analysis_updated_at
-                if self._analysis_updated_at is not None
+            fire_smoke_updated_at = self._analysis_updated_at_by_function.get(
+                "fire_smoke"
+            )
+            fire_smoke_age_seconds = (
+                time.monotonic() - fire_smoke_updated_at
+                if fire_smoke_updated_at is not None
                 else self._analysis_result_max_age_seconds + 1.0
             )
             # Smoking is a temporal state owned by SmokingBehaviorEngine and
@@ -995,7 +1093,7 @@ maintain-aspect-ratio=0
             # the engine clears it; a renderer TTL must not turn a confirmed
             # smoking track back into a plain person between slow analysis runs.
             detection_results = list(self._analysis_detections)
-            if analysis_age_seconds <= self._analysis_result_max_age_seconds:
+            if fire_smoke_age_seconds <= self._analysis_result_max_age_seconds:
                 fire_smoke_detections = list(self._analysis_fire_smoke)
             else:
                 fire_smoke_detections = []
@@ -1015,19 +1113,9 @@ maintain-aspect-ratio=0
         return Gst.PadProbeReturn.OK
 
     def _stop_analysis_worker(self) -> None:
-        if self._analysis_thread is None:
-            return
-        self._analysis_stop.set()
-        try:
-            self._analysis_queue.put_nowait(None)
-        except queue.Full:
-            try:
-                self._analysis_queue.get_nowait()
-                self._analysis_queue.put_nowait(None)
-            except queue.Empty:
-                pass
-        self._analysis_thread.join(timeout=5)
-        self._analysis_thread = None
+        for executor in self._analysis_executors.values():
+            executor.stop(timeout=5.0)
+        self._analysis_executors.clear()
 
     def _write_runtime_status(self) -> bool:
         payload = {
@@ -1041,7 +1129,9 @@ maintain-aspect-ratio=0
             "last_output_at": self.last_output_at,
             "last_output_pts_ns": self.last_output_pts_ns,
             "frame_count": self.frame_count,
-            "analysis_queue_depth": self._analysis_queue.qsize(),
+            "analysis_queue_depth": sum(
+                executor.queue_depth for executor in self._analysis_executors.values()
+            ),
             "analysis_error": self._analysis_error,
             "analysis_flow": {
                 "probe_count": self._analysis_probe_count,
@@ -1050,27 +1140,50 @@ maintain-aspect-ratio=0
                 "processed_count": self._analysis_processed_count,
                 "last_enqueued_frame": self._analysis_last_enqueued_frame,
                 "last_processed_frame": self._analysis_last_processed_frame,
-                "result_age_seconds": (
-                    round(time.monotonic() - self._analysis_updated_at, 3)
-                    if self._analysis_updated_at is not None
-                    else None
-                ),
+                "result_age_seconds": {
+                    function: round(time.monotonic() - updated_at, 3)
+                    for function, updated_at in self._analysis_updated_at_by_function.items()
+                },
                 "result_max_age_seconds": self._analysis_result_max_age_seconds,
+                "stale_drops": self._analysis_stale_drops,
+                "out_of_order_drops": self._analysis_out_of_order_drops,
+                "functions": {
+                    function: executor.status()
+                    for function, executor in self._analysis_executors.items()
+                },
             },
             "analysis_decode": getattr(self.face_engine, "_last_decode_info", None),
             "analysis_debug": {
                 "smoking_person_count": getattr(self.smoking_behavior_engine, "last_person_count", 0),
                 "smoking_scores": getattr(self.smoking_behavior_engine, "last_scores", {}),
-                "smoking_score_histories": getattr(
-                    self.smoking_behavior_engine, "last_histories", {}
-                ),
                 "smoking_roi_bboxes": getattr(
                     self.smoking_behavior_engine, "last_roi_bboxes", {}
                 ),
-                "smoking_confirmed_tracks": getattr(
-                    self.smoking_behavior_engine, "last_confirmed_tracks", []
+                "smoking_invalid_crop_track_ids": getattr(
+                    self.smoking_behavior_engine, "last_invalid_crop_track_ids", []
                 ),
+                "smoking_object_scores": getattr(
+                    self.smoking_behavior_engine, "last_object_scores", {}
+                ),
+                "smoking_signal_sources": getattr(
+                    self.smoking_behavior_engine, "last_signal_sources", {}
+                ),
+                "smoking_object_detections": [
+                    {
+                        "source": detection.source,
+                        "label": detection.label,
+                        "score": round(float(detection.score), 5),
+                        "bbox": [round(float(value), 2) for value in detection.bbox],
+                    }
+                    for detection in getattr(
+                        getattr(self.smoking_behavior_engine, "object_detector", None),
+                        "last_detections",
+                        [],
+                    )
+                ],
+                "smoking_episodes": self.event_store.metrics(),
                 "fire_smoke_raw_scores": getattr(self.fire_smoke_engine, "last_raw_scores", {}),
+                "fire_smoke_regions": self.fire_smoke_events.metrics(),
                 "person_detector_count": self.last_person_count,
                 "person_track_count": len(self._person_tracks),
                 "person_candidate_count": sum(
@@ -1078,12 +1191,9 @@ maintain-aspect-ratio=0
                     for track in self._person_tracks.values()
                     if not track["confirmation"].confirmed
                 ),
-                "person_fire_smoke_excluded_count": sum(
-                    1
-                    for track in self._person_tracks.values()
-                    if track.get("environment_excluded", False)
-                ),
-                "person_fire_smoke_excluded_last_frame": self._last_person_fire_smoke_excluded_count,
+                "person_fire_smoke_overlap_count": self._last_person_fire_smoke_overlap_count,
+                "person_fire_smoke_excluded_count": 0,
+                "person_fire_smoke_excluded_last_frame": 0,
                 "person_confirmed_count": sum(
                     1
                     for track in self._person_tracks.values()
@@ -1123,9 +1233,6 @@ maintain-aspect-ratio=0
             top = float(obj_meta.rect_params.top)
             right = left + float(obj_meta.rect_params.width)
             bottom = top + float(obj_meta.rect_params.height)
-            box = np.array([left, top, right, bottom], dtype=np.float32)
-            if self._person_box_overlaps_fresh_fire_smoke(box):
-                continue
             persons.append((track_id, left, top, right, bottom))
         return persons
 
@@ -1135,10 +1242,12 @@ maintain-aspect-ratio=0
         return bool(confirmation is not None and confirmation.confirmed)
 
     def _person_box_overlaps_fresh_fire_smoke(self, box: np.ndarray) -> bool:
+        """Correlation only; callers must never use overlap to suppress a person."""
         with self._analysis_lock:
-            if self._analysis_updated_at is None:
+            updated_at = self._analysis_updated_at_by_function.get("fire_smoke")
+            if updated_at is None:
                 return False
-            age_seconds = time.monotonic() - self._analysis_updated_at
+            age_seconds = time.monotonic() - updated_at
             if age_seconds > self._analysis_result_max_age_seconds:
                 return False
             detections = list(self._analysis_fire_smoke)
@@ -1148,7 +1257,7 @@ maintain-aspect-ratio=0
             other = np.asarray(detection.bbox, dtype=np.float32)
             if (
                 intersection_over_candidate(box, other)
-                >= self._person_fire_smoke_overlap_ratio
+                >= 0.25
             ):
                 return True
         return False
@@ -1254,7 +1363,6 @@ maintain-aspect-ratio=0
 
         matched_tracks: set[int] = set()
         matched_detections: set[int] = set()
-        environment_excluded_count = 0
         for _, _, track_id, index in pairs:
             if track_id in matched_tracks or index in matched_detections:
                 continue
@@ -1279,11 +1387,7 @@ maintain-aspect-ratio=0
                 last_frame=frame_number,
                 frames_seen=int(track.get("frames_seen", 0)) + 1,
             )
-            environment_excluded = self._person_box_overlaps_fresh_fire_smoke(box)
-            track["environment_excluded"] = environment_excluded
-            environment_excluded_count += int(environment_excluded)
-            if not environment_excluded:
-                track["confirmation"].observe(frame_number)
+            track["confirmation"].observe(frame_number)
             detections[index][0].rect_params.left = float(smoothed_box[0])
             detections[index][0].rect_params.top = float(smoothed_box[1])
             detections[index][0].rect_params.width = float(smoothed_box[2] - smoothed_box[0])
@@ -1303,8 +1407,6 @@ maintain-aspect-ratio=0
                 continue
             track_id = self._next_person_track_id
             self._next_person_track_id += 1
-            environment_excluded = self._person_box_overlaps_fresh_fire_smoke(box)
-            environment_excluded_count += int(environment_excluded)
             self._person_tracks[track_id] = {
                 "box": box,
                 "center": center,
@@ -1312,16 +1414,17 @@ maintain-aspect-ratio=0
                 "disappeared": 0,
                 "last_frame": frame_number,
                 "frames_seen": 1,
-                "environment_excluded": environment_excluded,
                 "confirmation": PersonConfirmation(
                     required_hits=self._person_confirmation_hits,
                     window_frames=self._person_confirmation_window,
                 ),
             }
-            if not self._person_tracks[track_id]["environment_excluded"]:
-                self._person_tracks[track_id]["confirmation"].observe(frame_number)
+            self._person_tracks[track_id]["confirmation"].observe(frame_number)
             obj.object_id = track_id
-        self._last_person_fire_smoke_excluded_count = environment_excluded_count
+        self._last_person_fire_smoke_overlap_count = sum(
+            int(self._person_box_overlaps_fresh_fire_smoke(box))
+            for _obj, box, _center in detections
+        )
 
     def _recognition_tracks(self, frame_meta: Any) -> list[dict[str, Any]]:
         frame_num = int(frame_meta.frame_num)
@@ -1337,18 +1440,6 @@ maintain-aspect-ratio=0
             if label == "person" and not self._person_track_confirmed(int(track_id)):
                 continue
             rect = obj_meta.rect_params
-            if label == "person":
-                box = np.array(
-                    [
-                        float(rect.left),
-                        float(rect.top),
-                        float(rect.left + rect.width),
-                        float(rect.top + rect.height),
-                    ],
-                    dtype=np.float32,
-                )
-                if self._person_box_overlaps_fresh_fire_smoke(box):
-                    continue
             key = TrackKey(
                 str(self.config["input"].get("camera", "safety_camera")),
                 self.recognition.stream_epoch,
@@ -1409,6 +1500,7 @@ maintain-aspect-ratio=0
             left, top, right, bottom = detection.bbox
             obj_meta = pyds.nvds_acquire_obj_meta_from_pool(batch_meta)
             obj_meta.class_id = 0 if detection.label == "fire" else 1
+            obj_meta.object_id = int(getattr(detection, "region_track_id", 0))
             obj_meta.confidence = float(detection.score)
             obj_meta.obj_label = detection.label
             obj_meta.rect_params.left = float(left)
@@ -1457,6 +1549,8 @@ maintain-aspect-ratio=0
                 {
                     "kind": "smoking",
                     "track_id": detection.track_id,
+                    "episode_sequence": detection.episode_sequence,
+                    "confirmation_state": detection.confirmation_state,
                     "left": detection.person_bbox[0],
                     "top": detection.person_bbox[1],
                     "right": detection.person_bbox[2],
@@ -1469,6 +1563,8 @@ maintain-aspect-ratio=0
             overlays.append(
                 {
                     "kind": "fire" if detection.label == "fire" else "smoke",
+                    "region_track_id": getattr(detection, "region_track_id", None),
+                    "confirmation_state": getattr(detection, "confirmation_state", None),
                     "left": detection.bbox[0],
                     "top": detection.bbox[1],
                     "right": detection.bbox[2],
@@ -1490,7 +1586,7 @@ maintain-aspect-ratio=0
             "bbox_count": len(detection_results),
             "fire_smoke_count": len(fire_smoke_detections),
             "event_id": self.event_store.active_event_id,
-            "event_state": self.event_store.state.value,
+            "event_state": self.event_store.state.value if self.event_store.state else "IDLE",
             "fire_smoke_events": [
                 {
                     "operation": item.operation,
@@ -1509,6 +1605,8 @@ maintain-aspect-ratio=0
                     "label": "person",
                     "behavior": "smoking",
                     "track_id": detection.track_id,
+                    "episode_sequence": detection.episode_sequence,
+                    "confirmation_state": detection.confirmation_state,
                     "confidence": round(float(detection.score), 5),
                     "left": round(float(detection.person_bbox[0]), 2),
                     "top": round(float(detection.person_bbox[1]), 2),
@@ -1520,6 +1618,8 @@ maintain-aspect-ratio=0
             "fire_smoke": [
                 {
                     "label": detection.label,
+                    "region_track_id": getattr(detection, "region_track_id", None),
+                    "confirmation_state": getattr(detection, "confirmation_state", None),
                     "confidence": round(float(detection.score), 5),
                     "left": round(float(detection.bbox[0]), 2),
                     "top": round(float(detection.bbox[1]), 2),
@@ -1528,6 +1628,8 @@ maintain-aspect-ratio=0
                 }
                 for detection in fire_smoke_detections
             ],
+            "fire_smoke_regions": self.fire_smoke_events.metrics(),
+            "smoking_episodes": self.event_store.metrics(),
         }
         self._publish_live_metadata(payload)
         self.frame_count += 1
@@ -1601,15 +1703,17 @@ maintain-aspect-ratio=0
                 self._analysis_probe_count += 1
                 frame: np.ndarray | None = None
                 boxes: list[np.ndarray] = []
-                detections: list[SafetyDetection] = []
                 detection_results: list[Any] = []
                 fire_smoke_detections: list[Any] = []
                 if self.analysis_enabled:
-                    frame_num = int(frame_meta.frame_num)
                     now = time.monotonic()
-                    if now >= self._next_analysis_at:
-                        self._analysis_due_count += 1
-                        self._next_analysis_at = now + self._analysis_interval_seconds
+                    due_functions = [
+                        function
+                        for function, executor in self._analysis_executors.items()
+                        if executor.is_due(now)
+                    ]
+                    if due_functions:
+                        self._analysis_due_count += len(due_functions)
                         frame_width = int(
                             getattr(frame_meta, "source_frame_width", 0)
                             or self.config["input"]["width"]
@@ -1624,17 +1728,8 @@ maintain-aspect-ratio=0
                             frame_height,
                         )
                         persons = self._person_rois(frame_meta)
-                        if not persons:
-                            with self._analysis_lock:
-                                cache_age = (
-                                    time.monotonic() - self._latest_person_updated_at
-                                    if self._latest_person_updated_at is not None
-                                    else None
-                                )
-                                if cache_age is not None and cache_age <= 1.0:
-                                    persons = list(self._latest_person_rois)
                         self._last_behavior_person_count = len(persons)
-                        self._queue_analysis_sample(frame_num, frame, persons)
+                        self._queue_analysis_sample(frame_meta, frame, persons, now)
                     (
                         detection_results,
                         fire_smoke_detections,
@@ -1648,15 +1743,6 @@ maintain-aspect-ratio=0
                         )
                         for detection in detection_results
                     ]
-                    detections = [
-                        SafetyDetection(
-                            track_id=detection.track_id,
-                            score=float(detection.score),
-                            bbox=detection.person_bbox,
-                            model_roi_bbox=detection.model_roi_bbox,
-                        )
-                        for detection in detection_results
-                    ]
                 else:
                     cached_transitions = []
                     cached_transition = None
@@ -1667,17 +1753,7 @@ maintain-aspect-ratio=0
                     fire_smoke_transitions = cached_transitions
                     self.last_event_transition = cached_transition
                 else:
-                    transition = (
-                        self.event_store.observe(
-                            frame_num=int(frame_meta.frame_num),
-                            timestamp=time.time(),
-                            detections=detections,
-                            frame=frame,
-                        )
-                        if self.smoking_behavior_enabled
-                        else None
-                    )
-                    self.last_event_transition = transition.operation if transition else None
+                    self.last_event_transition = None
                     fire_smoke_transitions = (
                         self.fire_smoke_events.observe(
                             frame_num=int(frame_meta.frame_num),
@@ -1688,8 +1764,6 @@ maintain-aspect-ratio=0
                         if self.fire_smoke_enabled
                         else []
                     )
-                    if transition is not None:
-                        self._notify_transitions([transition])
                     self._notify_transitions(fire_smoke_transitions)
                 with self._analysis_lock:
                     face_tracks = list(self._face_tracks.values())
@@ -1722,6 +1796,8 @@ maintain-aspect-ratio=0
                         {
                             "kind": "smoking",
                             "track_id": detection.track_id,
+                            "episode_sequence": detection.episode_sequence,
+                            "confirmation_state": detection.confirmation_state,
                             "left": detection.person_bbox[0],
                             "top": detection.person_bbox[1],
                             "right": detection.person_bbox[2],
@@ -1734,6 +1810,8 @@ maintain-aspect-ratio=0
                     overlays.append(
                         {
                             "kind": "fire" if detection.label == "fire" else "smoke",
+                            "region_track_id": getattr(detection, "region_track_id", None),
+                            "confirmation_state": getattr(detection, "confirmation_state", None),
                             "left": detection.bbox[0],
                             "top": detection.bbox[1],
                             "right": detection.bbox[2],
@@ -1752,7 +1830,7 @@ maintain-aspect-ratio=0
                     "bbox_count": len(boxes),
                     "fire_smoke_count": len(fire_smoke_detections),
                     "event_id": self.event_store.active_event_id,
-                    "event_state": self.event_store.state.value,
+                    "event_state": self.event_store.state.value if self.event_store.state else "IDLE",
                     "fire_smoke_events": [
                         {
                             "operation": item.operation,
@@ -1771,6 +1849,8 @@ maintain-aspect-ratio=0
                             "label": "person",
                             "behavior": "smoking",
                             "track_id": detection.track_id,
+                            "episode_sequence": detection.episode_sequence,
+                            "confirmation_state": detection.confirmation_state,
                             "confidence": round(float(detection.score), 5),
                             "left": round(float(detection.person_bbox[0]), 2),
                             "top": round(float(detection.person_bbox[1]), 2),
@@ -1788,6 +1868,8 @@ maintain-aspect-ratio=0
                     "fire_smoke": [
                         {
                             "label": detection.label,
+                            "region_track_id": getattr(detection, "region_track_id", None),
+                            "confirmation_state": getattr(detection, "confirmation_state", None),
                             "confidence": round(float(detection.score), 5),
                             "left": round(float(detection.bbox[0]), 2),
                             "top": round(float(detection.bbox[1]), 2),
@@ -1796,6 +1878,8 @@ maintain-aspect-ratio=0
                         }
                         for detection in fire_smoke_detections
                     ],
+                    "fire_smoke_regions": self.fire_smoke_events.metrics(),
+                    "smoking_episodes": self.event_store.metrics(),
                 }
                 self.socket.send_json(payload, flags=zmq.NOBLOCK)
                 frame_list = frame_list.next

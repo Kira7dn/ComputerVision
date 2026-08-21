@@ -10,6 +10,11 @@ cameras:
       loop: true
     output:
       rtsp_url: rtsp://mediamtx:8554/face_bbox
+    functions:
+      trace: true
+      face_recognition: true
+      smoking_behavior: false
+      fire_smoke: false
   - id: camera_safety
     source:
       type: mock
@@ -18,6 +23,24 @@ cameras:
       loop: true
     output:
       rtsp_url: rtsp://mediamtx:8554/safety_bbox
+    functions:
+      trace: true
+      face_recognition: false
+      smoking_behavior: true
+      fire_smoke: true
+    analysis:
+      functions:
+        fire_smoke:
+          interval_ms: 300
+          thresholds: {fire: 0.30, smoke: 0.40}
+          rois:
+            fire: [0.30, 0.05, 0.70, 0.80]
+            smoke: [0.05, 0.00, 0.80, 0.95]
+        smoking:
+          interval_ms: 400
+          threshold: 0.60
+          crop: {strategy: person_padded, padding_ratio: 0.20}
+          confirmation: {hits: 2, attempts: 4, clear_hits: 4}
   - id: camera_dahua
     source:
       type: mock
@@ -26,3 +49,19 @@ cameras:
       loop: true
     output:
       rtsp_url: rtsp://mediamtx:8554/dahua_bbox
+    functions:
+      trace: true
+      face_recognition: false
+      smoking_behavior: true
+      fire_smoke: true
+    analysis:
+      functions:
+        fire_smoke:
+          interval_ms: 300
+          thresholds: {fire: 0.30, smoke: 0.40}
+          rois: {}
+        smoking:
+          interval_ms: 400
+          threshold: 0.60
+          crop: {strategy: person_padded, padding_ratio: 0.20}
+          confirmation: {hits: 2, attempts: 4, clear_hits: 4}

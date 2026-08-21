@@ -5,6 +5,58 @@ runtime:
   status_directory: /opt/camera-safety/status
   state_directory: /opt/camera-safety/state
 
+analysis:
+  result_max_age_ms: 1000
+  functions: {}
+
+smoking_behavior:
+  object_detection:
+    enabled: true
+    warmup: true
+    input_width: 640
+    input_height: 640
+    confidence: 0.35
+    nms_iou: 0.50
+    person_match_iou: 0.10
+  temporal:
+    confirmation_hits: 2
+    confirmation_window: 4
+    minimum_duration_seconds: 0.4
+    clear_negative_observations: 4
+  lifecycle:
+    candidate_timeout_seconds: 3.0
+    clearing_seconds: 3.0
+    notification_min_duration_seconds: 3.0
+    trace_interval_ms: 400
+
+fire_smoke:
+  tracking:
+    match_iou: 0.10
+    match_center_distance: 0.20
+    min_area_ratio: 0.25
+    max_area_ratio: 4.0
+    bbox_smoothing_alpha: 0.35
+    confirmation_hits: 4
+    confirmation_window: 6
+    minimum_duration_seconds: 1.5
+    notification_min_duration_seconds: 3.0
+    clear_seconds: 3.0
+  dynamics:
+    mode: advisory
+    crop_padding_ratio: 0.10
+    crop_size: 96
+    changed_pixel_delta: 15
+    changed_pixel_ratio: 0.06
+    edge_change_ratio: 0.04
+    flow_q75: 0.5
+    flow_circular_variance: 0.25
+    required_conditions: 2
+    confirmation_votes: 3
+    confirmation_window: 5
+    context_padding_ratio: 0.30
+    canny_low: 50
+    canny_high: 150
+
 evidence:
   directory: /opt/camera-safety/evidence
   prefix: snapshots-acceptance

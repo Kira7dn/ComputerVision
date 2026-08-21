@@ -125,15 +125,14 @@ def test_multi_camera_config_isolated_per_camera() -> None:
     assert face["input"]["mode"] == "rtsp"
     assert face["recognition"]["enabled"] is True
     assert face["smoking_behavior"]["enabled"] is False
-    assert face["events"]["enabled"] is False
-    assert "directory" not in face["events"]
+    assert "events" not in face
     assert "directory" not in face["snapshots"]
     assert face["metadata"]["zmq_pub_url"] == "tcp://127.0.0.1:5555"
     assert safety["input"]["mode"] == "mock"
     assert safety["recognition"]["enabled"] is False
     assert safety["smoking_behavior"]["enabled"] is True
     assert safety["recognition"]["face_runtime"]["trace_enabled"] is False
-    assert safety["events"]["trace_enabled"] is False
+    assert "events" not in safety
     assert safety["metadata"]["zmq_pub_url"] == "tcp://127.0.0.1:5556"
 
 

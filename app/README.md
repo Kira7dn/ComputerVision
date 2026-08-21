@@ -8,11 +8,14 @@ Development uses native WSL:
 ```powershell
 npm run wsl:start
 npm run wsl:status
+npm run wsl:pause
 npm run wsl:stop
 ```
 
 Native WSL development includes Vite HMR for `app/web` and backend hot reload for `app/src`,
 `app/config`, `.env.local` and the development MediaMTX configuration.
+`wsl:pause` stops only the development runtime and keeps Ubuntu running. `wsl:stop` shuts down
+all WSL distros, including Docker Desktop's WSL backend.
 
 Production uses Docker Compose on WSL2 with NVIDIA Container Toolkit:
 

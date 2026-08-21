@@ -37,7 +37,7 @@ class FireSmokeEngine:
             float(runtime.get("detection_hold_seconds", 1.0)),
         )
         self.nms_iou = float(runtime.get("nms_iou", 0.45))
-        self.max_detections_per_label = max(1, int(runtime.get("max_detections_per_label", 1)))
+        self.max_detections_per_label = max(1, int(runtime.get("max_detections_per_label", 8)))
         self.max_bbox_area_ratio = {
             str(label): min(1.0, max(0.01, float(value)))
             for label, value in (runtime.get("max_bbox_area_ratio", {}) or {}).items()
@@ -225,10 +225,7 @@ class FireSmokeEngine:
             self.last_fresh_detections = []
             return list(self._cached_detections)
         self._last_attempt = now
-        image, ratio, pad_x, pad_y = self._letterbox(frame)
-        tensor = cv2.cvtColor(image, cv2.COLOR_BGR2RGB).astype(np.float32).transpose(2, 0, 1)[None] / 255.0
-        output = self.session.run(None, {self.input_name: tensor})[0]
-        detections = self._decode(output, frame, ratio, pad_x, pad_y)
+        detections = self.infer(frame)
         self.last_inference_ran = True
         self.last_fresh_detections = list(detections)
         now = time.monotonic()
@@ -258,3 +255,12 @@ class FireSmokeEngine:
         elif now - self._last_nonempty_at > self.detection_hold_seconds:
             self._cached_detections = []
         return list(self._cached_detections)
+
+    def infer(self, frame: np.ndarray) -> list[FireSmokeDetection]:
+        """Run one fresh frame without cadence, hold, or smoothing state."""
+        if not self.enabled or self.session is None or frame.size == 0:
+            return []
+        image, ratio, pad_x, pad_y = self._letterbox(frame)
+        tensor = cv2.cvtColor(image, cv2.COLOR_BGR2RGB).astype(np.float32).transpose(2, 0, 1)[None] / 255.0
+        output = self.session.run(None, {self.input_name: tensor})[0]
+        return self._decode(output, frame, ratio, pad_x, pad_y)

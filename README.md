@@ -117,10 +117,18 @@ MediaMTX provides RTSP and WebRTC/HLS transport.
 # Start Vite HMR, backend hot reload, mock RTSP input, DeepStream inference, MediaMTX and the API
 npm run wsl:start
 
-# Check or stop the standalone runtime
+# Reattach logs, check status, pause the runtime, or shut down all WSL distros
+npm run wsl:logs
 npm run wsl:status
+npm run wsl:pause
 npm run wsl:stop
 ```
+
+`wsl:start` remains attached and streams backend, MediaMTX, hot-reload, and Vite logs. Pressing
+`Ctrl+C` detaches the log stream without stopping the runtime; use `wsl:logs` to reattach.
+`wsl:pause` gracefully stops LS-Vision, MediaMTX, mock publishers, API, and Vite while keeping
+Ubuntu running; use `wsl:start` to resume. `wsl:stop` additionally calls `wsl --shutdown`, which
+stops every WSL distro including the Docker Desktop WSL backend.
 
 Open the dashboard at:
 

@@ -12,8 +12,8 @@ from adapters.models.fire_smoke_engine import (
 )
 from adapters.models.smoking_engine import SmokingBehaviorEngine
 from adapters.persistence.evidence_repository import EvidenceStore
-from domain.events import SafetyDetection, SafetyEventStore
 from domain.fire_smoke_events import FireSmokeEventStore
+from domain.smoking_events import SmokingEpisodeStore, SmokingObservation
 
 
 def _config(root: Path) -> dict:
@@ -99,26 +99,42 @@ def test_recognition_annotation_uses_identity_not_classification() -> None:
 def test_smoking_lifecycle_uses_function_path(tmp_path: Path) -> None:
     config = _config(tmp_path)
     config["input"]["camera"] = "camera_safety"
-    config["events"] = {
+    config["smoking_behavior"] = {
         "enabled": True,
-        "camera": "camera_safety",
-        "confirm_seconds": 0.0,
-        "clear_seconds": 5.0,
-        "trace_interval_ms": 400,
+        "smoking_threshold": 0.60,
+        "temporal": {
+            "confirmation_hits": 2,
+            "confirmation_window": 4,
+            "minimum_duration_seconds": 0.0,
+            "clear_negative_observations": 4,
+        },
+        "lifecycle": {
+            "candidate_timeout_seconds": 3.0,
+            "clearing_seconds": 3.0,
+            "notification_min_duration_seconds": 30.0,
+            "trace_interval_ms": 400,
+        },
     }
     store = EvidenceStore(config, "run-002")
-    events = SafetyEventStore(config, store)
+    events = SmokingEpisodeStore(config, store)
     frame = np.full((24, 32, 3), 80, dtype=np.uint8)
-    detection = SafetyDetection(11, 0.72, (3.0, 4.0, 22.0, 23.0), (1.0, 2.0, 24.0, 24.0))
-    second_detection = SafetyDetection(12, 0.68, (5.0, 6.0, 24.0, 23.0), (3.0, 5.0, 26.0, 24.0))
+    detections = [
+        SmokingObservation(11, 0.72, (3.0, 4.0, 22.0, 23.0), (1.0, 2.0, 24.0, 24.0)),
+        SmokingObservation(12, 0.68, (5.0, 6.0, 24.0, 23.0), (3.0, 5.0, 26.0, 24.0)),
+    ]
 
-    transition = events.observe(1, 1.0, [detection, second_detection], frame)
-    assert transition is not None and transition.operation == "START"
+    assert events.observe(frame_num=1, timestamp=1.0, observations=detections,
+                          observed_track_ids={11, 12}, frame=frame) == []
+    transitions = events.observe(frame_num=2, timestamp=1.4, observations=detections,
+                                 observed_track_ids={11, 12}, frame=frame)
+    assert [transition.operation for transition in transitions] == ["START", "START"]
     event_ids = set(events.active_event_ids)
     assert len(event_ids) == 2
-    events.observe(2, 2.0, [], frame)
-    ended = events.observe(3, 8.0, [], frame)
-    assert ended is not None and ended.operation == "END"
+    assert events.observe(frame_num=3, timestamp=2.0, observations=[],
+                          observed_track_ids=set(), frame=frame) == []
+    ended = events.observe(frame_num=4, timestamp=5.1, observations=[],
+                           observed_track_ids=set(), frame=frame)
+    assert [transition.operation for transition in ended] == ["END", "END"]
     store.close()
 
     observed_bboxes: set[tuple[float, ...]] = set()
@@ -208,7 +224,16 @@ def test_evidence_keeps_only_start_peak_and_end_images(tmp_path: Path) -> None:
 def test_fire_smoke_has_independent_class_events(tmp_path: Path) -> None:
     config = _config(tmp_path)
     config["input"]["camera"] = "camera_safety"
-    config["fire_smoke"] = {"enabled": True, "confirmation_hits": 2, "confirmation_window": 4, "clear_seconds": 3}
+    config["fire_smoke"] = {
+        "enabled": True,
+        "tracking": {
+            "confirmation_hits": 2,
+            "confirmation_window": 2,
+            "minimum_duration_seconds": 1.0,
+            "clear_seconds": 3,
+        },
+        "dynamics": {"mode": "advisory"},
+    }
     store = EvidenceStore(config, "run-003")
     events = FireSmokeEventStore(config, store)
     frame = np.full((24, 32, 3), 50, dtype=np.uint8)
@@ -240,15 +265,13 @@ def test_fire_geometry_rejects_implausibly_large_bbox() -> None:
     assert engine._valid_geometry("smoke", (0.0, 0.0, 100.0, 100.0), frame)
 
 
-def test_smoking_behavior_confirms_scores_per_person_track() -> None:
+def test_smoking_behavior_returns_raw_scores_per_person_track() -> None:
     engine = SmokingBehaviorEngine(
         {
             "input": {"camera": "camera_dahua"},
             "smoking_behavior": {
                 "enabled": False,
                 "smoking_threshold": 0.60,
-                "confirmation_hits": 2,
-                "confirmation_window": 4,
             },
         }
     )
@@ -264,10 +287,10 @@ def test_smoking_behavior_confirms_scores_per_person_track() -> None:
     frame = np.full((100, 100, 3), 80, dtype=np.uint8)
     person = [(11, 20.0, 10.0, 80.0, 95.0)]
 
-    assert engine.process(frame, person, 1) == []
-    detections = engine.process(frame, person, 2)
+    first = engine.process(frame, person, 1)
+    second = engine.process(frame, person, 2)
 
-    assert len(detections) == 1
-    assert detections[0].track_id == 11
-    assert engine.last_histories[11] == [0.63, 0.67]
-    assert engine.last_confirmed_tracks == [11]
+    assert first.observations[0].track_id == 11
+    assert first.observations[0].score == 0.63
+    assert second.observations[0].score == 0.67
+    assert second.observed_track_ids == (11,)

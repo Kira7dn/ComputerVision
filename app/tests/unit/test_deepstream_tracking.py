@@ -59,15 +59,16 @@ def test_person_confirmation_rejects_invalid_window() -> None:
         PersonConfirmation(required_hits=3, window_frames=2)
 
 
-def test_person_confirmation_config_is_resolved_under_person_tracking() -> None:
+def test_person_confirmation_config_is_resolved_per_camera() -> None:
     config = resolve_camera_config(
         load_raw_config(ROOT / "app" / "config" / "dev.yaml"),
         "camera_safety",
     )
 
+    assert config["person"]["confidence"] == 0.05
     assert config["person"]["tracking"]["confirmation_hits"] == 2
     assert config["person"]["tracking"]["confirmation_window"] == 4
-    assert config["person"]["tracking"]["fire_smoke_exclusion_overlap_ratio"] == 0.25
+    assert "fire_smoke_exclusion_overlap_ratio" not in config["person"]["tracking"]
 
 
 def test_fire_smoke_overlap_uses_candidate_area() -> None:

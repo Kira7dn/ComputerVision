@@ -22,6 +22,9 @@ from urllib.parse import quote
 import httpx
 
 LOG = logging.getLogger("deepstream-safety.notifications")
+# Request URLs contain provider credentials, so the generic client request log
+# must never be emitted into the operator's live log stream.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 @dataclass(frozen=True)
@@ -243,10 +246,10 @@ class NotificationService:
             )
             self._thread.start()
         LOG.info(
-            "notifications enabled=%s telegram=%s zalo=%s public_media=%s",
+            "notifications enabled=%s telegram_enabled=%s zalo_enabled=%s public_media=%s",
             self.enabled,
-            self.providers["telegram"].configured,
-            self.providers["zalo"].configured,
+            self.providers["telegram"].enabled and self.providers["telegram"].configured,
+            self.providers["zalo"].enabled and self.providers["zalo"].configured,
             bool(self.public_base_url),
         )
 
