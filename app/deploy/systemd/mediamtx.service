@@ -1,0 +1,16 @@
+[Unit]
+Description=LeOS MediaMTX RTSP relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=letron
+Group=letron
+ExecStart=/opt/ls-vision/runtime/bin/mediamtx /opt/ls-vision/current/app/deploy/docker/mediamtx.yml
+Restart=always
+RestartSec=3
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

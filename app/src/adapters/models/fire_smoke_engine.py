@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import re
+import statistics
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,6 +14,20 @@ import cv2
 import numpy as np
 
 LOG = logging.getLogger("deepstream.fire_smoke")
+
+
+def _resolve_model_path(raw_path: str) -> Path:
+    """Allow Windows offline replay to consume the same WSL config path."""
+    path = Path(raw_path)
+    if path.is_file():
+        return path
+    match = re.match(r"^[\\/]+mnt[\\/](?P<drive>[A-Za-z])[\\/](?P<rest>.+)$", raw_path)
+    if match:
+        rest = match.group("rest").replace("/", "\\")
+        windows_path = Path(f"{match.group('drive')}:/{rest}")
+        if windows_path.is_file():
+            return windows_path
+    return path
 
 
 @dataclass(frozen=True)
@@ -60,11 +76,14 @@ class FireSmokeEngine:
         self.session = None
         self.input_name = ""
         self.active_providers: list[str] = []
+        self.model_path = str(runtime.get("onnx_path", ""))
+        self.inference_count = 0
+        self.inference_latencies_ms: list[float] = []
         self.labels = tuple(str(label) for label in runtime.get("labels", ["fire", "smoke"]))
 
         if not self.enabled:
             return
-        model_path = Path(str(runtime.get("onnx_path", "")))
+        model_path = _resolve_model_path(str(runtime.get("onnx_path", "")))
         if not model_path.is_file():
             raise FileNotFoundError(f"fire/smoke ONNX model not found: {model_path}")
         import onnxruntime as ort
@@ -262,5 +281,23 @@ class FireSmokeEngine:
             return []
         image, ratio, pad_x, pad_y = self._letterbox(frame)
         tensor = cv2.cvtColor(image, cv2.COLOR_BGR2RGB).astype(np.float32).transpose(2, 0, 1)[None] / 255.0
+        started = time.perf_counter()
         output = self.session.run(None, {self.input_name: tensor})[0]
-        return self._decode(output, frame, ratio, pad_x, pad_y)
+        detections = self._decode(output, frame, ratio, pad_x, pad_y)
+        self.inference_count += 1
+        self.inference_latencies_ms.append((time.perf_counter() - started) * 1000.0)
+        if len(self.inference_latencies_ms) > 256:
+            del self.inference_latencies_ms[:-256]
+        return detections
+
+    def runtime_metrics(self) -> dict[str, Any]:
+        values = list(self.inference_latencies_ms)
+        ordered = sorted(values)
+        p95 = ordered[min(len(ordered) - 1, int((len(ordered) - 1) * 0.95))] if ordered else None
+        return {
+            "model": self.model_path,
+            "providers": list(self.active_providers),
+            "inference_count": self.inference_count,
+            "p50_ms": statistics.median(values) if values else None,
+            "p95_ms": p95,
+        }

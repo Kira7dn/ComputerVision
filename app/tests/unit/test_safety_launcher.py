@@ -161,6 +161,19 @@ def test_config_is_valid_yaml_and_has_stable_evidence_contract() -> None:
     )
 
 
+def test_fire_smoke_canary_model_can_be_overridden_for_one_camera() -> None:
+    raw = load_raw_config(ROOT / "app" / "config" / "dev.yaml")
+    raw["cameras"][1]["analysis"]["functions"]["fire_smoke"]["onnx_path"] = (
+        "/tmp/fire-smoke-candidate.onnx"
+    )
+
+    safety = resolve_camera_config(raw, "camera_safety")
+    dahua = resolve_camera_config(raw, "camera_dahua")
+
+    assert safety["fire_smoke"]["onnx_path"] == "/tmp/fire-smoke-candidate.onnx"
+    assert dahua["fire_smoke"]["onnx_path"].endswith("fire_smoke/best.onnx")
+
+
 def test_runtime_can_disable_notifications_for_acceptance(monkeypatch) -> None:
     monkeypatch.setenv("DEEPSTREAM_NOTIFICATIONS_ENABLED", "false")
 

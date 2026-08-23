@@ -18,6 +18,12 @@ from bootstrap.config import camera_ids, load_raw_config, validate_config
 def _environment() -> dict[str, str]:
     env = os.environ.copy()
     libraries = [
+        "/opt/ls-vision/runtime/deepstream/lib",
+        "/opt/ls-vision/runtime/deepstream/lib/gst-plugins",
+        "/opt/ls-vision/runtime/triton/lib",
+        "/usr/local/cuda/lib64",
+        "/usr/lib/aarch64-linux-gnu/nvidia",
+        "/usr/lib/aarch64-linux-gnu",
         "/usr/local/lib/python3.10/dist-packages/nvidia/cudnn/lib",
         "/usr/local/lib/python3.10/dist-packages/nvidia/cublas/lib",
         "/usr/local/lib/python3.10/dist-packages/nvidia/cuda_nvrtc/lib",

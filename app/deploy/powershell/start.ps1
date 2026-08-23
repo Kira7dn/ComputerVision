@@ -3,6 +3,7 @@ param(
     [string]$Action = 'start',
     [ValidateSet('Dev', 'Production')]
     [string]$Mode = 'Production',
+    [string]$Config = 'config\dev.yaml',
     [switch]$FollowLogs
 )
 
@@ -14,6 +15,28 @@ $VitePidFile = '\\wsl.localhost\Ubuntu-22.04\opt\camera-safety-dev\status\vite.p
 $ViteStdout = '\\wsl.localhost\Ubuntu-22.04\opt\camera-safety-dev\logs\vite.stdout.log'
 $ViteStderr = '\\wsl.localhost\Ubuntu-22.04\opt\camera-safety-dev\logs\vite.stderr.log'
 $HotReloadPidPath = '/opt/camera-safety-dev/status/hot-reload.pid'
+
+function Resolve-DevConfig([string]$ConfigValue) {
+    $candidate = if ([System.IO.Path]::IsPathRooted($ConfigValue)) {
+        $ConfigValue
+    } else {
+        Join-Path $AppRoot $ConfigValue
+    }
+    if (-not (Test-Path -LiteralPath $candidate)) {
+        $candidate = Join-Path (Split-Path $AppRoot -Parent) $ConfigValue
+    }
+    if (-not (Test-Path -LiteralPath $candidate)) {
+        throw "Native WSL config does not exist: $ConfigValue"
+    }
+    (Resolve-Path -LiteralPath $candidate).Path
+}
+
+function Convert-ToWslPath([string]$WindowsPath) {
+    if ($WindowsPath -notmatch '^(?<drive>[A-Za-z]):\\(?<rest>.*)$') {
+        throw "Native WSL config must be on a local Windows drive: $WindowsPath"
+    }
+    "/mnt/$($Matches.drive.ToLowerInvariant())/$($Matches.rest.Replace('\', '/'))"
+}
 
 function Start-ViteDev {
     $existingPid = $null
@@ -72,7 +95,8 @@ if ($Mode -eq 'Production') {
 
 $distro = 'Ubuntu-22.04'
 $root = '/mnt/d/BusinessAnalyze/Camera'
-$config = "$root/app/config/dev.yaml"
+$configWindowsPath = Resolve-DevConfig $Config
+$config = Convert-ToWslPath $configWindowsPath
 $runtime = '/opt/camera-safety-dev'
 $hotReloadScript = "$root/app/deploy/dev/hot_reload.py"
 
@@ -107,7 +131,7 @@ if [ -f $root/.env.local ]; then export CAMERA_ENV_FILE=$root/.env.local; fi
 unset NVDS_ENABLE_LATENCY_MEASUREMENT NVDS_ENABLE_COMPONENT_LATENCY_MEASUREMENT
 export LD_LIBRARY_PATH=/usr/local/lib/python3.10/dist-packages/nvidia/cudnn/lib:/usr/local/lib/python3.10/dist-packages/nvidia/cublas/lib:`${LD_LIBRARY_PATH:-}
 mkdir -p $runtime/logs $runtime/status $runtime/state $runtime/evidence
-pkill -TERM -f '^python3 -m runner --config /mnt/d/BusinessAnalyze/Camera/app/config/dev.yaml$' || true
+pkill -TERM -f '^python3 -m runner --config ' || true
 pkill -TERM -f '^python3 -m interfaces.dashboard_api$' || true
 pkill -TERM -f '^/opt/camera-safety/mediamtx/mediamtx .*mediamtx.yml$' || true
 pkill -TERM -f '^python3 /mnt/d/BusinessAnalyze/Camera/app/deploy/dev/hot_reload.py ' || true
@@ -131,14 +155,14 @@ echo 'native WSL development runtime started with backend hot reload'
         Stop-WslPidFile '/opt/camera-safety-dev/status/mediamtx.pid'
         $command = @'
 set -euo pipefail
-pkill -TERM -f '^(/usr/bin/)?python3 -m runner --config /mnt/d/BusinessAnalyze/Camera/app/config/dev.yaml$' || true
+pkill -TERM -f '^(/usr/bin/)?python3 -m runner --config ' || true
 pkill -TERM -f '^(/usr/bin/)?python3 /mnt/d/BusinessAnalyze/Camera/app/deploy/dev/hot_reload.py ' || true
 pkill -TERM -f '^(/usr/bin/)?python3 -m application.camera_worker' || true
 pkill -TERM -f '^(/usr/bin/)?python3 -m interfaces.dashboard_api$' || true
 pkill -TERM -f '^/opt/camera-safety/mediamtx/mediamtx .*mediamtx.yml$' || true
 pkill -TERM -f '^ffmpeg .*rtsp://127.0.0.1:8554/(face_mock|safety_mock)$' || true
 for attempt in {1..60}; do
-    if ! pgrep -f '^(/usr/bin/)?python3 -m runner --config /mnt/d/BusinessAnalyze/Camera/app/config/dev.yaml$' >/dev/null && \
+    if ! pgrep -f '^(/usr/bin/)?python3 -m runner --config ' >/dev/null && \
        ! pgrep -f '^(/usr/bin/)?python3 /mnt/d/BusinessAnalyze/Camera/app/deploy/dev/hot_reload.py ' >/dev/null && \
        ! pgrep -f '^(/usr/bin/)?python3 -m application.camera_worker' >/dev/null && \
        ! pgrep -f '^(/usr/bin/)?python3 -m interfaces.dashboard_api$' >/dev/null && \
@@ -164,14 +188,14 @@ exit 1
         Stop-WslPidFile '/opt/camera-safety-dev/status/mediamtx.pid'
         $command = @'
 set -euo pipefail
-        pkill -TERM -f '^(/usr/bin/)?python3 -m runner --config /mnt/d/BusinessAnalyze/Camera/app/config/dev.yaml$' || true
+        pkill -TERM -f '^(/usr/bin/)?python3 -m runner --config ' || true
         pkill -TERM -f '^(/usr/bin/)?python3 /mnt/d/BusinessAnalyze/Camera/app/deploy/dev/hot_reload.py ' || true
         pkill -TERM -f '^(/usr/bin/)?python3 -m application.camera_worker' || true
         pkill -TERM -f '^(/usr/bin/)?python3 -m interfaces.dashboard_api$' || true
         pkill -TERM -f '^/opt/camera-safety/mediamtx/mediamtx .*mediamtx.yml$' || true
         pkill -TERM -f '^ffmpeg .*rtsp://127.0.0.1:8554/(face_mock|safety_mock)$' || true
         sleep 2
-        pkill -KILL -f '^(/usr/bin/)?python3 -m runner --config /mnt/d/BusinessAnalyze/Camera/app/config/dev.yaml$' || true
+        pkill -KILL -f '^(/usr/bin/)?python3 -m runner --config ' || true
         pkill -KILL -f '^(/usr/bin/)?python3 /mnt/d/BusinessAnalyze/Camera/app/deploy/dev/hot_reload.py ' || true
         pkill -KILL -f '^(/usr/bin/)?python3 -m application.camera_worker' || true
         pkill -KILL -f '^(/usr/bin/)?python3 -m interfaces.dashboard_api$' || true

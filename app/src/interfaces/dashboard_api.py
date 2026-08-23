@@ -13,7 +13,10 @@ from urllib.parse import parse_qs, quote, urlparse
 from bootstrap.config import camera_ids, load_raw_config, resolve_camera_config
 
 APP_ROOT = Path(__file__).resolve().parents[2]
-ROOT = Path(os.environ.get("CAMERA_WEB_ROOT", APP_ROOT / "web"))
+WEB_ROOT = Path(os.environ.get("CAMERA_WEB_ROOT", APP_ROOT / "web"))
+# Production deploys the Vite bundle below app/web/dist. Keep the source-root
+# fallback for native development, where Vite owns frontend serving.
+ROOT = WEB_ROOT / "dist" if (WEB_ROOT / "dist" / "dashboard.html").is_file() else WEB_ROOT
 CONFIG_PATH = Path(os.environ.get("CAMERA_CONFIG", APP_ROOT / "config" / "dev.yaml"))
 CLK_TCK = os.sysconf("SC_CLK_TCK")
 CPU_LOCK = Lock()
@@ -22,7 +25,7 @@ PREVIOUS_PROCESSES: dict[int, tuple[int, float]] = {}
 DASHBOARD_PORT = int(os.environ.get("CAMERA_DASHBOARD_PORT", "18080"))
 
 
-def _camera_definitions() -> list[dict[str, object]]:
+def _camera_definitions(stream_host: str = "localhost") -> list[dict[str, object]]:
     try:
         raw_config = load_raw_config(CONFIG_PATH)
         definitions: list[dict[str, object]] = []
@@ -35,8 +38,8 @@ def _camera_definitions() -> list[dict[str, object]]:
                     "id": camera_id,
                     "source": config["input"].get("mock_video") or config["input"].get("rtsp_url"),
                     "output": output_url,
-                    "webrtc_url": f"http://localhost:8889/{output_path}/whep",
-                    "hls_url": f"http://localhost:8888/{output_path}/index.m3u8",
+                    "webrtc_url": f"http://{stream_host}:8889/{output_path}/whep",
+                    "hls_url": f"http://{stream_host}:8888/{output_path}/index.m3u8",
                     "functions": config.get("functions", {}),
                 }
             )
@@ -402,7 +405,7 @@ def _gpu() -> dict[str, object]:
         return {"available": False, "name": "unavailable"}
 
 
-def collect_metrics() -> dict[str, object]:
+def collect_metrics(stream_host: str = "localhost") -> dict[str, object]:
     global PREVIOUS_CPU
     now = time.monotonic()
     cpu = _proc_cpu()
@@ -433,7 +436,7 @@ def collect_metrics() -> dict[str, object]:
     pipeline_rss = round(sum(float(item["rss_mb"]) for item in processes), 1) if processes else None
     pipeline_age = round(min(pipeline_age_values), 1) if pipeline_age_values else None
 
-    configured_cameras = _camera_definitions()
+    configured_cameras = _camera_definitions(stream_host)
     processes_by_camera = {str(item["camera"]): item for item in processes}
     camera_metrics: list[dict[str, object]] = []
     for camera in configured_cameras:
@@ -470,9 +473,11 @@ def collect_metrics() -> dict[str, object]:
                 "last_output_pts_ns": runtime_status.get("last_output_pts_ns"),
                 "frame_count": runtime_status.get("frame_count"),
                 "analysis_queue_depth": runtime_status.get("analysis_queue_depth"),
+                "analysis_flow": runtime_status.get("analysis_flow", {}),
                 "worker_epoch": runtime_status.get("worker_epoch"),
                 "analysis_error": runtime_status.get("analysis_error"),
                 "smoking_episodes": analysis_debug.get("smoking_episodes", {}),
+                "fire_smoke_runtime": analysis_debug.get("fire_smoke_runtime", {}),
             }
         )
 
@@ -506,6 +511,16 @@ def collect_metrics() -> dict[str, object]:
     }
 
 
+def _stream_host_from_header(host_header: str) -> str:
+    """Use the browser-facing host instead of hard-coding Jetson localhost."""
+    host = host_header.strip()
+    if not host:
+        return "localhost"
+    if host.startswith("["):
+        return host[1:].split("]", 1)[0]
+    return host.rsplit(":", 1)[0] if host.count(":") == 1 else host
+
+
 class DashboardHandler(SimpleHTTPRequestHandler):
     def __init__(self, *args: object, **kwargs: object) -> None:
         super().__init__(*args, directory=str(ROOT), **kwargs)
@@ -520,7 +535,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             self.wfile.write(b'{"status":"live"}')
             return
         if path == "/health/ready":
-            metrics = collect_metrics()
+            metrics = collect_metrics(_stream_host_from_header(self.headers.get("Host", "")))
             ready = bool((metrics.get("pipeline") or {}).get("ready"))
             payload = json.dumps({"status": "ready" if ready else "starting"}).encode("utf-8")
             self.send_response(200 if ready else 503)
@@ -535,7 +550,8 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             self.end_headers()
             return
         if path == "/api/metrics":
-            payload = json.dumps(collect_metrics()).encode("utf-8")
+            stream_host = _stream_host_from_header(self.headers.get("Host", ""))
+            payload = json.dumps(collect_metrics(stream_host)).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Cache-Control", "no-store")

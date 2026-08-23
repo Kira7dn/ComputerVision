@@ -17,7 +17,6 @@ import time
 from pathlib import Path
 from threading import Event
 
-
 IGNORED_DIRECTORIES = {
     ".git",
     ".pytest_cache",
@@ -173,9 +172,14 @@ def main() -> int:
     watched_paths = [
         root / "app" / "src",
         root / "app" / "config",
+        args.config,
         root / "app" / "deploy" / "docker" / "mediamtx.yml",
         env_file,
     ]
+    try:
+        config_relative = args.config.resolve().relative_to(root).as_posix()
+    except ValueError:
+        config_relative = ""
     previous_snapshot = file_snapshot(watched_paths, root)
     try:
         for process in processes.values():
@@ -194,6 +198,7 @@ def main() -> int:
                 source_or_config_changed = any(
                     path.startswith("app/src/")
                     or path.startswith("app/config/")
+                    or (config_relative and path == config_relative)
                     or path == ".env.local"
                     for path in changed_paths
                 )

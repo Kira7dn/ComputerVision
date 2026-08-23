@@ -69,6 +69,23 @@ model runtime bằng bind mount vào C:, D: hay /mnt/d; D: chỉ là build conte
 Production yêu cầu Docker Desktop, WSL2 integration và NVIDIA Container Toolkit/GPU support.
 Không cài dependency runtime thủ công sau khi container đã chạy.
 
+Jetson native production is a separate deployment target. The canonical source
+is still `app/`, but the deployment contract is LeOS `tbox_lab`:
+
+```powershell
+# From Camera; wrapper around the LeOS deploy contract
+npm run deploy:jetson
+
+# Equivalent command from the LeOS repository
+.\services\tbox\factory\tbox_lab.ps1 deploy-app `
+  -JetsonAlias jetson-default `
+  -CameraRoot D:\BusinessAnalyze\Camera
+```
+
+Both commands deploy `app/` to the native Jetson `ls-vision.service` and do
+not start the legacy Docker Compose runtime. Use the `docker:*` scripts for
+the WSL2/Docker target only.
+
 ## Preflight
 
 ```powershell

@@ -73,6 +73,13 @@ def validate_config(config: dict[str, Any], path: Path | None = None) -> dict[st
         (config.get("smoking_behavior", {}) or {}).get("onnx_path"),
         (config.get("fire_smoke", {}) or {}).get("onnx_path"),
     ]
+    for camera in config.get("cameras", []) or []:
+        camera_fire_smoke = (camera.get("fire_smoke", {}) or {}) if isinstance(camera, dict) else {}
+        camera_analysis = (camera.get("analysis", {}) or {}) if isinstance(camera, dict) else {}
+        camera_fire_override = (camera_analysis.get("functions", {}) or {}).get("fire_smoke", {}) or {}
+        model_paths.extend(
+            [camera_fire_smoke.get("onnx_path"), camera_fire_override.get("onnx_path"), camera_fire_override.get("model_path")]
+        )
     smoking_object = (
         (config.get("smoking_behavior", {}) or {}).get("object_detection", {}) or {}
     )
@@ -81,8 +88,16 @@ def validate_config(config: dict[str, Any], path: Path | None = None) -> dict[st
             (model or {}).get("onnx_path")
             for model in (smoking_object.get("models", {}) or {}).values()
         )
+    allow_engine_build = bool((config.get("runtime", {}) or {}).get("allow_engine_build", False))
+    engine_path = str((config.get("person", {}) or {}).get("engine_path", ""))
     if validate_models:
-        missing = [str(item) for item in model_paths if item and not Path(str(item)).is_file()]
+        missing = []
+        for item in model_paths:
+            if not item or Path(str(item)).is_file():
+                continue
+            if allow_engine_build and str(item) == engine_path:
+                continue
+            missing.append(str(item))
         if missing:
             raise ValueError(f"configured model files do not exist: {', '.join(missing)}")
     for section, key in (("smoking_behavior", "providers"), ("fire_smoke", "providers")):
@@ -211,6 +226,15 @@ def _normalize_camera_analysis(
             f"camera {camera_id} analysis.functions.fire_smoke must be a mapping"
         )
     fire_smoke = deepcopy(resolved.get("fire_smoke", {}) or {})
+    # A canary may replace the model for one camera while other workers keep
+    # the production baseline. This is configuration-only and does not alter
+    # the event/API contract.
+    camera_fire_smoke = camera.get("fire_smoke", {}) or {}
+    if isinstance(camera_fire_smoke, dict) and camera_fire_smoke.get("onnx_path"):
+        fire_smoke["onnx_path"] = str(camera_fire_smoke["onnx_path"])
+    for model_key in ("onnx_path", "model_path"):
+        if fire_override.get(model_key):
+            fire_smoke["onnx_path"] = str(fire_override[model_key])
     if "interval_ms" in fire_override:
         fire_smoke["interval_ms"] = int(fire_override["interval_ms"])
     thresholds = fire_override.get("thresholds", {}) or {}
@@ -471,6 +495,7 @@ def resolve_camera_config(config: dict[str, Any], camera_id: str | None = None) 
             "height": int(source.get("height", input_config.get("height", 1080))),
             "latency_ms": int(source.get("latency_ms", input_config.get("latency_ms", 200))),
             "codec": str(source.get("codec", input_config.get("codec", "h264"))),
+            "decoder": str(source.get("decoder", input_config.get("decoder", "hardware"))),
         }
     )
     runtime_environment = _runtime_environment()

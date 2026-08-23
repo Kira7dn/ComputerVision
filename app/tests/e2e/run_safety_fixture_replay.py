@@ -252,6 +252,11 @@ def run_replay(
     metrics = score_presence(scored_rows)
     metrics["inference_p50_seconds"] = statistics.median(latencies) if latencies else None
     metrics["inference_p95_seconds"] = _percentile(latencies, 0.95)
+    negative_hours = negative_video_seconds / 3600.0
+    metrics["false_alarms_per_hour"] = (
+        false_start_count / negative_hours if negative_hours > 0.0 else None
+    )
+    metrics["event_onset_p95_seconds"] = _percentile(confirmation_latencies, 0.95)
     verified_metrics = score_presence(verified_rows)
     case_expected_labels = {
         str(case["id"]): {

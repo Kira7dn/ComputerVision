@@ -60,7 +60,7 @@ def compare_with_baseline(
     candidate: dict[str, Any],
     baseline: dict[str, Any],
     *,
-    per_metric_tolerance: float = 0.02,
+    per_metric_tolerance: float = 0.0,
     onset_latency_tolerance_seconds: float = 0.20,
 ) -> dict[str, bool]:
     gates: dict[str, bool] = {
@@ -80,9 +80,17 @@ def compare_with_baseline(
         gates[f"{label}_precision"] = float(candidate_class["precision"]) >= (
             float(baseline_class["precision"]) - per_metric_tolerance
         )
-        gates[f"{label}_recall"] = float(candidate_class["recall"]) >= (
-            float(baseline_class["recall"]) - per_metric_tolerance
-        )
+        if label == "fire":
+            gates["fire_recall_within_5pp"] = float(candidate_class["recall"]) >= (
+                float(baseline_class["recall"]) - 0.05
+            )
+        else:
+            # Smoke is the P0 target. Equality is deliberately insufficient:
+            # a baseline smoke recall of 0.0 must be measurably improved.
+            gates["smoke_recall_improved"] = float(candidate_class["recall"]) > float(
+                baseline_class["recall"]
+            )
+            gates["smoke_recall"] = gates["smoke_recall_improved"]
     if (
         candidate.get("event_onset_p95_seconds") is not None
         and baseline.get("event_onset_p95_seconds") is not None
@@ -91,4 +99,18 @@ def compare_with_baseline(
             float(baseline["event_onset_p95_seconds"])
             + onset_latency_tolerance_seconds
         )
+    candidate_false_alarms = candidate.get("false_alarms_per_hour")
+    baseline_false_alarms = baseline.get("false_alarms_per_hour")
+    gates["false_alarms_per_hour_no_increase"] = (
+        candidate_false_alarms is not None
+        and baseline_false_alarms is not None
+        and float(candidate_false_alarms) <= float(baseline_false_alarms)
+    )
+    candidate_latency = candidate.get("inference_p95_seconds")
+    baseline_latency = baseline.get("inference_p95_seconds")
+    gates["inference_p95_within_10_percent"] = (
+        candidate_latency is not None
+        and baseline_latency is not None
+        and float(candidate_latency) <= float(baseline_latency) * 1.10
+    )
     return gates

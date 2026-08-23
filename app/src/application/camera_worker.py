@@ -384,6 +384,10 @@ class SafetyPipeline:
         model = self.config["person"]
         model_path = os.path.abspath(model["onnx_path"])
         engine_path = str(model.get("engine_path", "/opt/camera-safety/models/person-yolov9-t320.engine"))
+        if not Path(engine_path).is_file() and bool(
+            (self.config.get("runtime", {}) or {}).get("allow_engine_build", False)
+        ):
+            Path(engine_path).parent.mkdir(parents=True, exist_ok=True)
         model_source = (
             f"model-engine-file={engine_path}"
             if Path(engine_path).is_file()
@@ -435,7 +439,24 @@ maintain-aspect-ratio=0
             depay = make_element("rtph264depay", "rtp-h264-depay")
             parser = make_element("h264parse", "input-h264-parse")
         self.depay = depay
-        decoder = make_element("nvv4l2decoder", "input-decoder")
+        software_decode = str(input_cfg.get("decoder", "hardware")).lower() in {
+            "software",
+            "cpu",
+        }
+        decoder_factory = (
+            ("avdec_h265" if codec in {"h265", "hevc"} else "avdec_h264")
+            if software_decode
+            else "nvv4l2decoder"
+        )
+        decoder = make_element(decoder_factory, "input-decoder")
+        decoder_to_nvmm = None
+        decoder_nvmm_caps = None
+        if software_decode:
+            decoder_to_nvmm = make_element("nvvideoconvert", "decoder-to-nvmm")
+            decoder_nvmm_caps = make_element("capsfilter", "decoder-nvmm-caps")
+            decoder_nvmm_caps.set_property(
+                "caps", Gst.Caps.from_string("video/x-raw(memory:NVMM),format=NV12")
+            )
         mux = make_element("nvstreammux", "stream-muxer")
         mux.set_property("batch-size", 1)
         mux.set_property("width", int(input_cfg["width"]))
@@ -516,6 +537,7 @@ maintain-aspect-ratio=0
             self.depay,
             parser,
             decoder,
+            *([decoder_to_nvmm, decoder_nvmm_caps] if software_decode else []),
             mux,
             self.person_infer,
             analysis_tee,
@@ -538,11 +560,18 @@ maintain-aspect-ratio=0
             output_parser,
             sink,
         ]
-        self.pipeline.add(*elements)
+        # PyGObject exposes Gst.Bin.add() as a single-element call on the
+        # DeepStream Jetson image; add the topology one element at a time.
+        for element in elements:
+            self.pipeline.add(element)
         source.connect("pad-added", self._on_source_pad_added)
         if not self.depay.link(parser) or not parser.link(decoder):
             raise RuntimeError("Unable to link RTSP depayloader to decoder")
         decoder_src = decoder.get_static_pad("src")
+        if software_decode:
+            if not decoder.link(decoder_to_nvmm) or not decoder_to_nvmm.link(decoder_nvmm_caps):
+                raise RuntimeError("Unable to convert software decoder output to NVMM")
+            decoder_src = decoder_nvmm_caps.get_static_pad("src")
         mux_sink = mux.get_request_pad("sink_0")
         if decoder_src is None or mux_sink is None or decoder_src.link(mux_sink) != Gst.PadLinkReturn.OK:
             raise RuntimeError("Unable to link decoder to nvstreammux")
@@ -1184,6 +1213,11 @@ maintain-aspect-ratio=0
                 "smoking_episodes": self.event_store.metrics(),
                 "fire_smoke_raw_scores": getattr(self.fire_smoke_engine, "last_raw_scores", {}),
                 "fire_smoke_regions": self.fire_smoke_events.metrics(),
+                "fire_smoke_runtime": (
+                    self.fire_smoke_engine.runtime_metrics()
+                    if self.fire_smoke_engine is not None
+                    else {"model": None, "providers": [], "inference_count": 0}
+                ),
                 "person_detector_count": self.last_person_count,
                 "person_track_count": len(self._person_tracks),
                 "person_candidate_count": sum(
