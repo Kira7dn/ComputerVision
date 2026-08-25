@@ -10,74 +10,26 @@ runtime:
   analysis_result_max_age_seconds: 2.0
 
 cameras:
-  - id: camera_front
+  - id: DMS
     source:
-      type: mock
-      url: rtsp://127.0.0.1:8554/camera_front_mock
-      mock_video: /opt/ls-vision-dev/data/mock-videos/cameras/CAM_FRONT.mp4
+      type: rtsp
+      url: rtsp://192.168.1.229:554/cam/realmonitor?channel=5&subtype=0
+      username_env: CAMERA_DAHUA_USER
+      password_env: CAMERA_DAHUA_PASSWORD
+      codec: hevc
+      decoder: software
       loop: true
-      width: 1600
-      height: 900
+      width: 1920
+      height: 1080
       latency_ms: 200
     output:
-      rtsp_url: rtsp://127.0.0.1:8554/camera_front
+      rtsp_url: rtsp://127.0.0.1:8554/dahua_bbox
     functions:
       trace: false
       face_recognition: false
       smoking_behavior: false
       fire_smoke: false
-      dms: false
-  - id: camera_back
-    source:
-      type: mock
-      url: rtsp://127.0.0.1:8554/camera_back_mock
-      mock_video: /opt/ls-vision-dev/data/mock-videos/cameras/CAM_BACK.mp4
-      loop: true
-      width: 1600
-      height: 900
-      latency_ms: 200
-    output:
-      rtsp_url: rtsp://127.0.0.1:8554/camera_back
-    functions:
-      trace: false
-      face_recognition: false
-      smoking_behavior: false
-      fire_smoke: false
-      dms: false
-  - id: camera_left
-    source:
-      type: mock
-      url: rtsp://127.0.0.1:8554/camera_left_mock
-      mock_video: /opt/ls-vision-dev/data/mock-videos/cameras/CAM_FRONT_LEFT.mp4
-      loop: true
-      width: 1600
-      height: 900
-      latency_ms: 200
-    output:
-      rtsp_url: rtsp://127.0.0.1:8554/camera_left
-    functions:
-      trace: false
-      face_recognition: false
-      smoking_behavior: false
-      fire_smoke: false
-      dms: false
-  - id: camera_right
-    source:
-      type: mock
-      url: rtsp://127.0.0.1:8554/camera_right_mock
-      mock_video: /opt/ls-vision-dev/data/mock-videos/cameras/CAM_FRONT_RIGHT.mp4
-      loop: true
-      width: 1600
-      height: 900
-      latency_ms: 200
-    output:
-      rtsp_url: rtsp://127.0.0.1:8554/camera_right
-    functions:
-      trace: false
-      face_recognition: false
-      smoking_behavior: false
-      fire_smoke: false
-      dms: false
+      dms: true
 
 
 smoking_behavior:
@@ -85,11 +37,11 @@ smoking_behavior:
   object_detection:
     models:
       chaitanya:
-        onnx_path: /mnt/d/BusinessAnalyze/Camera/assets/models/smoking_behavior/tbox/chaitanya_best.onnx
+        onnx_path: /opt/ls-vision/models/smoking_behavior/tbox/chaitanya_best.onnx
         labels: [Cigarette, Drinking, Eating, Phone, Seatbelt]
         positive_labels: [Cigarette]
       soham:
-        onnx_path: /mnt/d/BusinessAnalyze/Camera/assets/models/smoking_behavior/tbox/soham_best.onnx
+        onnx_path: /opt/ls-vision/models/smoking_behavior/tbox/soham_best.onnx
         labels: [Distracted, Drinking, Drowsy, Eating, PhoneUse, SafeDriving, Seatbelt, Smoking]
         positive_labels: [Smoking]
   input_width: 224
@@ -112,11 +64,11 @@ dms:
     person_match_iou: 0.10
     models:
       chaitanya:
-        onnx_path: /mnt/d/BusinessAnalyze/Camera/assets/models/smoking_behavior/tbox/chaitanya_best.onnx
+        onnx_path: /opt/ls-vision/models/smoking_behavior/tbox/chaitanya_best.onnx
         labels: [Cigarette, Drinking, Eating, Phone, Seatbelt]
         positive_labels: [Cigarette, Drinking, Eating, Phone, Seatbelt]
       soham:
-        onnx_path: /mnt/d/BusinessAnalyze/Camera/assets/models/smoking_behavior/tbox/soham_best.onnx
+        onnx_path: /opt/ls-vision/models/smoking_behavior/tbox/soham_best.onnx
         labels: [Distracted, Drinking, Drowsy, Eating, PhoneUse, SafeDriving, Seatbelt, Smoking]
         positive_labels: [Distracted, Drinking, Drowsy, Eating, PhoneUse, SafeDriving, Seatbelt, Smoking]
   face_mesh:
@@ -152,8 +104,8 @@ fire_smoke:
   require_gpu_provider: true
 
 person:
-  onnx_path: /mnt/d/BusinessAnalyze/Camera/assets/models/yolov9-t-320.onnx
-  engine_path: /opt/camera-safety/models/person-yolov9-t320-fixed.engine
+  onnx_path: /opt/ls-vision/models/yolov9-t-320.onnx
+  engine_path: /opt/ls-vision/models/yolov9-t-320.onnx_b1_gpu0_fp16.engine
   input_width: 320
   input_height: 320
   confidence: 0.05
