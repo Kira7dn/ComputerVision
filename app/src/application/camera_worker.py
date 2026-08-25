@@ -43,6 +43,7 @@ from adapters.models.openpilot_front_engine import OpenpilotFrontEngine
 from adapters.models.smoking_engine import SmokingBehaviorEngine
 from adapters.persistence.evidence_repository import EvidenceStore
 from application.analysis_scheduler import (
+    AnalysisAdmissionGate,
     FrameResultGate,
     LatestSampleExecutor,
     as_function_result,
@@ -288,7 +289,12 @@ class SafetyPipeline:
         self._analysis_updated_at_by_function: dict[str, float] = {}
         analysis_intervals = [
             float(engine.interval_seconds)
-            for engine in (self.dms_engine, self.smoking_behavior_engine, self.fire_smoke_engine)
+            for engine in (
+                self.dms_engine,
+                self.smoking_behavior_engine,
+                self.fire_smoke_engine,
+                self.front_engine,
+            )
             if engine is not None
         ]
         if self.face_engine.enabled:
@@ -296,6 +302,9 @@ class SafetyPipeline:
                 self.face_engine.recognition_scheduler.interval_seconds
             )
         self._analysis_interval_seconds = min(analysis_intervals, default=0.5)
+        self._analysis_admission_gate = AnalysisAdmissionGate(
+            self._analysis_interval_seconds
+        )
         self._analysis_result_max_age_seconds = max(
             1.0,
             float(
@@ -324,6 +333,10 @@ class SafetyPipeline:
         self._last_behavior_person_count = 0
         self._last_person_fire_smoke_overlap_count = 0
         self._metadata_write_at = 0.0
+        self._metadata_write_interval_seconds = max(
+            0.10,
+            float(runtime.get("live_metadata_interval_ms", 250)) / 1000.0,
+        )
         self.metadata_path = self.status_dir / f"{config.get('input', {}).get('camera', 'camera')}.metadata.json"
         self.socket = zmq.Context.instance().socket(zmq.PUB)
         self.socket.bind(config["metadata"]["zmq_pub_url"])
@@ -495,7 +508,7 @@ model-color-format=0
 net-scale-factor=0.00392156862745098
 num-detected-classes=80
 infer-dims=3;{int(model['input_width'])};{int(model['input_height'])}
-interval=0
+interval={max(0, int(model.get('inference_interval', 0)))}
 gie-unique-id=2
 process-mode=1
 output-tensor-meta=1
@@ -552,6 +565,7 @@ maintain-aspect-ratio=0
             if software_decode
             else "nvv4l2decoder"
         )
+        self.input_decoder = decoder_factory
         decoder = make_element(decoder_factory, "input-decoder")
         decoder_to_nvmm = None
         decoder_nvmm_caps = None
@@ -617,6 +631,7 @@ maintain-aspect-ratio=0
                 except (TypeError, AttributeError):
                     LOG.debug("output encoder does not expose property=%s", property_name)
             output_caps = "video/x-raw(memory:NVMM),format=I420"
+            self.output_encoder = "nvv4l2h264enc"
             LOG.info("output encoder: nvv4l2h264enc")
         except RuntimeError:
             encoder = make_element("x264enc", "output-encoder")
@@ -626,6 +641,7 @@ maintain-aspect-ratio=0
             encoder.set_property("key-int-max", 15)
             encoder.set_property("bframes", 0)
             output_caps = "video/x-raw,format=I420"
+            self.output_encoder = "x264enc"
             LOG.warning("output encoder: x264enc fallback")
         output_i420_caps = make_element("capsfilter", "output-i420-caps")
         output_i420_caps.set_property(
@@ -768,6 +784,14 @@ maintain-aspect-ratio=0
         self.frame_probe_id = face_src.add_probe(
             Gst.PadProbeType.BUFFER, self._on_behavior_buffer
         )
+        if needs_cpu_frame:
+            analysis_admission_src = analysis_queue.get_static_pad("src")
+            if analysis_admission_src is None:
+                raise RuntimeError("Analysis admission queue has no src pad")
+            analysis_admission_src.add_probe(
+                Gst.PadProbeType.BUFFER,
+                self._on_analysis_admission_buffer,
+            )
 
     def _on_source_pad_added(self, source: Gst.Element, pad: Gst.Pad) -> None:
         caps = pad.get_current_caps() or pad.query_caps(None)
@@ -894,20 +918,34 @@ maintain-aspect-ratio=0
                     int((person_scores >= threshold).sum()),
                 )
                 self.person_score_logged = True
-            boxes: list[np.ndarray] = []
             scale_x = frame_width / input_width
             scale_y = frame_height / input_height
-            for row in matrix:
-                score = float(row[4])
-                if score < threshold:
-                    continue
-                center_x, center_y, width, height = [float(value) for value in row[:4]]
-                left = max(0.0, (center_x - width / 2.0) * scale_x)
-                top = max(0.0, (center_y - height / 2.0) * scale_y)
-                right = min(float(frame_width), (center_x + width / 2.0) * scale_x)
-                bottom = min(float(frame_height), (center_y + height / 2.0) * scale_y)
-                if right > left and bottom > top:
-                    boxes.append(np.array([left, top, right, bottom, score], dtype=np.float32))
+            selected = matrix[matrix[:, 4] >= threshold, :5].astype(
+                np.float32,
+                copy=False,
+            )
+            if selected.size == 0:
+                return []
+            centers = selected[:, :2]
+            sizes = selected[:, 2:4]
+            top_left = (centers - sizes / 2.0) * np.array(
+                [scale_x, scale_y],
+                dtype=np.float32,
+            )
+            bottom_right = (centers + sizes / 2.0) * np.array(
+                [scale_x, scale_y],
+                dtype=np.float32,
+            )
+            top_left = np.maximum(top_left, 0.0)
+            bottom_right = np.minimum(
+                bottom_right,
+                np.array([float(frame_width), float(frame_height)], dtype=np.float32),
+            )
+            valid = np.all(bottom_right > top_left, axis=1)
+            packed = np.column_stack(
+                (top_left[valid], bottom_right[valid], selected[valid, 4])
+            ).astype(np.float32, copy=False)
+            boxes = [row for row in packed]
             return nms(boxes, float(model["iou"]))
         return []
 
@@ -1261,8 +1299,10 @@ maintain-aspect-ratio=0
     ) -> None:
         if frame is None or not self._analysis_executors:
             return
-        frame_copy = frame.copy()
-        frame_copy.setflags(write=False)
+        # _decode_bgrx_buffer() already returns an owned copy detached from the
+        # GstBuffer. Share that immutable array with all latest-only executors
+        # instead of copying the full frame for a second time.
+        frame.setflags(write=False)
         raw_pts = int(getattr(frame_meta, "buf_pts", -1))
         buffer_pts_ns = raw_pts if 0 <= raw_pts < 2**63 - 1 else None
         ntp_timestamp = int(getattr(frame_meta, "ntp_timestamp", 0) or 0)
@@ -1276,7 +1316,7 @@ maintain-aspect-ratio=0
             ),
             source_timestamp=(ntp_timestamp / 1_000_000_000 if ntp_timestamp > 0 else time.time()),
             captured_monotonic=now,
-            frame=frame_copy,
+            frame=frame,
             persons=tuple(persons),
         )
         submitted = 0
@@ -1298,7 +1338,7 @@ maintain-aspect-ratio=0
     def _publish_live_metadata(self, payload: dict[str, Any]) -> None:
         """Publish latest overlay metadata without putting disk I/O on every frame."""
         now = time.monotonic()
-        if now - self._metadata_write_at < 0.10:
+        if now - self._metadata_write_at < self._metadata_write_interval_seconds:
             return
         self._metadata_write_at = now
         try:
@@ -1669,6 +1709,8 @@ maintain-aspect-ratio=0
             ),
             "camera_latency_samples": self.camera_latency_samples,
             "frame_count": self.frame_count,
+            "input_decoder": getattr(self, "input_decoder", "unknown"),
+            "output_encoder": getattr(self, "output_encoder", "unknown"),
             "analysis_queue_depth": sum(
                 executor.queue_depth for executor in self._analysis_executors.values()
             ),
@@ -1678,6 +1720,7 @@ maintain-aspect-ratio=0
                 "due_count": self._analysis_due_count,
                 "enqueued_count": self._analysis_enqueued_count,
                 "processed_count": self._analysis_processed_count,
+                "pre_conversion": self._analysis_admission_gate.status(),
                 "last_enqueued_frame": self._analysis_last_enqueued_frame,
                 "last_processed_frame": self._analysis_last_processed_frame,
                 "result_age_seconds": {
@@ -1823,7 +1866,12 @@ maintain-aspect-ratio=0
             LOG.warning("runtime status write failed: %s", exc)
         return True
 
-    def _person_rois(self, frame_meta: Any) -> list[tuple[int, float, float, float, float]]:
+    def _person_rois(
+        self,
+        frame_meta: Any,
+        *,
+        allow_cached: bool = False,
+    ) -> list[tuple[int, float, float, float, float]]:
         persons: list[tuple[int, float, float, float, float]] = []
         for obj_meta in self._frame_objects(frame_meta):
             if str(obj_meta.obj_label) != self.config["person"]["label"]:
@@ -1838,7 +1886,22 @@ maintain-aspect-ratio=0
             right = left + float(obj_meta.rect_params.width)
             bottom = top + float(obj_meta.rect_params.height)
             persons.append((track_id, left, top, right, bottom))
-        return persons
+        if persons or not allow_cached:
+            return persons
+        with self._analysis_lock:
+            if self._latest_person_updated_at is None:
+                return []
+            max_age = max(
+                self._analysis_interval_seconds * 4.0,
+                float(
+                    (self.config.get("person", {}) or {}).get(
+                        "roi_cache_max_age_seconds", 0.5
+                    )
+                ),
+            )
+            if time.monotonic() - self._latest_person_updated_at > max_age:
+                return []
+            return list(self._latest_person_rois)
 
     def _person_track_confirmed(self, track_id: int) -> bool:
         track = self._person_tracks.get(int(track_id))
@@ -2418,6 +2481,15 @@ maintain-aspect-ratio=0
         text_params.text_bg_clr.set(0.0, 0.0, 0.0, 0.70)
         pyds.nvds_add_display_meta_to_frame(frame_meta, display_meta)
 
+    def _on_analysis_admission_buffer(
+        self,
+        _pad: Gst.Pad,
+        _info: Gst.PadProbeInfo,
+    ) -> Gst.PadProbeReturn:
+        if self._analysis_admission_gate.accept(time.monotonic()):
+            return Gst.PadProbeReturn.OK
+        return Gst.PadProbeReturn.DROP
+
     def _on_behavior_buffer(self, pad: Gst.Pad, info: Gst.PadProbeInfo) -> Gst.PadProbeReturn:
         buffer = info.get_buffer()
         if buffer is None:
@@ -2456,7 +2528,7 @@ maintain-aspect-ratio=0
                             frame_width,
                             frame_height,
                         )
-                        persons = self._person_rois(frame_meta)
+                        persons = self._person_rois(frame_meta, allow_cached=True)
                         self._last_behavior_person_count = len(persons)
                         self._queue_analysis_sample(frame_meta, frame, persons, now)
                     (

@@ -17,9 +17,52 @@ from pathlib import Path
 from urllib.error import URLError
 from urllib.request import urlopen
 
+import yaml
+
 APP_ROOT = Path(__file__).resolve().parents[2]
 COMPOSE = APP_ROOT / "deploy" / "docker" / "compose.yaml"
 E2E_COMPOSE = APP_ROOT / "deploy" / "docker" / "compose.e2e.yaml"
+E2E_RUNTIME_CONFIG = APP_ROOT.parent / ".tmp" / "ls-vision-e2e" / "runtime-config.yaml"
+
+
+def _write_runtime_config() -> None:
+    """Generate the disposable E2E profile from the canonical dev topology."""
+    config = yaml.safe_load((APP_ROOT / "config" / "dev.yaml").read_text(encoding="utf-8"))
+    config["profile"] = "e2e"
+    config.setdefault("notifications", {})["enabled"] = False
+    fixture = "/opt/camera-safety/e2e-assets/fixtures/mock_videos/smoker/samples/part1/bucket11.mp4"
+    for camera in config.get("cameras", []):
+        camera_id = str(camera["id"])
+        output_path = "dahua_bbox" if camera_id == "DMS" else camera_id
+        camera["source"] = {
+            "type": "mock",
+            "url": f"rtsp://mediamtx:8554/{camera_id.lower()}_mock",
+            "mock_video": fixture,
+            "loop": True,
+            "width": 1280,
+            "height": 720,
+        }
+        if camera_id != "DMS":
+            camera["source"].update(
+                {
+                    "sync_group": "vehicle_surround",
+                    "sync_period_seconds": 75.56,
+                    "sync_epoch_seconds": 0.0,
+                }
+            )
+        camera["output"] = {"rtsp_url": f"rtsp://mediamtx:8554/{output_path}"}
+        camera["functions"] = {
+            "trace": False,
+            "face_recognition": False,
+            "smoking_behavior": False,
+            "fire_smoke": False,
+            "dms": False,
+            "front_assistance": False,
+        }
+    E2E_RUNTIME_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    E2E_RUNTIME_CONFIG.write_text(
+        yaml.safe_dump(config, allow_unicode=True, sort_keys=False), encoding="utf-8"
+    )
 
 
 def _run(*args: str, timeout: int = 60) -> subprocess.CompletedProcess[str]:
@@ -107,6 +150,7 @@ def main() -> int:
         args.report.write_text(json.dumps(report, indent=2), encoding="utf-8")
         return 2
 
+    _write_runtime_config()
     config = _run("config", "--quiet")
     report["gates"]["compose_config"] = config.returncode == 0
     if config.returncode:
@@ -128,7 +172,7 @@ def main() -> int:
         report["gates"]["dashboard_ready"] = bool(ready and ready.get("status") == "ready")
         metrics = _http_json("http://127.0.0.1:18080/api/metrics") or {}
         cameras = _camera_metrics(metrics)
-        expected = {"camera_face", "camera_safety", "DMS"}
+        expected = {"DMS", "camera_front", "camera_back", "camera_left", "camera_right"}
         report["gates"]["one_worker_per_camera"] = {_camera_key(item) for item in cameras} == expected
         report["gates"]["all_cameras_ready"] = bool(cameras) and all(item.get("ready") for item in cameras)
         hls_urls = [str(item["hls_url"]) for item in cameras if item.get("hls_url")]

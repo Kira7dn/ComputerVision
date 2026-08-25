@@ -193,6 +193,75 @@ def compute_face_metrics(
     }
 
 
+def select_primary_driver(
+    person_bboxes: dict[int, BBox],
+    preferred_track_id: int | None = None,
+) -> tuple[int, BBox] | None:
+    """Select one stable DMS subject without processing passenger faces."""
+    if not person_bboxes:
+        return None
+    strongest = max(
+        person_bboxes.items(),
+        key=lambda item: max(0.0, item[1][2] - item[1][0])
+        * max(0.0, item[1][3] - item[1][1]),
+    )
+    preferred = (
+        person_bboxes.get(int(preferred_track_id))
+        if preferred_track_id is not None
+        else None
+    )
+    if preferred is None:
+        return strongest
+    preferred_area = max(0.0, preferred[2] - preferred[0]) * max(
+        0.0, preferred[3] - preferred[1]
+    )
+    strongest_area = max(0.0, strongest[1][2] - strongest[1][0]) * max(
+        0.0, strongest[1][3] - strongest[1][1]
+    )
+    return (
+        (int(preferred_track_id), preferred)
+        if preferred_area >= strongest_area * 0.70
+        else strongest
+    )
+
+
+def crop_driver_face_input(
+    frame: np.ndarray,
+    bbox: BBox,
+    *,
+    upper_body_ratio: float,
+    padding_ratio: float,
+    max_side: int,
+) -> np.ndarray:
+    """Crop the upper driver ROI and bound FaceMesh input resolution."""
+    height, width = frame.shape[:2]
+    left, top, right, bottom = bbox
+    roi_width = max(1.0, right - left)
+    roi_height = max(1.0, bottom - top) * upper_body_ratio
+    pad_x = roi_width * padding_ratio
+    pad_y = roi_height * padding_ratio
+    crop_left = max(0, int(math.floor(left - pad_x)))
+    crop_top = max(0, int(math.floor(top - pad_y)))
+    crop_right = min(width, int(math.ceil(right + pad_x)))
+    crop_bottom = min(height, int(math.ceil(top + roi_height + pad_y)))
+    if crop_right <= crop_left or crop_bottom <= crop_top:
+        return np.empty((0, 0, 3), dtype=frame.dtype)
+    cropped = np.ascontiguousarray(
+        frame[crop_top:crop_bottom, crop_left:crop_right, :3]
+    )
+    longest = max(cropped.shape[:2])
+    if longest <= max_side:
+        return cropped
+    scale = max_side / float(longest)
+    resized_width = max(1, int(round(cropped.shape[1] * scale)))
+    resized_height = max(1, int(round(cropped.shape[0] * scale)))
+    return cv2.resize(
+        cropped,
+        (resized_width, resized_height),
+        interpolation=cv2.INTER_AREA,
+    )
+
+
 class DmsFaceAnalyzer:
     """Optional MediaPipe FaceMesh adapter with DMS reference thresholds."""
 
@@ -204,6 +273,16 @@ class DmsFaceAnalyzer:
         self.mar_threshold = float(face.get("mar_threshold", 0.65))
         self.yaw_threshold = float(face.get("yaw_threshold_deg", 16.0))
         self.pitch_threshold = float(face.get("pitch_threshold_deg", 14.0))
+        roi = face.get("driver_roi", {}) or {}
+        self.driver_roi_enabled = bool(roi.get("enabled", False))
+        self.driver_roi_required = bool(roi.get("require_person", True))
+        self.driver_roi_upper_body_ratio = min(
+            1.0, max(0.2, float(roi.get("upper_body_ratio", 0.55)))
+        )
+        self.driver_roi_padding_ratio = min(
+            0.5, max(0.0, float(roi.get("padding_ratio", 0.10)))
+        )
+        self.driver_roi_max_side = max(256, int(roi.get("max_side", 640)))
         self.pose_calibrator = NeutralPoseCalibrator(
             face.get("neutral_calibration", {}) or {}
         )
@@ -243,7 +322,11 @@ class DmsFaceAnalyzer:
         return self._mesh is not None
 
     def process(
-        self, frame: np.ndarray, *, timestamp: float | None = None
+        self,
+        frame: np.ndarray,
+        *,
+        timestamp: float | None = None,
+        driver_bbox: BBox | None = None,
     ) -> tuple[dict[str, Any], set[str], float]:
         started = time.perf_counter()
         metrics: dict[str, Any] = {
@@ -259,20 +342,44 @@ class DmsFaceAnalyzer:
             "neutral_pitch_deg": self.pose_calibrator.neutral_pitch,
             "yaw_deg": None,
             "pitch_deg": None,
+            "face_input_width": None,
+            "face_input_height": None,
+            "face_driver_roi": False,
         }
         if self._mesh is None or frame.size == 0:
             return metrics, set(), (time.perf_counter() - started) * 1000.0
-        result = self._mesh.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        face_input = frame
+        if self.driver_roi_enabled:
+            if driver_bbox is None:
+                if self.driver_roi_required:
+                    return metrics, set(), (time.perf_counter() - started) * 1000.0
+            else:
+                face_input = crop_driver_face_input(
+                    frame,
+                    driver_bbox,
+                    upper_body_ratio=self.driver_roi_upper_body_ratio,
+                    padding_ratio=self.driver_roi_padding_ratio,
+                    max_side=self.driver_roi_max_side,
+                )
+                if face_input.size == 0:
+                    return metrics, set(), (time.perf_counter() - started) * 1000.0
+                metrics["face_driver_roi"] = True
+        metrics["face_input_width"] = int(face_input.shape[1])
+        metrics["face_input_height"] = int(face_input.shape[0])
+        result = self._mesh.process(cv2.cvtColor(face_input, cv2.COLOR_BGR2RGB))
         faces = getattr(result, "multi_face_landmarks", None) or []
         if not faces:
             return metrics, set(), (time.perf_counter() - started) * 1000.0
-        metrics = compute_face_metrics(
-            faces[0].landmark,
-            ear_threshold=self.ear_threshold,
-            mar_threshold=self.mar_threshold,
-            yaw_threshold_deg=self.yaw_threshold,
-            pitch_threshold_deg=self.pitch_threshold,
-        )
+        metrics = {
+            **metrics,
+            **compute_face_metrics(
+                faces[0].landmark,
+                ear_threshold=self.ear_threshold,
+                mar_threshold=self.mar_threshold,
+                yaw_threshold_deg=self.yaw_threshold,
+                pitch_threshold_deg=self.pitch_threshold,
+            ),
+        }
         raw_yaw = float(metrics["yaw_deg"])
         raw_pitch = float(metrics["pitch_deg"])
         raw_alerts = set(metrics.get("raw_alerts", ()))
@@ -316,6 +423,7 @@ class DmsBehaviorEngine:
         self.face = DmsFaceAnalyzer(config)
         self.attention_policy = DriverAttentionPolicy(attention)
         self._last_behavior_at: float | None = None
+        self._primary_driver_track_id: int | None = None
         self._cached_raw_objects: list[SmokingObjectDetection] = []
         self.smoother = AlertSmoother(
             int((runtime.get("alerts", {}) or {}).get("on_frames", 3)),
@@ -399,8 +507,16 @@ class DmsBehaviorEngine:
             )
         ):
             raw_alerts.add("No Seatbelt")
+        primary_driver = select_primary_driver(
+            person_bboxes,
+            preferred_track_id=self._primary_driver_track_id,
+        )
+        if primary_driver is not None:
+            self._primary_driver_track_id = int(primary_driver[0])
         face_metrics, face_alerts, face_latency_ms = self.face.process(
-            frame, timestamp=timestamp
+            frame,
+            timestamp=timestamp,
+            driver_bbox=primary_driver[1] if primary_driver is not None else None,
         )
         raw_alerts.update(face_alerts)
         smoothed_alerts = set(self.smoother.update(raw_alerts))
@@ -502,6 +618,9 @@ class DmsBehaviorEngine:
             "object_providers": self.object_detector.active_providers,
             "driver_person_count": len(person_bboxes),
             "driver_person_track_ids": sorted(person_bboxes),
+            "face_driver_track_id": (
+                int(primary_driver[0]) if primary_driver is not None else None
+            ),
             "driver_person_bboxes": [
                 [round(float(value), 2) for value in person_bboxes[track_id]]
                 for track_id in sorted(person_bboxes)

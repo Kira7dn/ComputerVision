@@ -48,8 +48,11 @@ Import/entrypoint chuẩn là runner, container, application.camera_worker, inte
 domain.*, adapters.*, và bootstrap.*. Không tạo lại import camera_safety.*. Chuỗi camera_safety
 vẫn hợp lệ khi là camera ID trong config, metrics hoặc evidence path.
 
-app/config/dev.yaml, production.yaml, e2e.yaml và config/cameras/ là source of truth cho camera ID,
-input/output URL và function. runner.py tạo một run ID và một worker cho mỗi camera.
+`app/config/dev.yaml` và `app/config/production.yaml` là hai config source of truth duy nhất. Cả hai
+phải giữ cùng topology theo đúng thứ tự: `DMS`, `camera_front`, `camera_back`, `camera_left`,
+`camera_right`. DMS dùng RTSP channel 5; bốn camera 360 dùng bộ mock video đồng bộ. E2E tạo config
+dùng một lần dưới `.tmp`, không thêm config source thứ ba.
+runner.py tạo một run ID và một worker cho mỗi camera.
 application.camera_worker sở hữu pipeline DeepStream, tracking/annotation, function dispatch và
 RTSP output của một camera.
 
@@ -82,22 +85,17 @@ model runtime bằng bind mount vào C:, D: hay /mnt/d; D: chỉ là build conte
 Production yêu cầu Docker Desktop, WSL2 integration và NVIDIA Container Toolkit/GPU support.
 Không cài dependency runtime thủ công sau khi container đã chạy.
 
-Jetson native production is a separate deployment target. The canonical source
-is still `app/`, but the deployment contract is LeOS `tbox_lab`:
+Jetson native production is a separate deployment target. `D:\BusinessAnalyze\Camera` là workspace
+duy nhất được phép deploy, stop/start/restart hoặc thay đổi `ls-vision*` và `mediamtx.service`:
 
 ```powershell
-# From Camera; wrapper around the LeOS deploy contract
 npm run deploy
-
-# Equivalent command from the LeOS repository
-.\services\tbox\factory\tbox_lab.ps1 deploy-app `
-  -JetsonAlias jetson-nano `
-  -CameraRoot D:\BusinessAnalyze\Camera
 ```
 
-Both commands deploy `app/` to the native Jetson `ls-vision.service` and do
-not start Docker. For Nano or development deployment, pass arguments through
-the single deploy script:
+Lệnh này deploy `app/` vào native Jetson `ls-vision.service` và không deploy/restart T-Box. LeOS
+`tbox_lab deploy-app` chỉ sở hữu `tbox.service`/`tbox-gpio.service`; không được tham chiếu hoặc điều
+khiển LS-Vision/MediaMTX. For Nano or development deployment, pass arguments through the single
+Camera deploy script:
 
 ```powershell
 npm run deploy -- -JetsonAlias jetson-nano
@@ -123,9 +121,13 @@ stop runtime.
 
 ## Configuration và secrets
 
-- Development dùng app/config/dev.yaml; production dùng app/config/production.yaml; E2E dùng
-  app/config/e2e.yaml qua compose.e2e.yaml.
-- Production không bật mock input. Mock video chỉ dùng dev/E2E.
+- Development dùng `app/config/dev.yaml`; production dùng `app/config/production.yaml`. E2E sinh
+  `.tmp/ls-vision-e2e/runtime-config.yaml` từ topology dev rồi mount qua `compose.e2e.yaml`.
+- Dev và production đều giữ `1 DMS + 4 camera 360`: DMS dùng channel 5, còn bốn fixture 360 phải
+  giữ cùng `sync_group`, period và epoch. Không tự đổi source của bất kỳ endpoint nào.
+- Dev và production là hai endpoint độc lập: dev ở `http://127.0.0.1:5173`, production ở
+  `http://vision.local`. Khác biệt nằm ở lifecycle/deployment/runtime state, không nằm ở camera
+  topology, function ownership hoặc loại input.
 - Validate camera ID không trùng, URL hợp lệ, model/provider phù hợp và path runtime writable trước startup.
 - Notification secrets chỉ lấy từ environment/secret file; không commit, log hoặc ghi vào event,
   manifest, status và evidence.
@@ -240,14 +242,14 @@ Acceptance chỉ hợp lệ khi report có accepted=true và toàn bộ gate sau
 
 - Compose config/startup;
 - dashboard live/ready;
-- đúng một worker cho camera_face, camera_safety, DMS;
-- cả ba camera ready và frame input/output fresh;
+- đúng một worker cho DMS, camera_front, camera_back, camera_left, camera_right;
+- cả năm camera ready và frame input/output fresh;
 - MediaMTX HLS output;
 - event feed chỉ có record START;
 - container restart;
 - state/evidence API còn hoạt động sau restart.
 
-E2E mock không thay thế production acceptance với camera thật, model thật và GPU provider thật.
+E2E không thay thế acceptance của endpoint production với model thật và GPU provider thật.
 Giữ report/log/evidence của lần fail để điều tra; không overwrite hoặc xóa trước khi ghi nhận nguyên nhân.
 
 ## Live runtime và evidence

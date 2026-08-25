@@ -1,18 +1,15 @@
+import { subscribeLiveMetadata, type LiveMetadataSnapshot } from '@/lib/live-metadata'
+
 interface SynchronizedVideo {
   video: HTMLVideoElement
   periodSeconds: number
   epochSeconds: number
 }
 
-interface LiveMetadataClock {
-  timestamp?: number
-}
-
 const groups = new Map<string, Map<string, SynchronizedVideo>>()
 let synchronizationTimer: number | null = null
-let clockTimer: number | null = null
+let clockCleanup: (() => void) | null = null
 let serverClockOffsetSeconds: number | null = null
-let clockRequestInFlight = false
 
 function browserEpochSeconds() {
   return (performance.timeOrigin + performance.now()) / 1000
@@ -23,26 +20,14 @@ function circularDrift(current: number, target: number, duration: number) {
   return ((raw + duration / 2) % duration + duration) % duration - duration / 2
 }
 
-async function refreshServerClock() {
-  if (clockRequestInFlight) return
-  clockRequestInFlight = true
-  const requestStart = browserEpochSeconds()
-  try {
-    const response = await fetch('/api/live-metadata', { cache: 'no-store' })
-    if (!response.ok) return
-    const payload = await response.json() as LiveMetadataClock
-    const serverTimestamp = Number(payload.timestamp)
-    const requestEnd = browserEpochSeconds()
-    if (!Number.isFinite(serverTimestamp)) return
-    const offset = serverTimestamp - (requestStart + requestEnd) / 2
-    serverClockOffsetSeconds = serverClockOffsetSeconds == null
-      ? offset
-      : serverClockOffsetSeconds * 0.8 + offset * 0.2
-  } catch {
-    // Keep the most recent clock mapping through transient API failures.
-  } finally {
-    clockRequestInFlight = false
-  }
+function refreshServerClock(snapshot: LiveMetadataSnapshot) {
+  const serverTimestamp = Number(snapshot.payload.timestamp)
+  if (!Number.isFinite(serverTimestamp)) return
+  const browserMidpointSeconds = snapshot.browserMidpointEpochMs / 1000
+  const offset = serverTimestamp - browserMidpointSeconds
+  serverClockOffsetSeconds = serverClockOffsetSeconds == null
+    ? offset
+    : serverClockOffsetSeconds * 0.8 + offset * 0.2
 }
 
 function synchronize() {
@@ -95,18 +80,17 @@ function ensureTimers() {
   if (synchronizationTimer === null) {
     synchronizationTimer = window.setInterval(synchronize, 250)
   }
-  if (clockTimer === null) {
-    void refreshServerClock()
-    clockTimer = window.setInterval(() => void refreshServerClock(), 2_000)
+  if (clockCleanup === null) {
+    clockCleanup = subscribeLiveMetadata(refreshServerClock, 2_000)
   }
 }
 
 function stopTimersWhenIdle() {
   if ([...groups.values()].some((streams) => streams.size > 0)) return
   if (synchronizationTimer !== null) window.clearInterval(synchronizationTimer)
-  if (clockTimer !== null) window.clearInterval(clockTimer)
+  clockCleanup?.()
   synchronizationTimer = null
-  clockTimer = null
+  clockCleanup = null
   serverClockOffsetSeconds = null
 }
 

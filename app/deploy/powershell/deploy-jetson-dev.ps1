@@ -1,10 +1,10 @@
-<##
+<#
 .SYNOPSIS
     Publish the isolated Jetson development runtime.
 
 .DESCRIPTION
-    Internal adapter required by LeOS tbox_lab. package.json exposes only
-    dev, check and deploy; this file is not a user-facing script.
+    Camera-owned development deploy implementation. package.json exposes the
+    stable deploy entrypoint; this file is not a user-facing script.
 #>
 
 [CmdletBinding()]
@@ -14,7 +14,8 @@ param(
     [string]$RemoteHost = 'jetson-nano',
     [Parameter(Mandatory = $true)]
     [string]$SudoPassword,
-    [string]$RemoteRoot = '/opt/ls-vision-dev'
+    [string]$RemoteRoot = '/opt/ls-vision-dev',
+    [string]$Mock360Directory = 'E:\v1.0-mini\sweeps\videos\sync-lite'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -28,7 +29,7 @@ $modelsPath = Join-Path $cameraPath 'assets\models'
 $frontModelPath = Join-Path $modelsPath 'openpilot\driving_supercombo.onnx'
 $frontModelSha256 = '659727c4d4839adc4992a254409a54259a8756a743f2d567bf5fdc6579f8009b'
 $servicePath = Join-Path $appPath 'deploy\systemd\ls-vision-dev.service'
-foreach ($required in @($appPath, $servicePath, $frontModelPath)) {
+foreach ($required in @($appPath, $servicePath, $frontModelPath, $Mock360Directory)) {
     if (-not (Test-Path -LiteralPath $required)) {
         throw "Jetson development deployment input is missing: $required"
     }
@@ -38,8 +39,10 @@ $releaseName = "release-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
 $releaseRoot = "$RemoteRoot/releases/$releaseName"
 $tempArchive = Join-Path ([System.IO.Path]::GetTempPath()) "ls-vision-dev-$([guid]::NewGuid().ToString('N')).tar.gz"
 $tempModelArchive = Join-Path ([System.IO.Path]::GetTempPath()) "ls-vision-dev-models-$([guid]::NewGuid().ToString('N')).tar.gz"
+$tempMock360Archive = Join-Path ([System.IO.Path]::GetTempPath()) "ls-vision-dev-mock-360-$([guid]::NewGuid().ToString('N')).tar.gz"
 $remoteArchive = "/tmp/$(Split-Path -Leaf $tempArchive)"
 $remoteModelArchive = "/tmp/$(Split-Path -Leaf $tempModelArchive)"
+$remoteMock360Archive = "/tmp/$(Split-Path -Leaf $tempMock360Archive)"
 
 try {
     Write-Step "Checking Jetson $RemoteHost"
@@ -57,12 +60,16 @@ try {
     }
     tar -czf $tempModelArchive -C $modelsPath openpilot/driving_supercombo.onnx
     if ($LASTEXITCODE -ne 0) { throw 'Unable to package the front-assistance model' }
+    tar -czf $tempMock360Archive -C $Mock360Directory CAM_FRONT.mp4 CAM_BACK.mp4 CAM_FRONT_LEFT.mp4 CAM_FRONT_RIGHT.mp4
+    if ($LASTEXITCODE -ne 0) { throw 'Unable to package synchronized 360 mock videos' }
 
     Write-Step "Copying Jetson development release $releaseName"
     scp -q $tempArchive "${RemoteHost}:$remoteArchive"
     if ($LASTEXITCODE -ne 0) { throw 'Unable to copy Camera/app development archive' }
     scp -q $tempModelArchive "${RemoteHost}:$remoteModelArchive"
     if ($LASTEXITCODE -ne 0) { throw 'Unable to copy front-assistance model archive' }
+    scp -q $tempMock360Archive "${RemoteHost}:$remoteMock360Archive"
+    if ($LASTEXITCODE -ne 0) { throw 'Unable to copy synchronized 360 mock videos' }
     scp -q $servicePath "${RemoteHost}:/tmp/ls-vision-dev.service"
     if ($LASTEXITCODE -ne 0) { throw 'Unable to copy Jetson development systemd unit' }
 
@@ -79,15 +86,16 @@ sudo_cmd() { printf '%s\n' "$SUDO_PASSWORD" | sudo -S -p '' "$@"; }
 
 sudo_cmd systemctl stop ls-vision.service >/dev/null 2>&1 || true
 sudo_cmd systemctl stop ls-vision-dev.service >/dev/null 2>&1 || true
-sudo_cmd mkdir -p "$RELEASE_ROOT" "$REMOTE_ROOT/releases" "$REMOTE_ROOT/data/status" "$REMOTE_ROOT/data/state" "$REMOTE_ROOT/data/evidence" "$REMOTE_ROOT/data/queue" "$REMOTE_ROOT/data/logs" /opt/ls-vision/models/openpilot
+sudo_cmd mkdir -p "$RELEASE_ROOT" "$REMOTE_ROOT/releases" "$REMOTE_ROOT/data/status" "$REMOTE_ROOT/data/state" "$REMOTE_ROOT/data/evidence" "$REMOTE_ROOT/data/queue" "$REMOTE_ROOT/data/logs" "$REMOTE_ROOT/data/mock-videos/cameras/sync-lite" /opt/ls-vision/models/openpilot
 sudo_cmd tar -xzf "$REMOTE_ARCHIVE" -C "$RELEASE_ROOT"
 sudo_cmd tar -xzf "$REMOTE_MODEL_ARCHIVE" -C /opt/ls-vision/models
+sudo_cmd tar -xzf "$REMOTE_MOCK_360_ARCHIVE" -C "$REMOTE_ROOT/data/mock-videos/cameras/sync-lite"
 sudo_cmd rm -f -- /opt/ls-vision/models/openpilot/dmonitoring_model.onnx
 printf '%s  %s\n' "$FRONT_MODEL_SHA256" /opt/ls-vision/models/openpilot/driving_supercombo.onnx | sha256sum -c -
 sudo_cmd chown -R letron:letron "$RELEASE_ROOT"
 sudo_cmd ln -sfn "$RELEASE_ROOT" "$REMOTE_ROOT/current"
 sudo_cmd install -m 644 /tmp/ls-vision-dev.service /etc/systemd/system/ls-vision-dev.service
-rm -f "$REMOTE_ARCHIVE" "$REMOTE_MODEL_ARCHIVE" /tmp/ls-vision-dev.service
+rm -f "$REMOTE_ARCHIVE" "$REMOTE_MODEL_ARCHIVE" "$REMOTE_MOCK_360_ARCHIVE" /tmp/ls-vision-dev.service
 sudo_cmd systemctl daemon-reload
 sudo_cmd systemctl enable --now ls-vision-dev.service
 
@@ -113,6 +121,7 @@ exit 1
     $remoteScript = $remoteScript.Replace(([char]36 + 'releaseRoot'), $releaseRoot)
     $remoteScript = $remoteScript.Replace(([char]36 + 'remoteArchive'), $remoteArchive)
     $remoteScript = $remoteScript.Replace(([char]36 + 'remoteModelArchive'), $remoteModelArchive)
+    $remoteScript = $remoteScript.Replace(([char]36 + 'REMOTE_MOCK_360_ARCHIVE'), $remoteMock360Archive)
     $remoteScript = $remoteScript.Replace(([char]36 + 'frontModelSha256'), $frontModelSha256)
     $remoteScript = $remoteScript.Replace(([char]36 + 'SudoPassword'), $SudoPassword)
     $remoteScript = $remoteScript -replace "`r`n", "`n"
@@ -122,5 +131,5 @@ exit 1
     Write-OK 'Jetson development runtime deployed and healthy'
 }
 finally {
-    Remove-Item -LiteralPath $tempArchive, $tempModelArchive -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $tempArchive, $tempModelArchive, $tempMock360Archive -Force -ErrorAction SilentlyContinue
 }

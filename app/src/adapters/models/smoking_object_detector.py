@@ -161,25 +161,57 @@ class SmokingObjectDetector:
 
         frame_height, frame_width = frame.shape[:2]
         candidates: list[tuple[list[float], float, str]] = []
-        for row in predictions:
-            scores = row[4:]
-            class_index = int(np.argmax(scores))
-            if class_index >= len(model.labels):
+        class_scores = predictions[:, 4:]
+        class_indices = np.argmax(class_scores, axis=1)
+        best_scores = class_scores[np.arange(len(predictions)), class_indices]
+        for class_index in np.unique(class_indices):
+            if int(class_index) >= len(model.labels):
                 continue
-            label = model.labels[class_index]
-            score = float(scores[class_index])
+            label = model.labels[int(class_index)]
+            score = float(best_scores[class_indices == class_index].max())
             self.last_raw_scores[f"{model.source}:{label}"] = max(
                 self.last_raw_scores.get(f"{model.source}:{label}", 0.0), score
             )
-            if label not in model.positive_labels or score < self.confidence:
-                continue
-            center_x, center_y, box_width, box_height = [float(value) for value in row[:4]]
-            left = max(0.0, (center_x - box_width / 2.0 - pad_x) / ratio)
-            top = max(0.0, (center_y - box_height / 2.0 - pad_y) / ratio)
-            right = min(float(frame_width), (center_x + box_width / 2.0 - pad_x) / ratio)
-            bottom = min(float(frame_height), (center_y + box_height / 2.0 - pad_y) / ratio)
-            if right > left and bottom > top:
-                candidates.append(([left, top, right - left, bottom - top], score, label))
+
+        positive_class_mask = np.asarray(
+            [label in model.positive_labels for label in model.labels],
+            dtype=bool,
+        )
+        keep = positive_class_mask[class_indices] & (best_scores >= self.confidence)
+        if np.any(keep):
+            selected_rows = predictions[keep, :4].astype(np.float32, copy=False)
+            selected_scores = best_scores[keep]
+            selected_classes = class_indices[keep]
+            centers = selected_rows[:, :2]
+            sizes = selected_rows[:, 2:4]
+            top_left = (centers - sizes / 2.0 - np.array([pad_x, pad_y])) / ratio
+            bottom_right = (centers + sizes / 2.0 - np.array([pad_x, pad_y])) / ratio
+            top_left = np.maximum(top_left, 0.0)
+            bottom_right = np.minimum(
+                bottom_right,
+                np.array([float(frame_width), float(frame_height)]),
+            )
+            valid = np.all(bottom_right > top_left, axis=1)
+            for left_top, right_bottom, score, class_index in zip(
+                top_left[valid],
+                bottom_right[valid],
+                selected_scores[valid],
+                selected_classes[valid],
+                strict=True,
+            ):
+                label = model.labels[int(class_index)]
+                candidates.append(
+                    (
+                        [
+                            float(left_top[0]),
+                            float(left_top[1]),
+                            float(right_bottom[0] - left_top[0]),
+                            float(right_bottom[1] - left_top[1]),
+                        ],
+                        float(score),
+                        label,
+                    )
+                )
 
         detections: list[SmokingObjectDetection] = []
         for label in sorted(model.positive_labels):

@@ -69,18 +69,26 @@ def _frames_to_tensor(y: np.ndarray, u: np.ndarray, v: np.ndarray) -> np.ndarray
     ).reshape(6, MODEL_HEIGHT // 2, MODEL_WIDTH // 2)
 
 
-def prepare_model_frame(
-    frame: np.ndarray,
+def warp_transforms(
     calibration: FrontCalibration,
     *,
     big: bool,
-) -> np.ndarray:
-    if frame.ndim != 3 or frame.shape[2] < 3:
-        raise ValueError("front model frame must be HxWx3 BGR")
-    if frame.shape[1] != calibration.source_width or frame.shape[0] != calibration.source_height:
-        raise ValueError("front frame resolution does not match calibration")
-    y, u, v = _bgr_to_i420_planes(np.ascontiguousarray(frame[:, :, :3]))
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build full-resolution and chroma transforms once per calibration."""
     matrix = warp_matrix(calibration, big=big)
+    uv_scale = np.array(
+        [[0.5, 0.0, 0.0], [0.0, 0.5, 0.0], [0.0, 0.0, 1.0]],
+        dtype=np.float32,
+    )
+    return matrix, uv_scale @ matrix @ np.linalg.inv(uv_scale)
+
+
+def _warp_model_planes(
+    planes: tuple[np.ndarray, np.ndarray, np.ndarray],
+    transforms: tuple[np.ndarray, np.ndarray],
+) -> np.ndarray:
+    y, u, v = planes
+    matrix, uv_matrix = transforms
     y_warped = cv2.warpPerspective(
         y,
         matrix,
@@ -88,8 +96,6 @@ def prepare_model_frame(
         flags=cv2.INTER_NEAREST | cv2.WARP_INVERSE_MAP,
         borderMode=cv2.BORDER_CONSTANT,
     )
-    uv_scale = np.array([[0.5, 0.0, 0.0], [0.0, 0.5, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32)
-    uv_matrix = uv_scale @ matrix @ np.linalg.inv(uv_scale)
     u_warped = cv2.warpPerspective(
         u,
         uv_matrix,
@@ -104,4 +110,39 @@ def prepare_model_frame(
         flags=cv2.INTER_NEAREST | cv2.WARP_INVERSE_MAP,
         borderMode=cv2.BORDER_CONSTANT,
     )
-    return _frames_to_tensor(y_warped, u_warped, v_warped).astype(np.uint8, copy=False)
+    return _frames_to_tensor(y_warped, u_warped, v_warped).astype(
+        np.uint8,
+        copy=False,
+    )
+
+
+def prepare_model_frames(
+    frame: np.ndarray,
+    calibration: FrontCalibration,
+    *,
+    narrow_transforms: tuple[np.ndarray, np.ndarray] | None = None,
+    wide_transforms: tuple[np.ndarray, np.ndarray] | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Prepare narrow and wide tensors with one full-frame color conversion."""
+    if frame.ndim != 3 or frame.shape[2] < 3:
+        raise ValueError("front model frame must be HxWx3 BGR")
+    if frame.shape[1] != calibration.source_width or frame.shape[0] != calibration.source_height:
+        raise ValueError("front frame resolution does not match calibration")
+    planes = _bgr_to_i420_planes(np.ascontiguousarray(frame[:, :, :3]))
+    narrow = narrow_transforms or warp_transforms(calibration, big=False)
+    wide = wide_transforms or warp_transforms(calibration, big=True)
+    return _warp_model_planes(planes, narrow), _warp_model_planes(planes, wide)
+
+
+def prepare_model_frame(
+    frame: np.ndarray,
+    calibration: FrontCalibration,
+    *,
+    big: bool,
+) -> np.ndarray:
+    if frame.ndim != 3 or frame.shape[2] < 3:
+        raise ValueError("front model frame must be HxWx3 BGR")
+    if frame.shape[1] != calibration.source_width or frame.shape[0] != calibration.source_height:
+        raise ValueError("front frame resolution does not match calibration")
+    planes = _bgr_to_i420_planes(np.ascontiguousarray(frame[:, :, :3]))
+    return _warp_model_planes(planes, warp_transforms(calibration, big=big))

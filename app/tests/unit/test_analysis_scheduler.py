@@ -5,7 +5,11 @@ import time
 
 import numpy as np
 
-from application.analysis_scheduler import FrameResultGate, LatestSampleExecutor
+from application.analysis_scheduler import (
+    AnalysisAdmissionGate,
+    FrameResultGate,
+    LatestSampleExecutor,
+)
 from domain.contracts import AnalysisSample, FrameKey
 
 
@@ -39,6 +43,30 @@ def test_result_gate_rejects_stale_duplicate_and_regressive_results() -> None:
     assert duplicate.reason == "out_of_order"
     assert regressive.reason == "out_of_order"
     assert stale.reason == "stale"
+
+
+def test_result_gate_uses_frame_order_when_decoder_pts_regresses() -> None:
+    now = time.monotonic()
+    gate = FrameResultGate(max_age_seconds=1.0)
+    first = _sample(10, captured=now)
+    second = _sample(11, captured=now)
+    object.__setattr__(second.key, "buffer_pts_ns", first.key.buffer_pts_ns - 1)
+
+    assert gate.evaluate("dms", first, now + 0.1).accepted
+    assert gate.evaluate("dms", second, now + 0.2).accepted
+
+
+def test_analysis_admission_gate_limits_cpu_conversion_cadence() -> None:
+    gate = AnalysisAdmissionGate(0.1)
+
+    assert gate.accept(1.0)
+    assert not gate.accept(1.05)
+    assert gate.accept(1.1)
+    assert gate.status() == {
+        "interval_seconds": 0.1,
+        "accepted": 2,
+        "dropped": 1,
+    }
 
 
 def test_latest_executor_drops_intermediate_sample_without_growing_queue() -> None:

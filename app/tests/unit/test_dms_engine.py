@@ -10,7 +10,9 @@ from adapters.models.dms_engine import (
     DmsDetection,
     NeutralPoseCalibrator,
     compute_face_metrics,
+    crop_driver_face_input,
     select_dms_overlay_detections,
+    select_primary_driver,
 )
 from adapters.persistence.evidence_repository import EvidenceStore
 from domain.dms_events import DmsAlertEventStore
@@ -193,6 +195,28 @@ def test_dms_face_metrics_use_reference_thresholds() -> None:
     assert metrics["ear"] == pytest.approx(0.667, abs=0.02)
     assert metrics["mar"] == pytest.approx(0.767, abs=0.02)
     assert metrics["raw_alerts"] == ["Yawning"]
+
+
+def test_driver_face_crop_selects_largest_person_and_bounds_resolution() -> None:
+    frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
+    selected = select_primary_driver(
+        {
+            7: (700.0, 150.0, 1550.0, 1050.0),
+            8: (1700.0, 200.0, 1900.0, 500.0),
+        }
+    )
+
+    assert selected is not None
+    assert selected[0] == 7
+    cropped = crop_driver_face_input(
+        frame,
+        selected[1],
+        upper_body_ratio=0.55,
+        padding_ratio=0.10,
+        max_side=640,
+    )
+    assert cropped.size > 0
+    assert max(cropped.shape[:2]) == 640
 
 
 def test_neutral_pose_calibration_uses_camera_specific_straight_ahead() -> None:

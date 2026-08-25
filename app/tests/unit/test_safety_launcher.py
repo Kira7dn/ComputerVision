@@ -104,38 +104,22 @@ def test_live_output_follows_rtsp_sample_contract() -> None:
     assert 'make_element("nvv4l2h264enc", "output-encoder")' in pipeline
     assert 'make_element("rtspclientsink", "rtsp-output")' in pipeline
     assert 'output_queue.set_property("leaky", 2)' in pipeline
-    assert "tbox_lab.ps1" in launcher
+    assert "deploy-jetson-native.ps1" in launcher
+    assert "tbox_lab.ps1" not in launcher
 
 
 def test_config_routes_functions_per_camera() -> None:
     config_path = ROOT / "app" / "config" / "production.yaml"
     raw = load_raw_config(config_path)
 
-    assert camera_ids(raw) == ["camera_face", "camera_safety", "DMS"]
-    face = resolve_camera_config(raw, "camera_face")
-    safety = resolve_camera_config(raw, "camera_safety")
-
-    assert face["functions"] == {
-        "trace": True,
-        "face_recognition": True,
-        "smoking_behavior": False,
-        "fire_smoke": False,
-        "dms": False,
-        "front_assistance": False,
-    }
-    assert safety["functions"] == {
-        "trace": True,
-        "face_recognition": False,
-        "smoking_behavior": True,
-        "fire_smoke": True,
-        "dms": False,
-        "front_assistance": False,
-    }
-    assert face["person"]["confidence"] == 0.05
-    assert face["person"]["tracking"]["confirmation_hits"] == 2
+    assert camera_ids(raw) == ["DMS", "camera_front", "camera_back", "camera_left", "camera_right"]
+    front = resolve_camera_config(raw, "camera_front")
+    assert front["functions"]["front_assistance"] is True
+    assert front["person"]["confidence"] == 0.05
+    assert front["person"]["tracking"]["confirmation_hits"] == 2
     dahua = resolve_camera_config(raw, "DMS")
     assert dahua["input"]["mode"] == "rtsp"
-    assert dahua["input"]["rtsp_url"] == "rtsp://camera-dahua:554/stream"
+    assert "channel=5" in dahua["input"]["rtsp_url"]
     assert dahua["functions"] == {
         "trace": False,
         "face_recognition": False,
@@ -162,14 +146,14 @@ def test_config_is_valid_yaml_and_has_stable_evidence_contract() -> None:
 
 def test_fire_smoke_canary_model_can_be_overridden_for_one_camera() -> None:
     raw = load_raw_config(ROOT / "app" / "config" / "production.yaml")
-    raw["cameras"][1]["analysis"]["functions"]["fire_smoke"]["onnx_path"] = (
-        "/tmp/fire-smoke-candidate.onnx"
-    )
+    raw["cameras"][1]["analysis"] = {
+        "functions": {"fire_smoke": {"onnx_path": "/tmp/fire-smoke-candidate.onnx"}}
+    }
 
-    safety = resolve_camera_config(raw, "camera_safety")
+    front = resolve_camera_config(raw, "camera_front")
     dahua = resolve_camera_config(raw, "DMS")
 
-    assert safety["fire_smoke"]["onnx_path"] == "/tmp/fire-smoke-candidate.onnx"
+    assert front["fire_smoke"]["onnx_path"] == "/tmp/fire-smoke-candidate.onnx"
     assert dahua["fire_smoke"]["onnx_path"].endswith("fire_smoke/best.onnx")
 
 
@@ -178,7 +162,7 @@ def test_runtime_can_disable_notifications_for_acceptance(monkeypatch) -> None:
 
     resolved = resolve_camera_config(
         load_raw_config(ROOT / "app" / "config" / "production.yaml"),
-        "camera_safety",
+        "DMS",
     )
 
     assert resolved["notifications"]["enabled"] is False

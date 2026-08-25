@@ -1,121 +1,151 @@
 extends: dev.yaml
 profile: production
 
+# Production is a separate endpoint/runtime. Preserve the endpoint source
+# contract: DMS channel 5 plus four synchronized 360 mock fixtures.
 runtime:
-  status_directory: /opt/camera-safety/status
-  state_directory: /opt/camera-safety/state
-
-evidence:
-  directory: /opt/camera-safety/evidence
+  status_directory: /opt/ls-vision/data/status
+  state_directory: /opt/ls-vision/data/state
+  allow_engine_build: true
 
 cameras:
-  - id: camera_face
-    source:
-      type: rtsp
-      url: rtsp://camera-face:554/stream
-      username_env: CAMERA_FACE_USER
-      password_env: CAMERA_FACE_PASSWORD
-    output:
-      rtsp_url: rtsp://mediamtx:8554/face_bbox
-    functions:
-      trace: true
-      face_recognition: true
-      smoking_behavior: false
-      fire_smoke: false
-  - id: camera_safety
-    source:
-      type: rtsp
-      url: rtsp://camera-safety:554/stream
-      username_env: CAMERA_SAFETY_USER
-      password_env: CAMERA_SAFETY_PASSWORD
-    output:
-      rtsp_url: rtsp://mediamtx:8554/safety_bbox
-    functions:
-      trace: true
-      face_recognition: false
-      smoking_behavior: true
-      fire_smoke: true
-    analysis:
-      functions:
-        fire_smoke:
-          interval_ms: 300
-          thresholds: {fire: 0.30, smoke: 0.40}
-          rois:
-            fire: [0.30, 0.05, 0.70, 0.80]
-            smoke: [0.05, 0.00, 0.80, 0.95]
-        smoking:
-          interval_ms: 400
-          threshold: 0.60
-          crop: {strategy: person_padded, padding_ratio: 0.20}
-          confirmation: {hits: 2, attempts: 4, clear_hits: 4}
   - id: DMS
     source:
       type: rtsp
-      url: rtsp://camera-dahua:554/stream
+      url: rtsp://192.168.1.229:554/cam/realmonitor?channel=5&subtype=0
       username_env: CAMERA_DAHUA_USER
       password_env: CAMERA_DAHUA_PASSWORD
+      codec: hevc
+      decoder: software
+      loop: true
+      width: 1920
+      height: 1080
+      latency_ms: 200
     output:
-      rtsp_url: rtsp://mediamtx:8554/dahua_bbox
-    functions:
-      trace: false
-      face_recognition: false
-      dms: true
-      smoking_behavior: false
-      fire_smoke: false
-    analysis:
-      functions:
-        fire_smoke:
-          interval_ms: 300
-          thresholds: {fire: 0.30, smoke: 0.40}
-          rois: {}
-        smoking:
-          interval_ms: 400
-          threshold: 0.60
-          crop: {strategy: person_padded, padding_ratio: 0.20}
-          confirmation: {hits: 2, attempts: 4, clear_hits: 4}
+      rtsp_url: rtsp://127.0.0.1:8554/dahua_bbox
+    functions: {trace: false, face_recognition: false, smoking_behavior: false, fire_smoke: false, dms: true}
+  - id: camera_front
+    display_name: Camera trước
+    source:
+      type: mock
+      url: rtsp://127.0.0.1:8554/camera_front_raw
+      mock_video: /opt/ls-vision/data/mock-videos/cameras/sync-lite/CAM_FRONT.mp4
+      sync_group: vehicle_surround
+      sync_period_seconds: 191.1
+      sync_epoch_seconds: 0.0
+      loop: true
+      decoder: software
+      width: 960
+      height: 540
+      latency_ms: 200
+    output:
+      rtsp_url: rtsp://127.0.0.1:8554/camera_front
+    functions: {trace: false, face_recognition: false, smoking_behavior: false, fire_smoke: false, dms: false, front_assistance: true}
+    front_assistance:
+      model_path: /opt/ls-vision/models/openpilot/driving_supercombo.onnx
+      allow_cpu: false
+      traffic_convention: right_hand
+      overlay: {lane_min_probability: 0.5, path_half_width_m: 0.9}
+      calibration:
+        profile_id: nuscenes-mini-aggregate-front-v2
+        source_width: 960
+        source_height: 540
+        intrinsics:
+          - [756.585337605, 0.0, 492.237274656]
+          - [0.0, 756.585337605, 289.738862715]
+          - [0.0, 0.0, 1.0]
+        rpy_calib: [-0.0044246, 0.0000086, 0.0075154]
+        camera_height_m: 1.50453975110
+        artifact_hash: nuscenes-mini-cam-front-mean-v2-scaled-960x540
+        valid: true
+  - id: camera_back
+    display_name: Camera sau
+    source:
+      type: mock
+      url: rtsp://127.0.0.1:8554/camera_back
+      mock_video: /opt/ls-vision/data/mock-videos/cameras/sync-lite/CAM_BACK.mp4
+      media_only: true
+      sync_group: vehicle_surround
+      sync_period_seconds: 191.1
+      sync_epoch_seconds: 0.0
+      loop: true
+      width: 960
+      height: 540
+      latency_ms: 200
+    output: {rtsp_url: rtsp://127.0.0.1:8554/camera_back}
+    functions: {trace: false, face_recognition: false, smoking_behavior: false, fire_smoke: false, dms: false}
+  - id: camera_left
+    display_name: Camera trái
+    source:
+      type: mock
+      url: rtsp://127.0.0.1:8554/camera_left
+      mock_video: /opt/ls-vision/data/mock-videos/cameras/sync-lite/CAM_FRONT_LEFT.mp4
+      media_only: true
+      sync_group: vehicle_surround
+      sync_period_seconds: 191.1
+      sync_epoch_seconds: 0.0
+      loop: true
+      width: 960
+      height: 540
+      latency_ms: 200
+    output: {rtsp_url: rtsp://127.0.0.1:8554/camera_left}
+    functions: {trace: false, face_recognition: false, smoking_behavior: false, fire_smoke: false, dms: false}
+  - id: camera_right
+    display_name: Camera phải
+    source:
+      type: mock
+      url: rtsp://127.0.0.1:8554/camera_right
+      mock_video: /opt/ls-vision/data/mock-videos/cameras/sync-lite/CAM_FRONT_RIGHT.mp4
+      media_only: true
+      sync_group: vehicle_surround
+      sync_period_seconds: 191.1
+      sync_epoch_seconds: 0.0
+      loop: true
+      width: 960
+      height: 540
+      latency_ms: 200
+    output: {rtsp_url: rtsp://127.0.0.1:8554/camera_right}
+    functions: {trace: false, face_recognition: false, smoking_behavior: false, fire_smoke: false, dms: false}
+
+evidence:
+  directory: /opt/ls-vision/data/evidence
+  event_feed_update_interval_seconds: 5.0
+
+notifications:
+  enabled: false
 
 person:
-  onnx_path: /opt/camera-safety/models/yolov9-t-320.onnx
-  engine_path: /opt/camera-safety/models/person-yolov9-t320-fixed.engine
+  onnx_path: /opt/ls-vision/models/yolov9-t-320.onnx
+  engine_path: /opt/ls-vision/models/yolov9-t-320.onnx_b1_gpu0_fp16.engine
+  inference_interval: 1
+  roi_cache_max_age_seconds: 0.5
 
 smoking_behavior:
-  onnx_path: /opt/camera-safety/models/smoking_behavior/model.onnx
+  onnx_path: /opt/ls-vision/models/smoking_behavior/model.onnx
   object_detection:
     models:
       soham:
-        onnx_path: /opt/camera-safety/models/smoking_behavior/tbox/soham_best.onnx
+        onnx_path: /opt/ls-vision/models/smoking_behavior/tbox/soham_best.onnx
 
 dms:
-  object_detection:
-    enabled: true
-    input_width: 640
-    input_height: 640
-    confidence: 0.35
-    nms_iou: 0.50
-    person_match_iou: 0.10
-    models:
-      soham:
-        onnx_path: /opt/camera-safety/models/smoking_behavior/tbox/soham_best.onnx
-        labels: [Distracted, Drinking, Drowsy, Eating, PhoneUse, SafeDriving, Seatbelt, Smoking]
-        positive_labels: [Distracted, Drinking, Drowsy, Eating, PhoneUse, SafeDriving, Seatbelt, Smoking]
+  event_policy:
+    attention: {trace_interval_ms: 2000}
+    model: {trace_interval_ms: 2000}
+    face: {trace_interval_ms: 2000}
+    no_seatbelt: {trace_interval_ms: 2000}
   face_mesh:
-    enabled: true
-  alerts:
-    on_frames: 3
-    off_frames: 2
-  interval_ms: 200
+    driver_roi:
+      enabled: true
+      require_person: true
+      upper_body_ratio: 0.55
+      padding_ratio: 0.10
+      max_side: 640
 
 fire_smoke:
-  onnx_path: /opt/camera-safety/models/fire_smoke/best.onnx
-  # Advisory telemetry remains enabled for hard-negative mining.
-  dynamics:
-    mode: advisory
+  onnx_path: /opt/ls-vision/models/fire_smoke/best.onnx
 
 recognition:
   face_runtime:
-    detector_model: /opt/camera-safety/models/face/facedet.onnx
-    recognizer_model: /opt/camera-safety/models/face/arcface.onnx
-    library_directory: /opt/camera-safety/face_library
-
-notifications:
-  enabled: true
+    detector_model: /opt/ls-vision/models/face/facedet.onnx
+    recognizer_model: /opt/ls-vision/models/face/arcface.onnx
+    library_directory: /opt/ls-vision/face_library

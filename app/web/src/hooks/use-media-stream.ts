@@ -1,23 +1,17 @@
 import { useEffect, useRef, useState } from 'react'
 import type { CameraDetail, HlsConstructor, HlsInstance, MediaMTXReader, PlayerState } from '@/types'
 import { registerSynchronizedMock } from '@/lib/mock-stream-sync'
+import {
+  subscribeLiveMetadata,
+  type FrameTimingSample,
+  type LiveMetadataSnapshot,
+} from '@/lib/live-metadata'
 
 interface VideoFrameMetadataLike {
   captureTime?: number
   presentationTime?: number
   expectedDisplayTime?: number
   rtpTimestamp?: number
-}
-
-interface FrameTimingSample {
-  rtp_timestamp: number
-  capture_timestamp: number
-  output_timestamp: number
-}
-
-interface LiveMetadataResponse {
-  timestamp?: number
-  cameras?: Record<string, { frame_timing_samples?: FrameTimingSample[] }>
 }
 
 type VideoFrameCallback = (now: number, metadata: VideoFrameMetadataLike) => void
@@ -72,13 +66,12 @@ export function useMediaStream(camera: CameraDetail, onStateChange: (state: Play
     let fallbackTimer: number | null = null
     let mockSyncCleanup: (() => void) | null = null
     let videoFrameCallbackId: number | null = null
-    let frameTimingTimer: number | null = null
+    let frameTimingCleanup: (() => void) | null = null
     let lastLatencyReportAt = 0
     let lastValidLatencyAt = 0
     let smoothedVideoLatencyMs: number | null = null
     let serverBrowserClockOffsetMs: number | null = null
     let rtpTimestampOffset: number | null = null
-    let frameTimingRequestInFlight = false
     const frameSamples = new Map<number, FrameTimingSample>()
     const pendingFrames = new Map<number, number>()
     let destroyed = false
@@ -118,24 +111,17 @@ export function useMediaStream(camera: CameraDetail, onStateChange: (state: Play
       updateLatency(rawLatencyMs, 'rtp_ntp_map')
     }
 
-    const refreshFrameTiming = async () => {
-      if (destroyed || frameTimingRequestInFlight) return
-      frameTimingRequestInFlight = true
-      const requestStart = performance.now()
+    const refreshFrameTiming = (snapshot: LiveMetadataSnapshot) => {
+      if (destroyed) return
       try {
-        const response = await fetch('/api/live-metadata', { cache: 'no-store' })
-        if (!response.ok || destroyed) return
-        const payload = await response.json() as LiveMetadataResponse
-        const requestEnd = performance.now()
-        const serverTimestamp = Number(payload.timestamp)
+        const serverTimestamp = Number(snapshot.payload.timestamp)
         if (Number.isFinite(serverTimestamp)) {
-          const browserMidpointEpochMs = performance.timeOrigin + (requestStart + requestEnd) / 2
-          const offset = serverTimestamp * 1000 - browserMidpointEpochMs
+          const offset = serverTimestamp * 1000 - snapshot.browserMidpointEpochMs
           serverBrowserClockOffsetMs = serverBrowserClockOffsetMs == null
             ? offset
             : serverBrowserClockOffsetMs * 0.8 + offset * 0.2
         }
-        const samples = payload.cameras?.[camera.id]?.frame_timing_samples ?? []
+        const samples = snapshot.payload.cameras?.[camera.id]?.frame_timing_samples ?? []
         for (const sample of samples) {
           const rtpTimestamp = Number(sample.rtp_timestamp) >>> 0
           if (Number.isFinite(sample.capture_timestamp)) frameSamples.set(rtpTimestamp, sample)
@@ -171,9 +157,7 @@ export function useMediaStream(camera: CameraDetail, onStateChange: (state: Play
           update({ videoLatencyMs: null, videoLatencySource: 'unavailable' })
         }
       } catch {
-        // Keep the last measured value during a transient metadata request.
-      } finally {
-        frameTimingRequestInFlight = false
+        // Keep the last measured value during a transient metadata update.
       }
     }
 
@@ -240,8 +224,8 @@ export function useMediaStream(camera: CameraDetail, onStateChange: (state: Play
         timedVideo.cancelVideoFrameCallback(videoFrameCallbackId)
       }
       videoFrameCallbackId = null
-      if (frameTimingTimer !== null) window.clearInterval(frameTimingTimer)
-      frameTimingTimer = null
+      frameTimingCleanup?.()
+      frameTimingCleanup = null
       smoothedVideoLatencyMs = null
       lastLatencyReportAt = 0
       lastValidLatencyAt = 0
@@ -287,8 +271,7 @@ export function useMediaStream(camera: CameraDetail, onStateChange: (state: Play
       if (timedVideo.requestVideoFrameCallback) {
         videoFrameCallbackId = timedVideo.requestVideoFrameCallback(onVideoFrame)
       }
-      frameTimingTimer = window.setInterval(() => void refreshFrameTiming(), 250)
-      void refreshFrameTiming()
+      frameTimingCleanup = subscribeLiveMetadata(refreshFrameTiming, 250)
     }
 
     const activateFallback = () => {

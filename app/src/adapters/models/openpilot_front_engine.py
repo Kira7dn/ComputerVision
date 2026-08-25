@@ -14,7 +14,7 @@ from typing import Any
 
 import numpy as np
 
-from adapters.models.openpilot_preprocess import prepare_model_frame
+from adapters.models.openpilot_preprocess import prepare_model_frames, warp_transforms
 from domain.front_assistance import (
     FrontCalibration,
     FrontLead,
@@ -115,12 +115,28 @@ class OpenpilotFrontEngine:
         self.session: Any | None = None
         self.output_slices: dict[str, slice] = {}
         self.calibration = self._load_calibration(front.get("calibration", {}) or {})
+        self._narrow_transforms = (
+            warp_transforms(self.calibration, big=False)
+            if self.calibration.valid
+            else None
+        )
+        self._wide_transforms = (
+            warp_transforms(self.calibration, big=True)
+            if self.calibration.valid
+            else None
+        )
         traffic_convention = str(front.get("traffic_convention", "left_hand")).lower()
         if traffic_convention not in {"left_hand", "right_hand"}:
             raise ValueError(
                 "front traffic_convention must be left_hand or right_hand"
             )
         self.traffic_convention = traffic_convention
+        self._desire_pulse = np.zeros((1, 25, 8), dtype=np.float16)
+        self._traffic_convention = np.array(
+            [[0.0, 1.0] if traffic_convention == "right_hand" else [1.0, 0.0]],
+            dtype=np.float16,
+        )
+        self._action_t = np.array([[0.075, 0.375]], dtype=np.float16)
         self._epoch: str | None = None
         self._last_timestamp: float | None = None
         self._image_queue: deque[np.ndarray] = deque(maxlen=5)
@@ -250,8 +266,12 @@ class OpenpilotFrontEngine:
                 source_epoch, frame_number, source_timestamp, tuple(blocking)
             )
 
-        narrow = prepare_model_frame(frame, self.calibration, big=False)
-        wide = prepare_model_frame(frame, self.calibration, big=True)
+        narrow, wide = prepare_model_frames(
+            frame,
+            self.calibration,
+            narrow_transforms=self._narrow_transforms,
+            wide_transforms=self._wide_transforms,
+        )
         self._image_queue.append(narrow)
         self._big_image_queue.append(wide)
         img = np.concatenate((self._image_queue[0], self._image_queue[4]), axis=0)[None]
@@ -263,12 +283,9 @@ class OpenpilotFrontEngine:
             "img": img,
             "big_img": big_img,
             "features_buffer": features.astype(np.float16, copy=False),
-            "desire_pulse": np.zeros((1, 25, 8), dtype=np.float16),
-            "traffic_convention": np.array(
-                [[0.0, 1.0] if self.traffic_convention == "right_hand" else [1.0, 0.0]],
-                dtype=np.float16,
-            ),
-            "action_t": np.array([[0.075, 0.375]], dtype=np.float16),
+            "desire_pulse": self._desire_pulse,
+            "traffic_convention": self._traffic_convention,
+            "action_t": self._action_t,
         }
         started = time.perf_counter()
         raw = np.asarray(self.session.run(None, inputs)[0])

@@ -1,13 +1,29 @@
-extends: base.yaml
 profile: dev
 
 runtime:
+  live_metadata_interval_ms: 250
+  status_directory: /opt/ls-vision-dev/data/status
+  state_directory: /opt/ls-vision-dev/data/state
   wsl_distro: Ubuntu-22.04
   mediamtx_config: /mnt/d/BusinessAnalyze/Camera/app/deploy/docker/mediamtx.yml
   mediamtx_binary: /opt/camera-safety/mediamtx/mediamtx
   # Hold confirmed overlays between asynchronous inference cycles. Use wall
   # clock time because the RTSP frame rate differs between cameras.
   analysis_result_max_age_seconds: 2.0
+
+analysis:
+  result_max_age_ms: 1000
+  functions: {}
+
+front_assistance:
+  enabled: false
+  mode: vision_only
+  model_path: /opt/ls-vision/models/openpilot/driving_supercombo.onnx
+  model_rate_hz: 20
+  max_gap_seconds: 0.25
+  providers: [TensorrtExecutionProvider, CUDAExecutionProvider]
+  allow_cpu: false
+  rollout: shadow
 
 cameras:
   - id: DMS
@@ -40,10 +56,6 @@ cameras:
       sync_period_seconds: 191.1
       sync_epoch_seconds: 0.0
       loop: true
-      # The bounded sync-lite fixture is Main Profile H.264 and does not
-      # produce frames through nvv4l2decoder on the current Jetson image.
-      # Keep real RTSP cameras on the hardware default; only the dev fixture
-      # uses avdec_h264 before converting back to NVMM for DeepStream.
       decoder: software
       width: 960
       height: 540
@@ -128,6 +140,13 @@ cameras:
 smoking_behavior:
   onnx_path: /mnt/d/BusinessAnalyze/Camera/assets/models/smoking_behavior/model.onnx
   object_detection:
+    enabled: true
+    warmup: true
+    input_width: 640
+    input_height: 640
+    confidence: 0.35
+    nms_iou: 0.50
+    person_match_iou: 0.10
     models:
       soham:
         onnx_path: /opt/ls-vision/models/smoking_behavior/tbox/soham_best.onnx
@@ -142,6 +161,16 @@ smoking_behavior:
     - CUDAExecutionProvider
     - CPUExecutionProvider
   require_gpu_provider: true
+  temporal:
+    confirmation_hits: 2
+    confirmation_window: 4
+    minimum_duration_seconds: 0.4
+    clear_negative_observations: 4
+  lifecycle:
+    candidate_timeout_seconds: 3.0
+    clearing_seconds: 3.0
+    notification_min_duration_seconds: 3.0
+    trace_interval_ms: 400
 
 dms:
   object_detection:
@@ -158,6 +187,59 @@ dms:
         positive_labels: [Distracted, Drinking, Drowsy, Eating, PhoneUse, SafeDriving, Seatbelt, Smoking]
   face_mesh:
     enabled: true
+    ear_threshold: 0.20
+    mar_threshold: 0.65
+    yaw_threshold_deg: 16.0
+    pitch_threshold_deg: 14.0
+    neutral_calibration:
+      enabled: true
+      minimum_samples: 15
+      minimum_duration_seconds: 60.0
+      window_size: 1800
+      max_yaw_std_deg: 8.0
+      max_pitch_std_deg: 5.0
+      neutral_update_alpha: 0.01
+      neutral_update_max_delta_deg: 5.0
+  attention:
+    interval_ms: 100
+    alert_seconds: [5.0, 8.0, 13.0]
+    recovery_confirm_seconds: 2.0
+    max_step_seconds: 1.0
+  event_policy:
+    attention:
+      confirmation_hits: 1
+      confirmation_window: 1
+      minimum_duration_seconds: 0.0
+      candidate_timeout_seconds: 1.0
+      clear_seconds: 0.0
+      unknown_timeout_seconds: 1.0
+      trace_interval_ms: 1000
+    model:
+      min_score: 0.35
+      require_person_match: true
+      confirmation_hits: 6
+      confirmation_window: 10
+      minimum_duration_seconds: 1.0
+      candidate_timeout_seconds: 3.0
+      clear_seconds: 2.0
+      unknown_timeout_seconds: 1.5
+      trace_interval_ms: 1000
+    face:
+      confirmation_hits: 5
+      confirmation_window: 8
+      minimum_duration_seconds: 0.8
+      candidate_timeout_seconds: 2.0
+      clear_seconds: 1.0
+      unknown_timeout_seconds: 0.8
+      trace_interval_ms: 800
+    no_seatbelt:
+      confirmation_hits: 12
+      confirmation_window: 15
+      minimum_duration_seconds: 2.5
+      candidate_timeout_seconds: 4.0
+      clear_seconds: 2.0
+      unknown_timeout_seconds: 1.5
+      trace_interval_ms: 1000
   alerts:
     on_frames: 3
     off_frames: 2
@@ -187,6 +269,32 @@ fire_smoke:
     - CUDAExecutionProvider
     - CPUExecutionProvider
   require_gpu_provider: true
+  tracking:
+    match_iou: 0.10
+    match_center_distance: 0.20
+    min_area_ratio: 0.25
+    max_area_ratio: 4.0
+    bbox_smoothing_alpha: 0.35
+    confirmation_hits: 4
+    confirmation_window: 6
+    minimum_duration_seconds: 1.5
+    notification_min_duration_seconds: 3.0
+    clear_seconds: 3.0
+  dynamics:
+    mode: advisory
+    crop_padding_ratio: 0.10
+    crop_size: 96
+    changed_pixel_delta: 15
+    changed_pixel_ratio: 0.06
+    edge_change_ratio: 0.04
+    flow_q75: 0.5
+    flow_circular_variance: 0.25
+    required_conditions: 2
+    confirmation_votes: 3
+    confirmation_window: 5
+    context_padding_ratio: 0.30
+    canny_low: 50
+    canny_high: 150
 
 person:
   onnx_path: /opt/ls-vision/models/yolov9-t-320.onnx
@@ -196,6 +304,8 @@ person:
   confidence: 0.05
   iou: 0.45
   label: person
+  inference_interval: 0
+  roi_cache_max_age_seconds: 0.5
   tracking:
     bbox_smoothing_alpha: 0.30
     confirmation_hits: 2

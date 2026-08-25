@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import time
+from collections import deque
 from email.utils import formatdate
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -18,7 +19,7 @@ WEB_ROOT = Path(os.environ.get("CAMERA_WEB_ROOT", APP_ROOT / "web"))
 # fallback for native development, where Vite owns frontend serving.
 ROOT = WEB_ROOT / "dist" if (WEB_ROOT / "dist" / "dashboard.html").is_file() else WEB_ROOT
 CONFIG_PATH = Path(os.environ.get("CAMERA_CONFIG", APP_ROOT / "config" / "dev.yaml"))
-CLK_TCK = os.sysconf("SC_CLK_TCK")
+CLK_TCK = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
 CPU_LOCK = Lock()
 GPU_LOCK = Lock()
 METRICS_LOCK = Lock()
@@ -26,13 +27,133 @@ PREVIOUS_CPU: tuple[int, int] | None = None
 PREVIOUS_PROCESSES: dict[int, tuple[int, float]] = {}
 GPU_CACHE: tuple[float, dict[str, object]] | None = None
 METRICS_CACHE: dict[str, tuple[float, dict[str, object]]] = {}
+CONFIG_CACHE_LOCK = Lock()
+CONFIG_CACHE: tuple[tuple[object, ...], dict[str, object]] | None = None
+JOURNAL_CACHE_LOCK = Lock()
+JOURNAL_CACHE: dict[Path, dict[str, object]] = {}
+EVIDENCE_RUN_CACHE_LOCK = Lock()
+EVIDENCE_RUN_CACHE: dict[tuple[str, str], tuple[int, Path | None]] = {}
 DASHBOARD_PORT = int(os.environ.get("CAMERA_DASHBOARD_PORT", "18080"))
 MOCK_MEDIA_PORT = int(os.environ.get("CAMERA_MOCK_MEDIA_PORT", "18081"))
 
 
+def _config_fingerprint() -> tuple[object, ...]:
+    try:
+        files = sorted(CONFIG_PATH.parent.glob("*.yaml"))
+        return (
+            id(load_raw_config),
+            *(
+                (str(path), path.stat().st_mtime_ns, path.stat().st_size)
+                for path in files
+            ),
+        )
+    except OSError:
+        return (id(load_raw_config), str(CONFIG_PATH), "unavailable")
+
+
+def _raw_config() -> dict[str, object]:
+    """Cache inherited YAML until a source config file changes."""
+    global CONFIG_CACHE
+    fingerprint = _config_fingerprint()
+    with CONFIG_CACHE_LOCK:
+        if CONFIG_CACHE is not None and CONFIG_CACHE[0] == fingerprint:
+            return CONFIG_CACHE[1]
+        loaded = load_raw_config(CONFIG_PATH)
+        CONFIG_CACHE = (fingerprint, loaded)
+        return loaded
+
+
+def _latest_evidence_run(root: Path, prefix: str) -> Path | None:
+    try:
+        root_mtime = root.stat().st_mtime_ns
+    except OSError:
+        return None
+    key = (str(root), prefix)
+    with EVIDENCE_RUN_CACHE_LOCK:
+        cached = EVIDENCE_RUN_CACHE.get(key)
+        if cached is not None and cached[0] == root_mtime:
+            return cached[1]
+        runs = [path for path in root.glob(f"{prefix}-*") if path.is_dir()]
+        latest = max(runs, key=lambda path: path.stat().st_mtime) if runs else None
+        EVIDENCE_RUN_CACHE[key] = (root_mtime, latest)
+        return latest
+
+
+def _event_journal_snapshot(
+    path: Path,
+    *,
+    after: int | None,
+) -> tuple[int, tuple[tuple[int, str], ...], int]:
+    """Read only bytes appended since the previous request.
+
+    Cursor compatibility remains line-based. The cache retains complete lines
+    and a bounded set of event IDs while disk reads advance by byte offset.
+    """
+    try:
+        stat = path.stat()
+    except OSError:
+        return 0, (), 0
+    with JOURNAL_CACHE_LOCK:
+        state = JOURNAL_CACHE.get(path)
+        identity = (int(stat.st_dev), int(stat.st_ino))
+        if (
+            state is None
+            or state.get("identity") != identity
+            or int(stat.st_size) < int(state.get("offset", 0))
+        ):
+            if state is None and len(JOURNAL_CACHE) >= 4:
+                JOURNAL_CACHE.pop(next(iter(JOURNAL_CACHE)))
+            state = {
+                "identity": identity,
+                "offset": 0,
+                "pending": b"",
+                "cursor": 0,
+                "lines": deque(maxlen=10_000),
+                "event_ids": set(),
+            }
+            JOURNAL_CACHE[path] = state
+        offset = int(state["offset"])
+        if int(stat.st_size) > offset:
+            with path.open("rb") as stream:
+                stream.seek(offset)
+                chunk = stream.read()
+                state["offset"] = stream.tell()
+            payload = bytes(state["pending"]) + chunk
+            parts = payload.split(b"\n")
+            state["pending"] = parts.pop() if parts else b""
+            lines = state["lines"]
+            event_ids = state["event_ids"]
+            assert isinstance(lines, deque)
+            assert isinstance(event_ids, set)
+            for raw_line in parts:
+                line = raw_line.decode("utf-8", errors="replace")
+                state["cursor"] = int(state["cursor"]) + 1
+                lines.append((int(state["cursor"]), line))
+                if not line.strip():
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                event_id = record.get("event_id") if isinstance(record, dict) else None
+                if event_id:
+                    event_ids.add(str(event_id))
+        lines = state["lines"]
+        event_ids = state["event_ids"]
+        assert isinstance(lines, deque)
+        assert isinstance(event_ids, set)
+        cursor = int(state["cursor"])
+        selected = (
+            ()
+            if after is None
+            else tuple(item for item in lines if int(item[0]) > max(0, after))
+        )
+        return cursor, selected, len(event_ids)
+
+
 def _camera_definitions(stream_host: str = "localhost") -> list[dict[str, object]]:
     try:
-        raw_config = load_raw_config(CONFIG_PATH)
+        raw_config = _raw_config()
         definitions: list[dict[str, object]] = []
         for camera_id in camera_ids(raw_config):
             config = resolve_camera_config(raw_config, camera_id)
@@ -149,7 +270,7 @@ def _processes() -> list[dict[str, int | str]]:
 
 def _runtime_status(camera_id: str) -> dict[str, object]:
     try:
-        raw_config = load_raw_config(CONFIG_PATH)
+        raw_config = _raw_config()
         runtime = raw_config.get("runtime", {}) or {}
         status_dir = Path(str(runtime.get("status_directory", "/opt/camera-safety/status")))
         path = status_dir / f"{camera_id}.json"
@@ -165,7 +286,7 @@ def _live_metadata() -> dict[str, object]:
     """Read the latest bounded overlay payloads without running GPU metrics."""
     result: dict[str, object] = {"timestamp": time.time(), "cameras": {}}
     try:
-        raw_config = load_raw_config(CONFIG_PATH)
+        raw_config = _raw_config()
         runtime = raw_config.get("runtime", {}) or {}
         status_dir = Path(str(runtime.get("status_directory", "/opt/camera-safety/status")))
         cameras: dict[str, object] = {}
@@ -188,31 +309,22 @@ def _live_metadata() -> dict[str, object]:
 
 def _evidence_metrics() -> dict[str, object]:
     try:
-        raw_config = load_raw_config(CONFIG_PATH)
+        raw_config = _raw_config()
         evidence = raw_config.get("evidence", {}) or {}
         root = Path(str(evidence.get("directory", ".tmp/deepstream-safety")))
         prefix = str(evidence.get("prefix", "snapshots-acceptance"))
-        runs = [path for path in root.glob(f"{prefix}-*") if path.is_dir()]
-        if not runs:
+        latest = _latest_evidence_run(root, prefix)
+        if latest is None:
             return {"available": False, "run_id": None, "event_count": 0, "root": str(root)}
-        latest = max(runs, key=lambda path: path.stat().st_mtime)
         events_path = latest / "events.jsonl"
-        event_ids: set[str] = set()
-        if events_path.is_file():
-            for line in events_path.read_text(encoding="utf-8").splitlines():
-                if not line.strip():
-                    continue
-                try:
-                    record = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                event_id = record.get("event_id")
-                if event_id:
-                    event_ids.add(str(event_id))
+        _cursor, _lines, event_count = _event_journal_snapshot(
+            events_path,
+            after=None,
+        )
         return {
             "available": (latest / "manifest.json").is_file(),
             "run_id": latest.name.removeprefix(f"{prefix}-"),
-            "event_count": len(event_ids),
+            "event_count": event_count,
             "root": str(latest),
         }
     except (OSError, TypeError, ValueError):
@@ -228,24 +340,26 @@ def _event_feed(after: int = 0, limit: int | None = None) -> dict[str, object]:
     without scanning every event directory.
     """
     try:
-        raw_config = load_raw_config(CONFIG_PATH)
+        raw_config = _raw_config()
         evidence = raw_config.get("evidence", {}) or {}
         root = Path(str(evidence.get("directory", ".tmp/deepstream-safety")))
         prefix = str(evidence.get("prefix", "snapshots-acceptance"))
-        runs = [path for path in root.glob(f"{prefix}-*") if path.is_dir()]
-        if not runs:
+        latest = _latest_evidence_run(root, prefix)
+        if latest is None:
             return {"run_id": None, "cursor": 0, "events": []}
-        latest = max(runs, key=lambda path: path.stat().st_mtime)
         run_id = latest.name.removeprefix(f"{prefix}-")
         events_path = latest / "events.jsonl"
         if not events_path.is_file():
             return {"run_id": run_id, "cursor": 0, "events": []}
 
-        lines = events_path.read_text(encoding="utf-8").splitlines()
-        cursor = max(0, int(after))
-        scan_start = 0 if cursor == 0 else min(cursor, len(lines))
+        requested_cursor = max(0, int(after))
+        scan_start = requested_cursor
+        cursor, lines, _event_count = _event_journal_snapshot(
+            events_path,
+            after=scan_start,
+        )
         latest_by_event: dict[str, tuple[int, dict[str, object]]] = {}
-        for sequence, line in enumerate(lines[scan_start:], start=scan_start + 1):
+        for sequence, line in lines:
             if not line.strip():
                 continue
             try:
@@ -269,7 +383,7 @@ def _event_feed(after: int = 0, limit: int | None = None) -> dict[str, object]:
         }
         events: list[dict[str, object]] = []
         ordered = sorted(latest_by_event.values(), key=lambda item: item[0])
-        if cursor == 0 and limit is not None and limit > 0:
+        if requested_cursor == 0 and limit is not None and limit > 0:
             ordered = ordered[-limit:]
         for sequence, record in ordered:
             record_type = str(record.get("record_type") or "").upper()
@@ -394,7 +508,7 @@ def _event_feed(after: int = 0, limit: int | None = None) -> dict[str, object]:
                     "start_record": record if record_type == "START" else {},
                 }
             )
-        return {"run_id": run_id, "cursor": len(lines), "events": events}
+        return {"run_id": run_id, "cursor": cursor, "events": events}
     except (OSError, TypeError, ValueError):
         return {"run_id": None, "cursor": 0, "events": []}
 
@@ -404,18 +518,13 @@ def _event_thumbnail(
 ) -> Path | None:
     """Resolve only a START thumbnail inside the configured latest run."""
     try:
-        raw_config = load_raw_config(CONFIG_PATH)
+        raw_config = _raw_config()
         evidence = raw_config.get("evidence", {}) or {}
         root = Path(str(evidence.get("directory", ".tmp/deepstream-safety")))
         prefix = str(evidence.get("prefix", "snapshots-acceptance"))
-        latest = next(
-            (
-                path
-                for path in root.glob(f"{prefix}-*")
-                if path.is_dir() and path.name == f"{prefix}-{run_id}"
-            ),
-            None,
-        )
+        latest = _latest_evidence_run(root, prefix)
+        if latest is not None and latest.name != f"{prefix}-{run_id}":
+            latest = None
         relative = Path(event_path)
         if latest is None or relative.is_absolute() or ".." in relative.parts:
             return None
@@ -542,6 +651,8 @@ def _collect_metrics(stream_host: str = "localhost") -> dict[str, object]:
                 ),
                 "camera_latency_samples": runtime_status.get("camera_latency_samples", 0),
                 "frame_count": runtime_status.get("frame_count"),
+                "input_decoder": runtime_status.get("input_decoder"),
+                "output_encoder": runtime_status.get("output_encoder"),
                 "analysis_queue_depth": runtime_status.get("analysis_queue_depth"),
                 "analysis_flow": runtime_status.get("analysis_flow", {}),
                 "worker_epoch": runtime_status.get("worker_epoch"),
@@ -555,7 +666,7 @@ def _collect_metrics(stream_host: str = "localhost") -> dict[str, object]:
         )
 
     default_stream = next(
-        (camera for camera in camera_metrics if camera["id"] == "camera_safety"),
+        (camera for camera in camera_metrics if camera["id"] == "camera_front"),
         camera_metrics[0] if camera_metrics else {},
     )
 

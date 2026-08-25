@@ -1,10 +1,15 @@
 # Jetson deployment
 
-The current production Jetson profile runs `DMS` through the standalone
-DeepStream runtime. The development profile additionally runs the
-`camera_front` openpilot road-model adapter in camera-only shadow mode. It
-expects the Dahua LAN address to be `192.168.1.229` and the Jetson Ethernet
-interface to be `192.168.1.10/24`.
+Development and production both use one `DMS` worker from Dahua channel 5 plus
+four synchronized mock views: `camera_front`, `camera_back`, `camera_left` and
+`camera_right`. The front worker runs the openpilot road-model adapter in
+camera-only shadow mode. DMS credentials remain environment-owned.
+
+They are separate application endpoints. Development is served through Vite
+at `http://127.0.0.1:5173`; production is served at `http://vision.local`.
+Their deployment lifecycle and runtime directories differ. Existing source
+mapping, topology and function ownership are endpoint contracts and must not
+be rewritten while changing CV logic.
 
 The runtime is deliberately separate from the LeOS `tbox.service`. Its local
 dashboard/API is exposed on port `18080`; MediaMTX publishes the annotated
@@ -51,34 +56,22 @@ hardware gates are canonical in `docs/architecture/Platform.md` section 13.
 
 ## Deployment entrypoints
 
-The source of truth remains `Camera/app`, while LeOS owns the Jetson deploy
-contract. Both supported commands call the same `tbox_lab deploy-app` path:
-
-From the LeOS repository:
-
-```powershell
-.\services\tbox\factory\tbox_lab.ps1 deploy-app `
-  -JetsonAlias jetson-nano `
-  -CameraRoot D:\BusinessAnalyze\Camera
-```
-
-From the Camera repository:
+The source of truth and the only LS-Vision deployment owner is `Camera/app`:
 
 ```powershell
 Set-Location D:\BusinessAnalyze\Camera
 npm run deploy
 ```
 
-This is the one-step deploy for a new T-Box. It deploys the LeOS T-Box
-application, WiFi/GPIO services, native DeepStream/MediaMTX runtime, models,
-dashboard bundle and systemd units. The command succeeds only after
-`tbox.service`, `tbox-gpio.service`, the Camera service, `/health/ready`, every
-configured camera worker and its HLS stream are ready. The default SSH target
-is `jetson-nano`; override it explicitly with `-JetsonAlias` when provisioning
-another named device.
+This command deploys only the native DeepStream/MediaMTX runtime, models,
+dashboard bundle and Camera systemd units. It never deploys or restarts
+`tbox.service`/`tbox-gpio.service`. Conversely, LeOS `tbox_lab deploy-app` must
+not install, stop, start, restart or health-check LS-Vision/MediaMTX. The Camera
+command succeeds only after `/health/ready`, every configured camera worker and
+its HLS stream are ready. The default SSH target is `jetson-nano`.
 
-The Camera command is a wrapper only; it does not create a second deployment
-implementation and it does not start the legacy Docker Compose runtime.
+The Camera command owns its deployment implementation and does not start the
+legacy Docker Compose runtime.
 Before packaging, the deploy step builds `app/web` and the native API serves
 the generated `app/web/dist` bundle on port `18080`.
 
@@ -105,6 +98,6 @@ native DeepStream/model runtime under `/opt/ls-vision`.
 
 Do not run the production `ls-vision.service` or another development runtime
 at the same time as the Jetson development service, because they compete for
-the camera and ports. Stop the local hot-reload session with `Ctrl+C`; the
+GPU resources and ports. Stop the local hot-reload session with `Ctrl+C`; the
 remote service can be stopped with `ssh jetson-nano 'sudo systemctl stop
 ls-vision-dev.service'` before returning to production.

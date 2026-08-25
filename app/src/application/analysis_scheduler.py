@@ -45,6 +45,39 @@ class FrameResultGate:
         return GateDecision(True, age_seconds=age)
 
 
+class AnalysisAdmissionGate:
+    """Throttle the CPU conversion branch before pixels leave NVMM.
+
+    The downstream executors still own their independent function cadences.
+    This gate only limits how often a frame is allowed through the expensive
+    NVMM-to-BGRx conversion to the fastest configured analysis cadence.
+    """
+
+    def __init__(self, interval_seconds: float) -> None:
+        self.interval_seconds = max(0.001, float(interval_seconds))
+        self._lock = threading.Lock()
+        self._next_due = 0.0
+        self.accepted = 0
+        self.dropped = 0
+
+    def accept(self, now: float) -> bool:
+        with self._lock:
+            if now < self._next_due:
+                self.dropped += 1
+                return False
+            self._next_due = now + self.interval_seconds
+            self.accepted += 1
+            return True
+
+    def status(self) -> dict[str, int | float]:
+        with self._lock:
+            return {
+                "interval_seconds": self.interval_seconds,
+                "accepted": self.accepted,
+                "dropped": self.dropped,
+            }
+
+
 class LatestSampleExecutor:
     """Single consumer with latest-only admission and observable drops."""
 

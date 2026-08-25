@@ -11,7 +11,7 @@ Group=letron
 WorkingDirectory=/opt/ls-vision/current/app
 EnvironmentFile=/etc/ls-vision/ls-vision.env
 Environment=PYTHONPATH=/opt/ls-vision/current/app/src
-Environment=CAMERA_CONFIG=/opt/ls-vision/current/app/config/production-jetson-native.yaml
+Environment=CAMERA_CONFIG=/opt/ls-vision/current/app/config/production.yaml
 Environment=CAMERA_WEB_ROOT=/opt/ls-vision/current/app/web
 Environment=CAMERA_RUNTIME_ROOT=/opt/ls-vision
 Environment=CAMERA_DASHBOARD_HOST=0.0.0.0

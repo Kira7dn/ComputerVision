@@ -49,11 +49,11 @@ tự vẽ bbox lên live video, không glob evidence tree trong request path và
 |---|---|
 | Canonical source | `app/src/` đã là package runtime; launcher/package scripts/docs/tests đã chuyển sang boundary mới |
 | Test ownership | Test DeepStream hiện hành ở `app/tests`; test Frigate/legacy cũ đã được xóa khỏi gate Camera |
-| Config | Có `base.yaml`, `dev.yaml`, `production.yaml`, `e2e.yaml`; merge/duplicate ID/URL/mock production/model path được validate trước startup |
+| Config | Chỉ có `dev.yaml` và `production.yaml`; cả hai giữ DMS channel 5 + 4 camera 360 mock đồng bộ, còn E2E sinh config dùng một lần dưới `.tmp` |
 | Docker identity | Compose project/service/image dùng `ls-vision`; MediaMTX là service riêng |
 | Docker image | Build pass với DeepStream `7.1-gc-triton-devel` đã pin digest; image tag `ls-vision:deepstream-7.1-gc-triton` |
 | Runtime storage | Models/face library read-only; evidence/state/queue/logs là Docker-managed Linux volumes với prefix `ls-vision_` |
-| Mock E2E | 30-second E2E pass: 3 worker, dashboard live/ready, freshness, restart, event API và evidence API |
+| Mock E2E | Runner sinh profile dùng một lần từ topology 5 worker; report acceptance vẫn là evidence bắt buộc |
 | Media output E2E | HLS manifest thật từ MediaMTX đã trả HTTP 200 cho các output mock; không chỉ kiểm tra process tồn tại |
 | Static/package checks | Root pytest `45 passed`; compileall, Vite lint/build, Compose config và `git diff --check` pass |
 | Dashboard migration | `app/web` đã chuyển sang Vite + React + TypeScript + Tailwind v4 + shadcn/ui; API polling giữ state qua transient failure |
@@ -68,7 +68,7 @@ Report runtime gần nhất: `.tmp/ls-vision-e2e/final-summary.json` với
 | Mức | Khoảng trống | Gate đóng |
 |---|---|---|
 | P0 | Production model volume chưa có checksum đầy đủ; `manifest.yaml` còn `sha256: ""` | Nạp đúng model vào volume, verify checksum và ghi nhận GPU/provider/model loaded |
-| P0 | E2E hiện dùng `profile: e2e` và fixture mock, bỏ qua model validation khi tất cả source là mock | Chạy production profile với model thật và camera RTSP thật |
+| P0 | E2E hiện dùng `profile: e2e` và bỏ qua model validation khi tất cả source là mock | Chạy endpoint production với đúng năm fixture, model thật và GPU provider thật |
 | P1 | `application/camera_worker.py` vẫn là compatibility implementation lớn; các adapter/application boundary đã có nhưng chưa tách hết logic | Tách probe/orchestrator/evidence/notification mà không đổi event semantics |
 | P1 | Dashboard/API chưa có authentication/authorization/TLS operator | Bind/reverse proxy/auth/TLS và test endpoint access |
 | P1 | Chưa có acceptance notification provider thật, retry/cooldown/idempotency sau restart | Test outbox với provider sandbox hoặc fake server durable |
@@ -143,11 +143,8 @@ app/
 │     ├─ lib/
 │     └─ types.ts
 ├─ config/
-│  ├─ base.yaml
 │  ├─ dev.yaml
-│  ├─ production.yaml
-│  ├─ e2e.yaml
-│  └─ cameras/
+│  └─ production.yaml
 ├─ deploy/
 │  ├─ dev/
 │  │  └─ hot_reload.py
@@ -310,9 +307,8 @@ học phải có permission, retention, backup và access policy riêng.
 Precedence:
 
 ```text
-base.yaml
-  -> dev.yaml hoặc production.yaml
-  -> camera profile / camera override
+dev.yaml
+  -> production.yaml chỉ override production policy/runtime path
   -> environment variables hoặc secret file
   -> validated per-camera runtime config
 ```
@@ -340,19 +336,19 @@ analysis:
 ```
 
 Các field trên được resolve riêng cho từng camera rồi normalize về model
-adapter config. `camera_safety` giữ ROI burner/plume; `DMS` dùng
-`rois: {}` và do đó fire/smoke chạy toàn frame.
+adapter config. Topology hiện hành chỉ bật DMS cho cabin và front assistance
+cho `camera_front`; các worker 360 còn lại là media-only về capability.
 
 - camera ID không trùng;
 - source/output URL hợp lệ;
-- production không được dùng mock source;
+- DMS dùng RTSP channel 5; bốn camera 360 dùng mock source đồng bộ; không tự đổi mapping này;
 - model file tồn tại khi production hoặc khi ép `CAMERA_VALIDATE_MODELS=1`;
 - provider GPU phù hợp khi function yêu cầu GPU;
 - evidence/state writable;
 - secret chỉ lấy từ environment/secret file, không ghi vào event/manifest/log.
 
-`e2e.yaml` là profile kiểm thử riêng, dùng fixture mock và model-free worker;
-không được dùng làm production config.
+E2E sinh `.tmp/ls-vision-e2e/runtime-config.yaml` từ `dev.yaml`, thay source bằng fixture mock và
+không tạo thêm config source trong `app/config`.
 
 ## 7. Event/evidence contract
 
@@ -574,3 +570,26 @@ model accuracy tốt hơn.
 Chỉ gọi LS-Vision production-ready khi toàn bộ nhóm gate thứ hai có evidence
 được lưu cùng release report; unit test, HTTP 200, image build hoặc container
 healthy riêng lẻ không đủ.
+
+## 11. Performance contract trên Jetson
+
+- Analysis branch phải drop theo cadence trước bước NVMM sang BGRx; executor
+  vẫn giữ cadence riêng và latest-only queue.
+- `AnalysisSample.frame` là buffer immutable đã tách khỏi GstBuffer, không copy
+  toàn frame lần thứ hai khi gửi cho nhiều analyzer.
+- Person `nvinfer.interval` được cấu hình; frame không có detector output chỉ
+  được dùng confirmed ROI cache trong TTL hữu hạn.
+- DMS FaceMesh production dùng upper-body ROI của primary driver, resize cạnh
+  dài tối đa 640 px và fail closed khi không có person ROI.
+- Front model chuẩn bị narrow/wide bằng một lần BGR sang I420 và cache warp
+  transforms theo calibration.
+- Dashboard cache YAML theo fingerprint, đọc `events.jsonl` tăng dần theo byte
+  offset và dùng một live-metadata poller chung cho mọi WebRTC card.
+- Jetson Orin Nano không có NVENC, vì vậy `x264enc` là fallback dự kiến. Không
+  coi việc cài lại plugin là cách khắc phục; hướng loại encode CPU cần H.264
+  passthrough cộng browser-side overlay hoặc phần cứng Jetson có NVENC.
+
+Các field `input_decoder`, `output_encoder` và
+`analysis_flow.pre_conversion` trong `/api/metrics` là evidence bắt buộc cho
+A/B. Không đổi DMS production sang hardware decode nếu chưa chứng minh camera
+thật có frame/output fresh và không tăng queue drop trong run tối thiểu 30 phút.

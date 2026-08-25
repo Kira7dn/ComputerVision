@@ -18,6 +18,7 @@ from adapters.models.openpilot_preprocess import (
     VIEW_FROM_DEVICE,
     _rotation_from_euler,
     prepare_model_frame,
+    prepare_model_frames,
     warp_matrix,
 )
 from domain.front_assistance import FrontCalibration
@@ -106,6 +107,34 @@ def test_preprocess_produces_openpilot_tensor_shape() -> None:
     tensor = prepare_model_frame(np.zeros((8, 8, 3), dtype=np.uint8), calibration, big=False)
     assert tensor.shape == (6, 128, 256)
     assert tensor.dtype == np.uint8
+
+
+def test_preprocess_pair_converts_full_frame_only_once(monkeypatch) -> None:
+    calibration = FrontCalibration(
+        "fixture",
+        8,
+        8,
+        ((6.0, 0.0, 4.0), (0.0, 6.0, 4.0), (0.0, 0.0, 1.0)),
+        valid=True,
+    )
+    from adapters.models import openpilot_preprocess
+
+    original = openpilot_preprocess._bgr_to_i420_planes
+    calls = 0
+
+    def counted(frame):
+        nonlocal calls
+        calls += 1
+        return original(frame)
+
+    monkeypatch.setattr(openpilot_preprocess, "_bgr_to_i420_planes", counted)
+    narrow, wide = prepare_model_frames(
+        np.zeros((8, 8, 3), dtype=np.uint8),
+        calibration,
+    )
+
+    assert calls == 1
+    assert narrow.shape == wide.shape == (6, 128, 256)
 
 
 def test_warp_matrix_matches_openpilot_reference_order() -> None:

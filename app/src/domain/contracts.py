@@ -42,9 +42,11 @@ class FrameKey:
 
     @property
     def ordering_value(self) -> tuple[int, int]:
-        if self.buffer_pts_ns is not None:
-            return (1, self.buffer_pts_ns)
-        return (0, self.frame_number)
+        # Decoder PTS can move backwards around RTCP resynchronisation and
+        # reordered video frames.  DeepStream's frame number is monotonic for
+        # one source within one worker epoch, so use it as the result gate's
+        # canonical ordering key and retain PTS as timestamp metadata only.
+        return (self.source_id, self.frame_number)
 
 
 @dataclass(frozen=True)

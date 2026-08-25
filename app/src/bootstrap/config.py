@@ -61,6 +61,15 @@ def _merge_config(base: dict[str, Any], override: dict[str, Any]) -> dict[str, A
 def validate_config(config: dict[str, Any], path: Path | None = None) -> dict[str, Any]:
     """Fail closed on deployment errors before any worker or model is started."""
     profile = str(config.get("profile", "dev")).lower()
+    runtime_config = config.get("runtime", {}) or {}
+    if float(runtime_config.get("live_metadata_interval_ms", 250)) < 100.0:
+        raise ValueError("runtime.live_metadata_interval_ms must be at least 100")
+    person_config = config.get("person", {}) or {}
+    person_inference_interval = int(person_config.get("inference_interval", 0))
+    if not 0 <= person_inference_interval <= 30:
+        raise ValueError("person.inference_interval must be in [0, 30]")
+    if float(person_config.get("roi_cache_max_age_seconds", 0.5)) <= 0.0:
+        raise ValueError("person.roi_cache_max_age_seconds must be positive")
     ids = camera_ids(config)
     if not ids:
         raise ValueError("at least one camera is required")
@@ -69,8 +78,6 @@ def validate_config(config: dict[str, Any], path: Path | None = None) -> dict[st
         camera_id = str(camera["id"])
         source = camera.get("source", {}) or {}
         source_type = str(source.get("type", source.get("mode", "rtsp"))).lower()
-        if profile == "production" and source_type == "mock":
-            raise ValueError(f"production profile cannot use mock source: {camera_id}")
         media_only = bool(source.get("media_only", False))
         if media_only and source_type != "mock":
             raise ValueError(f"camera {camera_id} media_only requires a mock source")
@@ -251,6 +258,17 @@ def validate_config(config: dict[str, Any], path: Path | None = None) -> dict[st
         for key in ("yaw_threshold_deg", "pitch_threshold_deg"):
             if float(face_policy.get(key, 1.0)) <= 0.0:
                 raise ValueError(f"dms.face_mesh.{key} must be positive")
+        driver_roi = face_policy.get("driver_roi", {}) or {}
+        if not 0.2 <= float(driver_roi.get("upper_body_ratio", 0.55)) <= 1.0:
+            raise ValueError(
+                "dms.face_mesh.driver_roi.upper_body_ratio must be in [0.2, 1]"
+            )
+        if not 0.0 <= float(driver_roi.get("padding_ratio", 0.10)) <= 0.5:
+            raise ValueError(
+                "dms.face_mesh.driver_roi.padding_ratio must be in [0, 0.5]"
+            )
+        if int(driver_roi.get("max_side", 640)) < 256:
+            raise ValueError("dms.face_mesh.driver_roi.max_side must be at least 256")
         calibration = face_policy.get("neutral_calibration", {}) or {}
         minimum_samples = int(calibration.get("minimum_samples", 15))
         window_size = int(calibration.get("window_size", 30))
@@ -718,6 +736,13 @@ def resolve_camera_config(config: dict[str, Any], camera_id: str | None = None) 
     output.update(camera.get("output", {}) or {})
     if not output.get("rtsp_url"):
         raise ValueError(f"camera {camera_id} output must define rtsp_url")
+    output_base = runtime_environment.get("CAMERA_OUTPUT_RTSP_BASE", "").rstrip("/")
+    if output_base:
+        parsed_base = urlsplit(output_base)
+        if parsed_base.scheme not in {"rtsp", "rtsps", "rtmp"} or not parsed_base.netloc:
+            raise ValueError("CAMERA_OUTPUT_RTSP_BASE must be a valid streaming URL")
+        output_path = urlsplit(str(output["rtsp_url"])).path.strip("/")
+        output["rtsp_url"] = f"{output_base}/{output_path}"
     resolved["output"] = output
 
     functions = {

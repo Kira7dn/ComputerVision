@@ -1,8 +1,0 @@
-services:
-  ls-vision:
-    environment:
-      CAMERA_CONFIG: /opt/camera-safety/config/e2e.yaml
-    volumes:
-      - ../../config/e2e.yaml:/opt/camera-safety/config/e2e.yaml:ro
-      - ../../../assets:/opt/camera-safety/e2e-assets:ro
-      - ../../../.tmp/camera-safety-face-library/face_library:/opt/camera-safety/face_library:ro

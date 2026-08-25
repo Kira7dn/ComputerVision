@@ -558,31 +558,24 @@ clone openpilot vào image production hoặc chạy nguyên process graph của 
   Khi calibration, model output hoặc frame freshness không hợp lệ, front stream có thể tiếp tục
   nhưng assistance phải `not_ready` và không phát alert.
 
-#### Contract một timeline cho bộ camera 360 development
+#### Contract một timeline cho bộ camera 360
 
-Bốn fixture `camera_front`, `camera_back`, `camera_left`, `camera_right` là bốn góc nhìn của cùng
-một bộ camera, không phải bốn clip độc lập. Chúng phải khai báo cùng `sync_group`,
-`sync_period_seconds` và `sync_epoch_seconds`; config validation fail closed nếu một camera lệch
-contract. `sync_epoch_seconds=0` dùng Unix epoch làm mốc tuyệt đối ổn định qua restart.
+`dev.yaml` và `production.yaml` đều chạy `DMS`, `camera_front`, `camera_back`, `camera_left` và
+`camera_right`. DMS giữ nguồn RTSP channel 5. Bốn worker 360 dùng bốn view của cùng bộ fixture với
+một `sync_group`, period và epoch; config validation fail closed nếu một member lệch timeline.
 
-Tại thời điểm server `t`, phase canonical là
-`((t - sync_epoch_seconds) mod sync_period_seconds) / sync_period_seconds`. Mỗi fixture ánh xạ phase
-chuẩn hóa này vào frame count/duration riêng để dung sai metadata container không làm trôi góc nhìn.
-Front publisher trên Jetson chọn frame theo phase này trước khi đưa vào RTSP/DeepStream. Dashboard
-dùng timestamp từ `/api/live-metadata` để map browser clock sang server clock và seek ba file
-media-only theo cùng phase; khi WebRTC có capture latency, ba file lùi cùng độ trễ để khớp frame
-front đang hiển thị. Không camera DOM nào được làm master và reload/restart không quay riêng một
-camera về frame 0.
+Dev và production không phải hai camera profile. Chúng là hai endpoint deployment độc lập:
+`http://127.0.0.1:5173` dành cho hot reload và `http://vision.local` dành cho release production.
+Khác biệt nằm ở service lifecycle, bundle và thư mục state/evidence/log. Source mapping của từng
+endpoint là contract bất biến trong task logic; không được suy diễn rồi đổi RTSP/mock.
 
-Acceptance development cho bộ 360 yêu cầu:
+Nếu sau này có phần cứng và có yêu cầu chuyển source riêng, acceptance cho bộ 360 yêu cầu:
 
-- API trả cùng group/period/epoch cho cả bốn camera;
-- publisher front log đúng shared timeline và sau restart tiếp tục phase tuyệt đối;
-- browser xác nhận cả bốn video có cùng `data-sync-phase`; drift của back/left/right so với target
-  không quá 250 ms sau warmup;
-- front vẫn đi qua worker Openpilot/DeepStream và output `camera_front`; ba góc media-only không trở
-  thành owner của front inference;
-- kiểm tra lại sau reload browser và restart `ls-vision-dev.service`, không chỉ ở lần chạy đầu.
+- cả bốn channel có frame không đen và timestamp nguồn cùng clock;
+- input/output freshness của cả bốn worker đạt gate trong cùng run;
+- browser đo drift giữa bốn góc không quá 250 ms sau warmup và sau reload/restart;
+- front vẫn là worker duy nhất chạy front assistance; back/left/right không khởi tạo model CV;
+- lưu report theo release. Khi một channel đen/mất tín hiệu, không được gọi bộ 360 production-ready.
 
 Ownership đích:
 
@@ -594,7 +587,7 @@ Ownership đích:
 | Intrinsics/extrinsics/calibration state | `FrontCalibration` | Persist theo camera/config hash; invalid thì fail closed |
 | Vision LDW/FCW lifecycle | `VisionAlertPolicy` | Advisory state và `START/END` idempotent; không giả telemetry |
 | Event/evidence/API/metrics | LS-Vision persistence/interfaces hiện tại | Exact triggering frame, bounded query, không glob evidence tree |
-| Model và native release | LeOS `tbox_lab deploy-app` | Checksum/provenance, release-based deployment, rollback được |
+| Model và native release | Camera `npm run deploy` | Checksum/provenance, release-based deployment, rollback được |
 
 Topology đích:
 
@@ -750,7 +743,7 @@ khác đổi semantics.
 Deliverable:
 
 - Thêm `front_assistance` vào config validation và per-camera function dispatch.
-- Thêm `app/config/cameras/front.yaml`; chỉ thêm topology production sau khi Phase 0 chốt source.
+- `camera_front` nằm trực tiếp trong cả `dev.yaml` và `production.yaml`; hai profile giữ cùng topology.
 - Refactor `camera_worker` để primary person `nvinfer` là capability, không phải bước bắt buộc. Front
   worker đi từ decode/mux vào bounded front branch và output branch mà không chạy person detector.
 - Front analysis dùng latest-frame/drop-stale; không tích lũy backlog lịch sử. Recurrent input vẫn
@@ -802,8 +795,9 @@ Mục tiêu là chứng minh model nhỏ chạy đồng thời với DMS trên J
 Deployment:
 
 - Đưa model vào `assets/models/openpilot/driving_supercombo.onnx`, thêm checksum/provenance và cập
-  nhật cả Camera model manifest lẫn danh sách model hard-code trong LeOS `deploy-lsvision.ps1`.
-- Chỉ deploy bằng `npm run deploy`/LeOS `tbox_lab deploy-app`; không SCP model hoặc sửa runtime thủ
+  nhật cả Camera model manifest lẫn danh sách model trong Camera `deploy-jetson-native.ps1`.
+- Chỉ deploy Vision bằng Camera `npm run deploy`; LeOS `tbox_lab` không được điều khiển LS-Vision.
+  Không SCP model hoặc sửa runtime thủ
   công trên Jetson.
 - Provider order là TensorRT rồi CUDA. CPU provider chỉ được dùng cho offline parity; production
   shadow phải fail startup/readiness nếu cả TensorRT và CUDA không dùng được.
@@ -928,7 +922,7 @@ Canary sequence:
 
 Gate:
 
-- Release được tạo qua `tbox_lab`, có model/config/source commit và rollback target xác định.
+- Release được tạo qua Camera `npm run deploy`, có model/config/source commit và rollback target xác định.
 - Không restart loop, không unbounded queue/swap/thermal throttle và không regression DMS/T-Box.
 - Mọi alert có evidence lineage; mọi period `not_ready` có blocking reason/metric.
 - Accuracy được báo theo episode và vehicle-hour, tách ngày/đêm/mưa/cua/cut-in; không dùng vài clip

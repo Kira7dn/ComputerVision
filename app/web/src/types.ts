@@ -22,6 +22,8 @@ export interface CameraDetail {
   camera_latency_source?: 'rtcp_ntp' | 'unavailable' | string
   camera_latency_samples?: number
   rss_mb?: number | null
+  input_decoder?: string | null
+  output_encoder?: string | null
   analysis_error?: string | null
   driver_attention?: {
     contract_version?: number
