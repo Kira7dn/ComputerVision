@@ -4,7 +4,7 @@ Ngày cập nhật: 25/08/2026
 
 ## Source of truth và ownership
 
-`app/` là runtime Camera AI canonical. Native Jetson là production target hiện hành. `server/` là boundary ADAS/FTP/archive độc lập.
+`apps/ls-vision/` là runtime Camera AI canonical. Native Jetson là production target hiện hành. `services/camera-server/` là boundary ADAS/FTP/archive độc lập và không tham gia startup path của LS-Vision.
 
 | Lane | Owner |
 | --- | --- |

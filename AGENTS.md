@@ -5,13 +5,13 @@
 - Khi đọc file có tiếng Việt, luôn dùng UTF-8.
 - Làm việc từ PowerShell tại `D:\BusinessAnalyze\Camera`.
 - Giữ nguyên thay đổi ngoài task; không dùng reset/checkout phá hủy hoặc xóa đệ quy ngoài thư mục tạm đã xác định.
-- `server/` là boundary ADAS/FTP/archive độc lập, không thuộc runtime LS-Vision.
-- `app/` là source, test, config và deployment owner duy nhất của LS-Vision.
+- `services/camera-server/` là boundary ADAS/FTP/archive độc lập, không thuộc runtime LS-Vision.
+- `apps/ls-vision/` là source, test, config và deployment owner duy nhất của LS-Vision.
 
 ## Runtime canonical
 
 ```text
-app/config/{dev,production}.yaml
+apps/ls-vision/config/{dev,production}.yaml
   -> python -m ls_vision.service
   -> dashboard API + ls_vision.runner + optional mock media server
   -> one DeepStream process for each non-media-only camera
@@ -31,7 +31,7 @@ npm run deploy -- -Action rollback
 Development dùng isolated Jetson service và Vite HMR:
 
 ```powershell
-npm install --prefix app/web
+npm install --prefix apps/ls-vision/web
 npm run dev
 ```
 
@@ -39,7 +39,7 @@ Không dùng workspace khác để điều khiển `ls-vision*` hoặc `mediamtx
 
 ## Config và runtime data
 
-- Chỉ `app/config/dev.yaml` và `app/config/production.yaml` là config source of truth.
+- Chỉ `apps/ls-vision/config/dev.yaml` và `apps/ls-vision/config/production.yaml` là config source of truth.
 - Hai profile phải standalone và giữ cùng camera order: `DMS`, `camera_front`, `camera_back`, `camera_left`, `camera_right`.
 - Production root là `/opt/ls-vision`; development root là `/opt/ls-vision-dev`.
 - Model và face library read-only; evidence/state/queue/log/status nằm ngoài source release.
@@ -49,9 +49,9 @@ Không dùng workspace khác để điều khiển `ls-vision*` hoặc `mediamtx
 
 ```powershell
 $python = 'D:\BusinessAnalyze\Camera\.venv\Scripts\python.exe'
-& $python -m pytest -c app/pyproject.toml app/tests -q
-& $python -m ruff check app/src app/tests
-& $python -m compileall -q app/src app/tests
+& $python -m pytest -c apps/ls-vision/pyproject.toml apps/ls-vision/tests -q
+& $python -m ruff check apps/ls-vision/src apps/ls-vision/tests
+& $python -m compileall -q apps/ls-vision/src apps/ls-vision/tests
 npm run check
 git diff --check
 ```
@@ -59,7 +59,7 @@ git diff --check
 Native production acceptance:
 
 ```powershell
-& $python app/tests/e2e/run_jetson_production_e2e.py `
+& $python apps/ls-vision/tests/e2e/run_jetson_production_e2e.py `
   --jetson-alias jetson-nano `
   --report .tmp/ls-vision-native-e2e/summary.json
 ```
@@ -77,5 +77,5 @@ Chỉ gọi acceptance khi report có `accepted=true` và browser `http://vision
 - [Platform architecture](docs/architecture/Platform.md)
 - [DeepStream runtime](docs/architecture/DeepStream.md)
 - [Product requirements](docs/PRD.md)
-- [Jetson deployment](app/deploy/README-jetson.md)
+- [Jetson deployment](apps/ls-vision/deploy/README-jetson.md)
 - [Model inventory](docs/ModelInventoryAndFinetunePlan.md)

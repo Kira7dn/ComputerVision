@@ -31,11 +31,11 @@ htmlcov/
 *.egg-info/
 __pycache__/
 *.py[cod]
-server/uploads/
-server/runtime/
-server/models/
-server/media/
-server/vendor/dahua_sdk/
+services/camera-server/uploads/
+services/camera-server/runtime/
+services/camera-server/models/
+services/camera-server/media/
+services/camera-server/vendor/dahua_sdk/
 *.key
 *.crt
 *.sqlite3
@@ -44,9 +44,9 @@ server/vendor/dahua_sdk/
 *.engine.json
 *.pt
 *.onnx
-server/media/probe-*/
-server/media/dahua_netsdk_backup/bin/
-server/media/dahua_netsdk_backup/obj/
+services/camera-server/media/probe-*/
+services/camera-server/media/dahua_netsdk_backup/bin/
+services/camera-server/media/dahua_netsdk_backup/obj/
 camera_adas.egg-info/
 .pip-cache/
 .tmp/
@@ -59,5 +59,5 @@ runtime/output/
 dahua_sdk/
 assets/models/
 runtime/artifacts/
-app/face_library/
+apps/ls-vision/face_library/
 output/

@@ -1,10 +1,12 @@
 {
-  "name": "dahua-local-poc",
+  "name": "camera-workspace",
   "private": true,
   "scripts": {
-    "dev": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\app\\deploy\\powershell\\deploy-jetson-dev.ps1 -Action start",
-    "test": "powershell -NoProfile -Command \"& '.\\.venv\\Scripts\\python.exe' -m pytest -c app/pyproject.toml app/tests -q\"",
-    "check": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\app\\deploy\\powershell\\check.ps1",
-    "deploy": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\app\\deploy\\powershell\\deploy-jetson.ps1"
+    "dev": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\apps\\ls-vision\\deploy\\powershell\\deploy-jetson-dev.ps1 -Action start",
+    "test": "npm run test:vision && npm run test:camera-server",
+    "test:vision": "powershell -NoProfile -Command \"& '.\\.venv\\Scripts\\python.exe' -m pytest -c apps/ls-vision/pyproject.toml apps/ls-vision/tests -q\"",
+    "test:camera-server": "powershell -NoProfile -Command \"& '.\\.venv\\Scripts\\python.exe' -m pytest -c services/camera-server/pyproject.toml services/camera-server/tests -q\"",
+    "check": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\apps\\ls-vision\\deploy\\powershell\\check.ps1",
+    "deploy": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\apps\\ls-vision\\deploy\\powershell\\deploy-jetson.ps1"
   }
 }

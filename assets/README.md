@@ -2,7 +2,7 @@
 
 Local media and model inputs used by Camera development and acceptance tooling.
 
-- `assets/assets/models/`: local detector and recognition model files.
-- `fixtures/assets/fixtures/assets/fixtures/mock_videos/`: deterministic local media fixtures.
+- `assets/models/`: local detector and recognition model files.
+- `assets/fixtures/mock_videos/`: deterministic local media fixtures.
 
-These assets are intentionally outside the nested `frigate` repository.
+Assets are workspace-level inputs shared by development and acceptance tooling; runtime data is stored outside the source checkout.

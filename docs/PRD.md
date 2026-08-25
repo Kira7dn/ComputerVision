@@ -43,4 +43,4 @@ LS-Vision cung cấp phân tích camera AI on-premise cho nhà máy, kho vận v
 
 - Thay camera topology hoặc media-only behavior.
 - Thay model, threshold, confirmation policy hoặc event schema.
-- Thay đổi boundary `server/`.
+- Thay đổi boundary `services/camera-server/`.

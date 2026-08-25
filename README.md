@@ -2,23 +2,28 @@
 
 Workspace có hai boundary độc lập:
 
-- `app/`: LS-Vision multi-camera DeepStream runtime, dashboard và native Jetson deployment.
-- `server/`: Dahua ADAS/FTP/archive service.
+- `apps/ls-vision/`: ứng dụng multi-camera DeepStream, dashboard và native Jetson deployment.
+- `services/camera-server/`: dịch vụ Dahua ADAS/FTP/archive có package, dependency và test riêng.
 
 ## LS-Vision
 
 ```powershell
-npm install --prefix app/web
+npm install --prefix apps/ls-vision/web
 npm test
 npm run check
 npm run dev
 npm run deploy
 ```
 
-Runtime Python nằm trong package `app/src/ls_vision`. Production chạy từ source release versioned tại `/opt/ls-vision/releases`, với `current` là symlink atomic.
+Runtime Python nằm trong package `apps/ls-vision/src/ls_vision`. Production vẫn đóng gói ứng dụng dưới `/opt/ls-vision/releases/<release>/app` để tương thích rollback với các release cũ.
 
-Xem [app/README.md](app/README.md) và [kiến trúc Platform](docs/architecture/Platform.md).
+Xem [apps/ls-vision/README.md](apps/ls-vision/README.md) và [kiến trúc Platform](docs/architecture/Platform.md).
 
-## Server boundary
+## Camera Server
 
-`server/` giữ dependency, package và test riêng theo root `pyproject.toml`. Thay đổi LS-Vision không được kéo `server/` vào startup path hoặc acceptance gate.
+```powershell
+npm run test:camera-server
+& .\.venv\Scripts\python.exe -m camera_server.main
+```
+
+Lệnh chạy trực tiếp cần working directory `services/camera-server` hoặc cài package từ chính thư mục này. Camera Server không thuộc startup path hay acceptance gate production của LS-Vision.
