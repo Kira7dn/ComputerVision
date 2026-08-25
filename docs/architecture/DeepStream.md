@@ -220,7 +220,7 @@ Smoking dùng `person track ID` của DeepStream làm identity owner:
 ```text
 full frame + confirmed person ROI
   ├─ stateless person-crop classifier (threshold 0.60, padding 20%)
-  └─ T-Box ONNX detectors (Cigarette/Smoking, threshold 0.35)
+  └─ Soham ONNX detector (Smoking + DMS classes, threshold 0.35)
        -> spatial association về person track
        -> canonical smoking signal
   -> per-person SmokingEpisodeStore
@@ -237,13 +237,12 @@ cùng event; hết grace mới tạo `END`. Invalid crop, cached overlay, stale 
 out-of-order result không được tính hit/miss. Notification chỉ phát một lần sau
 khi episode tồn tại 3 giây; candidate không tạo event, overlay hay notification.
 
-Hai detector T-Box lấy từ LeOS T-Box commit
+Detector Soham lấy từ LeOS T-Box commit
 `0dc3dde2e6f5d998886c6dc18371c7beab2d3343`, export ONNX opset 17 và dùng
-cùng ONNX Runtime provider policy với LS-Vision. Chaitanya `Cigarette` và Soham
-`Smoking` được normalize thành smoking; các class DMS khác không đi vào
-lifecycle. Object inference chạy một lần trên full frame rồi ghép về person
-track, không lặp hai model cho từng person crop. Global `AlertSmoother 3/2` của
-T-Box không được dùng; per-person episode M-of-N vẫn là temporal owner duy nhất.
+cùng ONNX Runtime provider policy với LS-Vision. `Smoking` được normalize vào
+lifecycle cùng các class DMS còn lại. Object inference chạy một lần trên full
+frame rồi ghép về person track. Global `AlertSmoother 3/2` của T-Box không được
+dùng; per-person episode M-of-N vẫn là temporal owner duy nhất.
 
 Fire/smoke không được suppress person confirmation, face recognition hoặc
 smoking ROI. Overlap chỉ là correlation metric

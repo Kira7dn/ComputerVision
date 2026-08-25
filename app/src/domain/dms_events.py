@@ -17,6 +17,7 @@ from typing import Any
 import numpy as np
 
 from adapters.persistence.evidence_repository import EvidenceStore
+from domain.driver_attention import ATTENTION_EVENT_LABEL
 
 BBox = tuple[float, float, float, float]
 
@@ -25,13 +26,9 @@ MODEL_ALERTS = frozenset(
         "Smoking",
         "Drinking",
         "Eating",
-        "Phone Usage",
-        "Distracted",
-        "Drowsy",
     }
 )
-FACE_ALERTS = frozenset({"Head Away", "Eyes Closed", "Yawning"})
-ALL_ALERTS = tuple(sorted(MODEL_ALERTS | FACE_ALERTS | {"No Seatbelt"}))
+ALL_ALERTS = tuple(sorted(MODEL_ALERTS | {"No Seatbelt", ATTENTION_EVENT_LABEL}))
 
 
 class DmsEventState(str, Enum):
@@ -153,9 +150,21 @@ class DmsAlertEventStore:
         return values if len(values) == 4 else None  # type: ignore[return-value]
 
     def _policy(self, label: str) -> _ConfirmationPolicy:
-        if label in MODEL_ALERTS:
-            section_name = "model"
+        if label == ATTENTION_EVENT_LABEL:
+            section_name = "attention"
             defaults: dict[str, Any] = {
+                "confirmation_hits": 1,
+                "confirmation_window": 1,
+                "minimum_duration_seconds": 0.0,
+                "candidate_timeout_seconds": 1.0,
+                "clear_seconds": 0.0,
+                "unknown_timeout_seconds": 1.0,
+                "trace_interval_ms": 1000,
+                "require_person_match": True,
+            }
+        elif label in MODEL_ALERTS:
+            section_name = "model"
+            defaults = {
                 "confirmation_hits": 6,
                 "confirmation_window": 10,
                 "minimum_duration_seconds": 1.0,
@@ -254,6 +263,37 @@ class DmsAlertEventStore:
             metrics.get("object_models_available", metrics.get("object_providers"))
         )
         person_count = int(metrics.get("driver_person_count", 0) or 0)
+
+        if label == ATTENTION_EVENT_LABEL:
+            attention = dict(metrics.get("driver_attention", {}) or {})
+            event_active = attention.get("event_active") is True
+            observation_ready = (
+                person_count > 0
+                and attention.get("state") not in {None, "no_driver", "warming"}
+            )
+            state = (
+                ObservationState.POSITIVE
+                if event_active and observation_ready
+                else ObservationState.NEGATIVE
+                if observation_ready
+                else ObservationState.UNKNOWN
+            )
+            score = self._number(attention.get("score"))
+            severity = (100.0 - score) / 100.0 if score is not None else 0.0
+            return _Observation(
+                state=state,
+                evidence_type="driver_attention_policy",
+                score=severity if state == ObservationState.POSITIVE else None,
+                bbox=self._driver_bbox(metrics),
+                person_track_id=(
+                    int(metrics["driver_person_track_ids"][0])
+                    if metrics.get("driver_person_track_ids")
+                    else None
+                ),
+                quality=severity,
+                metrics=metrics,
+                detections=(),
+            )
 
         if label in MODEL_ALERTS:
             matching = [item for item in detections if str(item.label) == label]
@@ -473,6 +513,10 @@ class DmsAlertEventStore:
             "yaw_deg": metrics.get("yaw_deg"),
             "pitch_deg": metrics.get("pitch_deg"),
             "detections": list(observation.detections) if observation else [],
+            "attention_score": (metrics.get("driver_attention") or {}).get("score"),
+            "attention_level": (metrics.get("driver_attention") or {}).get("alert_level"),
+            "attention_reasons": (metrics.get("driver_attention") or {}).get("reasons", []),
+            "attention_source": (metrics.get("driver_attention") or {}).get("source"),
             "confirmation_hits": sum(episode.hit_history),
             "confirmation_window": len(episode.hit_history),
             "required_hits": policy.confirmation_hits,
@@ -500,7 +544,11 @@ class DmsAlertEventStore:
             "notification_emitted": False,
             "notification_suppressed": True,
             "score_semantics": (
-                "model_confidence" if score is not None else "rule_evidence"
+                "attention_severity"
+                if episode.label == ATTENTION_EVENT_LABEL
+                else "model_confidence"
+                if score is not None
+                else "rule_evidence"
             ),
             "score": score,
             "best_score": best_score,

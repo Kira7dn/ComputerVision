@@ -16,6 +16,7 @@ $cameraPath = if ($CameraRoot) {
     (Resolve-Path (Join-Path $PSScriptRoot '..\..\..')).Path
 }
 $webPath = Join-Path $cameraPath 'app\web'
+$sourcePath = Join-Path $cameraPath 'app\src'
 $syncScript = Join-Path $cameraPath 'app\deploy\dev\jetson_sync.py'
 $python = Join-Path $cameraPath '.venv\Scripts\python.exe'
 if (-not (Test-Path -LiteralPath $python -PathType Leaf)) { $python = 'python' }
@@ -88,8 +89,9 @@ try {
     ) -WorkingDirectory $webPath -NoNewWindow -PassThru
 
     $script:mockMediaProcess = Start-Process -FilePath $python -ArgumentList @(
-        '-m', 'http.server', "$MockMediaPort", '--bind', '127.0.0.1', '--directory', $MockMediaDirectory
-    ) -WorkingDirectory $cameraPath -WindowStyle Hidden -PassThru
+        '-m', 'interfaces.mock_media_server', '--root', $MockMediaDirectory,
+        '--host', '127.0.0.1', '--port', "$MockMediaPort"
+    ) -WorkingDirectory $sourcePath -WindowStyle Hidden -PassThru
 
     Write-Host "Jetson dev runtime active: http://127.0.0.1:$VitePort/dashboard.html" -ForegroundColor Green
     Write-Host 'Backend changes sync to Jetson and restart automatically; frontend changes use Vite HMR.' -ForegroundColor Cyan

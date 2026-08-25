@@ -38,6 +38,7 @@ cameras:
       mock_video: /opt/ls-vision-dev/data/mock-videos/cameras/sync-lite/CAM_FRONT.mp4
       sync_group: vehicle_surround
       sync_period_seconds: 191.1
+      sync_epoch_seconds: 0.0
       loop: true
       # The bounded sync-lite fixture is Main Profile H.264 and does not
       # produce frames through nvv4l2decoder on the current Jetson image.
@@ -53,17 +54,23 @@ cameras:
     front_assistance:
       model_path: /opt/ls-vision/models/openpilot/driving_supercombo.onnx
       allow_cpu: false
+      traffic_convention: right_hand
+      overlay:
+        # Match openpilot's LDW visibility gate. Low-confidence shadow lanes
+        # are not rendered as authoritative road geometry.
+        lane_min_probability: 0.5
+        path_half_width_m: 0.9
       calibration:
-        profile_id: nuscenes-mini-aggregate-front-v1
+        profile_id: nuscenes-mini-aggregate-front-v2
         source_width: 960
         source_height: 540
         intrinsics:
-          - [759.850321828, 0.0, 489.760211847]
-          - [0.0, 759.850321828, 294.904239476]
+          - [756.585337605, 0.0, 492.237274656]
+          - [0.0, 756.585337605, 289.738862715]
           - [0.0, 0.0, 1.0]
-        rpy_calib: [0.0, 0.0, 0.0]
-        camera_height_m: 1.51095763913
-        artifact_hash: nuscenes-calibrated-sensor-1d31c729b073425e8e0202c5c6e66ee1-scaled-960x540
+        rpy_calib: [-0.0044246, 0.0000086, 0.0075154]
+        camera_height_m: 1.50453975110
+        artifact_hash: nuscenes-mini-cam-front-mean-v2-scaled-960x540
         valid: true
   - id: camera_back
     display_name: Camera sau
@@ -74,6 +81,7 @@ cameras:
       media_only: true
       sync_group: vehicle_surround
       sync_period_seconds: 191.1
+      sync_epoch_seconds: 0.0
       loop: true
       width: 960
       height: 540
@@ -90,6 +98,7 @@ cameras:
       media_only: true
       sync_group: vehicle_surround
       sync_period_seconds: 191.1
+      sync_epoch_seconds: 0.0
       loop: true
       width: 960
       height: 540
@@ -106,6 +115,7 @@ cameras:
       media_only: true
       sync_group: vehicle_surround
       sync_period_seconds: 191.1
+      sync_epoch_seconds: 0.0
       loop: true
       width: 960
       height: 540
@@ -119,10 +129,6 @@ smoking_behavior:
   onnx_path: /mnt/d/BusinessAnalyze/Camera/assets/models/smoking_behavior/model.onnx
   object_detection:
     models:
-      chaitanya:
-        onnx_path: /opt/ls-vision/models/smoking_behavior/tbox/chaitanya_best.onnx
-        labels: [Cigarette, Drinking, Eating, Phone, Seatbelt]
-        positive_labels: [Cigarette]
       soham:
         onnx_path: /opt/ls-vision/models/smoking_behavior/tbox/soham_best.onnx
         labels: [Distracted, Drinking, Drowsy, Eating, PhoneUse, SafeDriving, Seatbelt, Smoking]
@@ -146,10 +152,6 @@ dms:
     nms_iou: 0.50
     person_match_iou: 0.10
     models:
-      chaitanya:
-        onnx_path: /opt/ls-vision/models/smoking_behavior/tbox/chaitanya_best.onnx
-        labels: [Cigarette, Drinking, Eating, Phone, Seatbelt]
-        positive_labels: [Cigarette, Drinking, Eating, Phone, Seatbelt]
       soham:
         onnx_path: /opt/ls-vision/models/smoking_behavior/tbox/soham_best.onnx
         labels: [Distracted, Drinking, Drowsy, Eating, PhoneUse, SafeDriving, Seatbelt, Smoking]

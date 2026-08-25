@@ -42,7 +42,11 @@ def _rotation_from_euler(rpy: tuple[float, float, float]) -> np.ndarray:
 def warp_matrix(calibration: FrontCalibration, *, big: bool) -> np.ndarray:
     intrinsics = np.asarray(calibration.intrinsics, dtype=np.float32)
     model_intrinsics = SBIGMODEL_INTRINSICS if big else MEDMODEL_INTRINSICS
-    calib_from_model = np.linalg.inv(VIEW_FROM_DEVICE @ np.linalg.inv(model_intrinsics))
+    # openpilot/common/transformations/model.py builds model-frame-from-calib
+    # as K_model @ view_from_device, then inverts that complete transform.
+    # Matrix multiplication is not commutative; reversing these operands warps
+    # the camera frame into an unrelated projective space.
+    calib_from_model = np.linalg.inv(model_intrinsics @ VIEW_FROM_DEVICE)
     camera_from_calib = intrinsics @ VIEW_FROM_DEVICE @ _rotation_from_euler(calibration.rpy_calib)
     return camera_from_calib @ calib_from_model
 

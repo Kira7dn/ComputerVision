@@ -549,10 +549,40 @@ clone openpilot vào image production hoặc chạy nguyên process graph của 
   tham gia front-camera runtime.
 - DMS tiếp tục là worker riêng. Front camera không dùng DMS model, face model, fire/smoke model hoặc
   person detector nếu topology không yêu cầu.
+- Riêng worker DMS luôn bật shared person detector/tracker. Model behavior chỉ được publish sau khi
+  ghép với driver track hiện tại và qua confirmation policy; thiếu person/face phải báo `PARTIAL`
+  hoặc `NO_DRIVER`, không được báo `OK`. Soham là object model DMS duy nhất; live overlay vẫn chỉ
+  vẽ bbox có score cao nhất cho mỗi behavior/driver.
 - Scope ban đầu chỉ quan sát và cảnh báo. Không phát lệnh ga, phanh, vô-lăng hoặc CAN actuation.
 - MVP là `vision_only` và `shadow`: không đọc T-Box/CAN/telemetry, không phát âm thanh/notification.
   Khi calibration, model output hoặc frame freshness không hợp lệ, front stream có thể tiếp tục
   nhưng assistance phải `not_ready` và không phát alert.
+
+#### Contract một timeline cho bộ camera 360 development
+
+Bốn fixture `camera_front`, `camera_back`, `camera_left`, `camera_right` là bốn góc nhìn của cùng
+một bộ camera, không phải bốn clip độc lập. Chúng phải khai báo cùng `sync_group`,
+`sync_period_seconds` và `sync_epoch_seconds`; config validation fail closed nếu một camera lệch
+contract. `sync_epoch_seconds=0` dùng Unix epoch làm mốc tuyệt đối ổn định qua restart.
+
+Tại thời điểm server `t`, phase canonical là
+`((t - sync_epoch_seconds) mod sync_period_seconds) / sync_period_seconds`. Mỗi fixture ánh xạ phase
+chuẩn hóa này vào frame count/duration riêng để dung sai metadata container không làm trôi góc nhìn.
+Front publisher trên Jetson chọn frame theo phase này trước khi đưa vào RTSP/DeepStream. Dashboard
+dùng timestamp từ `/api/live-metadata` để map browser clock sang server clock và seek ba file
+media-only theo cùng phase; khi WebRTC có capture latency, ba file lùi cùng độ trễ để khớp frame
+front đang hiển thị. Không camera DOM nào được làm master và reload/restart không quay riêng một
+camera về frame 0.
+
+Acceptance development cho bộ 360 yêu cầu:
+
+- API trả cùng group/period/epoch cho cả bốn camera;
+- publisher front log đúng shared timeline và sau restart tiếp tục phase tuyệt đối;
+- browser xác nhận cả bốn video có cùng `data-sync-phase`; drift của back/left/right so với target
+  không quá 250 ms sau warmup;
+- front vẫn đi qua worker Openpilot/DeepStream và output `camera_front`; ba góc media-only không trở
+  thành owner của front inference;
+- kiểm tra lại sau reload browser và restart `ls-vision-dev.service`, không chỉ ở lần chạy đầu.
 
 Ownership đích:
 
@@ -690,8 +720,12 @@ Implementation contract:
   `features_buffer [1,24,512] float16`, `desire_pulse [1,25,8] float16`,
   `traffic_convention [1,2] float16` và `action_t [1,2] float16`.
 - Giữ model frequency 20 Hz, context frequency 5 Hz, hai image contexts và hidden-state feedback.
+- Warp phải giữ đúng thứ tự openpilot
+  `camera_from_calib @ inverse(model_intrinsics @ view_from_device)`; unit test khóa ma trận này để
+  không đảo operand hoặc nghịch đảo từng phần sai.
 - Parser trả lane lines, road edges, path/velocity/acceleration/orientation, leads, pose, meta,
-  confidence và raw timing diagnostics qua domain type của LS-Vision.
+  confidence và raw timing diagnostics qua domain type của LS-Vision. Lane/road edge giữ đủ
+  `(x,y,z)`, không hạ xuống `(x,y)` trước projection.
 - Một engine chỉ xử lý một ordered camera epoch. Reset toàn bộ queue/hidden state khi epoch đổi,
   timestamp lùi, gap vượt ngưỡng, model/config hash đổi hoặc provider restart.
 - Không phụ thuộc Cap'n Proto, `msgq`, tinygrad runtime, openpilot Params hoặc CarParams.
@@ -746,6 +780,9 @@ Deliverable:
 - Extrinsic contract gồm height, roll, pitch, yaw, mount version và calibration state
   `uncalibrated/calibrating/calibrated/invalid/recalibrating`.
 - Provisioned calibration dùng giá trị đo thật; zero/default không được tự xem là calibrated.
+- Projection overlay dùng cùng `intrinsics @ view_from_device @ rotation(rpy_calib)` với model warp.
+  Lane dùng `z` do model trả; path cộng camera height giống openpilot. Không kéo dài longitudinal
+  position của path để tạo geometry giả khi camera-only model trả quãng ngắn.
 - Online calibration không nằm trong MVP camera-only; chỉ mở lại khi có motion/state đáng tin cậy.
 - Tamper detector so sánh calibration với baseline, phát degraded state khi camera bị xoay/rung hoặc
   geometry spread vượt ngưỡng.
@@ -850,8 +887,16 @@ Mục tiêu là biến output đã nghiệm thu thành workflow quan sát đư�
 
 Deliverable:
 
-- Camera card `camera_front` hiển thị stream, lane/path/lead overlay, calibration, provider,
-  inference latency, frame age, degraded reason và nhãn `CAMERA-ONLY / SHADOW`.
+- Camera card `camera_front` hiển thị stream với lane/path geometry; lead, calibration, provider,
+  inference latency và frame lineage tiếp tục có trong metadata để chẩn đoán cho đến khi từng visual
+  tương ứng được triển khai và nghiệm thu.
+- Front video ưu tiên geometry có giá trị: hai lane biên và predicted path corridor. Không render
+  `camera_front | LIVE`, timestamp, `FRONT SHADOW | NO ALERT`, inference time hoặc capability chip
+  lên video/card khi trạng thái bình thường. Chỉ hazard LDW/FCW hoặc `ADAS NOT READY` được phép che
+  lên hình. Runtime metadata phải ghi `visible_lane_count`, `path_point_count` và
+  `rendered_segment_count`; code path tồn tại nhưng các count bằng 0 không được coi là overlay đạt.
+- Lane confidence thấp không được vẽ thành đường màu rõ. Development dùng gate `0.5`, đồng nhất với
+  openpilot LDW visibility; path ngắn giữ nguyên metric và có thể không xuất hiện trong frame.
 - API/live metadata trả contract versioned, không đọc/glob toàn bộ evidence tree trên request path.
 - LDW/FCW dùng event lifecycle `START/UPDATE/END`; exact triggering frame, source timestamp,
   calibration/model/config hash được giữ trong evidence metadata.
@@ -903,9 +948,25 @@ Mỗi mục dưới đây là một feature track riêng, không nằm trong MVP
 | Camera-radar fusion | Có radar tracks thật, timestamp và coordinate calibration | Vision/radar association, uncertainty, track freshness |
 | IMU/GPS localization | Có IMU/GPS local cadence cao và time sync | Pose/yaw-rate fusion, sensor health, epoch |
 | Advisory lateral/longitudinal planner | Phase 8 accepted và vehicle profile đầy đủ | Wheelbase/steer ratio/delay, planner output chỉ advisory |
-| Openpilot DMS ensemble | DMS hiện tại có baseline/ground truth và còn compute headroom | Shadow disagreement metrics; không tự thay DMS owner |
 | Camera tamper nâng cao | Có long-term calibration baseline | Drift/spread policy, maintenance event |
 | Driver risk analytics | LDW/FCW/headway đã accepted | Versioned aggregation, privacy/retention policy |
 
 Radar fusion hoặc planner không tự cấp quyền actuation. Bất kỳ auto-steer/auto-brake/CAN write nào
 cũng là project và safety case riêng, ngoài Camera LS-Vision front-assistance plan này.
+
+## 14. DMS hiện tại
+
+DMS vẫn là một worker LS-Vision độc lập và tiếp tục sở hữu person tracking, event/evidence, output
+stream và API. Soham là nguồn cho `Smoking`, `Drinking`, `Eating`, `Seatbelt`; FaceMesh và Soham
+cung cấp observation cho `DriverAttentionPolicy`.
+
+- Policy awareness dùng source timestamp và các mốc 5/8/13 giây. Warning chỉ advisory; Critical tạo
+  một event `Driver Inattention`; pose/eyes/phone/fatigue/no-face/uncertain là reason của cùng event.
+- Cabin trống không tạo inattention. Person còn nhưng mất face hoặc model uncertainty vẫn làm giảm
+  awareness. Production không được báo attentive từ observation unknown.
+- Attention chạy cadence 100 ms từ FaceMesh/Soham, dùng neutral-pose calibration riêng của camera
+  và không có cabin model thứ hai chạy song song.
+- Openpilot cabin/DMS, shadow disagreement, model artifact và calibration provisional đã bị loại bỏ
+  để giảm tải Jetson. Thay đổi này không ảnh hưởng Openpilot front assistance ở section 13.
+- Trạng thái hiện tại: `[IMPLEMENTED — REAL-CAMERA ACCURACY GATE PENDING]`. Cần đánh giá false
+  alert, miss rate và latency trên video cabin Dahua thật trước khi coi DMS là production-accepted.

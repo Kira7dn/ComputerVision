@@ -12,19 +12,39 @@ stream on the local RTSP/WebRTC/HLS ports.
 
 `DMS` uses the DMS profile from the LeOS reference. The DeepStream
 worker keeps RTSP decode, person detection/tracking, NVOSD and MediaMTX, while
-the DMS adapter runs the Chaitanya and Soham ONNX models plus MediaPipe
+the DMS adapter runs the single Soham ONNX model plus MediaPipe
 FaceMesh. It publishes the canonical alerts `Smoking`, `Drinking`, `Eating`,
-`Phone Usage`, `Distracted`, `Drowsy`, `Yawning`, `Eyes Closed`, `Head Away`,
-and `No Seatbelt`, with the reference 3-frame-on/2-frame-off smoother. DMS
+and `No Seatbelt`. Pose, eyes, phone, fatigue, missing-face and uncertain
+observations feed one time-based awareness policy; critical attention creates
+one `Driver Inattention` lifecycle with the current reasons in its metadata. DMS
 state, metrics and boxes are available from `/api/live-metadata` and
 `/api/metrics`. Each smoothed alert is also persisted as a DMS `START`,
 `UPDATE`, `END` event with evidence snapshots; DMS events deliberately do not
 emit Telegram notifications.
 
+The DMS camera must enable the shared person detector even when its other
+camera functions are disabled. Model detections cannot become public alerts
+until they are associated with a current driver track and pass the temporal
+event policy. Operator status is fail-closed: `MONITORING` means both driver
+and face are visible, `PARTIAL` identifies a missing observation modality,
+and `NO_DRIVER` replaces the old false-positive `OK` state. Raw detections stay
+bounded diagnostics; confirmed overlay boxes are reduced to one strongest box
+per canonical behavior and driver. Soham is the sole object-model evidence
+source so one behavior is not inferred twice by overlapping models.
+
+Cabin DMS uses the canonical Soham object model, FaceMesh metrics and the shared
+`DriverAttentionPolicy`. No Openpilot cabin model or shadow inference is
+packaged for Jetson. This does not affect the separate Openpilot-derived front
+assistance model.
+
 `camera_front` publishes the annotated `camera_front` RTSP/WebRTC/HLS stream,
 lane/path/lead metadata and advisory-only `vision_ldw_left`,
 `vision_ldw_right` and `vision_fcw` lifecycle events. It does not read CAN,
 T-Box telemetry or vehicle-control state, and it never actuates the vehicle.
+Its preprocessing uses the pinned openpilot warp order, lane and road-edge
+outputs retain full XYZ geometry, and the overlay projects them with the same
+intrinsic/extrinsic calibration. Lane geometry below probability `0.5` and
+non-metric stretched paths are not rendered.
 The TensorRT-to-CUDA provider fallback is observable in runtime status; CPU is
 not permitted for Jetson shadow inference. Phase status and the remaining
 hardware gates are canonical in `docs/architecture/Platform.md` section 13.

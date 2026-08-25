@@ -48,14 +48,30 @@ dms:
     neutral_calibration:
       enabled: true
       minimum_samples: 15
-      window_size: 30
+      minimum_duration_seconds: 60.0
+      window_size: 1800
       max_yaw_std_deg: 8.0
       max_pitch_std_deg: 5.0
       neutral_update_alpha: 0.01
       neutral_update_max_delta_deg: 5.0
+  attention:
+    interval_ms: 100
+    alert_seconds: [5.0, 8.0, 13.0]
+    recovery_confirm_seconds: 2.0
+    max_step_seconds: 1.0
   event_policy:
+    attention:
+      confirmation_hits: 1
+      confirmation_window: 1
+      minimum_duration_seconds: 0.0
+      candidate_timeout_seconds: 1.0
+      clear_seconds: 0.0
+      unknown_timeout_seconds: 1.0
+      trace_interval_ms: 1000
     model:
-      min_score: 0.50
+      # Match the ONNX detector acceptance threshold. Person association plus
+      # the 6/10 temporal gate remain mandatory before publication.
+      min_score: 0.35
       require_person_match: true
       confirmation_hits: 6
       confirmation_window: 10

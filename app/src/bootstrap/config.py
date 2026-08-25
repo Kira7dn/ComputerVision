@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from copy import deepcopy
 from pathlib import Path
@@ -63,6 +64,7 @@ def validate_config(config: dict[str, Any], path: Path | None = None) -> dict[st
     ids = camera_ids(config)
     if not ids:
         raise ValueError("at least one camera is required")
+    sync_groups: dict[str, tuple[float, float]] = {}
     for camera in config.get("cameras", []) or []:
         camera_id = str(camera["id"])
         source = camera.get("source", {}) or {}
@@ -72,6 +74,28 @@ def validate_config(config: dict[str, Any], path: Path | None = None) -> dict[st
         media_only = bool(source.get("media_only", False))
         if media_only and source_type != "mock":
             raise ValueError(f"camera {camera_id} media_only requires a mock source")
+        sync_group = str(source.get("sync_group", "")).strip()
+        sync_period = float(source.get("sync_period_seconds", 0.0))
+        sync_epoch = float(source.get("sync_epoch_seconds", 0.0))
+        if sync_group or sync_period != 0.0:
+            if source_type != "mock":
+                raise ValueError(f"camera {camera_id} synchronized source must be mock")
+            if (
+                not sync_group
+                or not math.isfinite(sync_period)
+                or sync_period <= 0.0
+                or not math.isfinite(sync_epoch)
+            ):
+                raise ValueError(
+                    f"camera {camera_id} synchronized mock requires sync_group, "
+                    "positive sync_period_seconds and finite sync_epoch_seconds"
+                )
+            group_contract = (sync_period, sync_epoch)
+            existing_contract = sync_groups.setdefault(sync_group, group_contract)
+            if existing_contract != group_contract:
+                raise ValueError(
+                    f"camera {camera_id} sync timeline differs from group {sync_group}"
+                )
         if media_only:
             enabled_functions = [
                 name
@@ -83,8 +107,7 @@ def validate_config(config: dict[str, Any], path: Path | None = None) -> dict[st
                     f"camera {camera_id} media_only cannot enable functions: "
                     f"{', '.join(sorted(enabled_functions))}"
                 )
-            sync_period = float(source.get("sync_period_seconds", 0.0))
-            if not str(source.get("sync_group", "")).strip() or sync_period <= 0.0:
+            if not sync_group or sync_period <= 0.0:
                 raise ValueError(
                     f"camera {camera_id} media_only requires sync_group and positive sync_period_seconds"
                 )
@@ -110,12 +133,18 @@ def validate_config(config: dict[str, Any], path: Path | None = None) -> dict[st
             )
             calibration = front.get("calibration", {}) or {}
             intrinsic = calibration.get("intrinsics", [])
+            rpy_calib = calibration.get("rpy_calib", [])
+            traffic_convention = str(
+                front.get("traffic_convention", "left_hand")
+            ).lower()
             if (
                 int(front.get("model_rate_hz", 20)) != 20
                 or int(calibration.get("source_width", 0)) <= 0
                 or int(calibration.get("source_height", 0)) <= 0
                 or len(intrinsic) != 3
                 or any(not isinstance(row, list) or len(row) != 3 for row in intrinsic)
+                or len(rpy_calib) != 3
+                or traffic_convention not in {"left_hand", "right_hand"}
             ):
                 raise ValueError(
                     f"camera {camera_id} front_assistance calibration/model rate is invalid"
@@ -187,7 +216,7 @@ def validate_config(config: dict[str, Any], path: Path | None = None) -> dict[st
             if not labels or not positive_labels or not set(positive_labels).issubset(labels):
                 raise ValueError(f"dms object model {source} has invalid labels")
         event_policy = dms_config.get("event_policy", {}) or {}
-        for section_name in ("model", "face", "no_seatbelt"):
+        for section_name in ("attention", "model", "face", "no_seatbelt"):
             section = event_policy.get(section_name, {}) or {}
             hits = int(section.get("confirmation_hits", 1))
             window = int(section.get("confirmation_window", hits))
@@ -244,6 +273,14 @@ def validate_config(config: dict[str, Any], path: Path | None = None) -> dict[st
                 "dms.face_mesh.neutral_calibration.neutral_update_alpha "
                 "must be in [0, 1]"
             )
+        attention = dms_config.get("attention", {}) or {}
+        if float(attention.get("interval_ms", 100)) < 50.0:
+            raise ValueError("dms.attention.interval_ms must be at least 50")
+        alert_seconds = [float(item) for item in attention.get("alert_seconds", ())]
+        if len(alert_seconds) != 3 or not (
+            0.0 < alert_seconds[0] < alert_seconds[1] < alert_seconds[2]
+        ):
+            raise ValueError("dms.attention.alert_seconds must contain three increasing values")
     allow_engine_build = bool((config.get("runtime", {}) or {}).get("allow_engine_build", False))
     engine_path = str((config.get("person", {}) or {}).get("engine_path", ""))
     if validate_models:
@@ -651,6 +688,9 @@ def resolve_camera_config(config: dict[str, Any], camera_id: str | None = None) 
             "mock_sync_group": str(source.get("sync_group", input_config.get("mock_sync_group", ""))),
             "mock_sync_period_seconds": float(
                 source.get("sync_period_seconds", input_config.get("mock_sync_period_seconds", 0.0))
+            ),
+            "mock_sync_epoch_seconds": float(
+                source.get("sync_epoch_seconds", input_config.get("mock_sync_epoch_seconds", 0.0))
             ),
             "width": int(source.get("width", input_config.get("width", 1920))),
             "height": int(source.get("height", input_config.get("height", 1080))),

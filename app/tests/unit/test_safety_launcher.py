@@ -17,6 +17,8 @@ def test_jetson_dev_launcher_uses_source_sync_and_vite_hmr() -> None:
     assert "MediaMTX" not in launcher
     assert "Vite HMR" in launcher
     assert "ssh" in launcher
+    assert "interfaces.mock_media_server" in launcher
+    assert "http.server" not in launcher
     assert "start.ps1" not in launcher
 
 
@@ -106,7 +108,7 @@ def test_live_output_follows_rtsp_sample_contract() -> None:
 
 
 def test_config_routes_functions_per_camera() -> None:
-    config_path = ROOT / "app" / "config" / "dev.yaml"
+    config_path = ROOT / "app" / "config" / "production.yaml"
     raw = load_raw_config(config_path)
 
     assert camera_ids(raw) == ["camera_face", "camera_safety", "DMS"]
@@ -119,6 +121,7 @@ def test_config_routes_functions_per_camera() -> None:
         "smoking_behavior": False,
         "fire_smoke": False,
         "dms": False,
+        "front_assistance": False,
     }
     assert safety["functions"] == {
         "trace": True,
@@ -126,17 +129,20 @@ def test_config_routes_functions_per_camera() -> None:
         "smoking_behavior": True,
         "fire_smoke": True,
         "dms": False,
+        "front_assistance": False,
     }
     assert face["person"]["confidence"] == 0.05
     assert face["person"]["tracking"]["confirmation_hits"] == 2
     dahua = resolve_camera_config(raw, "DMS")
-    assert "channel=5" in dahua["input"]["rtsp_url"]
+    assert dahua["input"]["mode"] == "rtsp"
+    assert dahua["input"]["rtsp_url"] == "rtsp://camera-dahua:554/stream"
     assert dahua["functions"] == {
         "trace": False,
         "face_recognition": False,
         "smoking_behavior": False,
         "fire_smoke": False,
         "dms": True,
+        "front_assistance": False,
     }
 
 
@@ -155,7 +161,7 @@ def test_config_is_valid_yaml_and_has_stable_evidence_contract() -> None:
 
 
 def test_fire_smoke_canary_model_can_be_overridden_for_one_camera() -> None:
-    raw = load_raw_config(ROOT / "app" / "config" / "dev.yaml")
+    raw = load_raw_config(ROOT / "app" / "config" / "production.yaml")
     raw["cameras"][1]["analysis"]["functions"]["fire_smoke"]["onnx_path"] = (
         "/tmp/fire-smoke-candidate.onnx"
     )
@@ -171,7 +177,7 @@ def test_runtime_can_disable_notifications_for_acceptance(monkeypatch) -> None:
     monkeypatch.setenv("DEEPSTREAM_NOTIFICATIONS_ENABLED", "false")
 
     resolved = resolve_camera_config(
-        load_raw_config(ROOT / "app" / "config" / "dev.yaml"),
+        load_raw_config(ROOT / "app" / "config" / "production.yaml"),
         "camera_safety",
     )
 

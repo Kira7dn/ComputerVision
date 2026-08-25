@@ -32,7 +32,11 @@ from urllib.parse import urlparse
 from urllib.request import urlopen
 
 from adapters.media.mock_input import wait_for_rtsp_video
-from adapters.models.dms_engine import DmsBehaviorEngine, DmsInferenceResult
+from adapters.models.dms_engine import (
+    DmsBehaviorEngine,
+    DmsInferenceResult,
+    select_dms_overlay_detections,
+)
 from adapters.models.face_engine import FaceRecognitionEngine
 from adapters.models.fire_smoke_engine import FireSmokeEngine
 from adapters.models.openpilot_front_engine import OpenpilotFrontEngine
@@ -71,12 +75,17 @@ import zmq  # noqa: E402
 
 from domain.contracts import AnalysisSample, FrameKey, FunctionResult  # noqa: E402
 from domain.dms_events import DmsAlertEventStore  # noqa: E402
+from domain.dms_health import (  # noqa: E402
+    requires_person_inference,
+    resolve_dms_health,
+)
 from domain.fire_smoke_events import FireSmokeEventStore  # noqa: E402
 from domain.front_assistance import (  # noqa: E402
     FrontAlertTransition,
     FrontPerception,
     VisionAlertPolicy,
 )
+from domain.front_overlay import project_front_overlay  # noqa: E402
 from domain.recognition import RecognitionCore, TrackKey  # noqa: E402
 from domain.smoking_events import SmokingEpisodeStore, SmokingInferenceBatch  # noqa: E402
 from domain.tracking import (  # noqa: E402
@@ -114,10 +123,17 @@ def nms(boxes: list[np.ndarray], threshold: float) -> list[np.ndarray]:
     return selected
 
 
-def _dms_status_text(status: str, alerts: tuple[str, ...]) -> tuple[str, int]:
+def _dms_status_text(
+    status: str,
+    alerts: tuple[str, ...],
+    message: str | None = None,
+) -> tuple[str, int]:
     """Return a bounded two-line DMS HUD status and its line count."""
     if not alerts:
-        return f"DMS {status}", 1
+        if status in {"MONITORING", "OK"} or not message:
+            return f"DMS {status}", 1
+        detail = textwrap.shorten(message.upper(), width=42, placeholder="…")
+        return f"DMS {status}\n{detail}", 2
     alert_text = " • ".join(str(alert) for alert in alerts)
     lines = textwrap.wrap(
         alert_text,
@@ -174,11 +190,7 @@ class SafetyPipeline:
         self.front_assistance_enabled = bool(
             functions.get("front_assistance", False)
         )
-        self.person_inference_enabled = bool(
-            functions.get("face_recognition", False)
-            or self.smoking_behavior_enabled
-            or self.fire_smoke_enabled
-        )
+        self.person_inference_enabled = requires_person_inference(functions)
         self.trace_enabled = bool(functions.get("trace", True))
         LOG.info(
             "function topology: camera=%s dms=%s face_recognition=%s smoking_behavior=%s fire_smoke=%s front_assistance=%s person_inference=%s",
@@ -218,6 +230,14 @@ class SafetyPipeline:
         self.front_policy = VisionAlertPolicy()
         self._front_perception: FrontPerception | None = None
         self._front_transitions: list[FrontAlertTransition] = []
+        self._front_overlay_metrics: dict[str, Any] = {
+            "visible_lane_count": 0,
+            "lane_segment_count": 0,
+            "path_point_count": 0,
+            "path_segment_count": 0,
+            "rendered_segment_count": 0,
+            "lane_confidences": {},
+        }
         self.recognition_last_frame: dict[TrackKey, int] = {}
         self.last_event_transition: str | None = None
         self._person_tracks: dict[int, dict[str, Any]] = {}
@@ -985,6 +1005,7 @@ maintain-aspect-ratio=0
             sample.frame,
             list(sample.persons),
             sample.key.frame_number,
+            source_timestamp=sample.source_timestamp,
         )
 
     def _process_fire_smoke_sample(self, sample: AnalysisSample) -> dict[str, Any]:
@@ -1098,29 +1119,40 @@ maintain-aspect-ratio=0
                 "candidate_alerts": self.dms_events.candidate_labels,
                 "event_lifecycle": self.dms_events.metrics(),
             }
-            confirmed_status = raw_result.status
-            if confirmed_status not in {"DEGRADED", "DISABLED"}:
-                confirmed_status = "ALERT" if confirmed_alerts else "OK"
+            health = resolve_dms_health(
+                raw_result.status,
+                confirmed_alerts,
+                confirmed_metrics,
+                raw_result.message,
+            )
+            confirmed_status = health.status
+            confirmed_metrics.update(
+                {
+                    "observation_ready": health.observation_ready,
+                    "driver_visible": health.driver_visible,
+                    "face_visible": health.face_visible,
+                }
+            )
             published_result = DmsInferenceResult(
                 raw_result.smoking,
                 raw_result.detections,
                 confirmed_alerts,
                 confirmed_status,
                 confirmed_metrics,
-                raw_result.message,
+                health.message,
             )
-            confirmed_detections = [
+            confirmed_detections = select_dms_overlay_detections(
                 item
                 for item in raw_result.detections
                 if item.label in confirmed_alerts
-            ]
+            )
             metadata.update(
                 {
                     "status": confirmed_status,
                     "alerts": list(confirmed_alerts),
                     "candidate_alerts": self.dms_events.candidate_labels,
                     "metrics": confirmed_metrics,
-                    "message": raw_result.message,
+                    "message": health.message,
                     "raw_detection_count": len(raw_result.detections),
                     "confirmed_detection_count": len(confirmed_detections),
                 }
@@ -1352,6 +1384,7 @@ maintain-aspect-ratio=0
             status_label, status_lines = _dms_status_text(
                 dms_result.status,
                 tuple(dms_result.alerts),
+                dms_result.message,
             )
             frame_width = int(self.config["input"].get("width", 1920))
             frame_height = int(self.config["input"].get("height", 1080))
@@ -1400,9 +1433,12 @@ maintain-aspect-ratio=0
             first.y_offset = 24
             first.font_params.font_name = "Sans"
             first.font_params.font_size = 32
-            first.font_params.font_color.set(
-                1.0, 0.25, 0.10, 1.0
-            ) if dms_result.alerts else first.font_params.font_color.set(0.10, 1.0, 0.55, 1.0)
+            if dms_result.alerts:
+                first.font_params.font_color.set(1.0, 0.25, 0.10, 1.0)
+            elif dms_result.status == "MONITORING":
+                first.font_params.font_color.set(0.10, 1.0, 0.55, 1.0)
+            else:
+                first.font_params.font_color.set(1.0, 0.75, 0.10, 1.0)
             first.set_bg_clr = 1
             first.text_bg_clr.set(0.0, 0.0, 0.0, 0.70)
             for index, (label, x_offset, y_offset) in enumerate(laid_out, start=1):
@@ -1420,32 +1456,36 @@ maintain-aspect-ratio=0
             with self._analysis_lock:
                 perception = self._front_perception
                 active_alerts = list(self.front_policy.active_labels)
-            display_meta = pyds.nvds_acquire_display_meta_from_pool(batch_meta)
-            display_meta.num_labels = 1
-            text_params = display_meta.text_params[0]
-            if perception is None:
-                label = "FRONT SHADOW | WARMING"
-                color = (1.0, 0.75, 0.1, 1.0)
-            elif perception.valid:
-                alerts = ", ".join(active_alerts) if active_alerts else "NO ALERT"
-                label = f"FRONT SHADOW | {alerts} | {perception.inference_ms:.1f} ms"
-                color = (1.0, 0.2, 0.1, 1.0) if active_alerts else (0.1, 1.0, 0.55, 1.0)
-            else:
-                reason = ",".join(perception.blocking_reasons) or "NOT READY"
-                label = f"FRONT SHADOW | {reason}"
-                color = (1.0, 0.75, 0.1, 1.0)
+            label: str | None = None
+            color = (1.0, 0.75, 0.1, 1.0)
             if perception is not None and perception.valid:
                 self._render_front_geometry(batch_meta, frame_meta, perception)
-            text_params.display_text = label
-            text_params.x_offset = 24
-            text_params.y_offset = 90
-            text_params.font_params.font_name = "Sans"
-            text_params.font_params.font_size = 22
-            text_params.font_params.font_color.set(*color)
-            text_params.set_bg_clr = 1
-            text_params.text_bg_clr.set(0.0, 0.0, 0.0, 0.70)
-            pyds.nvds_add_display_meta_to_frame(frame_meta, display_meta)
-        self._add_live_timestamp(batch_meta, frame_meta)
+                if active_alerts:
+                    names = {
+                        "vision_ldw_left": "LANE DEPARTURE LEFT",
+                        "vision_ldw_right": "LANE DEPARTURE RIGHT",
+                        "vision_fcw": "FORWARD COLLISION WARNING",
+                    }
+                    label = " | ".join(names.get(item, item.upper()) for item in active_alerts)
+                    color = (1.0, 0.2, 0.1, 1.0)
+            elif perception is not None:
+                reason = ",".join(perception.blocking_reasons) or "NOT READY"
+                label = f"ADAS NOT READY | {reason}"
+            if label is not None:
+                display_meta = pyds.nvds_acquire_display_meta_from_pool(batch_meta)
+                display_meta.num_labels = 1
+                text_params = display_meta.text_params[0]
+                text_params.display_text = label
+                text_params.x_offset = 24
+                text_params.y_offset = 24
+                text_params.font_params.font_name = "Sans"
+                text_params.font_params.font_size = 24
+                text_params.font_params.font_color.set(*color)
+                text_params.set_bg_clr = 1
+                text_params.text_bg_clr.set(0.0, 0.0, 0.0, 0.70)
+                pyds.nvds_add_display_meta_to_frame(frame_meta, display_meta)
+        if not self.front_assistance_enabled:
+            self._add_live_timestamp(batch_meta, frame_meta)
 
     def _render_front_geometry(
         self,
@@ -1453,66 +1493,75 @@ maintain-aspect-ratio=0
         frame_meta: Any,
         perception: FrontPerception,
     ) -> None:
-        """Project a bounded lane/path summary into the configured camera frame."""
-        calibration = (self.config.get("front_assistance", {}) or {}).get(
-            "calibration", {}
-        ) or {}
-        intrinsic = calibration.get("intrinsics", [])
-        if len(intrinsic) != 3:
-            return
-        fx = float(intrinsic[0][0])
-        fy = float(intrinsic[1][1])
-        cx = float(intrinsic[0][2])
-        cy = float(intrinsic[1][2])
-        camera_height = float(calibration.get("camera_height_m", 1.51))
+        """Render projected lane boundaries and a visible predicted path corridor."""
+        front_config = self.config.get("front_assistance", {}) or {}
+        calibration = front_config.get("calibration", {}) or {}
+        overlay_config = front_config.get("overlay", {}) or {}
         width = int(self.config["input"].get("width", 960))
         height = int(self.config["input"].get("height", 540))
-
-        def project(x: float, y: float, z: float = 0.0) -> tuple[int, int] | None:
-            if x <= 1.0:
-                return None
-            px = int(round(cx + (fx * y / x)))
-            py = int(round(cy + (fy * (camera_height - z) / x)))
-            if px < 0 or px >= width or py < 0 or py >= height:
-                return None
-            return px, py
-
-        segments: list[tuple[tuple[int, int], tuple[int, int], tuple[float, ...]]] = []
-        lane_colors = ((0.2, 0.8, 1.0, 0.9), (0.2, 1.0, 0.4, 0.95))
-        for lane_index, color in zip((1, 2), lane_colors, strict=True):
-            if (
-                lane_index >= len(perception.lane_lines)
-                or lane_index >= len(perception.lane_probabilities)
-                or perception.lane_probabilities[lane_index] <= 0.2
-            ):
-                continue
-            sampled = perception.lane_lines[lane_index][2:23:5]
-            points = [project(x, y) for x, y in sampled]
-            valid_points = [point for point in points if point is not None]
-            segments.extend(
-                (left, right, color)
-                for left, right in zip(valid_points, valid_points[1:], strict=False)
-            )
-        path_points = [
-            project(x, y, z) for x, y, z in perception.path[2:23:5]
-        ]
-        valid_path = [point for point in path_points if point is not None]
-        segments.extend(
-            (left, right, (1.0, 0.75, 0.1, 0.95))
-            for left, right in zip(valid_path, valid_path[1:], strict=False)
+        geometry = project_front_overlay(
+            perception,
+            calibration,
+            width=width,
+            height=height,
+            lane_min_probability=float(
+                overlay_config.get("lane_min_probability", 0.5)
+            ),
+            path_half_width_m=float(overlay_config.get("path_half_width_m", 0.9)),
         )
-        if not segments:
-            return
-        display_meta = pyds.nvds_acquire_display_meta_from_pool(batch_meta)
-        bounded = segments[:16]
-        display_meta.num_lines = len(bounded)
-        for index, (left, right, color) in enumerate(bounded):
-            line = display_meta.line_params[index]
-            line.x1, line.y1 = left
-            line.x2, line.y2 = right
-            line.line_width = 4
-            line.line_color.set(*color)
-        pyds.nvds_add_display_meta_to_frame(frame_meta, display_meta)
+        segments: list[
+            tuple[tuple[int, int], tuple[int, int], tuple[float, ...], int]
+        ] = []
+
+        def add_polyline(
+            points: tuple[tuple[int, int], ...],
+            color: tuple[float, ...],
+            width_pixels: int,
+        ) -> None:
+            segments.extend(
+                (left, right, color, width_pixels)
+                for left, right in zip(points, points[1:], strict=False)
+            )
+
+        lane_colors = {
+            1: (0.05, 0.85, 1.0, 0.95),
+            2: (0.15, 1.0, 0.35, 0.95),
+        }
+        for lane in geometry.lanes:
+            line_width = 5 if lane.confidence >= 0.2 else 3
+            add_polyline(
+                lane.points,
+                lane_colors.get(lane.lane_index, (0.8, 0.8, 0.8, 0.8)),
+                line_width,
+            )
+        add_polyline(geometry.path_left, (1.0, 0.45, 0.0, 0.95), 5)
+        add_polyline(geometry.path_right, (1.0, 0.45, 0.0, 0.95), 5)
+        add_polyline(geometry.path_center, (1.0, 0.95, 0.15, 0.95), 4)
+        segments.extend(
+            (left, right, (1.0, 0.65, 0.05, 0.60), 2)
+            for left, right in zip(
+                geometry.path_left,
+                geometry.path_right,
+                strict=False,
+            )
+        )
+        metrics = {
+            **geometry.summary(),
+            "rendered_segment_count": len(segments),
+        }
+        with self._analysis_lock:
+            self._front_overlay_metrics = metrics
+        for offset in range(0, len(segments), 16):
+            chunk = segments[offset : offset + 16]
+            display_meta = pyds.nvds_acquire_display_meta_from_pool(batch_meta)
+            display_meta.num_lines = len(chunk)
+            for index, (left, right, color, line_width) in enumerate(chunk):
+                line = display_meta.line_params[index]
+                line.x1, line.y1 = left
+                line.x2, line.y2 = right
+                line.line_width = line_width
+                line.line_color.set(*color)
+            pyds.nvds_add_display_meta_to_frame(frame_meta, display_meta)
 
     def _on_output_buffer(self, pad: Gst.Pad, info: Gst.PadProbeInfo) -> Gst.PadProbeReturn:
         """Render backend-owned labels without applying an old ROI to a new frame."""
@@ -1649,6 +1698,7 @@ maintain-aspect-ratio=0
                     {
                         **self._front_perception.summary(),
                         "active_alerts": list(self.front_policy.active_labels),
+                        "overlay": dict(self._front_overlay_metrics),
                     }
                     if self._front_perception is not None
                     else {
@@ -1658,6 +1708,7 @@ maintain-aspect-ratio=0
                         if self.front_assistance_enabled
                         else "disabled",
                         "active_alerts": [],
+                        "overlay": dict(self._front_overlay_metrics),
                     }
                 ),
                 "smoking_person_count": getattr(self.smoking_behavior_engine, "last_person_count", 0),
@@ -1710,6 +1761,21 @@ maintain-aspect-ratio=0
                             "person_track_id": detection.person_track_id,
                         }
                         for detection in self._analysis_dms_detections
+                    ],
+                    "raw_detections": [
+                        {
+                            "source": detection.source,
+                            "original_class": detection.original_class,
+                            "label": detection.label,
+                            "score": round(float(detection.score), 5),
+                            "bbox": [round(float(value), 2) for value in detection.bbox],
+                            "person_track_id": detection.person_track_id,
+                        }
+                        for detection in (
+                            self._analysis_dms_result.detections
+                            if self._analysis_dms_result
+                            else ()
+                        )[:16]
                     ],
                     "events": self.dms_events.metrics(),
                     "active_event_ids": self.dms_events.active_event_ids,
@@ -2098,6 +2164,7 @@ maintain-aspect-ratio=0
             )
             front_perception = self._front_perception
             front_transitions = list(self._front_transitions)
+            front_overlay_metrics = dict(self._front_overlay_metrics)
         face_by_track = {
             int(item.get("track_id", -1)): item for item in face_tracks
         }
@@ -2193,6 +2260,20 @@ maintain-aspect-ratio=0
                     }
                     for detection in dms_detections
                 ],
+                "raw_detections": [
+                    {
+                        "source": detection.source,
+                        "original_class": detection.original_class,
+                        "label": detection.label,
+                        "confidence": round(float(detection.score), 5),
+                        "left": round(float(detection.bbox[0]), 2),
+                        "top": round(float(detection.bbox[1]), 2),
+                        "right": round(float(detection.bbox[2]), 2),
+                        "bottom": round(float(detection.bbox[3]), 2),
+                        "person_track_id": detection.person_track_id,
+                    }
+                    for detection in (dms_result.detections if dms_result else ())[:16]
+                ],
                 "events": self.dms_events.metrics(),
                 "active_event_ids": self.dms_events.active_event_ids,
                 "transitions": [
@@ -2209,6 +2290,7 @@ maintain-aspect-ratio=0
                 {
                     **front_perception.summary(),
                     "active_alerts": list(self.front_policy.active_labels),
+                    "overlay": front_overlay_metrics,
                     "transitions": [
                         {
                             "operation": item.operation,
@@ -2227,6 +2309,7 @@ maintain-aspect-ratio=0
                     if self.front_assistance_enabled
                     else "disabled",
                     "active_alerts": [],
+                    "overlay": front_overlay_metrics,
                     "transitions": [],
                 }
             ),
@@ -2558,7 +2641,11 @@ maintain-aspect-ratio=0
         mock_video = Path(str(input_cfg["mock_video"]))
         if not mock_video.is_file():
             raise FileNotFoundError(f"mock_video does not exist: {mock_video}")
-        if shutil.which("ffmpeg"):
+        sync_group = str(input_cfg.get("mock_sync_group", "")).strip()
+        sync_period = float(input_cfg.get("mock_sync_period_seconds", 0.0))
+        sync_epoch = float(input_cfg.get("mock_sync_epoch_seconds", 0.0))
+        synchronized = bool(sync_group) and sync_period > 0.0
+        if shutil.which("ffmpeg") and not synchronized:
             publisher_stderr: int | None = subprocess.DEVNULL
             command = [
                 "ffmpeg",
@@ -2608,9 +2695,25 @@ maintain-aspect-ratio=0
             ]
             if bool(input_cfg.get("mock_loop", True)):
                 command.append("--loop")
-            LOG.warning(
-                "ffmpeg is unavailable; using the bounded GStreamer mock publisher"
-            )
+            if synchronized:
+                command.extend(
+                    [
+                        "--sync-period",
+                        str(sync_period),
+                        "--sync-epoch",
+                        str(sync_epoch),
+                    ]
+                )
+                LOG.info(
+                    "using shared mock timeline: group=%s period=%.3f epoch=%.3f",
+                    sync_group,
+                    sync_period,
+                    sync_epoch,
+                )
+            else:
+                LOG.warning(
+                    "ffmpeg is unavailable; using the bounded GStreamer mock publisher"
+                )
         self.mock_publisher = subprocess.Popen(
             command,
             stdout=subprocess.DEVNULL,

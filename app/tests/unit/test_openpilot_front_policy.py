@@ -17,10 +17,10 @@ def _perception(
     valid: bool = True,
 ) -> FrontPerception:
     lanes = (
-        ((0.0, -3.0),),
-        ((0.0, -1.0 if left else -2.0),),
-        ((0.0, 1.0 if right else 2.0),),
-        ((0.0, 3.0),),
+        ((0.0, -3.0, 1.2),),
+        ((0.0, -1.0 if left else -2.0, 1.2),),
+        ((0.0, 1.0 if right else 2.0, 1.2),),
+        ((0.0, 3.0, 1.2),),
     )
     desire = (0.0, 0.2 if left else 0.0, 0.2 if right else 0.0)
     return FrontPerception(

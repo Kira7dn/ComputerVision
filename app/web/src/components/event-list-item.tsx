@@ -21,6 +21,7 @@ const DMS_LABELS: Record<string, string> = {
   phone: 'Dùng điện thoại',
   phoneuse: 'Dùng điện thoại',
   distracted: 'Mất tập trung',
+  'driver inattention': 'Tài xế mất tập trung',
   drowsy: 'Buồn ngủ',
   yawning: 'Ngáp',
   'eyes closed': 'Nhắm mắt',
@@ -124,6 +125,12 @@ export function formatDmsEvidence(event: EventRecord) {
   const pitch = typeof pitchValue === 'number' ? pitchValue.toFixed(1) : null
   const ear = typeof earValue === 'number' ? earValue.toFixed(3) : null
   const mar = typeof marValue === 'number' ? marValue.toFixed(3) : null
+  if (label === 'driver inattention') {
+    const score = storedEvidence?.attention_score
+    const reasons = stringList(storedEvidence?.attention_reasons)
+    const reasonText = reasons.map((item) => DMS_LABELS[normalizedLabel(item)] ?? humanizeLabel(item)).join(' · ')
+    return `Attention ${typeof score === 'number' ? `${score}%` : '--'}${reasonText ? ` · ${reasonText}` : ''}`
+  }
   if (label === 'head away' && (yaw !== null || pitch !== null)) return `Yaw ${yaw ?? '--'}° · Pitch ${pitch ?? '--'}°`
   if (label === 'no seatbelt') {
     const hits = storedEvidence?.confirmation_hits

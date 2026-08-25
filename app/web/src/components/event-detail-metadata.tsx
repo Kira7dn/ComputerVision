@@ -22,6 +22,7 @@ export function EventDetailMetadata({ event }: EventDetailMetadataProps) {
   const metrics = dmsMetrics(event)
   const details = asRecord(event.details)
   const dmsEvidence = asRecord(details.dms_evidence)
+  const attention = asRecord(metrics.driver_attention)
   const confidence = formatEventScore(event, 2)
   const metadata: Array<[string, unknown]> = [
     ['Camera', event.camera],
@@ -74,6 +75,10 @@ export function EventDetailMetadata({ event }: EventDetailMetadataProps) {
           <div className="event-detail-field"><span>Yaw / Pitch</span><strong>{display(metrics.yaw_deg)}° / {display(metrics.pitch_deg)}°</strong></div>
           <div className="event-detail-field"><span>Face latency</span><strong>{display(metrics.face_latency_ms)} ms</strong></div>
           <div className="event-detail-field"><span>Total latency</span><strong>{display(metrics.total_latency_ms)} ms</strong></div>
+          <div className="event-detail-field"><span>Attention</span><strong>{display(attention.score)}%</strong></div>
+          <div className="event-detail-field"><span>Mức attention</span><strong>{display(attention.alert_level)}</strong></div>
+          <div className="event-detail-field"><span>Nguyên nhân</span><strong>{display(Array.isArray(attention.reasons) ? attention.reasons.join(', ') : null)}</strong></div>
+          <div className="event-detail-field"><span>Nguồn attention</span><strong>{display(attention.source)}</strong></div>
           <div className="event-detail-field"><span>Evidence bbox</span><strong>{display(Array.isArray(dmsEvidence.best_bbox) ? dmsEvidence.best_bbox.join(', ') : null)}</strong></div>
           <div className="event-detail-field"><span>Person track</span><strong>{display(dmsEvidence.person_track_id)}</strong></div>
         </div>

@@ -115,6 +115,12 @@ class OpenpilotFrontEngine:
         self.session: Any | None = None
         self.output_slices: dict[str, slice] = {}
         self.calibration = self._load_calibration(front.get("calibration", {}) or {})
+        traffic_convention = str(front.get("traffic_convention", "left_hand")).lower()
+        if traffic_convention not in {"left_hand", "right_hand"}:
+            raise ValueError(
+                "front traffic_convention must be left_hand or right_hand"
+            )
+        self.traffic_convention = traffic_convention
         self._epoch: str | None = None
         self._last_timestamp: float | None = None
         self._image_queue: deque[np.ndarray] = deque(maxlen=5)
@@ -258,7 +264,10 @@ class OpenpilotFrontEngine:
             "big_img": big_img,
             "features_buffer": features.astype(np.float16, copy=False),
             "desire_pulse": np.zeros((1, 25, 8), dtype=np.float16),
-            "traffic_convention": np.array([[1.0, 0.0]], dtype=np.float16),
+            "traffic_convention": np.array(
+                [[0.0, 1.0] if self.traffic_convention == "right_hand" else [1.0, 0.0]],
+                dtype=np.float16,
+            ),
             "action_t": np.array([[0.075, 0.375]], dtype=np.float16),
         }
         started = time.perf_counter()
@@ -296,12 +305,18 @@ class OpenpilotFrontEngine:
             readiness=FrontReadiness.READY,
             blocking_reasons=(),
             lane_lines=tuple(
-                tuple((X_IDXS[index], float(point[0])) for index, point in enumerate(line))
+                tuple(
+                    (X_IDXS[index], float(point[0]), float(point[1]))
+                    for index, point in enumerate(line)
+                )
                 for line in lane_values
             ),
             lane_probabilities=tuple(float(value) for value in lane_probabilities),
             road_edges=tuple(
-                tuple((X_IDXS[index], float(point[0])) for index, point in enumerate(edge))
+                tuple(
+                    (X_IDXS[index], float(point[0]), float(point[1]))
+                    for index, point in enumerate(edge)
+                )
                 for edge in edge_values
             ),
             path=tuple(
@@ -325,7 +340,21 @@ class OpenpilotFrontEngine:
             inference_ms=inference_ms,
             model_hash=self.model_hash,
             calibration_hash=self.calibration.artifact_hash,
-            diagnostics={"model_rate_hz": round(1.0 / self.interval_seconds, 3)},
+            diagnostics={
+                "model_rate_hz": round(1.0 / self.interval_seconds, 3),
+                "path_x_range": [
+                    round(float(np.min(plan[:, 0])), 4),
+                    round(float(np.max(plan[:, 0])), 4),
+                ],
+                "path_y_range": [
+                    round(float(np.min(plan[:, 1])), 4),
+                    round(float(np.max(plan[:, 1])), 4),
+                ],
+                "path_z_range": [
+                    round(float(np.min(plan[:, 2])), 4),
+                    round(float(np.max(plan[:, 2])), 4),
+                ],
+            },
         )
 
     def _empty_perception(

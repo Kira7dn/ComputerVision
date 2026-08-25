@@ -17,7 +17,11 @@ def test_profiles_merge_and_production_has_no_mock_source() -> None:
     assert dev["cameras"][1]["source"].get("media_only", False) is False
     assert all(camera["source"]["media_only"] for camera in dev["cameras"][2:])
     assert {camera["source"]["sync_period_seconds"] for camera in dev["cameras"][1:]} == {191.1}
+    assert {camera["source"]["sync_epoch_seconds"] for camera in dev["cameras"][1:]} == {0.0}
     assert all(camera["source"]["type"] == "rtsp" for camera in production["cameras"])
+    for profile in (dev, production):
+        assert "mode" not in profile["dms"]["attention"]
+        assert "model_path" not in profile["dms"]["attention"]
 
 
 def test_runtime_directories_can_be_overridden_after_config_inheritance(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -49,8 +53,14 @@ def test_front_mock_has_worker_and_calibration_contract() -> None:
     assert resolved["input"]["media_only"] is False
     assert resolved["input"]["mock_sync_group"] == "vehicle_surround"
     assert resolved["input"]["mock_sync_period_seconds"] == 191.1
+    assert resolved["input"]["mock_sync_epoch_seconds"] == 0.0
     assert resolved["functions"]["front_assistance"] is True
     assert resolved["front_assistance"]["enabled"] is True
+    assert resolved["front_assistance"]["traffic_convention"] == "right_hand"
+    assert resolved["front_assistance"]["overlay"] == {
+        "lane_min_probability": 0.5,
+        "path_half_width_m": 0.9,
+    }
     assert resolved["front_assistance"]["calibration"]["source_width"] == 960
     assert resolved["input"]["rtsp_url"].endswith("/camera_front_raw")
     assert resolved["output"]["rtsp_url"].endswith("/camera_front")
@@ -62,6 +72,24 @@ def test_media_only_mock_rejects_enabled_cv_function() -> None:
     camera["functions"]["fire_smoke"] = True
 
     with pytest.raises(ValueError, match="media_only cannot enable functions"):
+        validate_config(raw)
+
+
+def test_synchronized_mock_group_rejects_different_period() -> None:
+    raw = load_raw_config(Path(__file__).parents[2] / "config" / "dev.yaml")
+    camera = next(item for item in raw["cameras"] if item["id"] == "camera_right")
+    camera["source"]["sync_period_seconds"] = 190.0
+
+    with pytest.raises(ValueError, match="sync timeline differs"):
+        validate_config(raw)
+
+
+def test_synchronized_mock_group_rejects_different_epoch() -> None:
+    raw = load_raw_config(Path(__file__).parents[2] / "config" / "dev.yaml")
+    camera = next(item for item in raw["cameras"] if item["id"] == "camera_left")
+    camera["source"]["sync_epoch_seconds"] = 1.0
+
+    with pytest.raises(ValueError, match="sync timeline differs"):
         validate_config(raw)
 
 
@@ -96,12 +124,20 @@ def test_analysis_overrides_are_isolated_per_camera() -> None:
     assert dahua["functions"]["smoking_behavior"] is False
     assert dahua["functions"]["fire_smoke"] is False
     dms_models = dahua["dms"]["object_detection"]["models"]
-    assert set(dms_models["chaitanya"]["positive_labels"]) == {
-        "Cigarette", "Drinking", "Eating", "Phone", "Seatbelt"
+    assert set(dms_models) == {"soham"}
+    assert set(dms_models["soham"]["positive_labels"]) == {
+        "Distracted",
+        "Drinking",
+        "Drowsy",
+        "Eating",
+        "PhoneUse",
+        "SafeDriving",
+        "Seatbelt",
+        "Smoking",
     }
     assert dahua["dms"]["alerts"] == {"on_frames": 3, "off_frames": 2}
     assert dahua["dms"]["event_policy"]["model"] == {
-        "min_score": 0.50,
+        "min_score": 0.35,
         "require_person_match": True,
         "confirmation_hits": 6,
         "confirmation_window": 10,
@@ -118,7 +154,7 @@ def test_analysis_overrides_are_isolated_per_camera() -> None:
     assert safety["smoking_behavior"]["temporal"]["minimum_duration_seconds"] == 0.4
     assert safety["smoking_behavior"]["lifecycle"]["clearing_seconds"] == 3.0
     object_models = safety["smoking_behavior"]["object_detection"]["models"]
-    assert object_models["chaitanya"]["positive_labels"] == ["Cigarette"]
+    assert set(object_models) == {"soham"}
     assert object_models["soham"]["positive_labels"] == ["Smoking"]
     assert "events" not in safety
 

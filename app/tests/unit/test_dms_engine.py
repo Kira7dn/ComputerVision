@@ -10,6 +10,7 @@ from adapters.models.dms_engine import (
     DmsDetection,
     NeutralPoseCalibrator,
     compute_face_metrics,
+    select_dms_overlay_detections,
 )
 from adapters.persistence.evidence_repository import EvidenceStore
 from domain.dms_events import DmsAlertEventStore
@@ -35,7 +36,7 @@ def _config(tmp_path, epoch: str = "epoch-1") -> dict:
             },
             "event_policy": {
                 "model": {
-                    "min_score": 0.50,
+                    "min_score": 0.35,
                     "require_person_match": True,
                     "confirmation_hits": 3,
                     "confirmation_window": 4,
@@ -131,6 +132,36 @@ def test_dms_alert_smoother_ignores_non_alert_classes() -> None:
     assert smoother.update(["Safe Driving", "Seatbelt"]) == []
 
 
+def test_dms_overlay_keeps_one_strongest_box_per_behavior_and_driver() -> None:
+    strongest = DmsDetection(
+        source="soham",
+        original_class="Smoking",
+        label="Smoking",
+        score=0.69,
+        bbox=(100.0, 100.0, 180.0, 180.0),
+        person_track_id=7,
+    )
+    weaker_overlap = DmsDetection(
+        source="soham",
+        original_class="Smoking",
+        label="Smoking",
+        score=0.63,
+        bbox=(104.0, 96.0, 176.0, 182.0),
+        person_track_id=7,
+    )
+
+    selected = select_dms_overlay_detections((weaker_overlap, strongest))
+
+    assert selected == [strongest]
+
+
+def test_dms_overlay_keeps_same_behavior_for_different_drivers() -> None:
+    first = _detection("Smoking", 0.70, track_id=1)
+    second = _detection("Smoking", 0.65, track_id=2)
+
+    assert select_dms_overlay_detections((first, second)) == [first, second]
+
+
 def test_dms_face_metrics_use_reference_thresholds() -> None:
     points = [SimpleNamespace(x=0.5, y=0.5) for _ in range(478)]
     for index in range(478):
@@ -200,7 +231,7 @@ def test_low_score_smoking_never_becomes_an_event(tmp_path) -> None:
     evidence = EvidenceStore(config, "run-low-score")
     store = DmsAlertEventStore(config, evidence)
     seatbelt = _detection("Seatbelt", 0.8)
-    low_smoking = _detection("Smoking", 0.49)
+    low_smoking = _detection("Smoking", 0.34)
 
     for index in range(8):
         transitions = store.observe(
@@ -282,103 +313,62 @@ def test_confirmed_smoking_has_one_lifecycle_and_complete_evidence(
     evidence.close()
 
 
-def test_head_away_uses_current_pose_not_stale_alert_state(tmp_path) -> None:
+def test_driver_inattention_has_one_event_for_changing_reasons(tmp_path) -> None:
     config = _config(tmp_path)
-    evidence = EvidenceStore(config, "run-head-away")
+    evidence = EvidenceStore(config, "run-attention")
     store = DmsAlertEventStore(config, evidence)
     seatbelt = _detection("Seatbelt", 0.8)
 
-    below_threshold = _result(
-        detections=(seatbelt,),
-        alerts=("Head Away",),
-        metrics={
-            "face_detected": True,
-            "pose_calibrated": True,
-            "ear": 0.4,
-            "mar": 0.1,
-            "yaw_deg": 9.6,
-            "pitch_deg": -1.3,
-        },
-    )
-    for index in range(4):
-        assert store.observe(
-            frame_num=index,
-            timestamp=index * 0.2,
-            result=below_threshold,
-            frame=None,
-        ) == []
-    assert "Head Away" not in store.candidate_labels
-
-    head_away = _result(
+    distracted = _result(
         detections=(seatbelt,),
         metrics={
-            "face_detected": True,
-            "pose_calibrated": True,
-            "ear": 0.4,
-            "mar": 0.1,
-            "yaw_deg": 27.0,
-            "pitch_deg": -1.6,
-        },
+            "driver_attention": {
+                "event_active": True,
+                "state": "distracted",
+                "score": 34,
+                "alert_level": "critical",
+                "reasons": ["pose"],
+                "source": "current",
+            }
+        }
     )
-    assert store.observe(frame_num=10, timestamp=1.0, result=head_away, frame=None) == []
-    started = store.observe(
-        frame_num=11,
-        timestamp=1.2,
-        result=head_away,
-        frame=None,
-    )
+    assert store.observe(frame_num=10, timestamp=1.0, result=distracted, frame=None) == []
+    started = store.observe(frame_num=11, timestamp=1.1, result=distracted, frame=None)
     assert [item.operation for item in started] == ["START"]
+    assert started[0].label == "Driver Inattention"
 
-    unavailable = _result(
+    phone = _result(
         detections=(seatbelt,),
-        metrics={"face_detected": False},
-    )
-    assert store.observe(
-        frame_num=12,
-        timestamp=1.4,
-        result=unavailable,
-        frame=None,
-    ) == []
-    ended = store.observe(
-        frame_num=13,
-        timestamp=1.6,
-        result=unavailable,
-        frame=None,
-    )
-    assert [item.operation for item in ended] == ["END"]
-    assert ended[0].label == "Head Away"
-    evidence.close()
-
-
-def test_head_away_is_unknown_until_neutral_pose_is_calibrated(tmp_path) -> None:
-    config = _config(tmp_path)
-    evidence = EvidenceStore(config, "run-head-away-calibrating")
-    store = DmsAlertEventStore(config, evidence)
-    seatbelt = _detection("Seatbelt", 0.8)
-    calibrating = _result(
-        detections=(seatbelt,),
-        alerts=("Head Away",),
         metrics={
-            "face_detected": True,
-            "pose_calibrated": False,
-            "pose_calibration_samples": 10,
-            "raw_yaw_deg": 24.0,
-            "raw_pitch_deg": -2.0,
-            "yaw_deg": None,
-            "pitch_deg": None,
-        },
+            "driver_attention": {
+                "event_active": True,
+                "state": "distracted",
+                "score": 12,
+                "alert_level": "emergency",
+                "reasons": ["phone"],
+                "source": "openpilot",
+            }
+        }
     )
+    updates = store.observe(frame_num=12, timestamp=1.3, result=phone, frame=None)
+    assert all(item.label == "Driver Inattention" for item in updates)
+    assert len(store.active_event_ids) == 1
 
-    for index in range(6):
-        assert store.observe(
-            frame_num=index,
-            timestamp=index * 0.2,
-            result=calibrating,
-            frame=None,
-        ) == []
-
-    assert "Head Away" not in store.candidate_labels
-    assert store.active_event_ids == []
+    attentive = _result(
+        detections=(seatbelt,),
+        metrics={
+            "driver_attention": {
+                "event_active": False,
+                "state": "attentive",
+                "score": 80,
+                "alert_level": "none",
+                "reasons": [],
+                "source": "openpilot",
+            }
+        }
+    )
+    ended = store.observe(frame_num=13, timestamp=1.4, result=attentive, frame=None)
+    assert [item.operation for item in ended] == ["END"]
     evidence.close()
 
 

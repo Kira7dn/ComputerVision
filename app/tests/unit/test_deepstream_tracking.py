@@ -61,7 +61,7 @@ def test_person_confirmation_rejects_invalid_window() -> None:
 
 def test_person_confirmation_config_is_resolved_per_camera() -> None:
     config = resolve_camera_config(
-        load_raw_config(ROOT / "app" / "config" / "dev.yaml"),
+        load_raw_config(ROOT / "app" / "config" / "production.yaml"),
         "camera_safety",
     )
 

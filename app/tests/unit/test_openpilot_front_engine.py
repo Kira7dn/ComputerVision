@@ -13,7 +13,13 @@ from adapters.models.openpilot_front_engine import (
     OpenpilotFrontEngine,
     parse_model_output,
 )
-from adapters.models.openpilot_preprocess import prepare_model_frame
+from adapters.models.openpilot_preprocess import (
+    MEDMODEL_INTRINSICS,
+    VIEW_FROM_DEVICE,
+    _rotation_from_euler,
+    prepare_model_frame,
+    warp_matrix,
+)
 from domain.front_assistance import FrontCalibration
 
 OUTPUT_SLICES = {
@@ -102,6 +108,30 @@ def test_preprocess_produces_openpilot_tensor_shape() -> None:
     assert tensor.dtype == np.uint8
 
 
+def test_warp_matrix_matches_openpilot_reference_order() -> None:
+    calibration = FrontCalibration(
+        "fixture",
+        960,
+        540,
+        (
+            (759.85, 0.0, 489.76),
+            (0.0, 759.85, 294.90),
+            (0.0, 0.0, 1.0),
+        ),
+        rpy_calib=(0.01, -0.02, 0.03),
+        valid=True,
+    )
+    camera_intrinsics = np.asarray(calibration.intrinsics, dtype=np.float32)
+    expected = (
+        camera_intrinsics
+        @ VIEW_FROM_DEVICE
+        @ _rotation_from_euler(calibration.rpy_calib)
+        @ np.linalg.inv(MEDMODEL_INTRINSICS @ VIEW_FROM_DEVICE)
+    )
+
+    assert np.allclose(warp_matrix(calibration, big=False), expected, atol=1e-5)
+
+
 def test_output_parser_shapes_and_probabilities() -> None:
     parsed = parse_model_output(np.zeros((1, 2576), dtype=np.float16), OUTPUT_SLICES)
     assert parsed["plan"].shape == (1, 33, 15)
@@ -132,8 +162,31 @@ def test_engine_uses_single_frame_for_both_contexts_and_resets_on_epoch(tmp_path
     assert session.inputs["img"].shape == (1, 12, 128, 256)
     assert session.inputs["big_img"].shape == (1, 12, 128, 256)
     assert session.inputs["features_buffer"].shape == (1, 24, 512)
+    assert session.inputs["traffic_convention"].tolist() == [[1.0, 0.0]]
+    assert len(result.lane_lines[0][0]) == 3
     engine.process(frame, source_epoch="epoch-2", frame_number=2, source_timestamp=2.0)
     assert engine._epoch == "epoch-2"
+
+
+def test_engine_supports_right_hand_traffic_convention(tmp_path: Path) -> None:
+    model = tmp_path / "driving_supercombo.onnx"
+    model.write_bytes(b"pinned-model")
+    config = _config(model)
+    config["front_assistance"]["traffic_convention"] = "right_hand"
+    session = _Session("", ["CUDAExecutionProvider"])
+    engine = OpenpilotFrontEngine(
+        config, session_factory=lambda *_args, **_kwargs: session
+    )
+
+    engine.process(
+        np.zeros((8, 8, 3), dtype=np.uint8),
+        source_epoch="epoch",
+        frame_number=1,
+        source_timestamp=1.0,
+    )
+
+    assert session.inputs is not None
+    assert session.inputs["traffic_convention"].tolist() == [[0.0, 1.0]]
 
 
 def test_invalid_calibration_fails_closed_without_inference(tmp_path: Path) -> None:

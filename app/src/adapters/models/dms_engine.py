@@ -1,8 +1,8 @@
 """DMS behavior adapter for the DeepStream camera worker.
 
-The reference implementation in LeOS owns the DMS policy: two YOLO models,
+The runtime uses one Soham YOLO model,
 MediaPipe face metrics, canonical alert names and a small hysteresis smoother.
-This module keeps that policy intact while receiving frames from the
+This module keeps that policy while receiving frames from the
 DeepStream probe and returning frame-aligned results to the worker.
 """
 
@@ -12,7 +12,6 @@ import logging
 import math
 import sys
 import time
-from collections import deque
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,21 +25,16 @@ from adapters.models.smoking_object_detector import (
     SmokingObjectDetection,
     SmokingObjectDetector,
 )
+from domain.driver_attention import (
+    ATTENTION_EVENT_LABEL,
+    AttentionObservation,
+    DriverAttentionPolicy,
+    NeutralPoseCalibrator,
+)
 from domain.smoking_events import SmokingInferenceBatch, SmokingObservation
 
 LOG = logging.getLogger("deepstream.dms")
 
-CHAITANYA_CLASSES = ("Cigarette", "Drinking", "Eating", "Phone", "Seatbelt")
-SOHAM_CLASSES = (
-    "Distracted",
-    "Drinking",
-    "Drowsy",
-    "Eating",
-    "PhoneUse",
-    "SafeDriving",
-    "Seatbelt",
-    "Smoking",
-)
 ALERT_CLASSES = frozenset(
     {
         "Smoking",
@@ -56,11 +50,9 @@ ALERT_CLASSES = frozenset(
     }
 )
 LABEL_MAP = {
-    "Cigarette": "Smoking",
     "Smoking": "Smoking",
     "Drinking": "Drinking",
     "Eating": "Eating",
-    "Phone": "Phone Usage",
     "PhoneUse": "Phone Usage",
     "Seatbelt": "Seatbelt",
     "Distracted": "Distracted",
@@ -92,6 +84,37 @@ class DmsInferenceResult:
     message: str | None = None
 
 
+def select_dms_overlay_detections(
+    detections: Iterable[DmsDetection],
+) -> list[DmsDetection]:
+    """Keep one strongest confirmed behavior box per driver and label.
+
+    A model may emit overlapping candidates for one behavior. Drawing all of
+    them creates a misleading duplicate overlay. Unassigned diagnostics remain
+    separate.
+    """
+    selected: dict[tuple[str, int], DmsDetection] = {}
+    unassigned: list[DmsDetection] = []
+    for detection in detections:
+        if detection.person_track_id is None:
+            unassigned.append(detection)
+            continue
+        key = (str(detection.label), int(detection.person_track_id))
+        current = selected.get(key)
+        if current is None or float(detection.score) > float(current.score):
+            selected[key] = detection
+    return sorted(
+        [*selected.values(), *unassigned],
+        key=lambda item: (
+            str(item.label),
+            item.person_track_id is None,
+            int(item.person_track_id or -1),
+            -float(item.score),
+            str(item.source),
+        ),
+    )
+
+
 class AlertSmoother:
     """The same 3-hit-on / 2-miss-off alert hysteresis as dms.py."""
 
@@ -113,99 +136,6 @@ class AlertSmoother:
             elif self.counts[alert] <= -self.off_frames:
                 self.active[alert] = False
         return sorted(alert for alert, is_active in self.active.items() if is_active)
-
-
-class NeutralPoseCalibrator:
-    """Estimate the camera-specific straight-ahead yaw/pitch zero point."""
-
-    def __init__(self, config: dict[str, Any]) -> None:
-        self.enabled = bool(config.get("enabled", True))
-        self.minimum_samples = max(3, int(config.get("minimum_samples", 15)))
-        self.window_size = max(
-            self.minimum_samples,
-            int(config.get("window_size", 30)),
-        )
-        self.max_yaw_std = max(
-            0.1,
-            float(config.get("max_yaw_std_deg", 8.0)),
-        )
-        self.max_pitch_std = max(
-            0.1,
-            float(config.get("max_pitch_std_deg", 5.0)),
-        )
-        self.neutral_update_alpha = max(
-            0.0,
-            min(1.0, float(config.get("neutral_update_alpha", 0.01))),
-        )
-        self.neutral_update_max_delta = max(
-            0.1,
-            float(config.get("neutral_update_max_delta_deg", 5.0)),
-        )
-        self.samples: deque[tuple[float, float]] = deque(maxlen=self.window_size)
-        self.neutral_yaw: float | None = None
-        self.neutral_pitch: float | None = None
-
-    @property
-    def calibrated(self) -> bool:
-        return not self.enabled or (
-            self.neutral_yaw is not None and self.neutral_pitch is not None
-        )
-
-    def update(self, yaw: float, pitch: float) -> dict[str, Any]:
-        if not self.enabled:
-            return {
-                "pose_calibrated": True,
-                "pose_calibration_samples": 0,
-                "neutral_yaw_deg": 0.0,
-                "neutral_pitch_deg": 0.0,
-                "yaw_deg": round(yaw, 2),
-                "pitch_deg": round(pitch, 2),
-            }
-
-        if self.neutral_yaw is None or self.neutral_pitch is None:
-            self.samples.append((yaw, pitch))
-            if len(self.samples) >= self.minimum_samples:
-                values = np.asarray(self.samples, dtype=np.float32)
-                if (
-                    float(np.std(values[:, 0])) <= self.max_yaw_std
-                    and float(np.std(values[:, 1])) <= self.max_pitch_std
-                ):
-                    self.neutral_yaw = float(np.median(values[:, 0]))
-                    self.neutral_pitch = float(np.median(values[:, 1]))
-
-        calibrated = self.neutral_yaw is not None and self.neutral_pitch is not None
-        if not calibrated:
-            return {
-                "pose_calibrated": False,
-                "pose_calibration_samples": len(self.samples),
-                "neutral_yaw_deg": None,
-                "neutral_pitch_deg": None,
-                "yaw_deg": None,
-                "pitch_deg": None,
-            }
-
-        yaw_delta = yaw - float(self.neutral_yaw)
-        pitch_delta = pitch - float(self.neutral_pitch)
-        if (
-            abs(yaw_delta) <= self.neutral_update_max_delta
-            and abs(pitch_delta) <= self.neutral_update_max_delta
-            and self.neutral_update_alpha > 0.0
-        ):
-            alpha = self.neutral_update_alpha
-            self.neutral_yaw = (1.0 - alpha) * float(self.neutral_yaw) + alpha * yaw
-            self.neutral_pitch = (
-                (1.0 - alpha) * float(self.neutral_pitch) + alpha * pitch
-            )
-            yaw_delta = yaw - float(self.neutral_yaw)
-            pitch_delta = pitch - float(self.neutral_pitch)
-        return {
-            "pose_calibrated": True,
-            "pose_calibration_samples": len(self.samples),
-            "neutral_yaw_deg": round(float(self.neutral_yaw), 2),
-            "neutral_pitch_deg": round(float(self.neutral_pitch), 2),
-            "yaw_deg": round(yaw_delta, 2),
-            "pitch_deg": round(pitch_delta, 2),
-        }
 
 
 def _distance(first: tuple[float, float], second: tuple[float, float]) -> float:
@@ -312,7 +242,9 @@ class DmsFaceAnalyzer:
     def available(self) -> bool:
         return self._mesh is not None
 
-    def process(self, frame: np.ndarray) -> tuple[dict[str, Any], set[str], float]:
+    def process(
+        self, frame: np.ndarray, *, timestamp: float | None = None
+    ) -> tuple[dict[str, Any], set[str], float]:
         started = time.perf_counter()
         metrics: dict[str, Any] = {
             "face_detected": False,
@@ -320,6 +252,7 @@ class DmsFaceAnalyzer:
             "mar": None,
             "pose_calibrated": False,
             "pose_calibration_samples": len(self.pose_calibrator.samples),
+            "pose_calibrated_percent": self.pose_calibrator.calibrated_percent,
             "raw_yaw_deg": None,
             "raw_pitch_deg": None,
             "neutral_yaw_deg": self.pose_calibrator.neutral_yaw,
@@ -344,7 +277,12 @@ class DmsFaceAnalyzer:
         raw_pitch = float(metrics["pitch_deg"])
         raw_alerts = set(metrics.get("raw_alerts", ()))
         raw_alerts.discard("Head Away")
-        pose = self.pose_calibrator.update(raw_yaw, raw_pitch)
+        pose = self.pose_calibrator.update(
+            raw_yaw,
+            raw_pitch,
+            timestamp=timestamp,
+            sample_valid=not raw_alerts,
+        )
         metrics.update(
             {
                 "raw_yaw_deg": round(raw_yaw, 2),
@@ -366,10 +304,19 @@ class DmsBehaviorEngine:
 
     def __init__(self, config: dict[str, Any]) -> None:
         runtime = config.get("dms", {}) or {}
+        attention = runtime.get("attention", {}) or {}
         self.enabled = bool(runtime.get("enabled", False))
-        self.interval_seconds = max(0.1, float(runtime.get("interval_ms", 200)) / 1000.0)
+        behavior_interval = max(0.1, float(runtime.get("interval_ms", 200)) / 1000.0)
+        attention_interval = max(
+            0.05, float(attention.get("interval_ms", 100)) / 1000.0
+        )
+        self.interval_seconds = min(behavior_interval, attention_interval)
+        self.behavior_interval_seconds = behavior_interval
         self.object_detector = SmokingObjectDetector(config, section="dms")
         self.face = DmsFaceAnalyzer(config)
+        self.attention_policy = DriverAttentionPolicy(attention)
+        self._last_behavior_at: float | None = None
+        self._cached_raw_objects: list[SmokingObjectDetection] = []
         self.smoother = AlertSmoother(
             int((runtime.get("alerts", {}) or {}).get("on_frames", 3)),
             int((runtime.get("alerts", {}) or {}).get("off_frames", 2)),
@@ -394,8 +341,10 @@ class DmsBehaviorEngine:
         frame: np.ndarray,
         persons: list[tuple[int, float, float, float, float]],
         frame_number: int,
+        source_timestamp: float | None = None,
     ) -> DmsInferenceResult:
         del frame_number
+        timestamp = float(source_timestamp if source_timestamp is not None else time.monotonic())
         observed_ids = tuple(sorted(int(person[0]) for person in persons))
         if not self.enabled or frame.size == 0:
             return self.last_result
@@ -404,9 +353,16 @@ class DmsBehaviorEngine:
             int(track_id): (float(left), float(top), float(right), float(bottom))
             for track_id, left, top, right, bottom in persons
         }
-        yolo_started = time.perf_counter()
-        raw_objects = self.object_detector.process(frame)
-        yolo_latency_ms = (time.perf_counter() - yolo_started) * 1000.0
+        yolo_latency_ms = 0.0
+        if (
+            self._last_behavior_at is None
+            or timestamp - self._last_behavior_at >= self.behavior_interval_seconds
+        ):
+            yolo_started = time.perf_counter()
+            self._cached_raw_objects = list(self.object_detector.process(frame))
+            yolo_latency_ms = (time.perf_counter() - yolo_started) * 1000.0
+            self._last_behavior_at = timestamp
+        raw_objects = self._cached_raw_objects
 
         def matched_person(item: SmokingObjectDetection) -> int | None:
             matches = [
@@ -443,15 +399,62 @@ class DmsBehaviorEngine:
             )
         ):
             raw_alerts.add("No Seatbelt")
-        face_metrics, face_alerts, face_latency_ms = self.face.process(frame)
+        face_metrics, face_alerts, face_latency_ms = self.face.process(
+            frame, timestamp=timestamp
+        )
         raw_alerts.update(face_alerts)
-        alerts = tuple(self.smoother.update(raw_alerts))
+        smoothed_alerts = set(self.smoother.update(raw_alerts))
 
         messages: list[str] = []
         if not self.object_detector.models:
             messages.append("DMS object models unavailable")
         if self.face.enabled and not self.face.available:
             messages.append(self.face.error or "DMS FaceMesh unavailable")
+        current_ready = bool(self.object_detector.models and self.face.available)
+        matched_labels = {
+            item.label for item in detections if item.person_track_id is not None
+        }
+        current_observation = AttentionObservation(
+            timestamp=timestamp,
+            driver_present=bool(person_bboxes),
+            face_detected=face_metrics.get("face_detected") is True,
+            pose=(
+                "Head Away" in smoothed_alerts or "Distracted" in matched_labels
+            )
+            if face_metrics.get("face_detected") is True
+            and face_metrics.get("pose_calibrated") is True
+            else None,
+            eyes=("Eyes Closed" in smoothed_alerts)
+            if face_metrics.get("face_detected") is True
+            else None,
+            phone=("Phone Usage" in matched_labels)
+            if self.object_detector.models and person_bboxes
+            else None,
+            fatigue=("Drowsy" in matched_labels or "Yawning" in smoothed_alerts)
+            if face_metrics.get("face_detected") is True
+            else None,
+            uncertain=False,
+            source="current",
+        )
+        attention_readiness = (
+            "ready"
+            if current_ready and face_metrics.get("pose_calibrated") is True
+            else "warming"
+            if current_ready
+            else "degraded"
+        )
+        attention_state = self.attention_policy.update(
+            current_observation, readiness=attention_readiness
+        )
+
+        behavior_alerts = {
+            label
+            for label in smoothed_alerts
+            if label in {"Smoking", "Drinking", "Eating", "No Seatbelt"}
+        }
+        if attention_state.event_active:
+            behavior_alerts.add(ATTENTION_EVENT_LABEL)
+        alerts = tuple(sorted(behavior_alerts))
         if messages:
             status = "DEGRADED" if self.object_detector.models or self.face.available else "DISABLED"
         else:
@@ -485,6 +488,14 @@ class DmsBehaviorEngine:
             **face_metrics,
             "raw_alerts": sorted(raw_alerts),
             "active_alerts": list(alerts),
+            "driver_attention": {
+                **attention_state.summary(),
+                "pose_calibrated_percent": int(
+                    face_metrics.get("pose_calibrated_percent", 0)
+                ),
+                "model_uncertainty": None,
+                "inference_ms": round(float(face_latency_ms), 2),
+            },
             "object_detection_count": len(detections),
             "object_models_available": bool(self.object_detector.models),
             "face_mesh_available": self.face.available,

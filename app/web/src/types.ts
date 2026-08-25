@@ -6,6 +6,8 @@ export interface CameraDetail {
   media_only?: boolean
   media_url?: string | null
   mock_sync_group?: string | null
+  mock_sync_period_seconds?: number
+  mock_sync_epoch_seconds?: number
   running: boolean
   pid: number | null
   ready: boolean
@@ -21,6 +23,18 @@ export interface CameraDetail {
   camera_latency_samples?: number
   rss_mb?: number | null
   analysis_error?: string | null
+  driver_attention?: {
+    contract_version?: number
+    readiness?: 'warming' | 'ready' | 'degraded' | 'not_ready' | 'disabled' | string
+    state?: 'attentive' | 'distracted' | 'unknown' | 'no_driver' | 'warming' | string
+    score?: number | null
+    alert_level?: 'none' | 'warning' | 'critical' | 'emergency' | string
+    reasons?: string[]
+    source?: string
+    pose_calibrated_percent?: number
+    model_uncertainty?: number | null
+    inference_ms?: number | null
+  }
   front_assistance?: {
     contract_version?: number
     mode?: 'vision_only' | string
@@ -31,6 +45,15 @@ export interface CameraDetail {
     inference_ms?: number
     model_hash?: string
     calibration_hash?: string
+    overlay?: {
+      visible_lane_count?: number
+      lane_segment_count?: number
+      path_point_count?: number
+      path_segment_count?: number
+      path_source?: 'model_position' | 'unavailable' | string
+      rendered_segment_count?: number
+      lane_confidences?: Record<string, number>
+    }
   }
 }
 export interface MetricsResponse {

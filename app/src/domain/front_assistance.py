@@ -45,9 +45,9 @@ class FrontPerception:
     valid: bool
     readiness: FrontReadiness
     blocking_reasons: tuple[str, ...]
-    lane_lines: tuple[tuple[tuple[float, float], ...], ...]
+    lane_lines: tuple[tuple[tuple[float, float, float], ...], ...]
     lane_probabilities: tuple[float, ...]
-    road_edges: tuple[tuple[tuple[float, float], ...], ...]
+    road_edges: tuple[tuple[tuple[float, float, float], ...], ...]
     path: tuple[tuple[float, float, float], ...]
     leads: tuple[FrontLead, ...]
     desire_prediction: tuple[float, ...]

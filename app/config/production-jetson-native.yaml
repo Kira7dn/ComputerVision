@@ -53,8 +53,6 @@ smoking_behavior:
   onnx_path: /opt/ls-vision/models/smoking_behavior/model.onnx
   object_detection:
     models:
-      chaitanya:
-        onnx_path: /opt/ls-vision/models/smoking_behavior/tbox/chaitanya_best.onnx
       soham:
         onnx_path: /opt/ls-vision/models/smoking_behavior/tbox/soham_best.onnx
 
@@ -67,10 +65,6 @@ dms:
     nms_iou: 0.50
     person_match_iou: 0.10
     models:
-      chaitanya:
-        onnx_path: /opt/ls-vision/models/smoking_behavior/tbox/chaitanya_best.onnx
-        labels: [Cigarette, Drinking, Eating, Phone, Seatbelt]
-        positive_labels: [Cigarette, Drinking, Eating, Phone, Seatbelt]
       soham:
         onnx_path: /opt/ls-vision/models/smoking_behavior/tbox/soham_best.onnx
         labels: [Distracted, Drinking, Drowsy, Eating, PhoneUse, SafeDriving, Seatbelt, Smoking]

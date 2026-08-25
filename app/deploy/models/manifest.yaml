@@ -24,10 +24,6 @@ artifacts:
     path: models/smoking_behavior/model.onnx
     sha256: "e7821be9226aa8ea896fa34573b532f1e035299ca361a65472b31063197a45c7"
     required: true
-  - id: smoking-tbox-chaitanya
-    path: models/smoking_behavior/tbox/chaitanya_best.onnx
-    sha256: "0bf86b210f9d4fb20512041fc02b1a1b786f97f262947760bb4f866b6300c46a"
-    required: true
   - id: smoking-tbox-soham
     path: models/smoking_behavior/tbox/soham_best.onnx
     sha256: "272a1e87a643d81c2d748de0365289a683e5a6d79aed9b5597aa68e5ad25ff8a"

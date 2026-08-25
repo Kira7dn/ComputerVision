@@ -82,6 +82,7 @@ sudo_cmd systemctl stop ls-vision-dev.service >/dev/null 2>&1 || true
 sudo_cmd mkdir -p "$RELEASE_ROOT" "$REMOTE_ROOT/releases" "$REMOTE_ROOT/data/status" "$REMOTE_ROOT/data/state" "$REMOTE_ROOT/data/evidence" "$REMOTE_ROOT/data/queue" "$REMOTE_ROOT/data/logs" /opt/ls-vision/models/openpilot
 sudo_cmd tar -xzf "$REMOTE_ARCHIVE" -C "$RELEASE_ROOT"
 sudo_cmd tar -xzf "$REMOTE_MODEL_ARCHIVE" -C /opt/ls-vision/models
+sudo_cmd rm -f -- /opt/ls-vision/models/openpilot/dmonitoring_model.onnx
 printf '%s  %s\n' "$FRONT_MODEL_SHA256" /opt/ls-vision/models/openpilot/driving_supercombo.onnx | sha256sum -c -
 sudo_cmd chown -R letron:letron "$RELEASE_ROOT"
 sudo_cmd ln -sfn "$RELEASE_ROOT" "$REMOTE_ROOT/current"

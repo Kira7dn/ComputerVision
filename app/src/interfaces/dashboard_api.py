@@ -55,6 +55,12 @@ def _camera_definitions(stream_host: str = "localhost") -> list[dict[str, object
                     "source_type": config["input"].get("mode", "rtsp"),
                     "media_only": media_only,
                     "mock_sync_group": config["input"].get("mock_sync_group") or None,
+                    "mock_sync_period_seconds": config["input"].get(
+                        "mock_sync_period_seconds"
+                    ),
+                    "mock_sync_epoch_seconds": config["input"].get(
+                        "mock_sync_epoch_seconds"
+                    ),
                     "media_url": (
                         f"http://{stream_host}:{MOCK_MEDIA_PORT}/{quote(Path(str(source)).name)}"
                         if media_only
@@ -515,6 +521,8 @@ def _collect_metrics(stream_host: str = "localhost") -> dict[str, object]:
         worker_ready = bool(media_ready or (process and output_age is not None and output_age <= 5.0))
         ready = worker_ready
         analysis_debug = runtime_status.get("analysis_debug") or {}
+        dms_debug = analysis_debug.get("dms", {}) or {}
+        dms_metrics = dms_debug.get("metrics", {}) or {}
         camera_metrics.append(
             {
                 **camera,
@@ -539,7 +547,8 @@ def _collect_metrics(stream_host: str = "localhost") -> dict[str, object]:
                 "worker_epoch": runtime_status.get("worker_epoch"),
                 "analysis_error": runtime_status.get("analysis_error"),
                 "smoking_episodes": analysis_debug.get("smoking_episodes", {}),
-                "dms": analysis_debug.get("dms", {}),
+                "dms": dms_debug,
+                "driver_attention": dms_metrics.get("driver_attention", {}),
                 "front_assistance": analysis_debug.get("front_assistance", {}),
                 "fire_smoke_runtime": analysis_debug.get("fire_smoke_runtime", {}),
             }

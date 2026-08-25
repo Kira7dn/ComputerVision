@@ -28,15 +28,27 @@ def _detector() -> SmokingObjectDetector:
 def test_tbox_yolo_output_decodes_only_canonical_positive_class() -> None:
     detector = _detector()
     model = _Model(
-        "chaitanya",
-        ("Cigarette", "Drinking", "Eating", "Phone", "Seatbelt"),
-        frozenset({"Cigarette"}),
+        "soham",
+        (
+            "Distracted",
+            "Drinking",
+            "Drowsy",
+            "Eating",
+            "PhoneUse",
+            "SafeDriving",
+            "Seatbelt",
+            "Smoking",
+        ),
+        frozenset({"Smoking"}),
         SimpleNamespace(),
         "images",
     )
-    # cx, cy, width, height followed by five class scores.
+    # cx, cy, width, height followed by eight class scores.
     output = np.array(
-        [[[50.0], [60.0], [20.0], [30.0], [0.80], [0.05], [0.02], [0.01], [0.02]]],
+        [[
+            [50.0], [60.0], [20.0], [30.0],
+            [0.05], [0.02], [0.01], [0.02], [0.03], [0.04], [0.05], [0.80],
+        ]],
         dtype=np.float32,
     )
     frame = np.zeros((100, 100, 3), dtype=np.uint8)
@@ -44,20 +56,20 @@ def test_tbox_yolo_output_decodes_only_canonical_positive_class() -> None:
     detections = detector._decode(model, output, frame, 1.0, 0.0, 0.0)
 
     assert len(detections) == 1
-    assert detections[0].source == "chaitanya"
-    assert detections[0].label == "Cigarette"
+    assert detections[0].source == "soham"
+    assert detections[0].label == "Smoking"
     assert detections[0].score == pytest.approx(0.8)
     assert detections[0].bbox == (40.0, 45.0, 60.0, 75.0)
 
 
 def test_object_detection_is_spatially_assigned_to_one_person() -> None:
     detector = _detector()
-    cigarette = SmokingObjectDetection(
-        "chaitanya", "Cigarette", 0.72, (20.0, 20.0, 25.0, 28.0)
+    smoking = SmokingObjectDetection(
+        "soham", "Smoking", 0.72, (20.0, 20.0, 25.0, 28.0)
     )
 
-    assert detector.matches_person(cigarette, (10.0, 10.0, 50.0, 90.0))
-    assert not detector.matches_person(cigarette, (60.0, 10.0, 95.0, 90.0))
+    assert detector.matches_person(smoking, (10.0, 10.0, 50.0, 90.0))
+    assert not detector.matches_person(smoking, (60.0, 10.0, 95.0, 90.0))
 
 
 def test_one_object_signal_is_not_counted_for_two_overlapping_people() -> None:
@@ -73,12 +85,12 @@ def test_one_object_signal_is_not_counted_for_two_overlapping_people() -> None:
     engine.enabled = True
     engine.session = object()
     engine._score = lambda _crop: 0.10  # type: ignore[method-assign]
-    cigarette = SmokingObjectDetection(
-        "chaitanya", "Cigarette", 0.72, (35.0, 20.0, 40.0, 28.0)
+    smoking = SmokingObjectDetection(
+        "soham", "Smoking", 0.72, (35.0, 20.0, 40.0, 28.0)
     )
     engine.object_detector.enabled = True
     engine.object_detector.person_match_iou = 0.10
-    engine.object_detector.process = lambda _frame: [cigarette]  # type: ignore[method-assign]
+    engine.object_detector.process = lambda _frame: [smoking]  # type: ignore[method-assign]
     frame = np.zeros((100, 100, 3), dtype=np.uint8)
 
     batch = engine.process(
@@ -141,7 +153,7 @@ def test_tbox_positive_signal_advances_episode_below_classifier_threshold() -> N
         positive=True,
         classifier_score=0.18,
         object_score=0.72,
-        signal_sources=("tbox:chaitanya:Cigarette",),
+        signal_sources=("tbox:soham:Smoking",),
     )
 
     assert store.observe(
@@ -161,5 +173,5 @@ def test_tbox_positive_signal_advances_episode_below_classifier_threshold() -> N
 
     assert [transition.operation for transition in transitions] == ["START"]
     assert evidence.starts[0]["metadata"]["best_signal_sources"] == [
-        "tbox:chaitanya:Cigarette"
+        "tbox:soham:Smoking"
     ]

@@ -83,6 +83,7 @@ export function useMediaStream(camera: CameraDetail, onStateChange: (state: Play
     const pendingFrames = new Map<number, number>()
     let destroyed = false
     const timedVideo = video as unknown as VideoWithFrameCallback
+    video.dataset.cameraId = camera.id
 
     const update = (next: Partial<PlayerState>) => {
       if (!destroyed) setState((current) => ({ ...current, ...next }))
@@ -93,6 +94,7 @@ export function useMediaStream(camera: CameraDetail, onStateChange: (state: Play
       smoothedVideoLatencyMs = smoothedVideoLatencyMs == null
         ? rawLatencyMs
         : smoothedVideoLatencyMs * 0.8 + rawLatencyMs * 0.2
+      video.dataset.syncLiveLatencySeconds = (smoothedVideoLatencyMs / 1000).toFixed(6)
       const reportNow = performance.now()
       if (reportNow - lastLatencyReportAt < 500) return
       lastLatencyReportAt = reportNow
@@ -205,10 +207,16 @@ export function useMediaStream(camera: CameraDetail, onStateChange: (state: Play
     }
 
     const onPlaying = () => {
-      if (reader !== null) return
       if (camera.source_type === 'mock' && camera.mock_sync_group && mockSyncCleanup === null) {
-        mockSyncCleanup = registerSynchronizedMock(camera.mock_sync_group, camera.id, video)
+        mockSyncCleanup = registerSynchronizedMock(
+          camera.mock_sync_group,
+          camera.id,
+          video,
+          Number(camera.mock_sync_period_seconds),
+          Number(camera.mock_sync_epoch_seconds ?? 0),
+        )
       }
+      if (reader !== null) return
       update({
         live: true,
         error: false,
@@ -238,6 +246,7 @@ export function useMediaStream(camera: CameraDetail, onStateChange: (state: Play
       lastLatencyReportAt = 0
       lastValidLatencyAt = 0
       serverBrowserClockOffsetMs = null
+      delete video.dataset.syncLiveLatencySeconds
       rtpTimestampOffset = null
       frameSamples.clear()
       pendingFrames.clear()
@@ -352,7 +361,7 @@ export function useMediaStream(camera: CameraDetail, onStateChange: (state: Play
       video.loop = false
       video.load()
     }
-  }, [camera.hls_url, camera.id, camera.media_only, camera.media_url, camera.mock_sync_group, camera.running, camera.source_type, camera.webrtc_url, camera.worker_ready, onStateChange])
+  }, [camera.hls_url, camera.id, camera.media_only, camera.media_url, camera.mock_sync_epoch_seconds, camera.mock_sync_group, camera.mock_sync_period_seconds, camera.running, camera.source_type, camera.webrtc_url, camera.worker_ready, onStateChange])
 
   return { videoRef, state }
 }
