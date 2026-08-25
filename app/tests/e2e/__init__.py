@@ -1,1 +1,1 @@
-"""Runtime E2E entrypoints for the Camera Safety Compose stack."""
+"""Runtime E2E entrypoints for native LS-Vision targets."""

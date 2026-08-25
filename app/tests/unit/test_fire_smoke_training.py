@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from application.fire_smoke_training import validate_yolo_dataset
+from ls_vision.application.fire_smoke_training import validate_yolo_dataset
 
 
 def _write_dataset(root: Path) -> Path:

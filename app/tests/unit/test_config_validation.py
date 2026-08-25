@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from bootstrap.config import load_raw_config, resolve_camera_config, validate_config
+from ls_vision.bootstrap.config import load_raw_config, resolve_camera_config, validate_config
 
 
 def test_dev_and_production_share_the_same_five_camera_topology() -> None:

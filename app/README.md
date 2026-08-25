@@ -1,40 +1,34 @@
-# LS-Vision package
+# LS-Vision
 
-`app/src` is the canonical DeepStream runtime source root. `server/`
-remains the independent ADAS/FTP/archive boundary.
+LS-Vision là runtime DeepStream canonical dưới package `src/ls_vision`.
 
-Development runs against the native Jetson development service:
-
-```powershell
-npm install --prefix app/web
-npm run dev
+```text
+ls_vision.service
+  ├─ ls_vision.interfaces.dashboard_api
+  ├─ ls_vision.runner
+  │   └─ ls_vision.application.camera_runtime per non-media-only camera
+  └─ ls_vision.interfaces.mock_media_server when configured
 ```
 
-`dev` starts source synchronization, the Jetson development service, SSH tunnels
-and local Vite HMR. The isolated runtime uses `/opt/ls-vision-dev` and does not
-share production evidence/state directories.
-
-The three package entrypoints are:
+## Commands
 
 ```powershell
-npm run dev
+npm test
 npm run check
-npm run deploy -- -JetsonAlias jetson-nano
+npm run dev
+npm run deploy
+npm run deploy -- -Action status
+npm run deploy -- -Action rollback
 ```
 
-Add `-Development` to `deploy` when publishing the isolated Jetson development
-service. Production deploy uses the default `deploy-app` action.
+`dev.yaml` và `production.yaml` là hai profile standalone. Runtime data không nằm trong source release.
 
-Run the package test suite and the real Compose E2E separately:
+## Layer ownership
 
-```powershell
-python -m pytest app/tests -q
-python app/tests/e2e/run_camera_safety_e2e.py
-```
+- `domain`: value objects, policies và transition contracts; không import outer layers.
+- `application`: scheduling, orchestration, ports và process entrypoints.
+- `adapters`: DeepStream, models, persistence, notifications và media implementations.
+- `interfaces`: HTTP/dashboard/ingress boundaries.
+- `bootstrap`: config, paths, lifecycle và composition.
 
-The E2E report is accepted only when the Docker health, MediaMTX HLS output,
-three worker freshness, event API, and restart persistence gates all pass.
-
-Models and the face library are read-only named volumes. Evidence, SQLite
-state, queue, and logs are writable named volumes; they are not stored on
-`/mnt/d` or in the source checkout.
+`media_only` là feed playback hiện hữu, không phải vision worker.

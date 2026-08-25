@@ -14,7 +14,7 @@ from pathlib import Path
 ROOT = Path(__file__).parents[2]
 sys.path.insert(0, str(ROOT / "app" / "src"))
 
-from application.fire_smoke_training import validate_yolo_dataset  # noqa: E402
+from ls_vision.application.fire_smoke_training import validate_yolo_dataset  # noqa: E402
 
 
 def _percentile(values: list[float], fraction: float) -> float | None:

@@ -15,8 +15,8 @@ APP_ROOT = Path(__file__).resolve().parents[2]
 if str(APP_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(APP_ROOT / "src"))
 
-from adapters.models.smoking_engine import SmokingBehaviorEngine  # noqa: E402
-from bootstrap.config import load_raw_config, resolve_camera_config  # noqa: E402
+from ls_vision.adapters.models.smoking_engine import SmokingBehaviorEngine  # noqa: E402
+from ls_vision.bootstrap.config import load_raw_config, resolve_camera_config  # noqa: E402
 
 
 def main() -> int:

@@ -22,7 +22,7 @@ import yaml
 ROOT = Path(__file__).parents[2]
 sys.path.insert(0, str(ROOT / "app" / "src"))
 
-from application.fire_smoke_dataset import (  # noqa: E402
+from ls_vision.application.fire_smoke_dataset import (  # noqa: E402
     CLASS_IDS,
     parse_source_spec,
     sha256_file,
@@ -189,7 +189,7 @@ def _source_data_yaml(source_root: Path) -> tuple[Path, dict[str, Any]]:
     if configured_root.is_absolute() and configured_root.is_dir():
         pass
     elif configured_value.startswith(("/", "\\")):
-        # On Windows, pathlib treats a POSIX container path such as
+        # On Windows, pathlib treats a POSIX training-platform path such as
         # /kaggle/working/... as rooted but not absolute.  The downloaded
         # archive is authoritative on this machine.
         configured_root = source_root
@@ -329,7 +329,7 @@ def main() -> int:
                 total_counts[split][key] += value
 
     data_yaml = {
-        # Keep the manifest portable between Windows and native WSL.
+        # Keep the manifest portable between Windows and the native target.
         "path": ".",
         "train": "images/train",
         "val": "images/val",

@@ -1,4 +1,4 @@
-from domain.driver_attention import AttentionObservation, DriverAttentionPolicy
+from ls_vision.domain.driver_attention import AttentionObservation, DriverAttentionPolicy
 
 
 def _observation(timestamp: float, **overrides: object) -> AttentionObservation:

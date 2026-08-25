@@ -13,8 +13,9 @@ dependencies = [
 ]
 
 [project.scripts]
-ls-vision = "runner:main"
-ls-vision-dashboard = "interfaces.dashboard_api:main"
+ls-vision = "ls_vision.service:main"
+ls-vision-runner = "ls_vision.runner:main"
+ls-vision-dashboard = "ls_vision.interfaces.dashboard_api:main"
 
 [project.optional-dependencies]
 test = ["pytest>=8,<9", "ruff>=0.12,<0.13"]

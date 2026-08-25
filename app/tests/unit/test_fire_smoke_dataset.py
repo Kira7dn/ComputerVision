@@ -1,6 +1,6 @@
 import pytest
 
-from application.fire_smoke_dataset import temporal_split, yolo_labels
+from ls_vision.application.fire_smoke_dataset import temporal_split, yolo_labels
 
 
 def test_temporal_split_keeps_each_twenty_sample_block_together() -> None:

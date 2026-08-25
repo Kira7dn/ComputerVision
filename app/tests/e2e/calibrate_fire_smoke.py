@@ -17,9 +17,9 @@ import numpy as np
 ROOT = Path(__file__).parents[3]
 sys.path.insert(0, str(ROOT / "app" / "src"))
 
-from adapters.models.fire_smoke_engine import FireSmokeEngine
-from application.safety_replay import score_presence
-from bootstrap.config import load_config
+from ls_vision.adapters.models.fire_smoke_engine import FireSmokeEngine
+from ls_vision.application.safety_replay import score_presence
+from ls_vision.bootstrap.config import load_config
 from run_safety_fixture_replay import _load_manifest, _select_rows
 
 

@@ -10,7 +10,7 @@
 
 ## P0 execution result — 2026-08-22
 
-Đã hoàn tất một run exploratory bằng D-Fire trên CUDA native WSL. CCTV nội bộ không có nên
+Đã hoàn tất một run exploratory bằng D-Fire trên CUDA. CCTV nội bộ không có nên
 được xử lý là dữ liệu tùy chọn cho exploratory candidate, không phải điều kiện chặn việc chạy
 training; điều kiện promote vẫn giữ nguyên.
 

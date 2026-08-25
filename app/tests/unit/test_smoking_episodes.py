@@ -4,7 +4,7 @@ from typing import Any
 
 import numpy as np
 
-from domain.smoking_events import SmokingEpisodeStore, SmokingObservation, SmokingState
+from ls_vision.domain.smoking_events import SmokingEpisodeStore, SmokingObservation, SmokingState
 
 
 class RecordingEvidence:

@@ -1,0 +1,524 @@
+"""Canonical, deduplicated evidence storage for one DeepStream run."""
+
+from __future__ import annotations
+
+import json
+import re
+import sqlite3
+import threading
+import time
+import uuid
+from pathlib import Path
+from typing import Any
+
+import cv2
+import numpy as np
+
+
+def _slug(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("._") or "unknown"
+
+
+def run_directory(config: dict[str, Any], run_id: str) -> Path:
+    evidence = config.get("evidence", {}) or {}
+    root = Path(str(evidence.get("directory", ".tmp/ls-vision")))
+    prefix = str(evidence.get("prefix", "snapshots-acceptance"))
+    return root / f"{prefix}-{_slug(run_id)}"
+
+
+def write_manifest(config: dict[str, Any], run_id: str, target: Path) -> None:
+    cameras = []
+    for camera in config.get("cameras", []) or []:
+        cameras.append(
+            {
+                "id": str(camera.get("id")),
+                "functions": dict(camera.get("functions", {}) or {}),
+                "source": str((camera.get("source", {}) or {}).get("url", "")),
+            }
+        )
+    if not cameras:
+        cameras = [
+            {
+                "id": str((config.get("input", {}) or {}).get("camera", "camera")),
+                "functions": dict(config.get("functions", {}) or {}),
+                "source": str((config.get("input", {}) or {}).get("rtsp_url", "")),
+            }
+        ]
+    target.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "schema_version": 1,
+        "run_id": run_id,
+        "created_at": time.time(),
+        "cameras": cameras,
+        "dedupe": {"index": "index.sqlite3", "key": "idempotency_key"},
+    }
+    temporary = target / "manifest.json.tmp"
+    temporary.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    temporary.replace(target / "manifest.json")
+
+
+class EvidenceStore:
+    """Own all event JSON, JSONL traces, and event evidence images."""
+
+    def __init__(self, config: dict[str, Any], run_id: str) -> None:
+        self.config = config
+        self.run_id = run_id
+        runtime = config.get("runtime", {}) or {}
+        self.worker_epoch = str(runtime.get("worker_epoch", "worker-0"))
+        self.camera_id = str((config.get("input", {}) or {}).get("camera", "camera"))
+        self.root = run_directory(config, run_id)
+        self.root.mkdir(parents=True, exist_ok=True)
+        evidence_config = config.get("evidence", {}) or {}
+        self.max_snapshots_per_event = max(
+            2, int(evidence_config.get("max_snapshots_per_event", 3))
+        )
+        self.peak_score_delta = max(
+            0.0, float(evidence_config.get("peak_score_delta", 0.05))
+        )
+        self.event_feed_update_interval_seconds = max(
+            0.25,
+            float(evidence_config.get("event_feed_update_interval_seconds", 1.0)),
+        )
+        self._events: dict[str, dict[str, Any]] = {}
+        self._pending_peaks: dict[str, dict[str, Any]] = {}
+        self._last_event_feed_update_at: dict[str, float] = {}
+        self._lock = threading.RLock()
+        self.db = sqlite3.connect(
+            str(self.root / "index.sqlite3"),
+            check_same_thread=False,
+            timeout=30.0,
+        )
+        self.db.execute("PRAGMA busy_timeout=30000")
+        self.db.execute(
+            "CREATE TABLE IF NOT EXISTS records ("
+            "idempotency_key TEXT PRIMARY KEY, path TEXT NOT NULL, "
+            "kind TEXT NOT NULL, created_at REAL NOT NULL)"
+        )
+        self.db.commit()
+        manifest = self.root / "manifest.json"
+        if not manifest.exists():
+            write_manifest(config, run_id, self.root)
+
+    def _claim(self, key: str, path: Path, kind: str) -> bool:
+        with self._lock:
+            try:
+                self.db.execute(
+                    "INSERT INTO records(idempotency_key,path,kind,created_at) VALUES(?,?,?,?)",
+                    (key, str(path.relative_to(self.root)), kind, time.time()),
+                )
+                self.db.commit()
+                return True
+            except sqlite3.IntegrityError:
+                self.db.rollback()
+                return False
+
+    def _event_dir(self, event: dict[str, Any]) -> Path:
+        # Keep the path immutable for the whole lifecycle. Classification is
+        # mutable event metadata; moving directories made START journal rows
+        # stale and was unreliable on non-native filesystems.
+        return (
+            self.root
+            / _slug(str(event["camera_id"]))
+            / _slug(str(event["function"]))
+            / _slug(str(event["event_id"]))
+        )
+
+    def event_directory(self, event_id: str) -> Path | None:
+        """Return the durable directory for an in-memory event."""
+        event = self._events.get(event_id)
+        return self._event_dir(event) if event is not None else None
+
+    def _write_event(self, event: dict[str, Any]) -> None:
+        event_dir = self._event_dir(event)
+        event_dir.mkdir(parents=True, exist_ok=True)
+        temporary = event_dir / "event.json.tmp"
+        temporary.write_text(json.dumps(event, indent=2), encoding="utf-8")
+        temporary.replace(event_dir / "event.json")
+
+    def _append_event_index(
+        self,
+        event: dict[str, Any],
+        record_type: str,
+        *,
+        timestamp: float | None = None,
+        payload: dict[str, Any] | None = None,
+        score: float | None = None,
+        frame_number: int | None = None,
+    ) -> None:
+        path = self.root / "events.jsonl"
+        key = f"{self.run_id}|{self.worker_epoch}|{event['camera_id']}|{event['function']}|{event['event_id']}|index|{record_type}"
+        if record_type == "UPDATE":
+            key = f"{key}|{timestamp or event.get('updated_at', 0)}"
+        if not self._claim(key, path, "event-index"):
+            return
+        details = dict(payload or {})
+        summary = {
+            "record_type": record_type,
+            "event_id": event["event_id"],
+            "run_id": self.run_id,
+            "worker_epoch": self.worker_epoch,
+            "camera_id": event["camera_id"],
+            "function": event["function"],
+            "classification": event["classification"],
+            "person_track_id": event.get("person_track_id"),
+            "identity": event.get("identity"),
+            "status": event["status"],
+            "started_at": event["started_at"],
+            "ended_at": event.get("ended_at"),
+            "updated_at": timestamp or event.get("updated_at"),
+            "timestamp": timestamp or event.get("updated_at") or event["started_at"],
+            "frame": frame_number,
+            "label": details.get("label") or event.get("label"),
+            "score": score if score is not None else event.get("last_score"),
+            "details": details,
+            "event_path": str(self._event_dir(event).relative_to(self.root)),
+            "idempotency_key": key,
+        }
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(summary, separators=(",", ":")) + "\n")
+
+    @staticmethod
+    def _annotation_label(event: dict[str, Any], payload: dict[str, Any], score: float | None) -> str:
+        if event.get("function") == "face_recognition":
+            identity = str(payload.get("identity") or event.get("identity") or "recognized")
+            return f"{identity.upper()} {score * 100:.0f}%" if score is not None else identity.upper()
+        label = str(payload.get("label") or event.get("classification") or event.get("function"))
+        if event.get("function") == "fire_smoke" and label == "smoke":
+            label = "smoke area"
+        if event.get("function") == "smoking_behavior":
+            track_id = event.get("person_track_id")
+            prefix = f"person #{track_id} | " if track_id is not None else "person | "
+            return f"{prefix}{label.upper()} {score * 100:.0f}%" if score is not None else f"{prefix}{label.upper()}"
+        if score is not None:
+            return f"{label.upper()} {score * 100:.0f}%"
+        return label.upper()
+
+    @staticmethod
+    def _annotation_color(event: dict[str, Any]) -> tuple[int, int, int]:
+        if event.get("function") == "smoking_behavior":
+            return (0, 0, 255)
+        if str(event.get("classification")) == "fire":
+            return (0, 140, 255)
+        if str(event.get("classification")) == "smoke":
+            # BGR cyan: high contrast against the dark camera and pale smoke.
+            return (255, 255, 0)
+        return (0, 220, 0)
+
+    def start_event(
+        self,
+        *,
+        event_id: str | None,
+        function: str,
+        classification: str,
+        camera_id: str | None = None,
+        person_track_id: int | None = None,
+        pending: bool = False,
+        metadata: dict[str, Any] | None = None,
+        frame: np.ndarray | None = None,
+        frame_number: int | None = None,
+        bbox: tuple[float, float, float, float] | None = None,
+        score: float | None = None,
+    ) -> str:
+        event_id = event_id or f"evt-{uuid.uuid4().hex[:24]}"
+        event = {
+            "event_id": event_id,
+            "run_id": self.run_id,
+            "worker_epoch": self.worker_epoch,
+            "camera_id": camera_id or self.camera_id,
+            "function": function,
+            "classification": "pending" if pending else classification,
+            "status": "active",
+            "person_track_id": person_track_id,
+            "identity": None,
+            "started_at": time.time(),
+            "ended_at": None,
+            "last_score": 0.0,
+            "peak_score": 0.0,
+            "image_baseline_score": 0.0,
+            "last_bbox": None,
+            "snapshot_count": 0,
+            **(metadata or {}),
+        }
+        self._events[event_id] = event
+        self._write_event(event)
+        start_payload = {
+            "status": "active",
+            "person_track_id": person_track_id,
+            **(metadata or {}),
+        }
+        self.record(
+            event_id,
+            "START",
+            start_payload,
+            frame=frame,
+            frame_number=frame_number,
+            bbox=bbox,
+            score=score,
+            force_image=frame is not None,
+        )
+        self._append_event_index(
+            event,
+            "START",
+            timestamp=event["started_at"],
+            payload=start_payload,
+            score=score,
+            frame_number=frame_number,
+        )
+        return event_id
+
+    def record(
+        self,
+        event_id: str,
+        record_type: str,
+        payload: dict[str, Any],
+        *,
+        frame: np.ndarray | None = None,
+        frame_number: int | None = None,
+        bbox: tuple[float, float, float, float] | None = None,
+        score: float | None = None,
+        force_image: bool = False,
+    ) -> bool:
+        event = self._events.get(event_id)
+        if event is None:
+            return False
+        frame_key = "none" if frame_number is None else str(frame_number)
+        key = f"{self.run_id}|{self.worker_epoch}|{event['camera_id']}|{event['function']}|{event_id}|{record_type}|{frame_key}"
+        trace_path = self._event_dir(event) / "trace.jsonl"
+        if not self._claim(key, trace_path, "trace"):
+            return False
+
+        evidence: list[str] = []
+        now = time.time()
+        snapshot_count = int(event.get("snapshot_count", 0))
+        previous_peak = float(event.get("peak_score", 0.0) or 0.0)
+        image_baseline = float(event.get("image_baseline_score", 0.0) or 0.0)
+        is_peak_candidate = (
+            record_type == "UPDATE"
+            and score is not None
+            and score >= image_baseline + self.peak_score_delta
+            and frame is not None
+        )
+        if is_peak_candidate:
+            pending = self._pending_peaks.get(event_id)
+            if pending is None or score > float(pending["score"]):
+                self._pending_peaks[event_id] = {
+                    "frame": frame.copy(),
+                    "frame_number": frame_number,
+                    "bbox": bbox,
+                    "score": score,
+                    "payload": dict(payload),
+                }
+        should_image = frame is not None and (
+            record_type in {"START", "END"}
+            or (
+                record_type == "PEAK"
+                and snapshot_count < self.max_snapshots_per_event - 1
+            )
+            or (
+                force_image
+                and record_type not in {"UPDATE", "PEAK"}
+                and snapshot_count < self.max_snapshots_per_event - 1
+            )
+        )
+        if should_image:
+            event_dir = self._event_dir(event)
+            image_dir = event_dir / "snapshots"
+            image_dir.mkdir(parents=True, exist_ok=True)
+            sequence = snapshot_count + 1
+            image_role = record_type.lower()
+            stem = f"{image_role}-{sequence:04d}"
+            annotated_path = image_dir / f"{stem}-annotated.jpg"
+            image_key = f"{key}|image"
+            if self._claim(image_key, annotated_path, "annotated-image"):
+                annotated = frame.copy()
+                if bbox is not None:
+                    height, width = annotated.shape[:2]
+                    left, top, right, bottom = [
+                        int(max(0, value)) for value in bbox
+                    ]
+                    left = min(left, max(0, width - 1))
+                    right = min(max(left + 1, right), width)
+                    top = min(top, max(0, height - 1))
+                    bottom = min(max(top + 1, bottom), height)
+                    color = self._annotation_color(event)
+                    cv2.rectangle(annotated, (left, top), (right, bottom), color, 3)
+                    text = self._annotation_label(event, payload, score)
+                    text_y = max(24, top - 8)
+                    cv2.putText(
+                        annotated,
+                        text,
+                        (left, text_y),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.75,
+                        color,
+                        2,
+                        cv2.LINE_AA,
+                    )
+                if cv2.imwrite(str(annotated_path), annotated):
+                    evidence.append(str(annotated_path.relative_to(self.root)))
+                    # Keep the report image at its original resolution, but
+                    # write a small immutable derivative for dashboard cards.
+                    thumbnail_width = 320
+                    thumbnail_height = max(
+                        1,
+                        int(round(annotated.shape[0] * thumbnail_width / annotated.shape[1])),
+                    )
+                    thumbnail = cv2.resize(
+                        annotated,
+                        (thumbnail_width, thumbnail_height),
+                        interpolation=cv2.INTER_AREA,
+                    )
+                    thumbnail_path = image_dir / f"{stem}-thumbnail.jpg"
+                    if cv2.imwrite(
+                        str(thumbnail_path),
+                        thumbnail,
+                        [int(cv2.IMWRITE_JPEG_QUALITY), 72],
+                    ):
+                        evidence.append(str(thumbnail_path.relative_to(self.root)))
+                    event["snapshot_count"] = sequence
+
+        trace = {
+            "record_type": record_type,
+            "event_id": event_id,
+            "run_id": self.run_id,
+            "camera_id": event["camera_id"],
+            "function": event["function"],
+            "classification": event["classification"],
+            "timestamp": now,
+            "frame": frame_number,
+            "score": score,
+            "bbox": list(bbox) if bbox is not None else None,
+            "evidence": evidence,
+            "idempotency_key": key,
+            **payload,
+        }
+        trace_path.parent.mkdir(parents=True, exist_ok=True)
+        with trace_path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(trace, separators=(",", ":")) + "\n")
+        if score is not None:
+            event["last_score"] = score
+            event["peak_score"] = max(previous_peak, score)
+            if record_type == "START":
+                event["image_baseline_score"] = score
+        if bbox is not None:
+            event["last_bbox"] = list(bbox)
+        for field in (
+            "person_bbox",
+            "model_roi_bbox",
+            "bbox_semantics",
+            "label",
+            "region_track_id",
+            "confirmation_state",
+            "detector_hits",
+            "dynamic_votes",
+            "dynamic_score",
+            "best_bbox",
+            "best_frame_number",
+            "notification_emitted",
+            "notification_min_duration_seconds",
+            "episode_sequence",
+            "positive_votes",
+            "observation_window",
+            "best_score",
+            "best_person_bbox",
+            "best_model_roi_bbox",
+            "classifier_score",
+            "object_score",
+            "signal_sources",
+            "best_classifier_score",
+            "best_object_score",
+            "best_signal_sources",
+            "dms_status",
+            "dms_alerts",
+            "active_dms_alerts",
+            "dms_metrics",
+            "dms_evidence",
+            "alert_sequence",
+            "candidate_started_at",
+            "confirmed_at",
+            "last_positive_at",
+            "source_timestamp",
+            "score_semantics",
+            "end_reason",
+        ):
+            if field in payload:
+                event[field] = payload[field]
+        event["updated_at"] = now
+        self._write_event(event)
+        if event.get("function") == "dms" and record_type == "UPDATE":
+            last_published = self._last_event_feed_update_at.get(event_id, 0.0)
+            if now - last_published >= self.event_feed_update_interval_seconds:
+                self._append_event_index(
+                    event,
+                    "UPDATE",
+                    timestamp=now,
+                    payload=payload,
+                    score=score,
+                    frame_number=frame_number,
+                )
+                self._last_event_feed_update_at[event_id] = now
+        return True
+
+    def _flush_peak(self, event_id: str) -> None:
+        peak = self._pending_peaks.pop(event_id, None)
+        if peak is None:
+            return
+        self.record(
+            event_id,
+            "PEAK",
+            peak["payload"],
+            frame=peak["frame"],
+            frame_number=peak["frame_number"],
+            bbox=peak["bbox"],
+            score=peak["score"],
+            force_image=True,
+        )
+
+    def finish_event(
+        self,
+        event_id: str,
+        *,
+        classification: str | None = None,
+        identity: str | None = None,
+        payload: dict[str, Any] | None = None,
+        frame: np.ndarray | None = None,
+        frame_number: int | None = None,
+        bbox: tuple[float, float, float, float] | None = None,
+        score: float | None = None,
+    ) -> None:
+        event = self._events.get(event_id)
+        if event is None:
+            return
+        self._flush_peak(event_id)
+        event["status"] = "ended"
+        event["ended_at"] = time.time()
+        if identity is not None:
+            event["identity"] = identity
+        final_classification = classification or str(event["classification"])
+        end_payload = dict(payload or {})
+        end_payload["classification"] = final_classification
+        self.record(
+            event_id,
+            "END",
+            end_payload,
+            frame=frame,
+            frame_number=frame_number,
+            bbox=bbox,
+            score=score,
+            force_image=True,
+        )
+        if classification and event["classification"] != classification:
+            event["classification"] = classification
+        self._write_event(event)
+        self._append_event_index(
+            event,
+            "END",
+            timestamp=event["ended_at"],
+            payload=end_payload,
+            score=score,
+            frame_number=frame_number,
+        )
+        self._last_event_feed_update_at.pop(event_id, None)
+
+    def close(self) -> None:
+        self.db.close()

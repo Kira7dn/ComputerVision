@@ -3,8 +3,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from bootstrap.config import load_raw_config, resolve_camera_config
-from domain.tracking import (
+from ls_vision.bootstrap.config import load_raw_config, resolve_camera_config
+from ls_vision.domain.tracking import (
     PersonConfirmation,
     intersection_over_candidate,
     opposite_frame_edge_transition,

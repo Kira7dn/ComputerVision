@@ -1,4 +1,4 @@
-from application.safety_replay import compare_with_baseline, score_presence
+from ls_vision.application.safety_replay import compare_with_baseline, score_presence
 
 
 def test_presence_metrics_are_balanced_per_class() -> None:

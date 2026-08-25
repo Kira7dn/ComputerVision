@@ -5,9 +5,13 @@ from pathlib import Path
 
 import numpy as np
 
-from adapters.models.fire_smoke_engine import FireSmokeDetection
-from adapters.persistence.evidence_repository import EvidenceStore
-from domain.fire_smoke_events import DynamicsResult, FireSmokeEventStore, RegionDynamicsVerifier
+from ls_vision.adapters.persistence.evidence_repository import EvidenceStore
+from ls_vision.domain.detections import FireSmokeDetection
+from ls_vision.domain.fire_smoke_events import (
+    DynamicsResult,
+    FireSmokeEventStore,
+    RegionDynamicsVerifier,
+)
 
 
 def _config(tmp_path: Path, *, hits: int = 4, window: int = 6) -> dict:

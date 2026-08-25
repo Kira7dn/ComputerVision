@@ -5,13 +5,13 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from adapters.models.smoking_engine import SmokingBehaviorEngine
-from adapters.models.smoking_object_detector import (
+from ls_vision.adapters.models.smoking_engine import SmokingBehaviorEngine
+from ls_vision.adapters.models.smoking_object_detector import (
     SmokingObjectDetection,
     SmokingObjectDetector,
     _Model,
 )
-from domain.smoking_events import SmokingEpisodeStore, SmokingObservation
+from ls_vision.domain.smoking_events import SmokingEpisodeStore, SmokingObservation
 
 
 def _detector() -> SmokingObjectDetector:

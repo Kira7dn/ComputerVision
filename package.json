@@ -3,7 +3,8 @@
   "private": true,
   "scripts": {
     "dev": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\app\\deploy\\powershell\\deploy-jetson-dev.ps1 -Action start",
-    "test": "powershell -NoProfile -Command \"& '.\\.venv\\Scripts\\python.exe' -m pytest app/tests -q\"",
+    "test": "powershell -NoProfile -Command \"& '.\\.venv\\Scripts\\python.exe' -m pytest -c app/pyproject.toml app/tests -q\"",
+    "check": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\app\\deploy\\powershell\\check.ps1",
     "deploy": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\app\\deploy\\powershell\\deploy-jetson.ps1"
   }
 }

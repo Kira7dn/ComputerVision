@@ -2,7 +2,7 @@ from pathlib import Path
 
 import yaml
 
-from bootstrap.config import (
+from ls_vision.bootstrap.config import (
     camera_ids,
     load_raw_config,
     resolve_camera_config,
@@ -16,7 +16,7 @@ def test_jetson_dev_launcher_uses_source_sync_and_vite_hmr() -> None:
     assert "jetson_sync.py" in launcher
     assert "vite.js" in launcher
     assert "ssh" in launcher
-    assert "interfaces.mock_media_server" in launcher
+    assert "ls_vision.interfaces.mock_media_server" in launcher
     assert "http.server" not in launcher
     assert "start.ps1" not in launcher
     assert "18080:127.0.0.1:28080" in launcher
@@ -29,12 +29,10 @@ def test_package_has_only_the_supported_jetson_entrypoints() -> None:
     assert '"dev"' in package
     assert '"test"' in package
     assert '"deploy"' in package
-    assert '"wsl:' not in package
-    assert '"docker:' not in package
 
 
 def test_cpu_analysis_branch_has_a_terminal_sink() -> None:
-    pipeline = (ROOT / "app" / "src" / "application" / "camera_worker.py").read_text(
+    pipeline = (ROOT / "app" / "src" / "ls_vision" / "adapters" / "deepstream" / "runtime.py").read_text(
         encoding="utf-8"
     )
 
@@ -51,7 +49,7 @@ def test_cpu_analysis_branch_has_a_terminal_sink() -> None:
 
 
 def test_live_output_drops_backlog_before_encoding() -> None:
-    pipeline = (ROOT / "app" / "src" / "application" / "camera_worker.py").read_text(
+    pipeline = (ROOT / "app" / "src" / "ls_vision" / "adapters" / "deepstream" / "runtime.py").read_text(
         encoding="utf-8"
     )
 
@@ -81,7 +79,7 @@ def test_mediamtx_reader_exposes_stats_and_dashboard_api_exposes_webrtc() -> Non
     reader = (ROOT / "app" / "web" / "mediamtx_reader.js").read_text(
         encoding="utf-8"
     )
-    server = (ROOT / "app" / "src" / "interfaces" / "dashboard_api.py").read_text(
+    server = (ROOT / "app" / "src" / "ls_vision" / "interfaces" / "dashboard_api.py").read_text(
         encoding="utf-8"
     )
 
@@ -94,7 +92,7 @@ def test_mediamtx_reader_exposes_stats_and_dashboard_api_exposes_webrtc() -> Non
 
 
 def test_live_output_follows_rtsp_sample_contract() -> None:
-    pipeline = (ROOT / "app" / "src" / "application" / "camera_worker.py").read_text(
+    pipeline = (ROOT / "app" / "src" / "ls_vision" / "adapters" / "deepstream" / "runtime.py").read_text(
         encoding="utf-8"
     )
     launcher = (ROOT / "app" / "deploy" / "powershell" / "deploy-jetson.ps1").read_text(
@@ -201,13 +199,13 @@ def test_runtime_can_disable_notifications_for_acceptance(monkeypatch) -> None:
 
 
 def test_event_feed_collapses_lifecycle_and_recognition_starts_on_exact_frame() -> None:
-    dashboard_server = (ROOT / "app" / "src" / "interfaces" / "dashboard_api.py").read_text(
+    dashboard_server = (ROOT / "app" / "src" / "ls_vision" / "interfaces" / "dashboard_api.py").read_text(
         encoding="utf-8"
     )
-    pipeline = (ROOT / "app" / "src" / "application" / "camera_worker.py").read_text(
+    pipeline = (ROOT / "app" / "src" / "ls_vision" / "adapters" / "deepstream" / "runtime.py").read_text(
         encoding="utf-8"
     )
-    notifications = (ROOT / "app" / "src" / "application" / "notification_service.py").read_text(
+    notifications = (ROOT / "app" / "src" / "ls_vision" / "adapters" / "notification" / "service.py").read_text(
         encoding="utf-8"
     )
 
@@ -244,10 +242,10 @@ def test_event_items_open_a_full_detail_modal() -> None:
 
 
 def test_unknown_recognition_event_uses_best_frame_after_track_end() -> None:
-    pipeline = (ROOT / "app" / "src" / "application" / "camera_worker.py").read_text(
+    pipeline = (ROOT / "app" / "src" / "ls_vision" / "adapters" / "deepstream" / "runtime.py").read_text(
         encoding="utf-8"
     )
-    face_engine = (ROOT / "app" / "src" / "adapters" / "models" / "face_engine.py").read_text(
+    face_engine = (ROOT / "app" / "src" / "ls_vision" / "adapters" / "models" / "face_engine.py").read_text(
         encoding="utf-8"
     )
 

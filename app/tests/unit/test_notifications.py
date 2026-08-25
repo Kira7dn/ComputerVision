@@ -7,8 +7,8 @@ from pathlib import Path
 import httpx
 import numpy as np
 
-from adapters.persistence.evidence_repository import EvidenceStore
-from application.notification_service import NotificationService
+from ls_vision.adapters.notification.service import NotificationService
+from ls_vision.adapters.persistence.evidence_repository import EvidenceStore
 
 
 def _config(root: Path) -> dict:

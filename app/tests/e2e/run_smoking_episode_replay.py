@@ -15,7 +15,7 @@ APP_ROOT = Path(__file__).resolve().parents[2]
 if str(APP_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(APP_ROOT / "src"))
 
-from domain.smoking_events import SmokingEpisodeStore, SmokingObservation  # noqa: E402
+from ls_vision.domain.smoking_events import SmokingEpisodeStore, SmokingObservation  # noqa: E402
 
 
 class ReplayEvidence:

@@ -8,12 +8,12 @@ from typing import Any
 
 import numpy as np
 
-from adapters.models.openpilot_front_engine import (
+from ls_vision.adapters.models.openpilot_front_engine import (
     EXPECTED_INPUTS,
     OpenpilotFrontEngine,
     parse_model_output,
 )
-from adapters.models.openpilot_preprocess import (
+from ls_vision.adapters.models.openpilot_preprocess import (
     MEDMODEL_INTRINSICS,
     VIEW_FROM_DEVICE,
     _rotation_from_euler,
@@ -21,7 +21,7 @@ from adapters.models.openpilot_preprocess import (
     prepare_model_frames,
     warp_matrix,
 )
-from domain.front_assistance import FrontCalibration
+from ls_vision.domain.front_assistance import FrontCalibration
 
 OUTPUT_SLICES = {
     "meta": slice(0, 55),
@@ -117,7 +117,7 @@ def test_preprocess_pair_converts_full_frame_only_once(monkeypatch) -> None:
         ((6.0, 0.0, 4.0), (0.0, 6.0, 4.0), (0.0, 0.0, 1.0)),
         valid=True,
     )
-    from adapters.models import openpilot_preprocess
+    from ls_vision.adapters.models import openpilot_preprocess
 
     original = openpilot_preprocess._bgr_to_i420_planes
     calls = 0

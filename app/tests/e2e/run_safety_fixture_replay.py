@@ -18,10 +18,10 @@ import yaml
 ROOT = Path(__file__).parents[3]
 sys.path.insert(0, str(ROOT / "app" / "src"))
 
-from adapters.models.fire_smoke_engine import FireSmokeEngine  # noqa: E402
-from application.safety_replay import compare_with_baseline, score_presence  # noqa: E402
-from bootstrap.config import load_config  # noqa: E402
-from domain.fire_smoke_events import FireSmokeEventStore  # noqa: E402
+from ls_vision.adapters.models.fire_smoke_engine import FireSmokeEngine  # noqa: E402
+from ls_vision.application.safety_replay import compare_with_baseline, score_presence  # noqa: E402
+from ls_vision.bootstrap.config import load_config  # noqa: E402
+from ls_vision.domain.fire_smoke_events import FireSmokeEventStore  # noqa: E402
 
 
 class _ReplayEvidence:

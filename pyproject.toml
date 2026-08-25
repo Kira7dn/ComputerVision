@@ -60,12 +60,11 @@ typecheck = [
     "transformers>=4.45,<4.46",
 ]
 
-# Root-owned Python tooling is shared by camera-adas, validators and the
-# embedded Frigate source tree.
+# Root-owned Python tooling belongs only to the independent server boundary.
 [tool.ty.environment]
 python-version = "3.11"
 python-platform = "all"
-root = [".", "server", "frigate/src"]
+root = [".", "server"]
 extra-paths = ["server/typings"]
 
 [tool.ty.src]
@@ -73,11 +72,6 @@ respect-ignore-files = false
 include = [
     "*.py",
     "server",
-    "frigate/src",
-    "tools",
-    "migrations",
-    "tests",
-    "scripts",
 ]
 exclude = [
     "**/.venv/**",
@@ -96,13 +90,11 @@ ignore = ["E501", "E711", "E712", "UP031", "UP032", "UP042", "G004"]
 extend-select = ["I", "UP", "G", "ASYNC210", "B904"]
 
 [tool.ruff.lint.per-file-ignores]
-"frigate/src/extension/tracker/service/v1/tracker_pb2.py" = ["ALL"]
-"frigate/src/extension/tracker/service/v1/tracker_pb2_grpc.py" = ["ALL"]
 "server/camera_server/media/netsdk_source.py" = ["E402"]
 "server/camera_server/tools/probe_osd.py" = ["E402"]
 "server/test_real_live.py" = ["E402"]
 "server/test_sdk_api.py" = ["E402"]
 
 [tool.pytest.ini_options]
-pythonpath = [".", "app/src", "server"]
-testpaths = ["server/tests", "app/tests"]
+pythonpath = [".", "server"]
+testpaths = ["server/tests"]

@@ -1,4 +1,4 @@
-from domain.dms_health import requires_person_inference, resolve_dms_health
+from ls_vision.domain.dms_health import requires_person_inference, resolve_dms_health
 
 
 def test_dms_requires_the_shared_person_tracker() -> None:

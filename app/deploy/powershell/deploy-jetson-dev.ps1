@@ -9,13 +9,13 @@
 
 [CmdletBinding()]
 param(
-    [ValidateSet('deploy','start','status','cleanup')]
+    [ValidateSet('deploy','start','status','rollback','cleanup')]
     [string]$Action = 'deploy',
     [ValidateSet('development','production')]
     [string]$DeploymentProfile = 'development',
     [string]$CameraRoot = '',
     [string]$RemoteHost = 'jetson-nano',
-    [string]$SudoPassword = 'letron123',
+    [string]$SudoPassword = $env:LS_VISION_SUDO_PASSWORD,
     [string]$RemoteRoot = '',
     [string]$Mock360Directory = 'E:\v1.0-mini\sweeps\videos\sync-lite',
     [int]$VitePort = 5173,
@@ -61,15 +61,60 @@ $servicePath = Join-Path $appPath "deploy\systemd\$serviceName"
 $mediaServicePath = Join-Path $appPath 'deploy\systemd\mediamtx.service'
 $mdnsServicePath = Join-Path $appPath 'deploy\systemd\ls-vision-mdns.service'
 $ingressServicePath = Join-Path $appPath 'deploy\systemd\ls-vision-ingress.service'
-foreach ($required in @($appPath, $servicePath, $mediaServicePath, $mdnsServicePath, $ingressServicePath, $frontModelPath, $Mock360Directory)) {
-    if (-not (Test-Path -LiteralPath $required)) {
-        throw "Jetson development deployment input is missing: $required"
-    }
-}
 
 if ($Action -eq 'status') {
-    ssh $RemoteHost "systemctl is-active $serviceName 2>/dev/null || true"
+    ssh $RemoteHost "readlink -f '$RemoteRoot/current' 2>/dev/null || true; systemctl is-active '$serviceName' 2>/dev/null || true"
     exit $LASTEXITCODE
+}
+
+if ($Action -eq 'rollback') {
+    if ($DeploymentProfile -ne 'production') { throw 'Rollback is production-only.' }
+    if ([string]::IsNullOrWhiteSpace($SudoPassword)) { throw 'LS_VISION_SUDO_PASSWORD is required for rollback.' }
+    $rollbackScript = @'
+set -euo pipefail
+REMOTE_ROOT='$RemoteRoot'
+SUDO_PASSWORD='$SudoPassword'
+sudo_cmd() { printf '%s\n' "$SUDO_PASSWORD" | sudo -S -p '' "$@"; }
+CURRENT=$(readlink -f "$REMOTE_ROOT/current" || true)
+TARGET=''
+for release in $(find "$REMOTE_ROOT/releases" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' | sort -rn | cut -d' ' -f2-); do
+  [ "$release" = "$CURRENT" ] && continue
+  TARGET="$release"
+  break
+done
+[ -n "$TARGET" ] || { echo 'No previous LS-Vision release is available.' >&2; exit 1; }
+sudo_cmd ln -sfn "$TARGET" "$REMOTE_ROOT/current"
+for unit in ls-vision.service mediamtx.service ls-vision-ingress.service; do
+  source_unit="$TARGET/app/deploy/systemd/$unit"
+  [ -f "$source_unit" ] && sudo_cmd install -m 644 "$source_unit" "/etc/systemd/system/$unit"
+done
+sudo_cmd systemctl daemon-reload
+sudo_cmd systemctl restart mediamtx.service ls-vision.service ls-vision-ingress.service
+for attempt in $(seq 1 30); do
+  if curl --fail --silent --max-time 5 http://127.0.0.1:18080/health/ready >/dev/null; then
+    echo "$TARGET"
+    exit 0
+  fi
+  sleep 2
+done
+echo 'Rollback target did not become ready.' >&2
+exit 1
+'@
+    $rollbackScript = $rollbackScript.Replace(([char]36 + 'RemoteRoot'), $RemoteRoot)
+    $rollbackScript = $rollbackScript.Replace(([char]36 + 'SudoPassword'), $SudoPassword)
+    $rollbackScript = $rollbackScript -replace "`r`n", "`n"
+    $rollbackScript | ssh $RemoteHost "tr -d '\r' | bash -s"
+    exit $LASTEXITCODE
+}
+
+if ([string]::IsNullOrWhiteSpace($SudoPassword)) {
+    throw 'LS_VISION_SUDO_PASSWORD is required for deploy/start.'
+}
+
+foreach ($required in @($appPath, $servicePath, $mediaServicePath, $mdnsServicePath, $ingressServicePath, $frontModelPath, $Mock360Directory)) {
+    if (-not (Test-Path -LiteralPath $required)) {
+        throw "Jetson deployment input is missing: $required"
+    }
 }
 
 if ($Action -eq 'start') {
@@ -109,7 +154,7 @@ if ($Action -eq 'start') {
         $processes += Start-Process -FilePath 'ssh' -ArgumentList @('-o','ExitOnForwardFailure=yes','-o','ServerAliveInterval=3','-o','ServerAliveCountMax=2','-N','-L','18080:127.0.0.1:28080',$RemoteHost) -NoNewWindow -PassThru
         $processes += Start-Process -FilePath 'ssh' -ArgumentList @('-o','ExitOnForwardFailure=yes','-o','ServerAliveInterval=3','-o','ServerAliveCountMax=2','-N','-L','8888:127.0.0.1:28888','-L','8889:127.0.0.1:28889',$RemoteHost) -NoNewWindow -PassThru
         $processes += Start-Process -FilePath $node -ArgumentList @($viteScript,'--host','0.0.0.0','--port',"$VitePort") -WorkingDirectory $webPath -NoNewWindow -PassThru
-        $processes += Start-Process -FilePath $python -ArgumentList @('-m','interfaces.mock_media_server','--root',$Mock360Directory,'--host','127.0.0.1','--port',"$MockMediaPort") -WorkingDirectory $sourcePath -NoNewWindow -PassThru
+        $processes += Start-Process -FilePath $python -ArgumentList @('-m','ls_vision.interfaces.mock_media_server','--root',$Mock360Directory,'--host','127.0.0.1','--port',"$MockMediaPort") -WorkingDirectory $sourcePath -NoNewWindow -PassThru
         Write-OK "Development endpoint active at http://127.0.0.1:$VitePort/dashboard.html"
         while ($true) {
             Start-Sleep -Seconds 1
@@ -140,9 +185,11 @@ $releaseRoot = "$RemoteRoot/releases/$releaseName"
 $tempArchive = Join-Path ([System.IO.Path]::GetTempPath()) "ls-vision-dev-$([guid]::NewGuid().ToString('N')).tar.gz"
 $tempModelArchive = Join-Path ([System.IO.Path]::GetTempPath()) "ls-vision-dev-models-$([guid]::NewGuid().ToString('N')).tar.gz"
 $tempMock360Archive = Join-Path ([System.IO.Path]::GetTempPath()) "ls-vision-dev-mock-360-$([guid]::NewGuid().ToString('N')).tar.gz"
+$tempManifest = Join-Path ([System.IO.Path]::GetTempPath()) "ls-vision-release-$([guid]::NewGuid().ToString('N')).json"
 $remoteArchive = "/tmp/$(Split-Path -Leaf $tempArchive)"
 $remoteModelArchive = "/tmp/$(Split-Path -Leaf $tempModelArchive)"
 $remoteMock360Archive = "/tmp/$(Split-Path -Leaf $tempMock360Archive)"
+$remoteManifest = "/tmp/$(Split-Path -Leaf $tempManifest)"
 $remoteService = "/tmp/$serviceName"
 $remoteMediaService = '/tmp/mediamtx.service'
 $remoteMdnsService = '/tmp/ls-vision-mdns.service'
@@ -160,6 +207,25 @@ try {
         if ($LASTEXITCODE -ne 0) { throw 'Unable to build production dashboard' }
     }
     Write-Step "Packaging Camera/app $DeploymentProfile source"
+    $sourceCommit = (git -C $cameraPath rev-parse HEAD).Trim()
+    $sourceDirty = [bool](git -C $cameraPath status --porcelain)
+    $configPath = if ($DeploymentProfile -eq 'production') {
+        Join-Path $appPath 'config\production.yaml'
+    } else {
+        Join-Path $appPath 'config\dev.yaml'
+    }
+    $manifestJson = [ordered]@{
+        schema_version = 1
+        release = $releaseName
+        profile = $DeploymentProfile
+        source_commit = $sourceCommit
+        source_dirty = $sourceDirty
+        config_sha256 = (Get-FileHash -LiteralPath $configPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        front_model_sha256 = $frontModelSha256
+        created_at = (Get-Date).ToUniversalTime().ToString('o')
+    } | ConvertTo-Json
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($tempManifest, $manifestJson, $utf8NoBom)
     tar -czf $tempArchive --exclude='app/web/node_modules' `
         --exclude='app/.pytest_cache' --exclude='app/.ruff_cache' --exclude='*/__pycache__' `
         --exclude='*.pyc' -C $cameraPath app
@@ -179,6 +245,8 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Unable to copy front-assistance model archive' }
     scp -q $tempMock360Archive "${RemoteHost}:$remoteMock360Archive"
     if ($LASTEXITCODE -ne 0) { throw 'Unable to copy synchronized 360 mock videos' }
+    scp -q $tempManifest "${RemoteHost}:$remoteManifest"
+    if ($LASTEXITCODE -ne 0) { throw 'Unable to copy release manifest' }
     scp -q $servicePath "${RemoteHost}:$remoteService"
     if ($LASTEXITCODE -ne 0) { throw 'Unable to copy LS-Vision systemd unit' }
     if ($DeploymentProfile -eq 'production') {
@@ -215,6 +283,7 @@ else
 fi
 sudo_cmd mkdir -p "$RELEASE_ROOT" "$REMOTE_ROOT/releases" "$REMOTE_ROOT/runtime" "$REMOTE_ROOT/data/status" "$REMOTE_ROOT/data/state" "$REMOTE_ROOT/data/evidence" "$REMOTE_ROOT/data/queue" "$REMOTE_ROOT/data/logs" "$REMOTE_ROOT/data/mock-videos/cameras/sync-lite" /opt/ls-vision/models/openpilot
 sudo_cmd tar -xzf "$REMOTE_ARCHIVE" -C "$RELEASE_ROOT"
+sudo_cmd install -m 644 '$remoteManifest' "$RELEASE_ROOT/release-manifest.json"
 if [ "$DEPLOYMENT_PROFILE" = production ] || ! printf '%s  %s\n' "$FRONT_MODEL_SHA256" /opt/ls-vision/models/openpilot/driving_supercombo.onnx | sha256sum -c - >/dev/null 2>&1; then
   sudo_cmd tar -xzf "$REMOTE_MODEL_ARCHIVE" -C /opt/ls-vision/models
 fi
@@ -223,6 +292,7 @@ sudo_cmd install -m 644 /dev/null "$REMOTE_ROOT/runtime/mediamtx.conf"
 sudo_cmd rm -f -- /opt/ls-vision/models/openpilot/dmonitoring_model.onnx
 printf '%s  %s\n' "$FRONT_MODEL_SHA256" /opt/ls-vision/models/openpilot/driving_supercombo.onnx | sha256sum -c -
 sudo_cmd chown -R letron:letron "$RELEASE_ROOT"
+sudo_cmd chown -R letron:letron "$REMOTE_ROOT/data"
 sudo_cmd ln -sfn "$RELEASE_ROOT" "$REMOTE_ROOT/current"
 sudo_cmd install -m 644 "$REMOTE_SERVICE" "/etc/systemd/system/$SERVICE_NAME"
 if [ "$DEPLOYMENT_PROFILE" = production ]; then
@@ -231,7 +301,7 @@ if [ "$DEPLOYMENT_PROFILE" = production ]; then
   sudo_cmd install -m 644 "$REMOTE_INGRESS_SERVICE" /etc/systemd/system/ls-vision-ingress.service
   sudo_cmd rm -f -- /etc/systemd/system/tbox.service.d/50-ls-vision-ingress.conf
 fi
-rm -f "$REMOTE_ARCHIVE" "$REMOTE_MODEL_ARCHIVE" "$REMOTE_MOCK_360_ARCHIVE" "$REMOTE_SERVICE"
+rm -f "$REMOTE_ARCHIVE" "$REMOTE_MODEL_ARCHIVE" "$REMOTE_MOCK_360_ARCHIVE" '$remoteManifest' "$REMOTE_SERVICE"
 if [ "$DEPLOYMENT_PROFILE" = production ]; then rm -f "$REMOTE_MEDIA_SERVICE" "$REMOTE_MDNS_SERVICE" "$REMOTE_INGRESS_SERVICE"; fi
 sudo_cmd systemctl daemon-reload
 if [ "$DEPLOYMENT_PROFILE" = production ]; then
@@ -268,9 +338,11 @@ for attempt in $(seq 1 60); do
         exit 1
       fi
     fi
-    for old_release in "$REMOTE_ROOT"/releases/*; do
+    retained=0
+    for old_release in $(find "$REMOTE_ROOT/releases" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' | sort -rn | cut -d' ' -f2-); do
       [ "$old_release" = "$RELEASE_ROOT" ] && continue
-      [ -d "$old_release" ] || continue
+      retained=$((retained + 1))
+      [ "$retained" -le 2 ] && continue
       sudo_cmd rm -rf -- "$old_release"
     done
     sudo_cmd rm -f -- "$REMOTE_ROOT/data/status/hot-reload.pid"
@@ -288,6 +360,7 @@ exit 1
     $remoteScript = $remoteScript.Replace(([char]36 + 'remoteArchive'), $remoteArchive)
     $remoteScript = $remoteScript.Replace(([char]36 + 'remoteModelArchive'), $remoteModelArchive)
     $remoteScript = $remoteScript.Replace(([char]36 + 'REMOTE_MOCK_360_ARCHIVE'), $remoteMock360Archive)
+    $remoteScript = $remoteScript.Replace(([char]36 + 'remoteManifest'), $remoteManifest)
     $remoteScript = $remoteScript.Replace(([char]36 + 'frontModelSha256'), $frontModelSha256)
     $remoteScript = $remoteScript.Replace(([char]36 + 'SudoPassword'), $SudoPassword)
     $remoteScript = $remoteScript.Replace(([char]36 + 'DeploymentProfile'), $DeploymentProfile)
@@ -303,5 +376,5 @@ exit 1
     Write-OK "Jetson $DeploymentProfile runtime deployed and healthy"
 }
 finally {
-    Remove-Item -LiteralPath $tempArchive, $tempModelArchive, $tempMock360Archive -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $tempArchive, $tempModelArchive, $tempMock360Archive, $tempManifest -Force -ErrorAction SilentlyContinue
 }

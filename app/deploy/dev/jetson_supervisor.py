@@ -142,7 +142,7 @@ def main() -> int:
         ),
         "dashboard": ManagedProcess(
             "dashboard",
-            [sys.executable, "-m", "interfaces.dashboard_api"],
+            [sys.executable, "-m", "ls_vision.interfaces.dashboard_api"],
             runtime_logs / "dashboard.log",
             root,
             environment,
@@ -154,7 +154,7 @@ def main() -> int:
                     [
                         sys.executable,
                         "-m",
-                        "interfaces.mock_media_server",
+                        "ls_vision.interfaces.mock_media_server",
                         "--root",
                         str(args.mock_media_root),
                         "--port",
@@ -170,7 +170,7 @@ def main() -> int:
         ),
         "runner": ManagedProcess(
             "runner",
-            [sys.executable, "-m", "runner", "--config", str(args.config)],
+            [sys.executable, "-m", "ls_vision.runner", "--config", str(args.config)],
             runtime_logs / "pipeline.log",
             root,
             environment,

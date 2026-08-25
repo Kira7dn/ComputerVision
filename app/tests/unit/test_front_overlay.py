@@ -1,7 +1,7 @@
 from dataclasses import replace
 
-from domain.front_assistance import FrontPerception, FrontReadiness
-from domain.front_overlay import project_front_overlay
+from ls_vision.domain.front_assistance import FrontPerception, FrontReadiness
+from ls_vision.domain.front_overlay import project_front_overlay
 
 
 def perception() -> FrontPerception:

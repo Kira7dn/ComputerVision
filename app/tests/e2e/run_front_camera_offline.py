@@ -11,8 +11,8 @@ from typing import Any
 
 import cv2
 
-from adapters.models.openpilot_front_engine import OpenpilotFrontEngine
-from domain.front_assistance import VisionAlertPolicy
+from ls_vision.adapters.models.openpilot_front_engine import OpenpilotFrontEngine
+from ls_vision.domain.front_assistance import VisionAlertPolicy
 
 
 def _percentile(values: list[float], percentile: float) -> float | None:

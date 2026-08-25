@@ -1,165 +1,193 @@
 profile: dev
-
 runtime:
   live_metadata_interval_ms: 250
   status_directory: /opt/ls-vision-dev/data/status
   state_directory: /opt/ls-vision-dev/data/state
-  wsl_distro: Ubuntu-22.04
-  mediamtx_config: /mnt/d/BusinessAnalyze/Camera/app/deploy/docker/mediamtx.yml
-  mediamtx_binary: /opt/camera-safety/mediamtx/mediamtx
-  # Hold confirmed overlays between asynchronous inference cycles. Use wall
-  # clock time because the RTSP frame rate differs between cameras.
   analysis_result_max_age_seconds: 2.0
-
 analysis:
   result_max_age_ms: 1000
   functions: {}
-
 front_assistance:
   enabled: false
   mode: vision_only
   model_path: /opt/ls-vision/models/openpilot/driving_supercombo.onnx
   model_rate_hz: 20
   max_gap_seconds: 0.25
-  providers: [TensorrtExecutionProvider, CUDAExecutionProvider]
+  providers:
+  - CUDAExecutionProvider
+  - TensorrtExecutionProvider
   allow_cpu: false
   rollout: shadow
-
 cameras:
-  - id: DMS
-    source:
-      type: rtsp
-      url: rtsp://192.168.1.229:554/cam/realmonitor?channel=5&subtype=0
-      username_env: CAMERA_DAHUA_USER
-      password_env: CAMERA_DAHUA_PASSWORD
-      codec: hevc
-      decoder: software
-      loop: true
-      width: 1920
-      height: 1080
-      latency_ms: 200
-    output:
-      rtsp_url: rtsp://127.0.0.1:8554/dahua_bbox
-    functions:
-      trace: false
-      face_recognition: false
-      smoking_behavior: false
-      fire_smoke: false
-      dms: true
-  - id: camera_front
-    display_name: Camera trước
-    source:
-      type: mock
-      url: rtsp://127.0.0.1:8554/camera_front_raw
-      mock_video: /opt/ls-vision-dev/data/mock-videos/cameras/sync-lite/CAM_FRONT.mp4
-      sync_group: vehicle_surround
-      sync_period_seconds: 191.1
-      sync_epoch_seconds: 0.0
-      loop: true
-      decoder: software
-      width: 960
-      height: 540
-      latency_ms: 200
-    output:
-      rtsp_url: rtsp://127.0.0.1:8554/camera_front
-    functions: {trace: false, face_recognition: false, smoking_behavior: false, fire_smoke: false, dms: false, front_assistance: true}
-    front_assistance:
-      model_path: /opt/ls-vision/models/openpilot/driving_supercombo.onnx
-      allow_cpu: false
-      traffic_convention: right_hand
-      overlay:
-        # Match openpilot's LDW visibility gate. Low-confidence shadow lanes
-        # are not rendered as authoritative road geometry.
-        lane_min_probability: 0.5
-        path_half_width_m: 0.9
-      calibration:
-        profile_id: nuscenes-mini-aggregate-front-v2
-        source_width: 960
-        source_height: 540
-        intrinsics:
-          - [756.585337605, 0.0, 492.237274656]
-          - [0.0, 756.585337605, 289.738862715]
-          - [0.0, 0.0, 1.0]
-        rpy_calib: [-0.0044246, 0.0000086, 0.0075154]
-        camera_height_m: 1.50453975110
-        artifact_hash: nuscenes-mini-cam-front-mean-v2-scaled-960x540
-        valid: true
-  - id: camera_back
-    display_name: Camera sau
-    source:
-      type: mock
-      url: rtsp://127.0.0.1:8554/camera_back
-      mock_video: /opt/ls-vision-dev/data/mock-videos/cameras/sync-lite/CAM_BACK.mp4
-      media_only: true
-      sync_group: vehicle_surround
-      sync_period_seconds: 191.1
-      sync_epoch_seconds: 0.0
-      loop: true
-      width: 960
-      height: 540
-      latency_ms: 200
-    output:
-      rtsp_url: rtsp://127.0.0.1:8554/camera_back
-    functions: {trace: false, face_recognition: false, smoking_behavior: false, fire_smoke: false, dms: false}
-  - id: camera_left
-    display_name: Camera trái
-    source:
-      type: mock
-      url: rtsp://127.0.0.1:8554/camera_left
-      mock_video: /opt/ls-vision-dev/data/mock-videos/cameras/sync-lite/CAM_FRONT_LEFT.mp4
-      media_only: true
-      sync_group: vehicle_surround
-      sync_period_seconds: 191.1
-      sync_epoch_seconds: 0.0
-      loop: true
-      width: 960
-      height: 540
-      latency_ms: 200
-    output:
-      rtsp_url: rtsp://127.0.0.1:8554/camera_left
-    functions: {trace: false, face_recognition: false, smoking_behavior: false, fire_smoke: false, dms: false}
-  - id: camera_right
-    display_name: Camera phải
-    source:
-      type: mock
-      url: rtsp://127.0.0.1:8554/camera_right
-      mock_video: /opt/ls-vision-dev/data/mock-videos/cameras/sync-lite/CAM_FRONT_RIGHT.mp4
-      media_only: true
-      sync_group: vehicle_surround
-      sync_period_seconds: 191.1
-      sync_epoch_seconds: 0.0
-      loop: true
-      width: 960
-      height: 540
-      latency_ms: 200
-    output:
-      rtsp_url: rtsp://127.0.0.1:8554/camera_right
-    functions: {trace: false, face_recognition: false, smoking_behavior: false, fire_smoke: false, dms: false}
-
-
+- id: DMS
+  source:
+    type: rtsp
+    url: rtsp://192.168.1.229:554/cam/realmonitor?channel=5&subtype=0
+    username_env: CAMERA_DAHUA_USER
+    password_env: CAMERA_DAHUA_PASSWORD
+    codec: hevc
+    decoder: software
+    loop: true
+    width: 1920
+    height: 1080
+    latency_ms: 200
+  output:
+    rtsp_url: rtsp://127.0.0.1:8554/dahua_bbox
+  functions:
+    trace: false
+    face_recognition: false
+    smoking_behavior: false
+    fire_smoke: false
+    dms: true
+- id: camera_front
+  display_name: Camera trước
+  source:
+    type: mock
+    url: rtsp://127.0.0.1:8554/camera_front_raw
+    mock_video: /opt/ls-vision-dev/data/mock-videos/cameras/sync-lite/CAM_FRONT.mp4
+    sync_group: vehicle_surround
+    sync_period_seconds: 191.1
+    sync_epoch_seconds: 0.0
+    loop: true
+    decoder: software
+    width: 960
+    height: 540
+    latency_ms: 200
+  output:
+    rtsp_url: rtsp://127.0.0.1:8554/camera_front
+  functions:
+    trace: false
+    face_recognition: false
+    smoking_behavior: false
+    fire_smoke: false
+    dms: false
+    front_assistance: true
+  front_assistance:
+    model_path: /opt/ls-vision/models/openpilot/driving_supercombo.onnx
+    allow_cpu: false
+    traffic_convention: right_hand
+    overlay:
+      lane_min_probability: 0.5
+      path_half_width_m: 0.9
+    calibration:
+      profile_id: nuscenes-mini-aggregate-front-v2
+      source_width: 960
+      source_height: 540
+      intrinsics:
+      - - 756.585337605
+        - 0.0
+        - 492.237274656
+      - - 0.0
+        - 756.585337605
+        - 289.738862715
+      - - 0.0
+        - 0.0
+        - 1.0
+      rpy_calib:
+      - -0.0044246
+      - 8.6e-06
+      - 0.0075154
+      camera_height_m: 1.5045397511
+      artifact_hash: nuscenes-mini-cam-front-mean-v2-scaled-960x540
+      valid: true
+- id: camera_back
+  display_name: Camera sau
+  source:
+    type: mock
+    url: rtsp://127.0.0.1:8554/camera_back
+    mock_video: /opt/ls-vision-dev/data/mock-videos/cameras/sync-lite/CAM_BACK.mp4
+    media_only: true
+    sync_group: vehicle_surround
+    sync_period_seconds: 191.1
+    sync_epoch_seconds: 0.0
+    loop: true
+    width: 960
+    height: 540
+    latency_ms: 200
+  output:
+    rtsp_url: rtsp://127.0.0.1:8554/camera_back
+  functions:
+    trace: false
+    face_recognition: false
+    smoking_behavior: false
+    fire_smoke: false
+    dms: false
+- id: camera_left
+  display_name: Camera trái
+  source:
+    type: mock
+    url: rtsp://127.0.0.1:8554/camera_left
+    mock_video: /opt/ls-vision-dev/data/mock-videos/cameras/sync-lite/CAM_FRONT_LEFT.mp4
+    media_only: true
+    sync_group: vehicle_surround
+    sync_period_seconds: 191.1
+    sync_epoch_seconds: 0.0
+    loop: true
+    width: 960
+    height: 540
+    latency_ms: 200
+  output:
+    rtsp_url: rtsp://127.0.0.1:8554/camera_left
+  functions:
+    trace: false
+    face_recognition: false
+    smoking_behavior: false
+    fire_smoke: false
+    dms: false
+- id: camera_right
+  display_name: Camera phải
+  source:
+    type: mock
+    url: rtsp://127.0.0.1:8554/camera_right
+    mock_video: /opt/ls-vision-dev/data/mock-videos/cameras/sync-lite/CAM_FRONT_RIGHT.mp4
+    media_only: true
+    sync_group: vehicle_surround
+    sync_period_seconds: 191.1
+    sync_epoch_seconds: 0.0
+    loop: true
+    width: 960
+    height: 540
+    latency_ms: 200
+  output:
+    rtsp_url: rtsp://127.0.0.1:8554/camera_right
+  functions:
+    trace: false
+    face_recognition: false
+    smoking_behavior: false
+    fire_smoke: false
+    dms: false
 smoking_behavior:
-  onnx_path: /mnt/d/BusinessAnalyze/Camera/assets/models/smoking_behavior/model.onnx
+  onnx_path: /opt/ls-vision/models/smoking_behavior/model.onnx
   object_detection:
     enabled: true
     warmup: true
     input_width: 640
     input_height: 640
     confidence: 0.35
-    nms_iou: 0.50
-    person_match_iou: 0.10
+    nms_iou: 0.5
+    person_match_iou: 0.1
     models:
       soham:
         onnx_path: /opt/ls-vision/models/smoking_behavior/tbox/soham_best.onnx
-        labels: [Distracted, Drinking, Drowsy, Eating, PhoneUse, SafeDriving, Seatbelt, Smoking]
-        positive_labels: [Smoking]
+        labels:
+        - Distracted
+        - Drinking
+        - Drowsy
+        - Eating
+        - PhoneUse
+        - SafeDriving
+        - Seatbelt
+        - Smoking
+        positive_labels:
+        - Smoking
   input_width: 224
   input_height: 224
-  smoking_threshold: 0.60
-  padding_ratio: 0.20
+  smoking_threshold: 0.6
+  padding_ratio: 0.2
   interval_ms: 400
   providers:
-    - CUDAExecutionProvider
-    - CPUExecutionProvider
+  - CUDAExecutionProvider
+  - CPUExecutionProvider
   require_gpu_provider: true
   temporal:
     confirmation_hits: 2
@@ -171,23 +199,38 @@ smoking_behavior:
     clearing_seconds: 3.0
     notification_min_duration_seconds: 3.0
     trace_interval_ms: 400
-
 dms:
   object_detection:
     enabled: true
     input_width: 640
     input_height: 640
     confidence: 0.35
-    nms_iou: 0.50
-    person_match_iou: 0.10
+    nms_iou: 0.5
+    person_match_iou: 0.1
     models:
       soham:
         onnx_path: /opt/ls-vision/models/smoking_behavior/tbox/soham_best.onnx
-        labels: [Distracted, Drinking, Drowsy, Eating, PhoneUse, SafeDriving, Seatbelt, Smoking]
-        positive_labels: [Distracted, Drinking, Drowsy, Eating, PhoneUse, SafeDriving, Seatbelt, Smoking]
+        labels:
+        - Distracted
+        - Drinking
+        - Drowsy
+        - Eating
+        - PhoneUse
+        - SafeDriving
+        - Seatbelt
+        - Smoking
+        positive_labels:
+        - Distracted
+        - Drinking
+        - Drowsy
+        - Eating
+        - PhoneUse
+        - SafeDriving
+        - Seatbelt
+        - Smoking
   face_mesh:
     enabled: true
-    ear_threshold: 0.20
+    ear_threshold: 0.2
     mar_threshold: 0.65
     yaw_threshold_deg: 16.0
     pitch_threshold_deg: 14.0
@@ -202,7 +245,10 @@ dms:
       neutral_update_max_delta_deg: 5.0
   attention:
     interval_ms: 100
-    alert_seconds: [5.0, 8.0, 13.0]
+    alert_seconds:
+    - 5.0
+    - 8.0
+    - 13.0
     recovery_confirm_seconds: 2.0
     max_step_seconds: 1.0
   event_policy:
@@ -244,34 +290,32 @@ dms:
     on_frames: 3
     off_frames: 2
   interval_ms: 200
-
 fire_smoke:
-  # Exported from assets/models/fire_smoke/best.pt for the WSL runtime.
-  onnx_path: /mnt/d/BusinessAnalyze/Camera/assets/models/fire_smoke/best.onnx
+  onnx_path: /opt/ls-vision/models/fire_smoke/best.onnx
   input_width: 640
   input_height: 640
-  fire_threshold: 0.30
-  smoke_threshold: 0.40
+  fire_threshold: 0.3
+  smoke_threshold: 0.4
   interval_ms: 300
   detection_hold_seconds: 1.0
   nms_iou: 0.45
   max_detections_per_label: 8
   max_bbox_area_ratio:
-    fire: 0.20
-    smoke: 0.70
+    fire: 0.2
+    smoke: 0.7
   bbox_smoothing_alpha: 0.35
   bbox_smoothing_clear_seconds: 3.0
   trace_interval_ms: 500
   labels:
-    - fire
-    - smoke
+  - fire
+  - smoke
   providers:
-    - CUDAExecutionProvider
-    - CPUExecutionProvider
+  - CUDAExecutionProvider
+  - CPUExecutionProvider
   require_gpu_provider: true
   tracking:
-    match_iou: 0.10
-    match_center_distance: 0.20
+    match_iou: 0.1
+    match_center_distance: 0.2
     min_area_ratio: 0.25
     max_area_ratio: 4.0
     bbox_smoothing_alpha: 0.35
@@ -282,7 +326,7 @@ fire_smoke:
     clear_seconds: 3.0
   dynamics:
     mode: advisory
-    crop_padding_ratio: 0.10
+    crop_padding_ratio: 0.1
     crop_size: 96
     changed_pixel_delta: 15
     changed_pixel_ratio: 0.06
@@ -292,10 +336,9 @@ fire_smoke:
     required_conditions: 2
     confirmation_votes: 3
     confirmation_window: 5
-    context_padding_ratio: 0.30
+    context_padding_ratio: 0.3
     canny_low: 50
     canny_high: 150
-
 person:
   onnx_path: /opt/ls-vision/models/yolov9-t-320.onnx
   engine_path: /opt/ls-vision/models/yolov9-t-320.onnx_b1_gpu0_fp16.engine
@@ -307,13 +350,12 @@ person:
   inference_interval: 0
   roi_cache_max_age_seconds: 0.5
   tracking:
-    bbox_smoothing_alpha: 0.30
+    bbox_smoothing_alpha: 0.3
     confirmation_hits: 2
     confirmation_window: 4
-
 recognition:
   enabled: false
-  stream_epoch: deepstream-safety
+  stream_epoch: ls-vision
   face:
     unknown_score: 0.7
     recognition_threshold: 0.7
@@ -323,15 +365,15 @@ recognition:
     max_attempts_after_recognition: 6
     area_cap: 4000
   face_runtime:
-    detector_model: /mnt/d/BusinessAnalyze/Camera/assets/models/face/facedet.onnx
-    recognizer_model: /mnt/d/BusinessAnalyze/Camera/assets/models/face/arcface.onnx
-    library_directory: /mnt/d/BusinessAnalyze/Camera/.tmp/camera-safety-face-library/face_library
+    detector_model: /opt/ls-vision/models/face/facedet.onnx
+    recognizer_model: /opt/ls-vision/models/face/arcface.onnx
+    library_directory: /opt/ls-vision/face_library
     detection_threshold: 0.5
     min_area: 1200
     recognition_interval_ms: 400
     providers:
-      - CUDAExecutionProvider
-      - CPUExecutionProvider
+    - CUDAExecutionProvider
+    - CPUExecutionProvider
     require_gpu_provider: true
   lpr:
     detect_fps: 5
@@ -339,13 +381,8 @@ recognition:
     cluster_threshold: 0.85
     min_plate_length: 0
     plate_format: null
-
 metadata:
   zmq_pub_url: tcp://127.0.0.1:5555
-
-# Notification contract copied from the Frigate provider adapters, but owned
-# by the standalone DeepStream worker. Credentials and recipient chat IDs stay
-# in .env.local.
 notifications:
   enabled: true
   public_base_url_env: NGROK_URL
@@ -355,56 +392,67 @@ notifications:
     max_attempts: 3
     initial_backoff_seconds: 2
     max_backoff_seconds: 60
-  # Severity is resolved before notification rules are matched.
   severity:
     default: low
     rules:
-      - severity: critical
-        functions: [fire_smoke]
-        classifications: [fire]
-      - severity: high
-        functions: [fire_smoke]
-        classifications: [smoke]
-      - severity: high
-        functions: [smoking_behavior]
+    - severity: critical
+      functions:
+      - fire_smoke
+      classifications:
+      - fire
+    - severity: high
+      functions:
+      - fire_smoke
+      classifications:
+      - smoke
+    - severity: high
+      functions:
+      - smoking_behavior
   channels:
     telegram:
       enabled: true
       token_env: TELEGRAM_BOT_TOKEN
       recipients:
-        - id: operations
-          chat_id_env: TELEGRAM_CHAT_ID
+      - id: operations
+        chat_id_env: TELEGRAM_CHAT_ID
     zalo:
       enabled: false
       token_env: ZALO_BOT_TOKEN
       recipients:
-        - id: operations
-          chat_id_env: ZALO_CHAT_ID
+      - id: operations
+        chat_id_env: ZALO_CHAT_ID
   rules:
-    - id: critical-safety-alerts
-      enabled: true
-      severities: [critical]
-      functions: [fire_smoke]
-      cameras: []
-      destinations:
-        telegram: [operations]
-        zalo: [operations]
-    - id: high-safety-alerts
-      enabled: true
-      severities: [high]
-      functions: [smoking_behavior, fire_smoke]
-      cameras: []
-      destinations:
-        telegram: [operations]
-        zalo: [operations]
-
+  - id: critical-safety-alerts
+    enabled: true
+    severities:
+    - critical
+    functions:
+    - fire_smoke
+    cameras: []
+    destinations:
+      telegram:
+      - operations
+      zalo:
+      - operations
+  - id: high-safety-alerts
+    enabled: true
+    severities:
+    - high
+    functions:
+    - smoking_behavior
+    - fire_smoke
+    cameras: []
+    destinations:
+      telegram:
+      - operations
+      zalo:
+      - operations
 evidence:
-  directory: /mnt/d/BusinessAnalyze/Camera/.tmp/deepstream-safety
+  directory: /opt/ls-vision-dev/data/evidence
   prefix: snapshots-acceptance
   snapshot_interval_ms: 1000
   max_snapshots_per_event: 3
   peak_score_delta: 0.05
-
 snapshots:
   enabled: true
   min_interval_ms: 1000

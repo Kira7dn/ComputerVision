@@ -5,12 +5,12 @@ import time
 
 import numpy as np
 
-from application.analysis_scheduler import (
+from ls_vision.application.analysis_scheduler import (
     AnalysisAdmissionGate,
     FrameResultGate,
     LatestSampleExecutor,
 )
-from domain.contracts import AnalysisSample, FrameKey
+from ls_vision.domain.contracts import AnalysisSample, FrameKey
 
 
 def _sample(frame_number: int, *, captured: float | None = None) -> AnalysisSample:

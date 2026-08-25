@@ -5,13 +5,15 @@
 .DESCRIPTION
     This is the only supported owner of LS-Vision deployment. It publishes the
     Camera/app source tree and never deploys or restarts the LeOS T-Box
-    application. It does not start the old Docker Compose runtime.
+    application through native systemd services.
 #>
 
 [CmdletBinding()]
 param(
+    [ValidateSet('deploy','status','rollback')]
+    [string]$Action = 'deploy',
     [string]$JetsonAlias = 'jetson-nano',
-    [string]$SudoPassword = 'letron123',
+    [string]$SudoPassword = $env:LS_VISION_SUDO_PASSWORD,
     [switch]$Development
 )
 
@@ -23,23 +25,30 @@ if (-not (Test-Path -LiteralPath $deployScript -PathType Leaf)) {
     throw "Camera deploy implementation was not found: $deployScript"
 }
 
-if ($Development) {
+if ($Action -ne 'deploy') {
+    Write-Host "==> Camera Jetson $Action on $JetsonAlias" -ForegroundColor Cyan
+} elseif ($Development) {
     Write-Host "==> Deploying Camera Jetson development runtime to $JetsonAlias" -ForegroundColor Cyan
 } else {
     Write-Host "==> Deploying Camera native runtime to $JetsonAlias" -ForegroundColor Cyan
 }
 
 $deploymentProfile = if ($Development) { 'development' } else { 'production' }
-& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $deployScript `
-    -Action deploy `
-    -DeploymentProfile $deploymentProfile `
-    -CameraRoot $cameraRoot `
-    -RemoteHost $JetsonAlias `
-    -SudoPassword $SudoPassword
+$arguments = @(
+    '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $deployScript,
+    '-Action', $Action,
+    '-DeploymentProfile', $deploymentProfile,
+    '-CameraRoot', $cameraRoot,
+    '-RemoteHost', $JetsonAlias
+)
+if (-not [string]::IsNullOrWhiteSpace($SudoPassword)) {
+    $arguments += @('-SudoPassword', $SudoPassword)
+}
+& powershell.exe @arguments
 $deployExitCode = $LASTEXITCODE
 
 if ($deployExitCode -ne 0) {
     throw "Jetson deployment failed with exit code $deployExitCode"
 }
 
-Write-Host '  OK  Camera runtime deployed by the Camera workspace' -ForegroundColor Green
+Write-Host "  OK  Camera runtime action completed: $Action" -ForegroundColor Green

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from domain.front_assistance import (
+from ls_vision.domain.front_assistance import (
     FrontPerception,
     FrontReadiness,
     VisionAlertPolicy,

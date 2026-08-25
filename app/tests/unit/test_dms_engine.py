@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from adapters.models.dms_engine import (
+from ls_vision.adapters.models.dms_engine import (
     AlertSmoother,
     DmsDetection,
     NeutralPoseCalibrator,
@@ -14,13 +14,13 @@ from adapters.models.dms_engine import (
     select_dms_overlay_detections,
     select_primary_driver,
 )
-from adapters.persistence.evidence_repository import EvidenceStore
-from domain.dms_events import DmsAlertEventStore
+from ls_vision.adapters.persistence.evidence_repository import EvidenceStore
+from ls_vision.domain.dms_events import DmsAlertEventStore
 
 if not hasattr(os, "sysconf"):
     os.sysconf = lambda _name: 100  # type: ignore[attr-defined]
 
-from interfaces import dashboard_api
+from ls_vision.interfaces import dashboard_api
 
 
 def _config(tmp_path, epoch: str = "epoch-1") -> dict:

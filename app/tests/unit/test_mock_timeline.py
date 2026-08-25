@@ -1,6 +1,6 @@
 import pytest
 
-from domain.mock_timeline import (
+from ls_vision.domain.mock_timeline import (
     frame_index_for_timestamp,
     media_time_for_timestamp,
     normalized_timeline_phase,
