@@ -24,8 +24,11 @@ function Write-OK([string]$Message) { Write-Host "  OK  $Message" -ForegroundCol
 
 $cameraPath = (Resolve-Path -LiteralPath $CameraRoot).Path
 $appPath = Join-Path $cameraPath 'app'
+$modelsPath = Join-Path $cameraPath 'assets\models'
+$frontModelPath = Join-Path $modelsPath 'openpilot\driving_supercombo.onnx'
+$frontModelSha256 = '659727c4d4839adc4992a254409a54259a8756a743f2d567bf5fdc6579f8009b'
 $servicePath = Join-Path $appPath 'deploy\systemd\ls-vision-dev.service'
-foreach ($required in @($appPath, $servicePath)) {
+foreach ($required in @($appPath, $servicePath, $frontModelPath)) {
     if (-not (Test-Path -LiteralPath $required)) {
         throw "Jetson development deployment input is missing: $required"
     }
@@ -34,7 +37,9 @@ foreach ($required in @($appPath, $servicePath)) {
 $releaseName = "release-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
 $releaseRoot = "$RemoteRoot/releases/$releaseName"
 $tempArchive = Join-Path ([System.IO.Path]::GetTempPath()) "ls-vision-dev-$([guid]::NewGuid().ToString('N')).tar.gz"
+$tempModelArchive = Join-Path ([System.IO.Path]::GetTempPath()) "ls-vision-dev-models-$([guid]::NewGuid().ToString('N')).tar.gz"
 $remoteArchive = "/tmp/$(Split-Path -Leaf $tempArchive)"
+$remoteModelArchive = "/tmp/$(Split-Path -Leaf $tempModelArchive)"
 
 try {
     Write-Step "Checking Jetson $RemoteHost"
@@ -47,10 +52,17 @@ try {
         --exclude='app/.pytest_cache' --exclude='app/.ruff_cache' --exclude='*/__pycache__' `
         --exclude='*.pyc' -C $cameraPath app
     if ($LASTEXITCODE -ne 0) { throw 'Unable to package Camera/app development source' }
+    if ((Get-FileHash -LiteralPath $frontModelPath -Algorithm SHA256).Hash.ToLowerInvariant() -ne $frontModelSha256) {
+        throw 'Front model checksum does not match the pinned provenance record'
+    }
+    tar -czf $tempModelArchive -C $modelsPath openpilot/driving_supercombo.onnx
+    if ($LASTEXITCODE -ne 0) { throw 'Unable to package the front-assistance model' }
 
     Write-Step "Copying Jetson development release $releaseName"
     scp -q $tempArchive "${RemoteHost}:$remoteArchive"
     if ($LASTEXITCODE -ne 0) { throw 'Unable to copy Camera/app development archive' }
+    scp -q $tempModelArchive "${RemoteHost}:$remoteModelArchive"
+    if ($LASTEXITCODE -ne 0) { throw 'Unable to copy front-assistance model archive' }
     scp -q $servicePath "${RemoteHost}:/tmp/ls-vision-dev.service"
     if ($LASTEXITCODE -ne 0) { throw 'Unable to copy Jetson development systemd unit' }
 
@@ -59,18 +71,22 @@ set -euo pipefail
 REMOTE_ROOT='$RemoteRoot'
 RELEASE_ROOT='$releaseRoot'
 REMOTE_ARCHIVE='$remoteArchive'
+REMOTE_MODEL_ARCHIVE='$remoteModelArchive'
+FRONT_MODEL_SHA256='$frontModelSha256'
 SUDO_PASSWORD='$SudoPassword'
 
 sudo_cmd() { printf '%s\n' "$SUDO_PASSWORD" | sudo -S -p '' "$@"; }
 
 sudo_cmd systemctl stop ls-vision.service >/dev/null 2>&1 || true
 sudo_cmd systemctl stop ls-vision-dev.service >/dev/null 2>&1 || true
-sudo_cmd mkdir -p "$RELEASE_ROOT" "$REMOTE_ROOT/releases" "$REMOTE_ROOT/data/status" "$REMOTE_ROOT/data/state" "$REMOTE_ROOT/data/evidence" "$REMOTE_ROOT/data/queue" "$REMOTE_ROOT/data/logs"
+sudo_cmd mkdir -p "$RELEASE_ROOT" "$REMOTE_ROOT/releases" "$REMOTE_ROOT/data/status" "$REMOTE_ROOT/data/state" "$REMOTE_ROOT/data/evidence" "$REMOTE_ROOT/data/queue" "$REMOTE_ROOT/data/logs" /opt/ls-vision/models/openpilot
 sudo_cmd tar -xzf "$REMOTE_ARCHIVE" -C "$RELEASE_ROOT"
+sudo_cmd tar -xzf "$REMOTE_MODEL_ARCHIVE" -C /opt/ls-vision/models
+printf '%s  %s\n' "$FRONT_MODEL_SHA256" /opt/ls-vision/models/openpilot/driving_supercombo.onnx | sha256sum -c -
 sudo_cmd chown -R letron:letron "$RELEASE_ROOT"
 sudo_cmd ln -sfn "$RELEASE_ROOT" "$REMOTE_ROOT/current"
 sudo_cmd install -m 644 /tmp/ls-vision-dev.service /etc/systemd/system/ls-vision-dev.service
-rm -f "$REMOTE_ARCHIVE" /tmp/ls-vision-dev.service
+rm -f "$REMOTE_ARCHIVE" "$REMOTE_MODEL_ARCHIVE" /tmp/ls-vision-dev.service
 sudo_cmd systemctl daemon-reload
 sudo_cmd systemctl enable --now ls-vision-dev.service
 
@@ -95,6 +111,8 @@ exit 1
     $remoteScript = $remoteScript.Replace(([char]36 + 'RemoteRoot'), $RemoteRoot)
     $remoteScript = $remoteScript.Replace(([char]36 + 'releaseRoot'), $releaseRoot)
     $remoteScript = $remoteScript.Replace(([char]36 + 'remoteArchive'), $remoteArchive)
+    $remoteScript = $remoteScript.Replace(([char]36 + 'remoteModelArchive'), $remoteModelArchive)
+    $remoteScript = $remoteScript.Replace(([char]36 + 'frontModelSha256'), $frontModelSha256)
     $remoteScript = $remoteScript.Replace(([char]36 + 'SudoPassword'), $SudoPassword)
     $remoteScript = $remoteScript -replace "`r`n", "`n"
     $remoteScript | ssh $RemoteHost "tr -d '\r' | bash -s"
@@ -103,5 +121,5 @@ exit 1
     Write-OK 'Jetson development runtime deployed and healthy'
 }
 finally {
-    Remove-Item -LiteralPath $tempArchive -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $tempArchive, $tempModelArchive -Force -ErrorAction SilentlyContinue
 }

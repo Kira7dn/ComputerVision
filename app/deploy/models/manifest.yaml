@@ -2,6 +2,12 @@ schema_version: 1
 runtime: ls-vision
 deepstream: "7.1"
 artifacts:
+  - id: openpilot-driving-supercombo-small
+    path: models/openpilot/driving_supercombo.onnx
+    sha256: "659727c4d4839adc4992a254409a54259a8756a743f2d567bf5fdc6579f8009b"
+    required: false
+    capability: front_assistance
+    provenance: app/deploy/models/openpilot-front-provenance.yaml
   - id: person-yolov9-t320
     path: models/person-yolov9-t320-fixed.engine
     sha256: ""

@@ -550,8 +550,9 @@ clone openpilot vào image production hoặc chạy nguyên process graph của 
 - DMS tiếp tục là worker riêng. Front camera không dùng DMS model, face model, fire/smoke model hoặc
   person detector nếu topology không yêu cầu.
 - Scope ban đầu chỉ quan sát và cảnh báo. Không phát lệnh ga, phanh, vô-lăng hoặc CAN actuation.
-- Khi calibration, vehicle state, model output hoặc frame freshness không hợp lệ, front stream có
-  thể tiếp tục nhưng assistance phải `not_ready` và không phát alert.
+- MVP là `vision_only` và `shadow`: không đọc T-Box/CAN/telemetry, không phát âm thanh/notification.
+  Khi calibration, model output hoặc frame freshness không hợp lệ, front stream có thể tiếp tục
+  nhưng assistance phải `not_ready` và không phát alert.
 
 Ownership đích:
 
@@ -561,8 +562,7 @@ Ownership đích:
 | Temporal buffers và inference session | `OpenpilotFrontEngine`, một instance/front worker | Reset theo epoch/gap/model reload; không chia sẻ mutable state |
 | Lane/path/lead output | `domain.front_assistance.FrontPerception` | Typed, có source timestamp, frame number, model/config hash |
 | Intrinsics/extrinsics/calibration state | `FrontCalibration` | Persist theo camera/config hash; invalid thì fail closed |
-| Speed/brake/blinker | `tbox.service` | T-Box là producer; Camera chỉ đọc typed local latest-state |
-| LDW/FCW lifecycle | `FrontAssistanceOrchestrator` | Advisory state và `START/UPDATE/END` idempotent |
+| Vision LDW/FCW lifecycle | `VisionAlertPolicy` | Advisory state và `START/END` idempotent; không giả telemetry |
 | Event/evidence/API/metrics | LS-Vision persistence/interfaces hiện tại | Exact triggering frame, bounded query, không glob evidence tree |
 | Model và native release | LeOS `tbox_lab deploy-app` | Checksum/provenance, release-based deployment, rollback được |
 
@@ -575,10 +575,9 @@ flowchart LR
     Decode --> FrontBranch[Bounded front-assistance branch]
     FrontBranch --> Engine[OpenpilotFrontEngine]
     Engine --> Perception[Lane / edge / path / lead / pose]
-    Vehicle[tbox.service VehicleState] --> Policy[FrontAssistanceOrchestrator]
+    Perception --> Policy[VisionAlertPolicy]
     Calibration[FrontCalibration] --> Engine
     Calibration --> Policy
-    Perception --> Policy
     Perception --> OSD[NVOSD annotation]
     Policy --> OSD
     Policy --> Evidence[Event + evidence + SQLite]
@@ -629,14 +628,14 @@ gate nào còn thiếu.
 
 | Phase | Trạng thái | Kết quả chính | Phụ thuộc |
 | --- | --- | --- | --- |
-| 0 | `[PLANNED]` | Camera/model/vehicle-state/ground-truth contract | Không |
-| 1 | `[PLANNED]` | Offline model adapter và reference parity | Phase 0 |
-| 2 | `[PLANNED]` | Front worker topology, output và metadata | Phase 1 |
-| 3 | `[PLANNED]` | Intrinsic/extrinsic calibration và tamper state | Phase 0, 1 |
-| 4 | `[PLANNED]` | Jetson shadow inference với DMS chạy đồng thời | Phase 2, 3 |
-| 5 | `[PLANNED]` | Vehicle-state bridge và LDW advisory | Phase 4 |
-| 6 | `[PLANNED]` | Lead risk, headway/TTC và FCW advisory | Phase 5 |
-| 7 | `[PLANNED]` | Dashboard, event/evidence và operator workflow | Phase 5, 6 |
+| 0 | `[IN PROGRESS]` | Model/provenance, nuScenes fixture và fixed calibration | Không |
+| 1 | `[IMPLEMENTED — UNVERIFIED]` | Offline model adapter; còn thiếu real-model parity artifact | Phase 0 |
+| 2 | `[IMPLEMENTED — UNVERIFIED]` | Front worker topology, output và metadata; chưa hardware-run | Phase 1 |
+| 3 | `[IN PROGRESS]` | Fixed nuScenes calibration; production/tamper chưa có | Phase 0, 1 |
+| 4 | `[IMPLEMENTED — HARDWARE GATE FAILED]` | Jetson CUDA shadow chạy cùng DMS; còn thiếu throughput/GPU headroom | Phase 2, 3 |
+| 5 | `[IMPLEMENTED — UNVERIFIED]` | Camera-only vision LDW advisory | Phase 4 |
+| 6 | `[IMPLEMENTED — UNVERIFIED]` | Camera-only model FCW advisory | Phase 4 |
+| 7 | `[IMPLEMENTED — UNVERIFIED]` | Dashboard, event/evidence và operator workflow | Phase 5, 6 |
 | 8 | `[PLANNED]` | Production canary, rollback và release acceptance | Phase 7 |
 | 9 | `[PLANNED]` | Radar/IMU/DMS ensemble và planner mở rộng | Phase 8; tùy chọn |
 
@@ -655,11 +654,10 @@ Deliverable:
   từ đúng camera production.
 - Khóa model nhỏ `driving_supercombo.onnx`; ghi SHA-256, openpilot commit, license/provenance và
   third-party notice. Không đưa `big_driving_supercombo.onnx` vào scope.
-- Định nghĩa `VehicleState` tối thiểu gồm `source_epoch`, `sequence`, `monotonic_timestamp`,
-  `speed_mps`, `brake_pressed`, `left_blinker`, `right_blinker` và freshness. `yaw_rate`,
-  `steering_angle_deg`, `lateral_control_active` là optional typed fields.
-- Thu video road-facing thật có source timestamp và telemetry đồng bộ, gồm đường thẳng, cua, đổi làn,
-  xi-nhan, phanh, xe trước, ban ngày/ban đêm và negative sequences.
+- Tạo fixture builder từ nuScenes `sample_data` thay vì dùng MP4 không có lineage. Manifest phải giữ
+  frame/PTS, scene/sample/sample-data token, calibrated-sensor token và đánh dấu frame lặp.
+- Fixture mặc định dùng `scene-0061`; `scene-1077` là negative/night profile. Mỗi clip chỉ dùng một
+  fixed calibration profile và đổi clip/calibration phải tạo epoch mới.
 - Chốt accuracy metrics nhưng chưa chốt threshold theo cảm tính: lane alignment, lead presence,
   LDW episode precision/recall, FCW episode precision/recall và false alerts/vehicle-hour.
 
@@ -669,11 +667,10 @@ Gate:
 - Video fixture là media thật và có producer timestamp; không tạo synthetic frame/UUID/lifecycle để
   thay acceptance.
 - Model SHA/provenance/license record đầy đủ.
-- Vehicle-state schema có unit, nullability, freshness và epoch semantics rõ.
-- Report liệt kê đầy đủ những tín hiệu chưa có; thiếu speed/brake/blinker không chặn Phase 1-4 nhưng
-  bắt buộc chặn Phase 5-6.
+- Report ghi riêng `source_unique_fps` và `model_tick_hz`; frame lặp không được tính là camera 20 FPS.
+- Thiếu speed/brake/blinker là giới hạn công khai của `vision_*`, không được lấp bằng state giả.
 
-### 13.5 Phase 1 — Offline adapter và parity `[PLANNED]`
+### 13.5 Phase 1 — Offline adapter và parity `[IMPLEMENTED — UNVERIFIED]`
 
 Mục tiêu là tái tạo chính xác road-model contract mà không kéo process graph openpilot vào app.
 
@@ -711,7 +708,7 @@ Gate:
 - Targeted pytest, Ruff, compileall và `git diff --check` pass. Đây là code-quality gate, không thay
   hardware/perception acceptance.
 
-### 13.6 Phase 2 — Front worker và media path `[PLANNED]`
+### 13.6 Phase 2 — Front worker và media path `[IMPLEMENTED — UNVERIFIED]`
 
 Mục tiêu là thêm front camera như một worker chuẩn của LS-Vision mà không làm DMS hoặc các camera
 khác đổi semantics.
@@ -738,7 +735,7 @@ Gate:
 - Queue depth bounded và stale frames bị drop có counter; không biến live stream thành playback.
 - DMS targeted tests và DMS worker readiness không regression.
 
-### 13.7 Phase 3 — Camera geometry, calibration và tamper `[PLANNED]`
+### 13.7 Phase 3 — Camera geometry, calibration và tamper `[IN PROGRESS]`
 
 Mục tiêu là bảo đảm model warp và cảnh báo lane dùng đúng camera geometry.
 
@@ -749,8 +746,7 @@ Deliverable:
 - Extrinsic contract gồm height, roll, pitch, yaw, mount version và calibration state
   `uncalibrated/calibrating/calibrated/invalid/recalibrating`.
 - Provisioned calibration dùng giá trị đo thật; zero/default không được tự xem là calibrated.
-- Nếu port online calibration, chỉ lấy bounded math/state từ openpilot và giữ T-Box/LS-Vision typed
-  inputs. Online update yêu cầu speed/motion certainty và persist theo camera/config hash.
+- Online calibration không nằm trong MVP camera-only; chỉ mở lại khi có motion/state đáng tin cậy.
 - Tamper detector so sánh calibration với baseline, phát degraded state khi camera bị xoay/rung hoặc
   geometry spread vượt ngưỡng.
 
@@ -762,7 +758,7 @@ Gate:
 - Restart giữ đúng calibration cùng hash; đổi camera/lens/resolution/config bắt buộc invalidation.
 - Tamper fixture chuyển state đúng và phục hồi chỉ sau calibration gate, không tự clear vì một frame.
 
-### 13.8 Phase 4 — Jetson shadow inference `[PLANNED]`
+### 13.8 Phase 4 — Jetson shadow inference `[IMPLEMENTED — HARDWARE GATE FAILED]`
 
 Mục tiêu là chứng minh model nhỏ chạy đồng thời với DMS trên Jetson thật trước khi bật alert.
 
@@ -782,7 +778,8 @@ Hardware gate tối thiểu trong một run 10 phút sau warmup:
 
 - DMS và front worker cùng `ready`; không restart và không dùng swap.
 - Provider thực tế là TensorRT hoặc CUDA, được ghi từ session/runtime chứ không chỉ từ config.
-- Effective model rate đạt ít nhất 19 Hz; inference P95 không quá 50 ms và P99 không quá 75 ms.
+- Effective model tick đạt ít nhất 19 Hz; report ghi riêng unique source FPS của mock và không coi
+  frame lặp là camera 20 FPS. Inference P95 không quá 50 ms và P99 không quá 75 ms.
 - Output frame age P95 không quá 150 ms; dropped-frame ratio dưới 1% sau warmup.
 - GPU utilization P95 không quá 90%, không thermal throttle; RAM/CPU/GPU có headroom được ghi rõ.
 - DMS latency/readiness không vượt baseline đã đo trước run.
@@ -793,69 +790,71 @@ Nếu gate fail, phase giữ `[IMPLEMENTED — UNVERIFIED]`. Tối ưu được 
 decode, I/O binding, bounded queue và TensorRT engine/cache; không được bỏ temporal context, đổi
 output semantics hoặc giảm model rate trước khi có parity/accuracy quyết định riêng.
 
-### 13.9 Phase 5 — Vehicle-state bridge và LDW `[PLANNED]`
+Kết quả Jetson development ngày 2026-08-25:
 
-Mục tiêu là bật lane-departure warning advisory bằng state xe có freshness rõ.
+- Deploy đi đúng `npm run deploy -- -Development -JetsonAlias jetson-nano`; checksum model trên
+  Jetson khớp `659727c4d4839adc4992a254409a54259a8756a743f2d567bf5fdc6579f8009b`.
+- TensorRT 10.3 không build được fused graph `node_conv2d_1 + node_gelu_1`; runtime fail closed khỏi
+  TensorRT và dùng `CUDAExecutionProvider`, không dùng CPU provider.
+- Artifact offline `.tmp/front-camera/phase-1/summary.json` có `accepted=true`; đây không thay thế
+  hardware gate.
+- Artifact ổn định `.tmp/front-camera/phase-4/stability-summary.json` đo 326 giây đồng thời với DMS:
+  front/DMS không restart, HLS và readiness liên tục, không swap, source 19,564 FPS, output-age P95
+  56,552 ms và inference P99 67,890 ms.
+- Hardware gate chưa đạt: effective model tick 13,215 Hz, inference P95 50,992 ms, drop ratio
+  1,2832% và GPU utilization P95 99%. Artifact giữ `accepted=false` và
+  `production_accepted=false`; chưa được bật canary/production alert.
+- Publisher dev dùng `appsrc` với PTS 20 Hz liên tục và tự quay lại frame đầu, vì EOS của MP4 từng
+  làm MediaMTX ngắt raw RTSP và supervisor restart front worker. Raw mẫu được giữ ở
+  `.tmp/front-camera/phase-4/stability-summary-samples.jsonl`.
 
-Vehicle-state contract:
+Gate còn lại trước khi đổi trạng thái Phase 4: tối ưu CUDA/TensorRT hoặc I/O binding để đạt đủ bốn
+ngưỡng model tick, inference P95, drop ratio và GPU P95; sau đó chạy lại đủ 10 phút sau warmup, đo
+DMS baseline riêng và bổ sung cold-start/warm-start artifact.
 
-- `tbox.service` là producer duy nhất. Camera dùng `VehicleStatePort` và một local IPC adapter;
-  không poll SQLite 1 Hz, không lấy MQTT cloud làm critical path và không suy diễn xi-nhan từ video.
-- Producer cadence mục tiêu 10-20 Hz. Consumer reject sequence lùi, epoch cũ, timestamp tương lai và
-  state quá freshness budget.
-- LDW giữ gate gốc: speed lớn hơn 31 mph (xấp xỉ 49,9 km/h), không có xi-nhan trong 5 giây gần nhất,
-  lane probability lớn hơn 0,5, lane gần xe và lane-change desire probability lớn hơn 0,1.
-- Nếu vehicle có lateral control riêng, `lateral_control_active` phải suppress LDW; missing field
-  không được tự suy diễn là safe trong profile yêu cầu nó.
+### 13.9 Phase 5 — Camera-only vision LDW `[IMPLEMENTED — UNVERIFIED]`
 
-Gate:
+`VisionAlertPolicy` dùng đúng các tín hiệu thị giác: lane probability `>0,5`, lane gần hơn `1,08 m`
+với camera offset `0,04 m`, và lane-change desire `>0,1`. Episode cần 3 positive trong 5 model tick
+và clear sau 5 negative liên tục. Classification công khai là `vision_ldw_left/right`.
 
-- Hardware/replay chứng minh vehicle state đạt cadence, ordering và freshness; loss/restart tạo
-  typed stale/new-epoch state.
-- Positive LDW trái/phải và negative có xi-nhan, tốc độ thấp, lane không visible, calibration invalid
-  và stale vehicle state đều chạy bằng video/telemetry đồng bộ thật.
-- Alert state có debounce/clear bounded, không flicker theo từng inference cycle.
-- Stale/missing speed hoặc blinker không phát LDW; dashboard hiển thị đúng blocking reason.
-- Chưa bật notification âm thanh hoặc external notification trong phase này.
-
-### 13.10 Phase 6 — Lead risk, headway/TTC và FCW `[PLANNED]`
-
-Mục tiêu là thêm cảnh báo va chạm advisory mà không biến model output thành điều khiển xe.
-
-Deliverable:
-
-- Model-only hard-brake risk port rolling probability buffers/thresholds với attribution và unit
-  test; suppress khi brake đang nhấn, vehicle state stale hoặc model/calibration invalid.
-- Lead state gồm presence probability, longitudinal/lateral distance, relative velocity,
-  acceleration, source frame và uncertainty.
-- Headway/TTC/deceleration envelope dùng unit SI, timestamp đồng bộ và threshold versioned theo
-  vehicle profile. Không coi raw model distance là ground truth tuyệt đối.
-- FCW lifecycle giữ `candidate/active/clearing/ended`, minimum duration, cooldown và exact triggering
-  frame. Model-only và lead-aware reasons phải phân biệt trong metadata.
-- Không port toàn bộ `LongitudinalPlanner`, CarParams, opendbc hoặc MPC trong phase này.
+Không áp dụng speed gate, blinker cooldown hoặc lateral-control suppression vì MVP không có các tín
+hiệu đó. Dashboard/evidence phải luôn ghi `mode=vision_only`; không đổi tên thành LDW chuẩn.
 
 Gate:
 
-- Labeled real sequences bao gồm closing lead, cut-in, lead rời làn, dừng/đỗ, cua, shadow, mưa/đêm,
-  brake suppression và negative traffic.
-- Report tách model-only FCW, lead-aware FCW, headway và TTC metrics; không gộp frame accuracy thành
-  episode accuracy.
-- Không có FCW khi calibration/state/frame/model stale hoặc source epoch mismatch.
-- Threshold chỉ được bật operator alert sau khi precision/recall và false alerts/vehicle-hour đạt
-  tiêu chí Phase 0 đã phê duyệt.
-- Phase kết thúc ở advisory output; không có actuator command hoặc CAN write.
+- Positive trái/phải, lane không visible, calibration invalid, model stale và epoch reset có unit và
+  replay test.
+- Một episode chỉ tạo một `START` và một `END`, exact triggering frame có evidence.
+- Alert không phát notification/audio và không tồn tại qua source epoch mới.
 
-### 13.11 Phase 7 — Dashboard, Event, evidence và vận hành `[PLANNED]`
+### 13.10 Phase 6 — Camera-only vision FCW `[IMPLEMENTED — UNVERIFIED]`
+
+Port model hard-brake rolling policy: 5 mẫu `brake5m/s²` với threshold
+`[0,05;0,05;0,15;0,15;0,15]` và 2 mẫu `brake3m/s²` với threshold `0,7`. Classification là
+`vision_fcw`; lead output chỉ dùng cho overlay/attribution, chưa tính headway hoặc TTC.
+
+FCW start ngay khi rolling gate true và end sau một giây negative. Do không có brake state, hệ thống
+không biết người lái đang phanh; giới hạn này phải xuất hiện trên dashboard/report. Không port
+`LongitudinalPlanner`, CarParams, opendbc, radar hoặc MPC.
+
+Gate:
+
+- Rolling thresholds, invalid calibration/model/frame, epoch reset và event idempotency có test.
+- Golden model-output sequence chỉ chứng minh policy; không được dùng thay perception accuracy.
+- Phase kết thúc ở shadow advisory, không audio/notification/actuation.
+
+### 13.11 Phase 7 — Dashboard, Event, evidence và vận hành `[IMPLEMENTED — UNVERIFIED]`
 
 Mục tiêu là biến output đã nghiệm thu thành workflow quan sát được và điều tra được.
 
 Deliverable:
 
-- Camera card `front` hiển thị stream, lane/path/lead overlay, calibration, vehicle-state freshness,
-  provider, inference latency, frame age và degraded reason.
+- Camera card `camera_front` hiển thị stream, lane/path/lead overlay, calibration, provider,
+  inference latency, frame age, degraded reason và nhãn `CAMERA-ONLY / SHADOW`.
 - API/live metadata trả contract versioned, không đọc/glob toàn bộ evidence tree trên request path.
 - LDW/FCW dùng event lifecycle `START/UPDATE/END`; exact triggering frame, source timestamp,
-  calibration/model/config hash và vehicle-state sequence được giữ trong evidence metadata.
+  calibration/model/config hash được giữ trong evidence metadata.
 - Snapshot/evidence do front worker tạo từ frame đã dùng cho decision; không lấy live/current-frame
   fallback khác lineage.
 - Notification/buzzer là policy riêng, mặc định tắt cho đến khi accuracy gate và operator UX được
@@ -900,6 +899,7 @@ Mỗi mục dưới đây là một feature track riêng, không nằm trong MVP
 
 | Extension | Điều kiện vào | Contract bổ sung |
 | --- | --- | --- |
+| Vehicle-state LDW/FCW chuẩn | Có speed/brake/blinker local 10-20 Hz và time sync | Freshness/epoch, speed/blinker/brake suppression; bỏ prefix `vision_` chỉ sau accuracy gate |
 | Camera-radar fusion | Có radar tracks thật, timestamp và coordinate calibration | Vision/radar association, uncertainty, track freshness |
 | IMU/GPS localization | Có IMU/GPS local cadence cao và time sync | Pose/yaw-rate fusion, sensor health, epoch |
 | Advisory lateral/longitudinal planner | Phase 8 accepted và vehicle profile đầy đủ | Wheelbase/steer ratio/delay, planner output chỉ advisory |

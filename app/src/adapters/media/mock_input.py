@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 import time
 from collections.abc import Callable
@@ -15,15 +16,15 @@ def wait_for_rtsp_video(
     retry_delay_seconds: float = 0.5,
     publisher_alive: Callable[[], bool] | None = None,
 ) -> None:
-    """Wait until ffprobe can read a video stream from an RTSP URL."""
+    """Wait until an available native probe can read RTSP video."""
     deadline = time.monotonic() + timeout_seconds
     last_error = "RTSP video stream is not ready"
     while time.monotonic() < deadline:
         if publisher_alive is not None and not publisher_alive():
             raise RuntimeError("mock publisher exited before RTSP became ready")
         try:
-            result = subprocess.run(
-                [
+            if shutil.which("ffprobe"):
+                command = [
                     "ffprobe",
                     "-v",
                     "error",
@@ -38,16 +39,39 @@ def wait_for_rtsp_video(
                     "-of",
                     "default=noprint_wrappers=1:nokey=1",
                     rtsp_url,
-                ],
+                ]
+                expected_output = "video"
+            elif shutil.which("gst-launch-1.0"):
+                command = [
+                    "gst-launch-1.0",
+                    "-q",
+                    "rtspsrc",
+                    f"location={rtsp_url}",
+                    "protocols=tcp",
+                    "latency=100",
+                    "!",
+                    "rtph264depay",
+                    "!",
+                    "fakesink",
+                    "num-buffers=1",
+                    "sync=false",
+                ]
+                expected_output = None
+            else:
+                raise RuntimeError("neither ffprobe nor gst-launch-1.0 is available")
+            result = subprocess.run(
+                command,
                 capture_output=True,
                 text=True,
                 timeout=probe_timeout_seconds + 1.0,
                 check=False,
             )
-            if result.returncode == 0 and "video" in result.stdout.splitlines():
+            if result.returncode == 0 and (
+                expected_output is None or expected_output in result.stdout.splitlines()
+            ):
                 return
-            last_error = result.stderr.strip() or f"ffprobe exited {result.returncode}"
+            last_error = result.stderr.strip() or f"RTSP probe exited {result.returncode}"
         except subprocess.TimeoutExpired:
-            last_error = "ffprobe timed out"
+            last_error = "RTSP probe timed out"
         time.sleep(retry_delay_seconds)
     raise TimeoutError(f"mock RTSP readiness timed out: {last_error}")

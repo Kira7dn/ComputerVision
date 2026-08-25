@@ -94,6 +94,32 @@ def validate_config(config: dict[str, Any], path: Path | None = None) -> dict[st
             parsed = urlsplit(value)
             if parsed.scheme not in {"rtsp", "rtsps", "rtmp"} or not parsed.netloc:
                 raise ValueError(f"camera {camera_id} {label} URL is invalid: {value}")
+        functions = camera.get("functions", {}) or {}
+        if bool(functions.get("front_assistance", False)):
+            if media_only:
+                raise ValueError(
+                    f"camera {camera_id} front_assistance cannot use media_only"
+                )
+            if source_url == output_url:
+                raise ValueError(
+                    f"camera {camera_id} front_assistance source and output URLs must differ"
+                )
+            front = _merge_config(
+                config.get("front_assistance", {}) or {},
+                camera.get("front_assistance", {}) or {},
+            )
+            calibration = front.get("calibration", {}) or {}
+            intrinsic = calibration.get("intrinsics", [])
+            if (
+                int(front.get("model_rate_hz", 20)) != 20
+                or int(calibration.get("source_width", 0)) <= 0
+                or int(calibration.get("source_height", 0)) <= 0
+                or len(intrinsic) != 3
+                or any(not isinstance(row, list) or len(row) != 3 for row in intrinsic)
+            ):
+                raise ValueError(
+                    f"camera {camera_id} front_assistance calibration/model rate is invalid"
+                )
 
     cameras = config.get("cameras", []) or []
     all_mock_sources = bool(cameras) and all(
@@ -128,6 +154,12 @@ def validate_config(config: dict[str, Any], path: Path | None = None) -> dict[st
         model_paths.extend(
             [camera_fire_smoke.get("onnx_path"), camera_fire_override.get("onnx_path"), camera_fire_override.get("model_path")]
         )
+        if bool((camera.get("functions", {}) or {}).get("front_assistance", False)):
+            camera_front = _merge_config(
+                config.get("front_assistance", {}) or {},
+                camera.get("front_assistance", {}) or {},
+            )
+            model_paths.append(camera_front.get("model_path"))
     smoking_object = (
         (config.get("smoking_behavior", {}) or {}).get("object_detection", {}) or {}
     )
@@ -656,6 +688,9 @@ def resolve_camera_config(config: dict[str, Any], camera_id: str | None = None) 
         ),
         "fire_smoke": bool((resolved.get("fire_smoke", {}) or {}).get("enabled", False)),
         "dms": bool((resolved.get("dms", {}) or {}).get("enabled", False)),
+        "front_assistance": bool(
+            (resolved.get("front_assistance", {}) or {}).get("enabled", False)
+        ),
     }
     functions.update(camera.get("functions", {}) or {})
     resolved["functions"] = functions
@@ -688,6 +723,11 @@ def resolve_camera_config(config: dict[str, Any], camera_id: str | None = None) 
     dms = deepcopy(resolved.get("dms", {}) or {})
     dms["enabled"] = bool(functions["dms"])
     resolved["dms"] = dms
+
+    front_assistance = deepcopy(resolved.get("front_assistance", {}) or {})
+    front_assistance.update(camera.get("front_assistance", {}) or {})
+    front_assistance["enabled"] = bool(functions["front_assistance"])
+    resolved["front_assistance"] = front_assistance
 
     _normalize_camera_analysis(resolved, camera, camera_id)
 

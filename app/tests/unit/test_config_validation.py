@@ -14,7 +14,8 @@ def test_profiles_merge_and_production_has_no_mock_source() -> None:
         "DMS", "camera_front", "camera_back", "camera_left", "camera_right"
     ]
     assert all(camera["source"]["type"] == "mock" for camera in dev["cameras"][1:])
-    assert all(camera["source"]["media_only"] for camera in dev["cameras"][1:])
+    assert dev["cameras"][1]["source"].get("media_only", False) is False
+    assert all(camera["source"]["media_only"] for camera in dev["cameras"][2:])
     assert {camera["source"]["sync_period_seconds"] for camera in dev["cameras"][1:]} == {191.1}
     assert all(camera["source"]["type"] == "rtsp" for camera in production["cameras"])
 
@@ -41,19 +42,23 @@ def test_production_mock_source_is_rejected() -> None:
         validate_config(config)
 
 
-def test_media_only_mock_has_no_cv_and_keeps_sync_contract() -> None:
+def test_front_mock_has_worker_and_calibration_contract() -> None:
     raw = load_raw_config(Path(__file__).parents[2] / "config" / "dev.yaml")
     resolved = resolve_camera_config(raw, "camera_front")
 
-    assert resolved["input"]["media_only"] is True
+    assert resolved["input"]["media_only"] is False
     assert resolved["input"]["mock_sync_group"] == "vehicle_surround"
     assert resolved["input"]["mock_sync_period_seconds"] == 191.1
-    assert not any(resolved["functions"].values())
+    assert resolved["functions"]["front_assistance"] is True
+    assert resolved["front_assistance"]["enabled"] is True
+    assert resolved["front_assistance"]["calibration"]["source_width"] == 960
+    assert resolved["input"]["rtsp_url"].endswith("/camera_front_raw")
+    assert resolved["output"]["rtsp_url"].endswith("/camera_front")
 
 
 def test_media_only_mock_rejects_enabled_cv_function() -> None:
     raw = load_raw_config(Path(__file__).parents[2] / "config" / "dev.yaml")
-    camera = next(item for item in raw["cameras"] if item["id"] == "camera_front")
+    camera = next(item for item in raw["cameras"] if item["id"] == "camera_back")
     camera["functions"]["fire_smoke"] = True
 
     with pytest.raises(ValueError, match="media_only cannot enable functions"):

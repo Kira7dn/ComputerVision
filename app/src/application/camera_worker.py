@@ -16,6 +16,7 @@ import importlib
 import json
 import logging
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -34,6 +35,7 @@ from adapters.media.mock_input import wait_for_rtsp_video
 from adapters.models.dms_engine import DmsBehaviorEngine, DmsInferenceResult
 from adapters.models.face_engine import FaceRecognitionEngine
 from adapters.models.fire_smoke_engine import FireSmokeEngine
+from adapters.models.openpilot_front_engine import OpenpilotFrontEngine
 from adapters.models.smoking_engine import SmokingBehaviorEngine
 from adapters.persistence.evidence_repository import EvidenceStore
 from application.analysis_scheduler import (
@@ -70,6 +72,11 @@ import zmq  # noqa: E402
 from domain.contracts import AnalysisSample, FrameKey, FunctionResult  # noqa: E402
 from domain.dms_events import DmsAlertEventStore  # noqa: E402
 from domain.fire_smoke_events import FireSmokeEventStore  # noqa: E402
+from domain.front_assistance import (  # noqa: E402
+    FrontAlertTransition,
+    FrontPerception,
+    VisionAlertPolicy,
+)
 from domain.recognition import RecognitionCore, TrackKey  # noqa: E402
 from domain.smoking_events import SmokingEpisodeStore, SmokingInferenceBatch  # noqa: E402
 from domain.tracking import (  # noqa: E402
@@ -164,14 +171,24 @@ class SafetyPipeline:
         self.dms_enabled = bool(functions.get("dms", False))
         self.smoking_behavior_enabled = bool(functions.get("smoking_behavior", False))
         self.fire_smoke_enabled = bool(functions.get("fire_smoke", False))
+        self.front_assistance_enabled = bool(
+            functions.get("front_assistance", False)
+        )
+        self.person_inference_enabled = bool(
+            functions.get("face_recognition", False)
+            or self.smoking_behavior_enabled
+            or self.fire_smoke_enabled
+        )
         self.trace_enabled = bool(functions.get("trace", True))
         LOG.info(
-            "function topology: camera=%s dms=%s face_recognition=%s smoking_behavior=%s fire_smoke=%s",
+            "function topology: camera=%s dms=%s face_recognition=%s smoking_behavior=%s fire_smoke=%s front_assistance=%s person_inference=%s",
             config.get("input", {}).get("camera", "unknown"),
             self.dms_enabled,
             bool(functions.get("face_recognition", False)),
             self.smoking_behavior_enabled,
             self.fire_smoke_enabled,
+            self.front_assistance_enabled,
+            self.person_inference_enabled,
         )
         self.frame_count = 0
         self.person_frame_count = 0
@@ -195,6 +212,12 @@ class SafetyPipeline:
             SmokingBehaviorEngine(config) if self.smoking_behavior_enabled else None
         )
         self.fire_smoke_engine = FireSmokeEngine(config) if self.fire_smoke_enabled else None
+        self.front_engine = (
+            OpenpilotFrontEngine(config) if self.front_assistance_enabled else None
+        )
+        self.front_policy = VisionAlertPolicy()
+        self._front_perception: FrontPerception | None = None
+        self._front_transitions: list[FrontAlertTransition] = []
         self.recognition_last_frame: dict[TrackKey, int] = {}
         self.last_event_transition: str | None = None
         self._person_tracks: dict[int, dict[str, Any]] = {}
@@ -230,6 +253,7 @@ class SafetyPipeline:
             or self.dms_enabled
             or self.smoking_behavior_enabled
             or self.fire_smoke_enabled
+            or self.front_assistance_enabled
         )
         self._analysis_lock = threading.RLock()
         self._analysis_detections: list[Any] = []
@@ -283,7 +307,9 @@ class SafetyPipeline:
         self.metadata_path = self.status_dir / f"{config.get('input', {}).get('camera', 'camera')}.metadata.json"
         self.socket = zmq.Context.instance().socket(zmq.PUB)
         self.socket.bind(config["metadata"]["zmq_pub_url"])
-        self.person_infer_config = self._write_person_infer_config()
+        self.person_infer_config = (
+            self._write_person_infer_config() if self.person_inference_enabled else None
+        )
         self._build()
         if self.analysis_enabled:
             self._start_analysis_workers()
@@ -522,8 +548,11 @@ maintain-aspect-ratio=0
         mux.set_property("live-source", 1)
         mux.set_property("batched-push-timeout", 40000)
 
-        self.person_infer = make_element("nvinfer", "person-inference")
-        self.person_infer.set_property("config-file-path", self.person_infer_config)
+        if self.person_inference_enabled:
+            self.person_infer = make_element("nvinfer", "person-inference")
+            self.person_infer.set_property(
+                "config-file-path", self.person_infer_config
+            )
         analysis_tee = make_element("tee", "analysis-tee")
         analysis_queue = make_element("queue", "analysis-queue")
         analysis_queue.set_property("max-size-buffers", 1)
@@ -601,13 +630,17 @@ maintain-aspect-ratio=0
             decoder,
             *([decoder_to_nvmm, decoder_nvmm_caps] if software_decode else []),
             mux,
-            self.person_infer,
+            *([self.person_infer] if self.person_infer is not None else []),
             analysis_tee,
             analysis_queue,
             output_input_queue,
             *(
                 [face_cpu_convert, face_cpu_caps]
-                if self.face_engine.enabled or self.dms_enabled or self.smoking_behavior_enabled or self.fire_smoke_enabled
+                if self.face_engine.enabled
+                or self.dms_enabled
+                or self.smoking_behavior_enabled
+                or self.fire_smoke_enabled
+                or self.front_assistance_enabled
                 else []
             ),
             analysis_sink,
@@ -637,10 +670,13 @@ maintain-aspect-ratio=0
         mux_sink = mux.get_request_pad("sink_0")
         if decoder_src is None or mux_sink is None or decoder_src.link(mux_sink) != Gst.PadLinkReturn.OK:
             raise RuntimeError("Unable to link decoder to nvstreammux")
-        if not mux.link(self.person_infer):
-            raise RuntimeError("Unable to link nvstreammux to person nvinfer")
-        if not self.person_infer.link(analysis_tee):
-            raise RuntimeError("Unable to link person inference to analysis tee")
+        primary_analysis = mux
+        if self.person_infer is not None:
+            if not mux.link(self.person_infer):
+                raise RuntimeError("Unable to link nvstreammux to person nvinfer")
+            primary_analysis = self.person_infer
+        if not primary_analysis.link(analysis_tee):
+            raise RuntimeError("Unable to link primary inference to analysis tee")
         analysis_tee_pad = analysis_tee.get_request_pad("src_%u")
         analysis_sink_pad = analysis_queue.get_static_pad("sink")
         if (
@@ -657,7 +693,13 @@ maintain-aspect-ratio=0
             or output_tee_pad.link(output_sink_pad) != Gst.PadLinkReturn.OK
         ):
             raise RuntimeError("Unable to link analysis tee to output queue")
-        needs_cpu_frame = self.face_engine.enabled or self.dms_enabled or self.smoking_behavior_enabled or self.fire_smoke_enabled
+        needs_cpu_frame = (
+            self.face_engine.enabled
+            or self.dms_enabled
+            or self.smoking_behavior_enabled
+            or self.fire_smoke_enabled
+            or self.front_assistance_enabled
+        )
         if needs_cpu_frame:
             if not analysis_queue.link(face_cpu_convert):
                 raise RuntimeError("Unable to link analysis source to face converter")
@@ -670,9 +712,6 @@ maintain-aspect-ratio=0
             raise RuntimeError("Unable to terminate analysis branch")
         if not output_input_queue.link(convert_before_osd):
             raise RuntimeError("Unable to link output queue to OSD converter")
-        infer_src = self.person_infer.get_static_pad("src")
-        if infer_src is None:
-            raise RuntimeError("Person nvinfer has no src pad")
         if not convert_before_osd.link(face_rgba_caps):
             raise RuntimeError("Unable to link CPU face frame to OSD converter")
         if not face_rgba_caps.link(osd) or not osd.link(convert_after_osd):
@@ -695,13 +734,14 @@ maintain-aspect-ratio=0
         if osd_input_src is None:
             raise RuntimeError("OSD input has no src pad")
         osd_input_src.add_probe(Gst.PadProbeType.BUFFER, self._on_output_buffer)
-        person_src = self.person_infer.get_static_pad("src")
-        if person_src is None:
-            raise RuntimeError("Person nvinfer has no src pad")
-        # Create person objects before assigning stable application track IDs;
-        # otherwise behavior and face recognition see every object as UNTRACKED.
-        person_src.add_probe(Gst.PadProbeType.BUFFER, self._on_person_buffer)
-        person_src.add_probe(Gst.PadProbeType.BUFFER, self._on_metadata_buffer)
+        metadata_src = primary_analysis.get_static_pad("src")
+        if metadata_src is None:
+            raise RuntimeError("Primary analysis element has no src pad")
+        if self.person_infer is not None:
+            # Create person objects before assigning stable application track IDs;
+            # otherwise behavior and face recognition see every object as UNTRACKED.
+            metadata_src.add_probe(Gst.PadProbeType.BUFFER, self._on_person_buffer)
+        metadata_src.add_probe(Gst.PadProbeType.BUFFER, self._on_metadata_buffer)
         face_src = analysis_src.get_static_pad("src")
         if face_src is None:
             raise RuntimeError("Analysis probe has no src pad")
@@ -898,6 +938,14 @@ maintain-aspect-ratio=0
                     self._process_fire_smoke_sample,
                 )
             )
+        if self.front_assistance_enabled and self.front_engine is not None:
+            definitions.append(
+                (
+                    "front_assistance",
+                    self.front_engine.interval_seconds,
+                    self._process_front_sample,
+                )
+            )
         for function, interval, processor in definitions:
             executor = LatestSampleExecutor(
                 name=function,
@@ -948,6 +996,53 @@ maintain-aspect-ratio=0
             "fresh": list(self.fire_smoke_engine.last_fresh_detections),
             "inference_ran": bool(self.fire_smoke_engine.last_inference_ran),
         }
+
+    def _process_front_sample(self, sample: AnalysisSample) -> FrontPerception:
+        if self.front_engine is None:
+            raise RuntimeError("front assistance engine is unavailable")
+        return self.front_engine.process(
+            sample.frame,
+            source_epoch=self.evidence.worker_epoch,
+            frame_number=sample.key.frame_number,
+            source_timestamp=sample.source_timestamp,
+        )
+
+    def _record_front_transitions(
+        self,
+        transitions: list[FrontAlertTransition],
+        sample: AnalysisSample,
+        perception: FrontPerception,
+    ) -> None:
+        common = {
+            "mode": "vision_only",
+            "source_epoch": perception.source_epoch,
+            "source_timestamp": perception.source_timestamp,
+            "model_hash": perception.model_hash,
+            "calibration_hash": perception.calibration_hash,
+            "provider": perception.provider,
+        }
+        for transition in transitions:
+            payload = {**common, **transition.metadata}
+            if transition.operation == "START":
+                self.evidence.start_event(
+                    event_id=transition.event_id,
+                    function="front_assistance",
+                    classification=transition.label,
+                    camera_id=str(self.config["input"]["camera"]),
+                    metadata=payload,
+                    frame=sample.frame,
+                    frame_number=sample.key.frame_number,
+                    score=transition.confidence,
+                )
+            elif transition.operation == "END":
+                self.evidence.finish_event(
+                    transition.event_id,
+                    classification=transition.label,
+                    payload=payload,
+                    frame=sample.frame,
+                    frame_number=sample.key.frame_number,
+                    score=transition.confidence,
+                )
 
     def _on_analysis_error(self, function: str, exc: Exception) -> None:
         message = f"{function}: {exc}"
@@ -1063,11 +1158,35 @@ maintain-aspect-ratio=0
             # Raw/cached detector output is diagnostic only. Only a verified
             # region may reach NVOSD, live metadata, events, or notifications.
             detections = list(self.fire_smoke_events.visible_detections)
+        elif function == "front_assistance":
+            perception = raw_result
+            transitions.extend(self.front_policy.observe(perception))
+            self._record_front_transitions(transitions, sample, perception)
+            metadata.update(
+                {
+                    **perception.summary(),
+                    "active_alerts": list(self.front_policy.active_labels),
+                    "transitions": [
+                        {
+                            "operation": item.operation,
+                            "event_id": item.event_id,
+                            "label": item.label,
+                            "frame_number": item.frame_number,
+                        }
+                        for item in transitions
+                    ],
+                }
+            )
+            with self._analysis_lock:
+                self._front_perception = perception
+                self._front_transitions = list(transitions)
 
-        self._notify_transitions(transitions)
+        if function != "front_assistance":
+            self._notify_transitions(transitions)
         model_section = "smoking_behavior" if function == "smoking_behavior" else function
+        model_config = self.config.get(model_section, {}) or {}
         model_revision = str(
-            (self.config.get(model_section, {}) or {}).get("onnx_path", "")
+            model_config.get("model_path" if function == "front_assistance" else "onnx_path", "")
         ) or None
         result = as_function_result(
             function,
@@ -1297,7 +1416,103 @@ maintain-aspect-ratio=0
                 text_params.set_bg_clr = 1
                 text_params.text_bg_clr.set(0.0, 0.0, 0.0, 0.65)
             pyds.nvds_add_display_meta_to_frame(frame_meta, display_meta)
+        if self.front_assistance_enabled:
+            with self._analysis_lock:
+                perception = self._front_perception
+                active_alerts = list(self.front_policy.active_labels)
+            display_meta = pyds.nvds_acquire_display_meta_from_pool(batch_meta)
+            display_meta.num_labels = 1
+            text_params = display_meta.text_params[0]
+            if perception is None:
+                label = "FRONT SHADOW | WARMING"
+                color = (1.0, 0.75, 0.1, 1.0)
+            elif perception.valid:
+                alerts = ", ".join(active_alerts) if active_alerts else "NO ALERT"
+                label = f"FRONT SHADOW | {alerts} | {perception.inference_ms:.1f} ms"
+                color = (1.0, 0.2, 0.1, 1.0) if active_alerts else (0.1, 1.0, 0.55, 1.0)
+            else:
+                reason = ",".join(perception.blocking_reasons) or "NOT READY"
+                label = f"FRONT SHADOW | {reason}"
+                color = (1.0, 0.75, 0.1, 1.0)
+            if perception is not None and perception.valid:
+                self._render_front_geometry(batch_meta, frame_meta, perception)
+            text_params.display_text = label
+            text_params.x_offset = 24
+            text_params.y_offset = 90
+            text_params.font_params.font_name = "Sans"
+            text_params.font_params.font_size = 22
+            text_params.font_params.font_color.set(*color)
+            text_params.set_bg_clr = 1
+            text_params.text_bg_clr.set(0.0, 0.0, 0.0, 0.70)
+            pyds.nvds_add_display_meta_to_frame(frame_meta, display_meta)
         self._add_live_timestamp(batch_meta, frame_meta)
+
+    def _render_front_geometry(
+        self,
+        batch_meta: Any,
+        frame_meta: Any,
+        perception: FrontPerception,
+    ) -> None:
+        """Project a bounded lane/path summary into the configured camera frame."""
+        calibration = (self.config.get("front_assistance", {}) or {}).get(
+            "calibration", {}
+        ) or {}
+        intrinsic = calibration.get("intrinsics", [])
+        if len(intrinsic) != 3:
+            return
+        fx = float(intrinsic[0][0])
+        fy = float(intrinsic[1][1])
+        cx = float(intrinsic[0][2])
+        cy = float(intrinsic[1][2])
+        camera_height = float(calibration.get("camera_height_m", 1.51))
+        width = int(self.config["input"].get("width", 960))
+        height = int(self.config["input"].get("height", 540))
+
+        def project(x: float, y: float, z: float = 0.0) -> tuple[int, int] | None:
+            if x <= 1.0:
+                return None
+            px = int(round(cx + (fx * y / x)))
+            py = int(round(cy + (fy * (camera_height - z) / x)))
+            if px < 0 or px >= width or py < 0 or py >= height:
+                return None
+            return px, py
+
+        segments: list[tuple[tuple[int, int], tuple[int, int], tuple[float, ...]]] = []
+        lane_colors = ((0.2, 0.8, 1.0, 0.9), (0.2, 1.0, 0.4, 0.95))
+        for lane_index, color in zip((1, 2), lane_colors, strict=True):
+            if (
+                lane_index >= len(perception.lane_lines)
+                or lane_index >= len(perception.lane_probabilities)
+                or perception.lane_probabilities[lane_index] <= 0.2
+            ):
+                continue
+            sampled = perception.lane_lines[lane_index][2:23:5]
+            points = [project(x, y) for x, y in sampled]
+            valid_points = [point for point in points if point is not None]
+            segments.extend(
+                (left, right, color)
+                for left, right in zip(valid_points, valid_points[1:], strict=False)
+            )
+        path_points = [
+            project(x, y, z) for x, y, z in perception.path[2:23:5]
+        ]
+        valid_path = [point for point in path_points if point is not None]
+        segments.extend(
+            (left, right, (1.0, 0.75, 0.1, 0.95))
+            for left, right in zip(valid_path, valid_path[1:], strict=False)
+        )
+        if not segments:
+            return
+        display_meta = pyds.nvds_acquire_display_meta_from_pool(batch_meta)
+        bounded = segments[:16]
+        display_meta.num_lines = len(bounded)
+        for index, (left, right, color) in enumerate(bounded):
+            line = display_meta.line_params[index]
+            line.x1, line.y1 = left
+            line.x2, line.y2 = right
+            line.line_width = 4
+            line.line_color.set(*color)
+        pyds.nvds_add_display_meta_to_frame(frame_meta, display_meta)
 
     def _on_output_buffer(self, pad: Gst.Pad, info: Gst.PadProbeInfo) -> Gst.PadProbeReturn:
         """Render backend-owned labels without applying an old ROI to a new frame."""
@@ -1430,6 +1645,21 @@ maintain-aspect-ratio=0
             },
             "analysis_decode": getattr(self.face_engine, "_last_decode_info", None),
             "analysis_debug": {
+                "front_assistance": (
+                    {
+                        **self._front_perception.summary(),
+                        "active_alerts": list(self.front_policy.active_labels),
+                    }
+                    if self._front_perception is not None
+                    else {
+                        "contract_version": 1,
+                        "mode": "vision_only",
+                        "readiness": "warming"
+                        if self.front_assistance_enabled
+                        else "disabled",
+                        "active_alerts": [],
+                    }
+                ),
                 "smoking_person_count": getattr(self.smoking_behavior_engine, "last_person_count", 0),
                 "smoking_scores": getattr(self.smoking_behavior_engine, "last_scores", {}),
                 "smoking_roi_bboxes": getattr(
@@ -1866,6 +2096,8 @@ maintain-aspect-ratio=0
             fire_smoke_transitions = list(
                 self._analysis_transitions_by_function.get("fire_smoke", ())
             )
+            front_perception = self._front_perception
+            front_transitions = list(self._front_transitions)
         face_by_track = {
             int(item.get("track_id", -1)): item for item in face_tracks
         }
@@ -1973,6 +2205,31 @@ maintain-aspect-ratio=0
                     for item in dms_transitions
                 ],
             },
+            "front_assistance": (
+                {
+                    **front_perception.summary(),
+                    "active_alerts": list(self.front_policy.active_labels),
+                    "transitions": [
+                        {
+                            "operation": item.operation,
+                            "event_id": item.event_id,
+                            "label": item.label,
+                            "frame_number": item.frame_number,
+                        }
+                        for item in front_transitions
+                    ],
+                }
+                if front_perception is not None
+                else {
+                    "contract_version": 1,
+                    "mode": "vision_only",
+                    "readiness": "warming"
+                    if self.front_assistance_enabled
+                    else "disabled",
+                    "active_alerts": [],
+                    "transitions": [],
+                }
+            ),
             "event_id": self.event_store.active_event_id,
             "event_state": self.event_store.state.value if self.event_store.state else "IDLE",
             "fire_smoke_events": [
@@ -2301,43 +2558,63 @@ maintain-aspect-ratio=0
         mock_video = Path(str(input_cfg["mock_video"]))
         if not mock_video.is_file():
             raise FileNotFoundError(f"mock_video does not exist: {mock_video}")
-        command = [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-re",
-        ]
-        if bool(input_cfg.get("mock_loop", True)):
-            command.extend(["-stream_loop", "-1"])
-        command.extend(
-            [
-                "-i",
-                str(mock_video),
-                "-r",
-                "15",
-                "-an",
-                "-c:v",
-                "libx264",
-                "-preset",
-                "ultrafast",
-                "-tune",
-                "zerolatency",
-                "-g",
-                "5",
-                "-keyint_min",
-                "5",
-                "-pix_fmt",
-                "yuv420p",
-                "-f",
-                "rtsp",
-                str(input_cfg["rtsp_url"]),
+        if shutil.which("ffmpeg"):
+            publisher_stderr: int | None = subprocess.DEVNULL
+            command = [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-re",
             ]
-        )
+            if bool(input_cfg.get("mock_loop", True)):
+                command.extend(["-stream_loop", "-1"])
+            command.extend(
+                [
+                    "-i",
+                    str(mock_video),
+                    "-r",
+                    "20" if self.front_assistance_enabled else "15",
+                    "-an",
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "ultrafast",
+                    "-tune",
+                    "zerolatency",
+                    "-g",
+                    "5",
+                    "-keyint_min",
+                    "5",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-f",
+                    "rtsp",
+                    str(input_cfg["rtsp_url"]),
+                ]
+            )
+        else:
+            publisher_stderr = None
+            command = [
+                sys.executable,
+                "-m",
+                "adapters.media.gstreamer_mock_publisher",
+                "--input",
+                str(mock_video),
+                "--output",
+                str(input_cfg["rtsp_url"]),
+                "--fps",
+                "20" if self.front_assistance_enabled else "15",
+            ]
+            if bool(input_cfg.get("mock_loop", True)):
+                command.append("--loop")
+            LOG.warning(
+                "ffmpeg is unavailable; using the bounded GStreamer mock publisher"
+            )
         self.mock_publisher = subprocess.Popen(
             command,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=publisher_stderr,
         )
         # FFmpeg can remain alive for tens of seconds before its first encoded
         # frame reaches MediaMTX while all camera models initialize together.

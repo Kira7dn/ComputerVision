@@ -1,8 +1,10 @@
 # Jetson deployment
 
-The Jetson profile runs only `DMS` through the standalone DeepStream
-runtime. It expects the Dahua LAN address to be `192.168.1.229` and the Jetson
-Ethernet interface to be `192.168.1.10/24`.
+The current production Jetson profile runs `DMS` through the standalone
+DeepStream runtime. The development profile additionally runs the
+`camera_front` openpilot road-model adapter in camera-only shadow mode. It
+expects the Dahua LAN address to be `192.168.1.229` and the Jetson Ethernet
+interface to be `192.168.1.10/24`.
 
 The runtime is deliberately separate from the LeOS `tbox.service`. Its local
 dashboard/API is exposed on port `18080`; MediaMTX publishes the annotated
@@ -18,6 +20,14 @@ state, metrics and boxes are available from `/api/live-metadata` and
 `/api/metrics`. Each smoothed alert is also persisted as a DMS `START`,
 `UPDATE`, `END` event with evidence snapshots; DMS events deliberately do not
 emit Telegram notifications.
+
+`camera_front` publishes the annotated `camera_front` RTSP/WebRTC/HLS stream,
+lane/path/lead metadata and advisory-only `vision_ldw_left`,
+`vision_ldw_right` and `vision_fcw` lifecycle events. It does not read CAN,
+T-Box telemetry or vehicle-control state, and it never actuates the vehicle.
+The TensorRT-to-CUDA provider fallback is observable in runtime status; CPU is
+not permitted for Jetson shadow inference. Phase status and the remaining
+hardware gates are canonical in `docs/architecture/Platform.md` section 13.
 
 ## Deployment entrypoints
 

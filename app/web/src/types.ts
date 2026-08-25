@@ -21,6 +21,17 @@ export interface CameraDetail {
   camera_latency_samples?: number
   rss_mb?: number | null
   analysis_error?: string | null
+  front_assistance?: {
+    contract_version?: number
+    mode?: 'vision_only' | string
+    readiness?: 'warming' | 'ready' | 'degraded' | 'not_ready' | 'disabled' | string
+    blocking_reasons?: string[]
+    active_alerts?: string[]
+    provider?: string
+    inference_ms?: number
+    model_hash?: string
+    calibration_hash?: string
+  }
 }
 export interface MetricsResponse {
   timestamp: number

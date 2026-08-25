@@ -540,6 +540,7 @@ def _collect_metrics(stream_host: str = "localhost") -> dict[str, object]:
                 "analysis_error": runtime_status.get("analysis_error"),
                 "smoking_episodes": analysis_debug.get("smoking_episodes", {}),
                 "dms": analysis_debug.get("dms", {}),
+                "front_assistance": analysis_debug.get("front_assistance", {}),
                 "fire_smoke_runtime": analysis_debug.get("fire_smoke_runtime", {}),
             }
         )

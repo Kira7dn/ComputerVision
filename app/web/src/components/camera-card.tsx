@@ -19,6 +19,8 @@ export function CameraCard({ camera, focused, onFocus, onStateChange }: CameraCa
   const ready = Boolean(camera.worker_ready ?? camera.ready)
   const displayName = camera.display_name ?? friendlyCameraName(camera.id)
   const isDms = camera.id === 'DMS' || Boolean(camera.functions?.dms)
+  const isFrontAssistance = Boolean(camera.functions?.front_assistance)
+  const front = camera.front_assistance
   const functions = Object.entries(camera.functions ?? {}).filter(([name, enabled]) => enabled && !(isDms && name === 'dms'))
   const latencyTitle = state.videoLatencySource === 'rtp_ntp_map'
     ? 'Đối chiếu RTP frame với timestamp NTP của Dahua đến thời điểm compositor'
@@ -51,6 +53,15 @@ export function CameraCard({ camera, focused, onFocus, onStateChange }: CameraCa
         <div className="relative aspect-video overflow-hidden bg-[linear-gradient(135deg,_#0d1117,_#151b24)] p-0 md:min-h-0 md:flex-1 md:aspect-auto">
           <video ref={videoRef} className="h-full w-full bg-black object-contain p-0" hidden={!state.live} autoPlay muted playsInline aria-label={`Luồng video ${displayName}`} />
           {!state.live && <CameraEmptyState camera={camera} state={state} ready={ready} />}
+          {isFrontAssistance && (
+            <div className="absolute left-2 top-2 z-[3] rounded-md border border-white/20 bg-black/70 px-2 py-1 font-mono text-[0.62rem] text-white" title={(front?.blocking_reasons ?? []).join(', ')}>
+              <div>FRONT · CAMERA-ONLY · SHADOW</div>
+              <div className={front?.active_alerts?.length ? 'text-danger' : front?.readiness === 'ready' ? 'text-healthy' : 'text-warning'}>
+                {front?.active_alerts?.length ? front.active_alerts.join(' · ') : (front?.readiness ?? 'warming')}
+                {typeof front?.inference_ms === 'number' ? ` · ${front.inference_ms.toFixed(1)} ms` : ''}
+              </div>
+            </div>
+          )}
           <div className="absolute inset-x-0 bottom-0 z-[2] flex min-w-0 items-center justify-between gap-[0.7rem] text-[0.66rem] [text-shadow:0_1px_3px_#000] max-[430px]:flex-col max-[430px]:items-end max-[430px]:gap-[0.35rem]">
             <div className="flex min-w-0 flex-wrap gap-[0.3rem]" aria-label="Chức năng camera">
               {functions.length ? functions.map(([name]) => <span className="inline-flex items-center gap-1 whitespace-nowrap rounded-full border border-white/20 bg-black/50 px-[0.38rem] py-[0.2rem] text-white/90" key={name}>{functionIcon(name)} {functionLabel(name)}</span>) : !isDms && <span className="text-muted-foreground">Chưa khai báo chức năng</span>}
@@ -81,6 +92,7 @@ function functionLabel(name: string) {
     face_recognition: 'Khuôn mặt',
     smoking_behavior: 'Hút thuốc',
     fire_smoke: 'Lửa / khói',
+    front_assistance: 'Hỗ trợ lái (camera)',
     lpr: 'Biển số',
   }
   return labels[name] ?? name.replaceAll('_', ' ')

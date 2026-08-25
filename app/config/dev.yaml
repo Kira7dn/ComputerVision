@@ -34,18 +34,37 @@ cameras:
     display_name: Camera trước
     source:
       type: mock
-      url: rtsp://127.0.0.1:8554/camera_front
+      url: rtsp://127.0.0.1:8554/camera_front_raw
       mock_video: /opt/ls-vision-dev/data/mock-videos/cameras/sync-lite/CAM_FRONT.mp4
-      media_only: true
       sync_group: vehicle_surround
       sync_period_seconds: 191.1
       loop: true
+      # The bounded sync-lite fixture is Main Profile H.264 and does not
+      # produce frames through nvv4l2decoder on the current Jetson image.
+      # Keep real RTSP cameras on the hardware default; only the dev fixture
+      # uses avdec_h264 before converting back to NVMM for DeepStream.
+      decoder: software
       width: 960
       height: 540
       latency_ms: 200
     output:
       rtsp_url: rtsp://127.0.0.1:8554/camera_front
-    functions: {trace: false, face_recognition: false, smoking_behavior: false, fire_smoke: false, dms: false}
+    functions: {trace: false, face_recognition: false, smoking_behavior: false, fire_smoke: false, dms: false, front_assistance: true}
+    front_assistance:
+      model_path: /opt/ls-vision/models/openpilot/driving_supercombo.onnx
+      allow_cpu: false
+      calibration:
+        profile_id: nuscenes-mini-aggregate-front-v1
+        source_width: 960
+        source_height: 540
+        intrinsics:
+          - [759.850321828, 0.0, 489.760211847]
+          - [0.0, 759.850321828, 294.904239476]
+          - [0.0, 0.0, 1.0]
+        rpy_calib: [0.0, 0.0, 0.0]
+        camera_height_m: 1.51095763913
+        artifact_hash: nuscenes-calibrated-sensor-1d31c729b073425e8e0202c5c6e66ee1-scaled-960x540
+        valid: true
   - id: camera_back
     display_name: Camera sau
     source:

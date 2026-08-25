@@ -9,6 +9,16 @@ analysis:
   result_max_age_ms: 1000
   functions: {}
 
+front_assistance:
+  enabled: false
+  mode: vision_only
+  model_path: /opt/ls-vision/models/openpilot/driving_supercombo.onnx
+  model_rate_hz: 20
+  max_gap_seconds: 0.25
+  providers: [TensorrtExecutionProvider, CUDAExecutionProvider]
+  allow_cpu: false
+  rollout: shadow
+
 smoking_behavior:
   object_detection:
     enabled: true
