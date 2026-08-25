@@ -44,15 +44,22 @@ def main() -> int:
 
     raw_config = validate_config(load_raw_config(args.config), args.config)
     ids = camera_ids(raw_config)
+    media_only_ids = {
+        str(camera["id"])
+        for camera in raw_config.get("cameras", []) or []
+        if str((camera.get("source", {}) or {}).get("type", "rtsp")).lower() == "mock"
+        and bool((camera.get("source", {}) or {}).get("media_only", False))
+    }
+    worker_ids = [camera_id for camera_id in ids if camera_id not in media_only_ids]
     run_id = args.run_id or f"{time.strftime('%Y%m%dT%H%M%S', time.gmtime())}-{uuid.uuid4().hex[:8]}"
     run_root = run_directory(raw_config, run_id)
     write_manifest(raw_config, run_id, run_root)
     print(f"run_id={run_id} evidence_root={run_root}", flush=True)
     workers: dict[str, subprocess.Popen[bytes]] = {}
-    restart_at: dict[str, float] = {camera_id: 0.0 for camera_id in ids}
-    restart_attempts: dict[str, int] = {camera_id: 0 for camera_id in ids}
+    restart_at: dict[str, float] = {camera_id: 0.0 for camera_id in worker_ids}
+    restart_attempts: dict[str, int] = {camera_id: 0 for camera_id in worker_ids}
     worker_started_at: dict[str, float] = {}
-    worker_epochs: dict[str, int] = {camera_id: 0 for camera_id in ids}
+    worker_epochs: dict[str, int] = {camera_id: 0 for camera_id in worker_ids}
     stopping = False
 
     def command_for(camera_id: str) -> list[str]:
@@ -97,11 +104,11 @@ def main() -> int:
     signal.signal(signal.SIGINT, stop_workers)
     signal.signal(signal.SIGTERM, stop_workers)
     try:
-        for camera_id in ids:
+        for camera_id in worker_ids:
             start_worker(camera_id)
         while not stopping:
             now = time.monotonic()
-            for camera_id in ids:
+            for camera_id in worker_ids:
                 worker = workers.get(camera_id)
                 if worker is not None and worker.poll() is not None:
                     return_code = int(worker.returncode or 0)

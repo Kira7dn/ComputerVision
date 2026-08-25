@@ -48,11 +48,14 @@ function App() {
   const [focusedCameraId, setFocusedCameraId] = useState<string | null>(null)
   const eventCursor = useRef<number | null>(null)
   const eventRunId = useRef<string | null>(null)
+  const metricsRequestInFlight = useRef(false)
   const eventsRequestInFlight = useRef(false)
   const liveCameras = useRef<Set<string>>(new Set())
   const runtimeReady = useRef(false)
 
   const refreshMetrics = useCallback(async () => {
+    if (metricsRequestInFlight.current) return
+    metricsRequestInFlight.current = true
     try {
       const data = await fetchMetrics()
       const cameras = data.pipeline.camera_details ?? []
@@ -64,6 +67,8 @@ function App() {
     } catch {
       setApiError(true)
       // Preserve the last good metrics, camera state and event history during transient API failures.
+    } finally {
+      metricsRequestInFlight.current = false
     }
   }, [])
 
@@ -127,7 +132,7 @@ function App() {
   }, [])
 
   const handleCameraFocus = useCallback((cameraId: string) => {
-    setFocusedCameraId((current) => current === cameraId ? null : cameraId)
+    setFocusedCameraId(cameraId)
   }, [])
 
   const cameras: CameraDetail[] = metrics?.pipeline.camera_details ?? []
@@ -144,7 +149,7 @@ function App() {
   useEffect(() => {
     const ids = new Set(cameraKey ? cameraKey.split('|') : [])
     setPlayerStates((current) => Object.fromEntries(Object.entries(current).filter(([id]) => ids.has(id))))
-    setFocusedCameraId((current) => current && ids.has(current) ? current : null)
+    setFocusedCameraId((current) => current && ids.has(current) ? current : ids.values().next().value ?? null)
   }, [cameraKey])
 
   const hasFocusedCamera = focusedCameraId !== null
@@ -162,7 +167,7 @@ function App() {
         <DashboardHeader metrics={metrics} status={status} apiError={apiError} glassLatency={glassLatency} />
         <div className="dashboard-content grid min-h-0 flex-1 gap-4 md:overflow-hidden lg:grid-cols-[minmax(0,1fr)_minmax(320px,380px)]">
           <section className="flex min-h-0 min-w-0 flex-col gap-4 md:overflow-hidden">
-            <div className={`camera-wall grid min-h-0 flex-1 grid-cols-1 content-start gap-3 md:overflow-hidden md:grid-cols-2 ${hasFocusedCamera ? `camera-wall-focused ${focusedLayoutClass}` : ''}`}>
+            <div className={`camera-wall grid min-h-0 flex-1 grid-cols-1 content-start gap-3 overflow-y-auto overscroll-contain pr-1 md:grid-cols-2 ${hasFocusedCamera ? `camera-wall-focused ${focusedLayoutClass}` : ''}`}>
               {cameras.map((camera) => <CameraCard key={camera.id} camera={camera} focused={focusedCameraId === camera.id} onFocus={handleCameraFocus} onStateChange={handlePlayerState} />)}
               {cameras.length === 0 && <div className="camera-wall-empty"><span>{apiError ? 'Không thể đọc trạng thái camera' : 'Chưa có camera cấu hình'}</span><small>{apiError ? 'Dữ liệu cuối cùng sẽ được giữ lại khi kết nối lại.' : 'Runtime chưa cung cấp camera detail.'}</small></div>}
             </div>

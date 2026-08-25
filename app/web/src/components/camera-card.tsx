@@ -30,7 +30,7 @@ export function CameraCard({ camera, focused, onFocus, onStateChange }: CameraCa
       role="button"
       tabIndex={0}
       aria-pressed={focused}
-      aria-label={`${focused ? 'Thu nhỏ' : 'Phóng to'} camera ${displayName}`}
+      aria-label={`${focused ? 'Camera chính' : 'Chọn làm camera chính'} ${displayName}`}
       onClick={() => onFocus(camera.id)}
       onKeyDown={(event) => {
         if (event.key !== 'Enter' && event.key !== ' ') return
@@ -42,7 +42,7 @@ export function CameraCard({ camera, focused, onFocus, onStateChange }: CameraCa
         <div className="flex h-full min-w-0 flex-1 items-center gap-2">
           <CardTitle className="min-w-0 truncate text-sm leading-none">{displayName}</CardTitle>
           {!isDms && <span className="max-w-28 truncate font-mono text-[0.62rem] leading-none text-muted-foreground max-[430px]:hidden">{camera.id}</span>}
-          <span className="inline-flex shrink-0 items-center gap-[0.2rem] whitespace-nowrap font-mono text-[0.6rem] leading-none text-muted-foreground"><Cpu size={11} /> {camera.running ? `worker ${camera.pid ?? '--'}` : 'worker offline'}</span>
+          <span className="inline-flex shrink-0 items-center gap-[0.2rem] whitespace-nowrap font-mono text-[0.6rem] leading-none text-muted-foreground"><Cpu size={11} /> {camera.media_only ? 'media only' : camera.running ? `worker ${camera.pid ?? '--'}` : 'worker offline'}</span>
           {camera.analysis_error && <span className="shrink-0 whitespace-nowrap text-[0.62rem] leading-none text-danger" title={camera.analysis_error}>detector lỗi</span>}
         </div>
         <div className="flex h-full shrink-0 items-center"><CameraStatusBadge camera={camera} state={state} /></div>
@@ -67,6 +67,10 @@ function friendlyCameraName(id: string) {
   const names: Record<string, string> = {
     camera_face: 'Cổng nhận diện',
     camera_safety: 'Khu vực an toàn',
+    camera_front: 'Camera trước',
+    camera_back: 'Camera sau',
+    camera_left: 'Camera trái',
+    camera_right: 'Camera phải',
     DMS: 'DMS',
   }
   return names[id] ?? id.replace(/^camera_/, '').replaceAll('_', ' ')

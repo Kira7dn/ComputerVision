@@ -20,9 +20,14 @@ ROOT = WEB_ROOT / "dist" if (WEB_ROOT / "dist" / "dashboard.html").is_file() els
 CONFIG_PATH = Path(os.environ.get("CAMERA_CONFIG", APP_ROOT / "config" / "dev.yaml"))
 CLK_TCK = os.sysconf("SC_CLK_TCK")
 CPU_LOCK = Lock()
+GPU_LOCK = Lock()
+METRICS_LOCK = Lock()
 PREVIOUS_CPU: tuple[int, int] | None = None
 PREVIOUS_PROCESSES: dict[int, tuple[int, float]] = {}
+GPU_CACHE: tuple[float, dict[str, object]] | None = None
+METRICS_CACHE: dict[str, tuple[float, dict[str, object]]] = {}
 DASHBOARD_PORT = int(os.environ.get("CAMERA_DASHBOARD_PORT", "18080"))
+MOCK_MEDIA_PORT = int(os.environ.get("CAMERA_MOCK_MEDIA_PORT", "18081"))
 
 
 def _camera_definitions(stream_host: str = "localhost") -> list[dict[str, object]]:
@@ -33,10 +38,28 @@ def _camera_definitions(stream_host: str = "localhost") -> list[dict[str, object
             config = resolve_camera_config(raw_config, camera_id)
             output_url = str(config["output"]["rtsp_url"])
             output_path = urlparse(output_url).path.strip("/")
+            source = config["input"].get("mock_video") or config["input"].get("rtsp_url")
+            media_only = bool(config["input"].get("media_only", False))
             definitions.append(
                 {
                     "id": camera_id,
-                    "source": config["input"].get("mock_video") or config["input"].get("rtsp_url"),
+                    "display_name": next(
+                        (
+                            str(item.get("display_name"))
+                            for item in raw_config.get("cameras", []) or []
+                            if str(item.get("id")) == camera_id and item.get("display_name")
+                        ),
+                        None,
+                    ),
+                    "source": source,
+                    "source_type": config["input"].get("mode", "rtsp"),
+                    "media_only": media_only,
+                    "mock_sync_group": config["input"].get("mock_sync_group") or None,
+                    "media_url": (
+                        f"http://{stream_host}:{MOCK_MEDIA_PORT}/{quote(Path(str(source)).name)}"
+                        if media_only
+                        else None
+                    ),
                     "output": output_url,
                     "webrtc_url": f"http://{stream_host}:8889/{output_path}/whep",
                     "hls_url": f"http://{stream_host}:8888/{output_path}/index.m3u8",
@@ -88,7 +111,8 @@ def _processes() -> list[dict[str, int | str]]:
             parts = command.split()
             if not any(
                 part.endswith("application/camera_worker.py")
-                or part == "application.camera_worker"
+                or part.endswith("application/mock_camera_worker.py")
+                or part in {"application.camera_worker", "application.mock_camera_worker"}
                 for part in parts
             ):
                 continue
@@ -404,6 +428,17 @@ def _event_thumbnail(
 
 
 def _gpu() -> dict[str, object]:
+    global GPU_CACHE
+    now = time.monotonic()
+    with GPU_LOCK:
+        if GPU_CACHE is not None and now - GPU_CACHE[0] < 30.0:
+            return dict(GPU_CACHE[1])
+        result = _read_gpu()
+        GPU_CACHE = (now, result)
+        return dict(result)
+
+
+def _read_gpu() -> dict[str, object]:
     command = [
         "nvidia-smi",
         "--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu",
@@ -424,7 +459,7 @@ def _gpu() -> dict[str, object]:
         return {"available": False, "name": "unavailable"}
 
 
-def collect_metrics(stream_host: str = "localhost") -> dict[str, object]:
+def _collect_metrics(stream_host: str = "localhost") -> dict[str, object]:
     global PREVIOUS_CPU
     now = time.monotonic()
     cpu = _proc_cpu()
@@ -461,7 +496,9 @@ def collect_metrics(stream_host: str = "localhost") -> dict[str, object]:
     for camera in configured_cameras:
         camera_id = str(camera["id"])
         process = processes_by_camera.get(camera_id)
-        runtime_status = _runtime_status(camera_id)
+        media_only = bool(camera.get("media_only", False))
+        media_ready = media_only and Path(str(camera.get("source", ""))).is_file()
+        runtime_status = {} if media_only else _runtime_status(camera_id)
         last_frame_at = runtime_status.get("last_frame_at")
         last_output_at = runtime_status.get("last_output_at")
         try:
@@ -475,13 +512,13 @@ def collect_metrics(stream_host: str = "localhost") -> dict[str, object]:
         # This is a worker readiness signal only. The browser owns WebRTC
         # playback state; the metrics endpoint must not pretend that a worker
         # heartbeat proves a live frame reached a browser.
-        worker_ready = bool(process and output_age is not None and output_age <= 5.0)
+        worker_ready = bool(media_ready or (process and output_age is not None and output_age <= 5.0))
         ready = worker_ready
         analysis_debug = runtime_status.get("analysis_debug") or {}
         camera_metrics.append(
             {
                 **camera,
-                "running": process is not None,
+                "running": bool(media_ready or process is not None),
                 "pid": process["pid"] if process else None,
                 "run_id": process["run_id"] if process else None,
                 "rss_mb": process["rss_mb"] if process else None,
@@ -520,9 +557,9 @@ def collect_metrics(stream_host: str = "localhost") -> dict[str, object]:
             "running": bool(processes),
             "pid": processes[0]["pid"] if processes else None,
             "pids": [item["pid"] for item in processes],
-            "camera_count": len(processes),
+            "camera_count": len(camera_metrics),
             "ready": bool(camera_metrics) and all(bool(camera["ready"]) for camera in camera_metrics),
-            "cameras": [item["camera"] for item in processes],
+            "cameras": [str(item["id"]) for item in camera_metrics],
             "cpu_percent": pipeline_cpu,
             "rss_mb": pipeline_rss,
             "age_seconds": pipeline_age,
@@ -537,6 +574,17 @@ def collect_metrics(stream_host: str = "localhost") -> dict[str, object]:
     }
 
 
+def collect_metrics(stream_host: str = "localhost") -> dict[str, object]:
+    now = time.monotonic()
+    with METRICS_LOCK:
+        cached = METRICS_CACHE.get(stream_host)
+        if cached is not None and now - cached[0] < 2.5:
+            return cached[1]
+        result = _collect_metrics(stream_host)
+        METRICS_CACHE[stream_host] = (now, result)
+        return result
+
+
 def _stream_host_from_header(host_header: str) -> str:
     """Use the browser-facing host instead of hard-coding Jetson localhost."""
     host = host_header.strip()
@@ -548,6 +596,8 @@ def _stream_host_from_header(host_header: str) -> str:
 
 
 class DashboardHandler(SimpleHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
     def __init__(self, *args: object, **kwargs: object) -> None:
         super().__init__(*args, directory=str(ROOT), **kwargs)
 
@@ -555,10 +605,12 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         if path == "/health/live":
+            payload = b'{"status":"live"}'
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
-            self.wfile.write(b'{"status":"live"}')
+            self.wfile.write(payload)
             return
         if path == "/health/ready":
             metrics = collect_metrics(_stream_host_from_header(self.headers.get("Host", "")))
@@ -573,6 +625,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         if path == "/":
             self.send_response(302)
             self.send_header("Location", "/dashboard.html")
+            self.send_header("Content-Length", "0")
             self.end_headers()
             return
         if path == "/api/metrics":

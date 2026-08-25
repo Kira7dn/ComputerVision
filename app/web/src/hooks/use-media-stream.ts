@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import type { CameraDetail, HlsConstructor, HlsInstance, MediaMTXReader, PlayerState } from '@/types'
+import { registerSynchronizedMock } from '@/lib/mock-stream-sync'
 
 interface VideoFrameMetadataLike {
   captureTime?: number
@@ -69,6 +70,7 @@ export function useMediaStream(camera: CameraDetail, onStateChange: (state: Play
     let hls: HlsInstance | null = null
     let fallbackCleanup: (() => void) | null = null
     let fallbackTimer: number | null = null
+    let mockSyncCleanup: (() => void) | null = null
     let videoFrameCallbackId: number | null = null
     let frameTimingTimer: number | null = null
     let lastLatencyReportAt = 0
@@ -204,17 +206,26 @@ export function useMediaStream(camera: CameraDetail, onStateChange: (state: Play
 
     const onPlaying = () => {
       if (reader !== null) return
+      if (camera.source_type === 'mock' && camera.mock_sync_group && mockSyncCleanup === null) {
+        mockSyncCleanup = registerSynchronizedMock(camera.mock_sync_group, camera.id, video)
+      }
       update({
         live: true,
         error: false,
         connecting: false,
-        transport: 'hls-fallback',
+        transport: camera.media_only ? 'mock-file' : 'hls-fallback',
         videoLatencyMs: null,
         videoLatencySource: 'unavailable',
-        message: 'HLS',
+        message: camera.media_only ? 'Mock đồng bộ' : 'HLS',
       })
     }
+    const onVideoError = () => {
+      if (camera.media_only) {
+        update({ live: false, error: true, connecting: false, message: 'Video mock không khả dụng' })
+      }
+    }
     video.addEventListener('playing', onPlaying)
+    video.addEventListener('error', onVideoError)
 
     const stopFrameTiming = () => {
       if (videoFrameCallbackId !== null && timedVideo.cancelVideoFrameCallback) {
@@ -281,39 +292,47 @@ export function useMediaStream(camera: CameraDetail, onStateChange: (state: Play
       void startFallback()
     }
 
-    try {
-      if (!window.MediaMTXWebRTCReader) throw new Error('MediaMTXWebRTCReader unavailable')
-      reader = new window.MediaMTXWebRTCReader({
-        url: camera.webrtc_url,
-        user: '',
-        pass: '',
-        token: '',
-        onError: () => update({ live: false, connecting: true, error: false, message: 'WebRTC reconnecting...' }),
-        onTrack: (event) => {
-          if (destroyed || event.track.kind !== 'video') return
-          if (fallbackTimer !== null) window.clearTimeout(fallbackTimer)
-          fallbackCleanup?.()
-          fallbackCleanup = null
-          update({
-            live: true,
-            error: false,
-            connecting: false,
-            transport: 'webrtc',
-            videoLatencyMs: null,
-            videoLatencySource: 'unavailable',
-            message: timedVideo.requestVideoFrameCallback
-              ? 'Live / WebRTC · đo màn hình'
-              : 'Live / WebRTC · browser không hỗ trợ đo frame',
-          })
-          video.srcObject = event.streams[0]
-          void video.play().catch(() => undefined)
-          startFrameTiming()
-        },
-      })
-      readerRef.current = reader
-      fallbackTimer = window.setTimeout(activateFallback, 10000)
-    } catch {
-      fallbackTimer = window.setTimeout(activateFallback, 0)
+    const synchronizedMock = camera.source_type === 'mock' && Boolean(camera.mock_sync_group)
+    if (synchronizedMock && camera.media_url) {
+      video.loop = true
+      video.preload = 'auto'
+      video.src = camera.media_url
+      void video.play().catch(() => undefined)
+    } else {
+      try {
+        if (!window.MediaMTXWebRTCReader) throw new Error('MediaMTXWebRTCReader unavailable')
+        reader = new window.MediaMTXWebRTCReader({
+          url: camera.webrtc_url,
+          user: '',
+          pass: '',
+          token: '',
+          onError: () => update({ live: false, connecting: true, error: false, message: 'WebRTC reconnecting...' }),
+          onTrack: (event) => {
+            if (destroyed || event.track.kind !== 'video') return
+            if (fallbackTimer !== null) window.clearTimeout(fallbackTimer)
+            fallbackCleanup?.()
+            fallbackCleanup = null
+            update({
+              live: true,
+              error: false,
+              connecting: false,
+              transport: 'webrtc',
+              videoLatencyMs: null,
+              videoLatencySource: 'unavailable',
+              message: timedVideo.requestVideoFrameCallback
+                ? 'Live / WebRTC · đo màn hình'
+                : 'Live / WebRTC · browser không hỗ trợ đo frame',
+            })
+            video.srcObject = event.streams[0]
+            void video.play().catch(() => undefined)
+            startFrameTiming()
+          },
+        })
+        readerRef.current = reader
+        fallbackTimer = window.setTimeout(activateFallback, 10000)
+      } catch {
+        fallbackTimer = window.setTimeout(activateFallback, 0)
+      }
     }
 
     return () => {
@@ -321,16 +340,19 @@ export function useMediaStream(camera: CameraDetail, onStateChange: (state: Play
       if (fallbackTimer !== null) window.clearTimeout(fallbackTimer)
       stopFrameTiming()
       fallbackCleanup?.()
+      mockSyncCleanup?.()
       hls?.destroy()
       reader?.close()
       readerRef.current = null
       video.removeEventListener('playing', onPlaying)
+      video.removeEventListener('error', onVideoError)
       video.srcObject = null
       video.pause()
       video.removeAttribute('src')
+      video.loop = false
       video.load()
     }
-  }, [camera.hls_url, camera.id, camera.running, camera.webrtc_url, camera.worker_ready, onStateChange])
+  }, [camera.hls_url, camera.id, camera.media_only, camera.media_url, camera.mock_sync_group, camera.running, camera.source_type, camera.webrtc_url, camera.worker_ready, onStateChange])
 
   return { videoRef, state }
 }

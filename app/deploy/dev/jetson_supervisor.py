@@ -100,6 +100,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--runtime", type=Path, required=True)
     parser.add_argument("--mediamtx-config", type=Path, required=True)
     parser.add_argument("--mediamtx-bin", type=Path, required=True)
+    parser.add_argument("--mock-media-root", type=Path, default=None)
+    parser.add_argument("--mock-media-port", type=int, default=18081)
     parser.add_argument("--pid-file", type=Path, required=True)
     return parser.parse_args()
 
@@ -144,6 +146,27 @@ def main() -> int:
             runtime_logs / "dashboard.log",
             root,
             environment,
+        ),
+        **(
+            {
+                "mock_media": ManagedProcess(
+                    "mock-media",
+                    [
+                        sys.executable,
+                        "-m",
+                        "interfaces.mock_media_server",
+                        "--root",
+                        str(args.mock_media_root),
+                        "--port",
+                        str(args.mock_media_port),
+                    ],
+                    runtime_logs / "mock-media.log",
+                    root,
+                    environment,
+                )
+            }
+            if args.mock_media_root is not None
+            else {}
         ),
         "runner": ManagedProcess(
             "runner",
@@ -196,6 +219,8 @@ def main() -> int:
                 if source_or_config_changed:
                     processes["dashboard"].restart()
                     processes["runner"].restart()
+                    if "mock_media" in processes:
+                        processes["mock_media"].restart()
                 if "app/deploy/docker/mediamtx.yml" in changed_paths:
                     processes["mediamtx"].restart()
 

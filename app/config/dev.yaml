@@ -30,6 +30,70 @@ cameras:
       smoking_behavior: false
       fire_smoke: false
       dms: true
+  - id: camera_front
+    display_name: Camera trước
+    source:
+      type: mock
+      url: rtsp://127.0.0.1:8554/camera_front
+      mock_video: /opt/ls-vision-dev/data/mock-videos/cameras/sync-lite/CAM_FRONT.mp4
+      media_only: true
+      sync_group: vehicle_surround
+      sync_period_seconds: 191.1
+      loop: true
+      width: 960
+      height: 540
+      latency_ms: 200
+    output:
+      rtsp_url: rtsp://127.0.0.1:8554/camera_front
+    functions: {trace: false, face_recognition: false, smoking_behavior: false, fire_smoke: false, dms: false}
+  - id: camera_back
+    display_name: Camera sau
+    source:
+      type: mock
+      url: rtsp://127.0.0.1:8554/camera_back
+      mock_video: /opt/ls-vision-dev/data/mock-videos/cameras/sync-lite/CAM_BACK.mp4
+      media_only: true
+      sync_group: vehicle_surround
+      sync_period_seconds: 191.1
+      loop: true
+      width: 960
+      height: 540
+      latency_ms: 200
+    output:
+      rtsp_url: rtsp://127.0.0.1:8554/camera_back
+    functions: {trace: false, face_recognition: false, smoking_behavior: false, fire_smoke: false, dms: false}
+  - id: camera_left
+    display_name: Camera trái
+    source:
+      type: mock
+      url: rtsp://127.0.0.1:8554/camera_left
+      mock_video: /opt/ls-vision-dev/data/mock-videos/cameras/sync-lite/CAM_FRONT_LEFT.mp4
+      media_only: true
+      sync_group: vehicle_surround
+      sync_period_seconds: 191.1
+      loop: true
+      width: 960
+      height: 540
+      latency_ms: 200
+    output:
+      rtsp_url: rtsp://127.0.0.1:8554/camera_left
+    functions: {trace: false, face_recognition: false, smoking_behavior: false, fire_smoke: false, dms: false}
+  - id: camera_right
+    display_name: Camera phải
+    source:
+      type: mock
+      url: rtsp://127.0.0.1:8554/camera_right
+      mock_video: /opt/ls-vision-dev/data/mock-videos/cameras/sync-lite/CAM_FRONT_RIGHT.mp4
+      media_only: true
+      sync_group: vehicle_surround
+      sync_period_seconds: 191.1
+      loop: true
+      width: 960
+      height: 540
+      latency_ms: 200
+    output:
+      rtsp_url: rtsp://127.0.0.1:8554/camera_right
+    functions: {trace: false, face_recognition: false, smoking_behavior: false, fire_smoke: false, dms: false}
 
 
 smoking_behavior:

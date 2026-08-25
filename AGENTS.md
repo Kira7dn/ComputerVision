@@ -8,6 +8,19 @@
 - server/ là boundary ADAS/FTP/archive độc lập, không đưa vào thay đổi LS-Vision.
 - frigate/ và kiến trúc Frigate cũ không phải startup path, media owner, event store, test gate hoặc source of truth của Camera runtime.
 
+## Tài liệu dự án
+
+- Kiến trúc tổng thể, ownership và trạng thái từng phase: [docs/architecture/Platform.md](docs/architecture/Platform.md)
+- Kiến trúc runtime DeepStream hiện hành: [docs/architecture/DeepStream.md](docs/architecture/DeepStream.md)
+- Yêu cầu sản phẩm tổng thể: [docs/PRD.md](docs/PRD.md)
+- Use case nghiệp vụ Camera: [docs/CameraUseCase.md](docs/CameraUseCase.md)
+- Cấu trúc và entrypoint của ứng dụng LS-Vision: [app/README.md](app/README.md)
+- Deployment native và development trên Jetson: [app/deploy/README-jetson.md](app/deploy/README-jetson.md)
+- Model inventory và kế hoạch fine-tune: [docs/ModelInventoryAndFinetunePlan.md](docs/ModelInventoryAndFinetunePlan.md)
+
+Không đặt lại nội dung kiến trúc hoặc phase plan trong `AGENTS.md`; cập nhật nội dung đó tại
+`docs/architecture/Platform.md` và chỉ giữ đường dẫn vận hành tại đây.
+
 ## Kiến trúc hiện tại
 
 LS-Vision là runtime DeepStream canonical dưới app/:

@@ -8,6 +8,7 @@ Secrets outside Camera/app are intentionally never synchronized.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import posixpath
 import shlex
@@ -27,6 +28,7 @@ IGNORED_PARTS = {
 }
 POLL_SECONDS = 0.75
 DEBOUNCE_SECONDS = 0.35
+LOCAL_ONLY_PREFIXES = ("deploy/dev/", "deploy/powershell/", "web/")
 
 
 def snapshot(app_root: Path) -> dict[str, tuple[int, int]]:
@@ -40,7 +42,10 @@ def snapshot(app_root: Path) -> dict[str, tuple[int, int]]:
                 stat = candidate.stat()
             except OSError:
                 continue
-            result[candidate.relative_to(app_root).as_posix()] = (
+            relative = candidate.relative_to(app_root).as_posix()
+            if relative.startswith(LOCAL_ONLY_PREFIXES):
+                continue
+            result[relative] = (
                 stat.st_mtime_ns,
                 stat.st_size,
             )
@@ -106,12 +111,31 @@ def sync(
         )
 
 
+def load_state(path: Path) -> dict[str, tuple[int, int]] | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        return {
+            str(name): (int(values[0]), int(values[1]))
+            for name, values in payload.items()
+        }
+    except (OSError, ValueError, TypeError, KeyError, IndexError):
+        return None
+
+
+def save_state(path: Path, state: dict[str, tuple[int, int]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(state, sort_keys=True), encoding="utf-8")
+    temporary.replace(path)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--jetson", required=True)
     parser.add_argument("--remote-app", default="/opt/ls-vision-dev/current/app")
     parser.add_argument("--interval", type=float, default=POLL_SECONDS)
+    parser.add_argument("--state-file", type=Path, default=None)
     parser.add_argument("--once", action="store_true")
     return parser.parse_args()
 
@@ -122,10 +146,20 @@ def main() -> int:
     if not app_root.is_dir():
         raise SystemExit(f"Camera app directory was not found: {app_root}")
 
-    run_ssh(args.jetson, f"mkdir -p {shlex.quote(args.remote_app)}")
-    previous: dict[str, tuple[int, int]] = {}
     current = snapshot(app_root)
-    sync(args.jetson, app_root, args.remote_app, previous, current)
+    state_file = args.state_file or (args.root.resolve() / ".tmp" / "jetson-dev-sync-state.json")
+    previous = load_state(state_file)
+    run_ssh(args.jetson, f"mkdir -p {shlex.quote(args.remote_app)}")
+    if previous is None:
+        # The native dev service is provisioned by npm run deploy. Adopt its
+        # current source as the first watcher baseline instead of rewriting
+        # every file and restarting a healthy DMS worker on each npm run dev.
+        previous = current
+        save_state(state_file, current)
+        print(f"jetson sync baseline recorded: {len(current)} files", flush=True)
+    else:
+        sync(args.jetson, app_root, args.remote_app, previous, current)
+        save_state(state_file, current)
     if args.once:
         return 0
 
@@ -145,6 +179,7 @@ def main() -> int:
                 print(f"jetson sync failed; will retry: {exc}", file=sys.stderr, flush=True)
                 continue
             previous = current
+            save_state(state_file, current)
     except KeyboardInterrupt:
         return 130
 

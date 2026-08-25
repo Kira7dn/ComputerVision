@@ -10,7 +10,12 @@ def test_profiles_merge_and_production_has_no_mock_source() -> None:
     production = load_raw_config(Path(__file__).parents[2] / "config" / "production.yaml")
 
     assert dev["profile"] == "dev"
-    assert all(camera["source"]["type"] == "mock" for camera in dev["cameras"][:2])
+    assert [camera["id"] for camera in dev["cameras"]] == [
+        "DMS", "camera_front", "camera_back", "camera_left", "camera_right"
+    ]
+    assert all(camera["source"]["type"] == "mock" for camera in dev["cameras"][1:])
+    assert all(camera["source"]["media_only"] for camera in dev["cameras"][1:])
+    assert {camera["source"]["sync_period_seconds"] for camera in dev["cameras"][1:]} == {191.1}
     assert all(camera["source"]["type"] == "rtsp" for camera in production["cameras"])
 
 
@@ -36,6 +41,25 @@ def test_production_mock_source_is_rejected() -> None:
         validate_config(config)
 
 
+def test_media_only_mock_has_no_cv_and_keeps_sync_contract() -> None:
+    raw = load_raw_config(Path(__file__).parents[2] / "config" / "dev.yaml")
+    resolved = resolve_camera_config(raw, "camera_front")
+
+    assert resolved["input"]["media_only"] is True
+    assert resolved["input"]["mock_sync_group"] == "vehicle_surround"
+    assert resolved["input"]["mock_sync_period_seconds"] == 191.1
+    assert not any(resolved["functions"].values())
+
+
+def test_media_only_mock_rejects_enabled_cv_function() -> None:
+    raw = load_raw_config(Path(__file__).parents[2] / "config" / "dev.yaml")
+    camera = next(item for item in raw["cameras"] if item["id"] == "camera_front")
+    camera["functions"]["fire_smoke"] = True
+
+    with pytest.raises(ValueError, match="media_only cannot enable functions"):
+        validate_config(raw)
+
+
 def test_duplicate_camera_id_is_rejected() -> None:
     config = {
         "cameras": [
@@ -48,7 +72,7 @@ def test_duplicate_camera_id_is_rejected() -> None:
 
 
 def test_analysis_overrides_are_isolated_per_camera() -> None:
-    raw = load_raw_config(Path(__file__).parents[2] / "config" / "dev.yaml")
+    raw = load_raw_config(Path(__file__).parents[2] / "config" / "production.yaml")
 
     safety = resolve_camera_config(raw, "camera_safety")
     dahua = resolve_camera_config(raw, "DMS")
@@ -95,7 +119,7 @@ def test_analysis_overrides_are_isolated_per_camera() -> None:
 
 
 def test_invalid_camera_analysis_fails_before_startup() -> None:
-    raw = load_raw_config(Path(__file__).parents[2] / "config" / "dev.yaml")
+    raw = load_raw_config(Path(__file__).parents[2] / "config" / "production.yaml")
     camera = next(item for item in raw["cameras"] if item["id"] == "camera_safety")
     camera["analysis"]["functions"]["smoking"]["crop"]["strategy"] = "upper_body"
 
@@ -104,7 +128,7 @@ def test_invalid_camera_analysis_fails_before_startup() -> None:
 
 
 def test_invalid_smoking_temporal_window_fails_before_startup() -> None:
-    raw = load_raw_config(Path(__file__).parents[2] / "config" / "dev.yaml")
+    raw = load_raw_config(Path(__file__).parents[2] / "config" / "production.yaml")
     camera = next(item for item in raw["cameras"] if item["id"] == "camera_safety")
     camera["analysis"]["functions"]["smoking"]["confirmation"] = {
         "hits": 5,
@@ -116,7 +140,7 @@ def test_invalid_smoking_temporal_window_fails_before_startup() -> None:
 
 
 def test_invalid_dms_confirmation_window_fails_before_startup() -> None:
-    raw = load_raw_config(Path(__file__).parents[2] / "config" / "dev.yaml")
+    raw = load_raw_config(Path(__file__).parents[2] / "config" / "production.yaml")
     raw["dms"]["event_policy"]["model"]["confirmation_hits"] = 11
     raw["dms"]["event_policy"]["model"]["confirmation_window"] = 10
 
@@ -125,7 +149,7 @@ def test_invalid_dms_confirmation_window_fails_before_startup() -> None:
 
 
 def test_smoking_notification_delay_cannot_precede_confirmation_duration() -> None:
-    raw = load_raw_config(Path(__file__).parents[2] / "config" / "dev.yaml")
+    raw = load_raw_config(Path(__file__).parents[2] / "config" / "production.yaml")
     camera = next(item for item in raw["cameras"] if item["id"] == "camera_safety")
     camera["analysis"]["functions"]["smoking"]["temporal"] = {
         "minimum_duration_seconds": 1.0,
@@ -150,7 +174,7 @@ def test_all_profiles_keep_dynamics_in_advisory_mode() -> None:
 
 
 def test_invalid_fire_dynamics_vote_window_fails_before_startup() -> None:
-    raw = load_raw_config(Path(__file__).parents[2] / "config" / "dev.yaml")
+    raw = load_raw_config(Path(__file__).parents[2] / "config" / "production.yaml")
     camera = next(item for item in raw["cameras"] if item["id"] == "DMS")
     camera["analysis"]["functions"]["fire_smoke"]["dynamics"] = {
         "confirmation_votes": 6,
@@ -162,7 +186,7 @@ def test_invalid_fire_dynamics_vote_window_fails_before_startup() -> None:
 
 
 def test_fire_dynamics_hard_enforcement_is_rejected() -> None:
-    raw = load_raw_config(Path(__file__).parents[2] / "config" / "dev.yaml")
+    raw = load_raw_config(Path(__file__).parents[2] / "config" / "production.yaml")
     camera = next(item for item in raw["cameras"] if item["id"] == "DMS")
     camera["analysis"]["functions"]["fire_smoke"]["dynamics"] = {
         "enforce": True

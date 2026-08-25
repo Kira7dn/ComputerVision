@@ -1,6 +1,11 @@
 export interface CameraDetail {
   id: string
   display_name?: string
+  source?: string
+  source_type?: 'rtsp' | 'mock' | string
+  media_only?: boolean
+  media_url?: string | null
+  mock_sync_group?: string | null
   running: boolean
   pid: number | null
   ready: boolean
@@ -102,7 +107,7 @@ export interface EventsResponse {
   events: EventRecord[]
 }
 
-export type StreamTransport = 'webrtc' | 'hls-fallback'
+export type StreamTransport = 'webrtc' | 'hls-fallback' | 'mock-file'
 
 export type VideoLatencySource = 'webrtc_capture' | 'rtp_ntp_map' | 'unavailable'
 

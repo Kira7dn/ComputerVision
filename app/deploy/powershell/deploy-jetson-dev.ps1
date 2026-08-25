@@ -74,8 +74,9 @@ rm -f "$REMOTE_ARCHIVE" /tmp/ls-vision-dev.service
 sudo_cmd systemctl daemon-reload
 sudo_cmd systemctl enable --now ls-vision-dev.service
 
-for attempt in $(seq 1 30); do
-  if curl --fail --silent --show-error --max-time 5 --output /dev/null 'http://127.0.0.1:18080/health/live'; then
+for attempt in $(seq 1 60); do
+  if curl --fail --silent --show-error --max-time 5 --output /dev/null 'http://127.0.0.1:18080/health/live' \
+    && curl --fail --silent --show-error --max-time 5 --output /dev/null 'http://127.0.0.1:18080/health/ready'; then
     for old_release in "$REMOTE_ROOT"/releases/*; do
       [ "$old_release" = "$RELEASE_ROOT" ] && continue
       [ -d "$old_release" ] || continue
@@ -87,7 +88,7 @@ for attempt in $(seq 1 30); do
   fi
   sleep 2
 done
-echo 'Jetson development health check timed out.' >&2
+echo 'Jetson development readiness check timed out.' >&2
 systemctl --no-pager --full status ls-vision-dev.service >&2 || true
 exit 1
 '@

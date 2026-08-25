@@ -69,6 +69,25 @@ def validate_config(config: dict[str, Any], path: Path | None = None) -> dict[st
         source_type = str(source.get("type", source.get("mode", "rtsp"))).lower()
         if profile == "production" and source_type == "mock":
             raise ValueError(f"production profile cannot use mock source: {camera_id}")
+        media_only = bool(source.get("media_only", False))
+        if media_only and source_type != "mock":
+            raise ValueError(f"camera {camera_id} media_only requires a mock source")
+        if media_only:
+            enabled_functions = [
+                name
+                for name, enabled in (camera.get("functions", {}) or {}).items()
+                if bool(enabled)
+            ]
+            if enabled_functions:
+                raise ValueError(
+                    f"camera {camera_id} media_only cannot enable functions: "
+                    f"{', '.join(sorted(enabled_functions))}"
+                )
+            sync_period = float(source.get("sync_period_seconds", 0.0))
+            if not str(source.get("sync_group", "")).strip() or sync_period <= 0.0:
+                raise ValueError(
+                    f"camera {camera_id} media_only requires sync_group and positive sync_period_seconds"
+                )
         source_url = str(source.get("url", source.get("rtsp_url", "")))
         output_url = str((camera.get("output", {}) or {}).get("rtsp_url", ""))
         for label, value in (("source", source_url), ("output", output_url)):
@@ -596,6 +615,11 @@ def resolve_camera_config(config: dict[str, Any], camera_id: str | None = None) 
             "rtsp_url": source.get("url", source.get("rtsp_url", input_config.get("rtsp_url"))),
             "mock_video": source.get("mock_video", input_config.get("mock_video")),
             "mock_loop": source.get("loop", source.get("mock_loop", input_config.get("mock_loop", True))),
+            "media_only": bool(source.get("media_only", input_config.get("media_only", False))),
+            "mock_sync_group": str(source.get("sync_group", input_config.get("mock_sync_group", ""))),
+            "mock_sync_period_seconds": float(
+                source.get("sync_period_seconds", input_config.get("mock_sync_period_seconds", 0.0))
+            ),
             "width": int(source.get("width", input_config.get("width", 1920))),
             "height": int(source.get("height", input_config.get("height", 1080))),
             "latency_ms": int(source.get("latency_ms", input_config.get("latency_ms", 200))),
