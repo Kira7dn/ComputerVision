@@ -126,6 +126,17 @@ def main() -> int:
             "PYTHONPATH": str(root / "app" / "src"),
             "CAMERA_CONFIG": str(args.config),
             "CAMERA_WEB_ROOT": str(root / "app" / "web"),
+            "MTX_RTSPADDRESS": ":8554",
+            "MTX_PROTOCOLS": "tcp",
+            "MTX_PATHS_ALL_OTHERS": "{}",
+            "MTX_HLSADDRESS": ":8888",
+            "MTX_HLSVARIANT": "mpegts",
+            "MTX_HLSSEGMENTDURATION": "3s",
+            "MTX_HLSSEGMENTCOUNT": "6",
+            "MTX_HLSALWAYSREMUX": "yes",
+            "MTX_HLSALLOWORIGIN": "*",
+            "MTX_WEBRTCADDRESS": ":8889",
+            "MTX_WEBRTCALLOWORIGIN": "*",
         }
     )
     env_file = root / ".env.local"
@@ -188,7 +199,6 @@ def main() -> int:
         root / "app" / "src",
         root / "app" / "config",
         args.config,
-        root / "app" / "deploy" / "docker" / "mediamtx.yml",
         env_file,
     ]
     try:
@@ -221,9 +231,6 @@ def main() -> int:
                     processes["runner"].restart()
                     if "mock_media" in processes:
                         processes["mock_media"].restart()
-                if "app/deploy/docker/mediamtx.yml" in changed_paths:
-                    processes["mediamtx"].restart()
-
             for process in processes.values():
                 if process.exited() and not stop_requested.is_set():
                     process.start()

@@ -15,6 +15,8 @@ Environment=CAMERA_CONFIG=/opt/ls-vision/current/app/config/production.yaml
 Environment=CAMERA_WEB_ROOT=/opt/ls-vision/current/app/web
 Environment=CAMERA_RUNTIME_ROOT=/opt/ls-vision
 Environment=CAMERA_DASHBOARD_HOST=0.0.0.0
+Environment=CAMERA_MOCK_MEDIA_ROOT=/opt/ls-vision/data/mock-videos/cameras/sync-lite
+Environment=CAMERA_MOCK_MEDIA_PORT=18081
 Environment=DEEPSTREAM_ROOT=/opt/ls-vision/runtime/deepstream
 Environment=GST_PLUGIN_PATH=/opt/ls-vision/runtime/deepstream/lib/gst-plugins:/usr/lib/aarch64-linux-gnu/gstreamer-1.0
 Environment=GST_PLUGIN_SYSTEM_PATH_1_0=/usr/lib/aarch64-linux-gnu/gstreamer-1.0

@@ -2,8 +2,8 @@
   "name": "dahua-local-poc",
   "private": true,
   "scripts": {
-    "dev": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\app\\deploy\\powershell\\start-jetson-dev.ps1 -Action start",
-    "check": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\app\\deploy\\powershell\\check.ps1",
+    "dev": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\app\\deploy\\powershell\\deploy-jetson-dev.ps1 -Action start",
+    "test": "powershell -NoProfile -Command \"& '.\\.venv\\Scripts\\python.exe' -m pytest app/tests -q\"",
     "deploy": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\app\\deploy\\powershell\\deploy-jetson.ps1"
   }
 }

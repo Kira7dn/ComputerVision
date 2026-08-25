@@ -18,11 +18,7 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $cameraRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..\..')).Path
-$deployScript = if ($Development) {
-    Join-Path $PSScriptRoot 'deploy-jetson-dev.ps1'
-} else {
-    Join-Path $PSScriptRoot 'deploy-jetson-native.ps1'
-}
+$deployScript = Join-Path $PSScriptRoot 'deploy-jetson-dev.ps1'
 if (-not (Test-Path -LiteralPath $deployScript -PathType Leaf)) {
     throw "Camera deploy implementation was not found: $deployScript"
 }
@@ -33,7 +29,10 @@ if ($Development) {
     Write-Host "==> Deploying Camera native runtime to $JetsonAlias" -ForegroundColor Cyan
 }
 
+$deploymentProfile = if ($Development) { 'development' } else { 'production' }
 & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $deployScript `
+    -Action deploy `
+    -DeploymentProfile $deploymentProfile `
     -CameraRoot $cameraRoot `
     -RemoteHost $JetsonAlias `
     -SudoPassword $SudoPassword

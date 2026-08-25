@@ -25,7 +25,7 @@ Environment=DEEPSTREAM_ROOT=/opt/ls-vision/runtime/deepstream
 Environment=GST_PLUGIN_PATH=/opt/ls-vision/runtime/deepstream/lib/gst-plugins:/usr/lib/aarch64-linux-gnu/gstreamer-1.0
 Environment=GST_PLUGIN_SYSTEM_PATH_1_0=/usr/lib/aarch64-linux-gnu/gstreamer-1.0
 Environment=LD_LIBRARY_PATH=/opt/ls-vision/runtime/deepstream/lib:/opt/ls-vision/runtime/deepstream/lib/gst-plugins:/opt/ls-vision/runtime/triton/lib:/usr/local/cuda/lib64:/usr/lib/aarch64-linux-gnu/nvidia:/usr/lib/aarch64-linux-gnu
-ExecStart=/opt/ls-vision/runtime/venv/bin/python3 /opt/ls-vision-dev/current/app/deploy/dev/jetson_supervisor.py --root /opt/ls-vision-dev/current --config /opt/ls-vision-dev/current/app/config/dev.yaml --runtime /opt/ls-vision-dev/data --mediamtx-config /opt/ls-vision-dev/current/app/deploy/docker/mediamtx.yml --mediamtx-bin /opt/ls-vision/runtime/bin/mediamtx --mock-media-root /opt/ls-vision-dev/data/mock-videos/cameras/sync-lite --mock-media-port 18081 --pid-file /opt/ls-vision-dev/data/status/jetson-supervisor.pid
+ExecStart=/opt/ls-vision/runtime/venv/bin/python3 /opt/ls-vision-dev/current/app/deploy/dev/jetson_supervisor.py --root /opt/ls-vision-dev/current --config /opt/ls-vision-dev/current/app/config/dev.yaml --runtime /opt/ls-vision-dev/data --mediamtx-config /opt/ls-vision/runtime/mediamtx.conf --mediamtx-bin /opt/ls-vision/runtime/bin/mediamtx --mock-media-root /opt/ls-vision-dev/data/mock-videos/cameras/sync-lite --mock-media-port 18081 --pid-file /opt/ls-vision-dev/data/status/jetson-supervisor.pid
 Restart=always
 RestartSec=5
 KillMode=mixed

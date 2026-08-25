@@ -14,6 +14,21 @@ def main() -> int:
         subprocess.Popen([sys.executable, "-m", "interfaces.dashboard_api"]),
         subprocess.Popen([sys.executable, "-m", "runner", "--config", config]),
     ]
+    mock_media_root = os.environ.get("CAMERA_MOCK_MEDIA_ROOT", "").strip()
+    if mock_media_root:
+        processes.append(
+            subprocess.Popen(
+                [
+                    sys.executable,
+                    "-m",
+                    "interfaces.mock_media_server",
+                    "--root",
+                    mock_media_root,
+                    "--port",
+                    os.environ.get("CAMERA_MOCK_MEDIA_PORT", "18081"),
+                ]
+            )
+        )
 
     def stop(_signum: int, _frame: object) -> None:
         for process in processes:
