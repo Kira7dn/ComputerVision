@@ -71,6 +71,34 @@ def test_output_rtsp_base_can_be_overridden_without_changing_stream_path(
     assert resolved["output"]["rtsp_url"] == "rtsp://mediamtx:8554/camera_front"
 
 
+def test_loopback_input_rtsp_base_can_be_isolated_without_changing_external_camera(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = Path(__file__).parents[2]
+    monkeypatch.setenv("CAMERA_INPUT_RTSP_BASE", "rtsp://127.0.0.1:28554")
+    raw = load_raw_config(root / "config" / "dev.yaml")
+
+    front = resolve_camera_config(raw, "camera_front")
+    dms = resolve_camera_config(raw, "DMS")
+
+    assert front["input"]["rtsp_url"] == "rtsp://127.0.0.1:28554/camera_front_raw"
+    assert "channel=5" in dms["input"]["rtsp_url"]
+
+
+def test_metadata_base_can_be_isolated_per_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = Path(__file__).parents[2]
+    monkeypatch.setenv("CAMERA_METADATA_ZMQ_BASE", "tcp://127.0.0.1:6555")
+    raw = load_raw_config(root / "config" / "dev.yaml")
+
+    dms = resolve_camera_config(raw, "DMS")
+    front = resolve_camera_config(raw, "camera_front")
+
+    assert dms["metadata"]["zmq_pub_url"] == "tcp://127.0.0.1:6555"
+    assert front["metadata"]["zmq_pub_url"] == "tcp://127.0.0.1:6556"
+
+
 def test_production_enables_bounded_dms_performance_contract() -> None:
     root = Path(__file__).parents[2]
     raw = load_raw_config(root / "config" / "production.yaml")

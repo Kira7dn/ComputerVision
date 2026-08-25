@@ -1,0 +1,13 @@
+[Unit]
+Description=LS-Vision production mDNS address
+After=network-online.target avahi-daemon.service
+Wants=network-online.target avahi-daemon.service
+
+[Service]
+Type=simple
+ExecStart=/bin/sh /opt/ls-vision/current/app/deploy/systemd/publish-vision-mdns.sh
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

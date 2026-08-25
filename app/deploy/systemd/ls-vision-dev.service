@@ -2,7 +2,6 @@
 Description=LS-Vision Jetson development runtime with source supervisor
 After=network-online.target
 Wants=network-online.target
-Conflicts=ls-vision.service mediamtx.service
 
 [Service]
 Type=simple
@@ -20,12 +19,32 @@ Environment=CAMERA_EVIDENCE_DIR=/opt/ls-vision-dev/data/evidence
 Environment=CAMERA_STATE_DIR=/opt/ls-vision-dev/data/state
 Environment=CAMERA_STATUS_DIR=/opt/ls-vision-dev/data/status
 Environment=CAMERA_DASHBOARD_HOST=0.0.0.0
+Environment=CAMERA_DASHBOARD_PORT=28080
 Environment=CAMERA_MOCK_MEDIA_PORT=18081
+Environment=CAMERA_INPUT_RTSP_BASE=rtsp://127.0.0.1:28554
+Environment=CAMERA_OUTPUT_RTSP_BASE=rtsp://127.0.0.1:28554
+Environment=CAMERA_METADATA_ZMQ_BASE=tcp://127.0.0.1:6555
+Environment=CAMERA_PUBLIC_HLS_PORT=8888
+Environment=CAMERA_PUBLIC_WEBRTC_PORT=8889
+Environment=MTX_RTSPADDRESS=:28554
+Environment=MTX_PROTOCOLS=tcp
+Environment=MTX_PATHS_ALL_OTHERS={}
+Environment=MTX_RTMP=no
+Environment=MTX_SRT=no
+Environment=MTX_HLSADDRESS=:28888
+Environment=MTX_HLSVARIANT=mpegts
+Environment=MTX_HLSSEGMENTDURATION=3s
+Environment=MTX_HLSSEGMENTCOUNT=6
+Environment=MTX_HLSALWAYSREMUX=yes
+Environment=MTX_HLSALLOWORIGIN=*
+Environment=MTX_WEBRTCADDRESS=:28889
+Environment=MTX_WEBRTCLOCALUDPADDRESS=:28189
+Environment=MTX_WEBRTCALLOWORIGIN=*
 Environment=DEEPSTREAM_ROOT=/opt/ls-vision/runtime/deepstream
 Environment=GST_PLUGIN_PATH=/opt/ls-vision/runtime/deepstream/lib/gst-plugins:/usr/lib/aarch64-linux-gnu/gstreamer-1.0
 Environment=GST_PLUGIN_SYSTEM_PATH_1_0=/usr/lib/aarch64-linux-gnu/gstreamer-1.0
 Environment=LD_LIBRARY_PATH=/opt/ls-vision/runtime/deepstream/lib:/opt/ls-vision/runtime/deepstream/lib/gst-plugins:/opt/ls-vision/runtime/triton/lib:/usr/local/cuda/lib64:/usr/lib/aarch64-linux-gnu/nvidia:/usr/lib/aarch64-linux-gnu
-ExecStart=/opt/ls-vision/runtime/venv/bin/python3 /opt/ls-vision-dev/current/app/deploy/dev/jetson_supervisor.py --root /opt/ls-vision-dev/current --config /opt/ls-vision-dev/current/app/config/dev.yaml --runtime /opt/ls-vision-dev/data --mediamtx-config /opt/ls-vision/runtime/mediamtx.conf --mediamtx-bin /opt/ls-vision/runtime/bin/mediamtx --mock-media-root /opt/ls-vision-dev/data/mock-videos/cameras/sync-lite --mock-media-port 18081 --pid-file /opt/ls-vision-dev/data/status/jetson-supervisor.pid
+ExecStart=/opt/ls-vision/runtime/venv/bin/python3 /opt/ls-vision-dev/current/app/deploy/dev/jetson_supervisor.py --root /opt/ls-vision-dev/current --config /opt/ls-vision-dev/current/app/config/dev.yaml --runtime /opt/ls-vision-dev/data --mediamtx-config /opt/ls-vision-dev/runtime/mediamtx.conf --mediamtx-bin /opt/ls-vision/runtime/bin/mediamtx --mock-media-root /opt/ls-vision-dev/data/mock-videos/cameras/sync-lite --mock-media-port 28081 --pid-file /opt/ls-vision-dev/data/status/jetson-supervisor.pid
 Restart=always
 RestartSec=5
 KillMode=mixed

@@ -63,10 +63,13 @@ Set-Location D:\BusinessAnalyze\Camera
 npm run deploy
 ```
 
-This command deploys only the native DeepStream/MediaMTX runtime, models,
-dashboard bundle and Camera systemd units. It never deploys or restarts
-`tbox.service`/`tbox-gpio.service`. Conversely, LeOS `tbox_lab deploy-app` must
-not install, stop, start, restart or health-check LS-Vision/MediaMTX. The Camera
+This command deploys the native DeepStream/MediaMTX runtime, models, dashboard
+bundle and Camera-owned ingress/mDNS units. It never deploys or restarts
+`tbox.service`/`tbox-gpio.service`. The accepted T-Box boundary release no
+longer owns port 80, so Camera removes the retired
+`50-ls-vision-ingress.conf` compatibility drop-in during production deploy.
+Conversely, LeOS `tbox_lab deploy-app` must not install, stop, start, restart
+or health-check LS-Vision/MediaMTX. The Camera
 command succeeds only after `/health/ready`, every configured camera worker and
 its HLS stream are ready. The default SSH target is `jetson-nano`.
 
@@ -87,17 +90,19 @@ npm install --prefix app/web
 npm run dev -- -JetsonAlias jetson-nano
 ```
 
-`ls-vision-dev.service` runs the backend, runner and MediaMTX on the Jetson.
+`ls-vision-dev.service` runs the backend, runner and an isolated MediaMTX on the Jetson.
 `jetson_sync.py` watches `Camera/app` and synchronizes source/config changes
 over SSH; the backend supervisor restarts the API and workers automatically.
-Vite runs locally on port `5173`, proxies the API and stream through SSH
-tunnels to the Jetson's ports `18080`, `8888` and `8889`, and provides frontend
-HMR. The development service uses
+Vite runs locally on port `5173`, proxies local ports `18080`, `8888` and
+`8889` through SSH to the Jetson development ports `28080`, `28888` and
+`28889`, and provides frontend HMR. Development RTSP uses `28554`; production
+keeps `8554`. The development service uses
 `/opt/ls-vision-dev` for source, state, evidence and logs, while reusing the
 native DeepStream/model runtime under `/opt/ls-vision`.
 
-Do not run the production `ls-vision.service` or another development runtime
-at the same time as the Jetson development service, because they compete for
-GPU resources and ports. Stop the local hot-reload session with `Ctrl+C`; the
-remote service can be stopped with `ssh jetson-nano 'sudo systemctl stop
-ls-vision-dev.service'` before returning to production.
+Production and development are designed to run concurrently without sharing
+dashboard, RTSP, HLS, WebRTC or metadata ports. Production remains the owner of
+`vision.local` throughout a development session. `ls-vision-dev.service` must
+remain disabled at boot and is started only by `npm run dev`. Stop the local
+hot-reload session with `Ctrl+C`; cleanup disables and stops only the remote
+development service.

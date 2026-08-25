@@ -112,7 +112,6 @@ docker info --format '{{.OSType}} {{.Architecture}}'
 Get-CimInstance Win32_Process |
   Where-Object { $_.Name -in @('python.exe', 'pytest.exe') -and $_.CommandLine -like '*BusinessAnalyze\Camera*' } |
   Select-Object ProcessId, Name, CommandLine
-docker compose -f app\deploy\docker\compose.yaml ps
 ```
 
 Sau run bị ngắt, chỉ dừng process Camera đã xác nhận là stale. Giữ failed evidence/log để chẩn đoán.
@@ -147,12 +146,14 @@ npm run dev
 For status, call the implementation directly:
 
 ```powershell
-.\app\deploy\powershell\start-jetson-dev.ps1 -Action status -JetsonAlias jetson-nano
+.\app\deploy\powershell\deploy-jetson-dev.ps1 -Action status -RemoteHost jetson-nano
 ```
 
 The `dev` launcher owns `jetson_sync.py`, the SSH API/MediaMTX tunnel and Vite.
 Backend/config changes sync to Jetson and restart the isolated service; frontend
-changes use Vite HMR. Stop the session with `Ctrl+C`.
+changes use Vite HMR. Production remains active and continues serving
+`vision.local`. Stop the session with `Ctrl+C`; cleanup must disable and stop
+`ls-vision-dev.service`, leaving production untouched.
 
 Kiểm tra dev:
 

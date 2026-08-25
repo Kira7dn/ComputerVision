@@ -397,10 +397,11 @@ def _camera_metadata_url(config: dict[str, Any], camera_id: str, index: int) -> 
         else {}
     )
     metadata.update(camera_metadata)
-    url = metadata.get("zmq_pub_url")
+    environment_base = _runtime_environment().get("CAMERA_METADATA_ZMQ_BASE", "").strip()
+    url = environment_base or metadata.get("zmq_pub_url")
     if not url:
         url = "tcp://127.0.0.1:5555"
-    if not url or camera_metadata.get("zmq_pub_url"):
+    if not url or (camera_metadata.get("zmq_pub_url") and not environment_base):
         return url
     parsed = urlsplit(str(url))
     if parsed.port is None:
@@ -726,6 +727,14 @@ def resolve_camera_config(config: dict[str, Any], camera_id: str | None = None) 
         input_config["rtsp_password"] = runtime_environment.get(str(password_env), "")
     if not input_config.get("rtsp_url"):
         raise ValueError(f"camera {camera_id} source must define url/rtsp_url")
+    input_base = runtime_environment.get("CAMERA_INPUT_RTSP_BASE", "").rstrip("/")
+    input_url = str(input_config["rtsp_url"])
+    if input_base and urlsplit(input_url).hostname in {"127.0.0.1", "localhost"}:
+        parsed_base = urlsplit(input_base)
+        if parsed_base.scheme not in {"rtsp", "rtsps"} or not parsed_base.netloc:
+            raise ValueError("CAMERA_INPUT_RTSP_BASE must be a valid RTSP URL")
+        input_path = urlsplit(input_url).path.strip("/")
+        input_config["rtsp_url"] = f"{input_base}/{input_path}"
     resolved["input"] = input_config
 
     metadata = deepcopy(resolved.get("metadata", {}) or {})

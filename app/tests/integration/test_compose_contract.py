@@ -1,14 +1,18 @@
 from pathlib import Path
 
-import yaml
 
-
-def test_compose_declares_current_services_and_linux_volumes() -> None:
+def test_native_jetson_declares_isolated_production_and_development_services() -> None:
     root = Path(__file__).parents[2]
-    compose = yaml.safe_load((root / "deploy/docker/compose.yaml").read_text(encoding="utf-8"))
-    assert compose["name"] == "ls-vision"
-    assert set(compose["services"]) == {"ls-vision", "mediamtx"}
-    assert compose["services"]["ls-vision"]["restart"] == "unless-stopped"
-    assert compose["services"]["ls-vision"]["image"].startswith("ls-vision:")
-    assert compose["services"]["ls-vision"]["deploy"]["resources"]["reservations"]["devices"]
-    assert {"camera_evidence", "camera_state", "camera_queue", "camera_logs"} <= set(compose["volumes"])
+    systemd = root / "deploy/systemd"
+    production = (systemd / "ls-vision.service").read_text(encoding="utf-8")
+    development = (systemd / "ls-vision-dev.service").read_text(encoding="utf-8")
+    ingress = (systemd / "ls-vision-ingress.service").read_text(encoding="utf-8")
+
+    assert "config/production.yaml" in production
+    assert "CAMERA_DASHBOARD_PORT=28080" in development
+    assert "CAMERA_INPUT_RTSP_BASE=rtsp://127.0.0.1:28554" in development
+    assert "Conflicts=ls-vision.service" not in development
+    assert "interfaces.host_ingress" in ingress
+    assert "127.0.0.1:18080" in ingress
+    assert "127.0.0.1:8000" in ingress
+    assert "tbox.service" not in ingress

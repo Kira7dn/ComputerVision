@@ -35,6 +35,8 @@ EVIDENCE_RUN_CACHE_LOCK = Lock()
 EVIDENCE_RUN_CACHE: dict[tuple[str, str], tuple[int, Path | None]] = {}
 DASHBOARD_PORT = int(os.environ.get("CAMERA_DASHBOARD_PORT", "18080"))
 MOCK_MEDIA_PORT = int(os.environ.get("CAMERA_MOCK_MEDIA_PORT", "18081"))
+PUBLIC_HLS_PORT = int(os.environ.get("CAMERA_PUBLIC_HLS_PORT", "8888"))
+PUBLIC_WEBRTC_PORT = int(os.environ.get("CAMERA_PUBLIC_WEBRTC_PORT", "8889"))
 
 
 def _config_fingerprint() -> tuple[object, ...]:
@@ -188,8 +190,12 @@ def _camera_definitions(stream_host: str = "localhost") -> list[dict[str, object
                         else None
                     ),
                     "output": output_url,
-                    "webrtc_url": f"http://{stream_host}:8889/{output_path}/whep",
-                    "hls_url": f"http://{stream_host}:8888/{output_path}/index.m3u8",
+                    "webrtc_url": (
+                        f"http://{stream_host}:{PUBLIC_WEBRTC_PORT}/{output_path}/whep"
+                    ),
+                    "hls_url": (
+                        f"http://{stream_host}:{PUBLIC_HLS_PORT}/{output_path}/index.m3u8"
+                    ),
                     "functions": config.get("functions", {}),
                 }
             )
@@ -242,6 +248,11 @@ def _processes() -> list[dict[str, int | str]]:
                 or part in {"application.camera_worker", "application.mock_camera_worker"}
                 for part in parts
             ):
+                continue
+            if "--config" not in parts:
+                continue
+            config_index = parts.index("--config")
+            if config_index + 1 >= len(parts) or Path(parts[config_index + 1]) != CONFIG_PATH:
                 continue
             stat = (entry / "stat").read_text(encoding="ascii")
             rest = stat[stat.rfind(")") + 2 :].split()

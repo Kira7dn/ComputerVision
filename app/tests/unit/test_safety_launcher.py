@@ -12,20 +12,22 @@ ROOT = Path(__file__).parents[3]
 
 
 def test_jetson_dev_launcher_uses_source_sync_and_vite_hmr() -> None:
-    launcher = (ROOT / "app" / "deploy" / "powershell" / "start-jetson-dev.ps1").read_text(encoding="utf-8")
+    launcher = (ROOT / "app" / "deploy" / "powershell" / "deploy-jetson-dev.ps1").read_text(encoding="utf-8")
     assert "jetson_sync.py" in launcher
-    assert "MediaMTX" not in launcher
-    assert "Vite HMR" in launcher
+    assert "vite.js" in launcher
     assert "ssh" in launcher
     assert "interfaces.mock_media_server" in launcher
     assert "http.server" not in launcher
     assert "start.ps1" not in launcher
+    assert "18080:127.0.0.1:28080" in launcher
+    assert "8888:127.0.0.1:28888" in launcher
+    assert "8889:127.0.0.1:28889" in launcher
 
 
-def test_package_has_only_the_three_jetson_entrypoints() -> None:
+def test_package_has_only_the_supported_jetson_entrypoints() -> None:
     package = (ROOT / "package.json").read_text(encoding="utf-8")
     assert '"dev"' in package
-    assert '"check"' in package
+    assert '"test"' in package
     assert '"deploy"' in package
     assert '"wsl:' not in package
     assert '"docker:' not in package
@@ -104,8 +106,38 @@ def test_live_output_follows_rtsp_sample_contract() -> None:
     assert 'make_element("nvv4l2h264enc", "output-encoder")' in pipeline
     assert 'make_element("rtspclientsink", "rtsp-output")' in pipeline
     assert 'output_queue.set_property("leaky", 2)' in pipeline
-    assert "deploy-jetson-native.ps1" in launcher
+    assert "deploy-jetson-dev.ps1" in launcher
     assert "tbox_lab.ps1" not in launcher
+
+
+def test_jetson_dev_service_is_isolated_from_production() -> None:
+    service = (ROOT / "app" / "deploy" / "systemd" / "ls-vision-dev.service").read_text(
+        encoding="utf-8"
+    )
+
+    assert "Conflicts=ls-vision.service" not in service
+    assert "CAMERA_CONFIG=/opt/ls-vision-dev/current/app/config/dev.yaml" in service
+    assert "CAMERA_DASHBOARD_PORT=28080" in service
+    assert "CAMERA_INPUT_RTSP_BASE=rtsp://127.0.0.1:28554" in service
+    assert "CAMERA_OUTPUT_RTSP_BASE=rtsp://127.0.0.1:28554" in service
+    assert "MTX_HLSADDRESS=:28888" in service
+    assert "MTX_WEBRTCADDRESS=:28889" in service
+
+    launcher = (ROOT / "app" / "deploy" / "powershell" / "deploy-jetson-dev.ps1").read_text(
+        encoding="utf-8"
+    )
+    assert "systemctl enable --now ls-vision-dev.service" not in launcher
+    assert "systemctl disable --now ls-vision-dev.service" in launcher
+
+
+def test_vision_ingress_has_no_tbox_service_dependency() -> None:
+    ingress = (ROOT / "app" / "deploy" / "systemd" / "ls-vision-ingress.service").read_text(
+        encoding="utf-8"
+    )
+
+    assert "tbox.service" not in ingress
+    assert "After=network-online.target" in ingress
+    assert "Wants=network-online.target" in ingress
 
 
 def test_config_routes_functions_per_camera() -> None:

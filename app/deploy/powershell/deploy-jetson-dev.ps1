@@ -38,7 +38,7 @@ if ($Action -eq 'cleanup') {
     $remoteStop = @'
 set -e
 SUDO_PASSWORD='$cleanupPassword'
-printf '%s\n' "$SUDO_PASSWORD" | sudo -S -p '' systemctl stop ls-vision-dev.service
+printf '%s\n' "$SUDO_PASSWORD" | sudo -S -p '' systemctl disable --now ls-vision-dev.service
 '@
     $remoteStop = $remoteStop.Replace(([char]36 + 'cleanupPassword'), $cleanupPassword)
     $remoteStop = $remoteStop -replace "`r`n", "`n"
@@ -59,7 +59,9 @@ $frontModelSha256 = '659727c4d4839adc4992a254409a54259a8756a743f2d567bf5fdc6579f
 $serviceName = if ($DeploymentProfile -eq 'production') { 'ls-vision.service' } else { 'ls-vision-dev.service' }
 $servicePath = Join-Path $appPath "deploy\systemd\$serviceName"
 $mediaServicePath = Join-Path $appPath 'deploy\systemd\mediamtx.service'
-foreach ($required in @($appPath, $servicePath, $mediaServicePath, $frontModelPath, $Mock360Directory)) {
+$mdnsServicePath = Join-Path $appPath 'deploy\systemd\ls-vision-mdns.service'
+$ingressServicePath = Join-Path $appPath 'deploy\systemd\ls-vision-ingress.service'
+foreach ($required in @($appPath, $servicePath, $mediaServicePath, $mdnsServicePath, $ingressServicePath, $frontModelPath, $Mock360Directory)) {
     if (-not (Test-Path -LiteralPath $required)) {
         throw "Jetson development deployment input is missing: $required"
     }
@@ -104,8 +106,8 @@ if ($Action -eq 'start') {
             }
         }
         $processes += Start-Process -FilePath $python -ArgumentList @($syncScript, '--root', $cameraPath, '--jetson', $RemoteHost) -WorkingDirectory $cameraPath -NoNewWindow -PassThru
-        $processes += Start-Process -FilePath 'ssh' -ArgumentList @('-o','ExitOnForwardFailure=yes','-o','ServerAliveInterval=3','-o','ServerAliveCountMax=2','-N','-L','18080:127.0.0.1:18080',$RemoteHost) -NoNewWindow -PassThru
-        $processes += Start-Process -FilePath 'ssh' -ArgumentList @('-o','ExitOnForwardFailure=yes','-o','ServerAliveInterval=3','-o','ServerAliveCountMax=2','-N','-L','8888:127.0.0.1:8888','-L','8889:127.0.0.1:8889',$RemoteHost) -NoNewWindow -PassThru
+        $processes += Start-Process -FilePath 'ssh' -ArgumentList @('-o','ExitOnForwardFailure=yes','-o','ServerAliveInterval=3','-o','ServerAliveCountMax=2','-N','-L','18080:127.0.0.1:28080',$RemoteHost) -NoNewWindow -PassThru
+        $processes += Start-Process -FilePath 'ssh' -ArgumentList @('-o','ExitOnForwardFailure=yes','-o','ServerAliveInterval=3','-o','ServerAliveCountMax=2','-N','-L','8888:127.0.0.1:28888','-L','8889:127.0.0.1:28889',$RemoteHost) -NoNewWindow -PassThru
         $processes += Start-Process -FilePath $node -ArgumentList @($viteScript,'--host','0.0.0.0','--port',"$VitePort") -WorkingDirectory $webPath -NoNewWindow -PassThru
         $processes += Start-Process -FilePath $python -ArgumentList @('-m','interfaces.mock_media_server','--root',$Mock360Directory,'--host','127.0.0.1','--port',"$MockMediaPort") -WorkingDirectory $sourcePath -NoNewWindow -PassThru
         Write-OK "Development endpoint active at http://127.0.0.1:$VitePort/dashboard.html"
@@ -121,7 +123,7 @@ if ($Action -eq 'start') {
         $remoteStop = @'
 set -e
 SUDO_PASSWORD='$SudoPassword'
-printf '%s\n' "$SUDO_PASSWORD" | sudo -S -p '' systemctl stop ls-vision-dev.service
+printf '%s\n' "$SUDO_PASSWORD" | sudo -S -p '' systemctl disable --now ls-vision-dev.service
 '@
         $remoteStop = $remoteStop.Replace(([char]36 + 'SudoPassword'), $SudoPassword)
         $remoteStop = $remoteStop -replace "`r`n", "`n"
@@ -143,6 +145,8 @@ $remoteModelArchive = "/tmp/$(Split-Path -Leaf $tempModelArchive)"
 $remoteMock360Archive = "/tmp/$(Split-Path -Leaf $tempMock360Archive)"
 $remoteService = "/tmp/$serviceName"
 $remoteMediaService = '/tmp/mediamtx.service'
+$remoteMdnsService = '/tmp/ls-vision-mdns.service'
+$remoteIngressService = '/tmp/ls-vision-ingress.service'
 
 try {
     Write-Step "Checking Jetson $RemoteHost"
@@ -177,8 +181,14 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Unable to copy synchronized 360 mock videos' }
     scp -q $servicePath "${RemoteHost}:$remoteService"
     if ($LASTEXITCODE -ne 0) { throw 'Unable to copy LS-Vision systemd unit' }
-    scp -q $mediaServicePath "${RemoteHost}:$remoteMediaService"
-    if ($LASTEXITCODE -ne 0) { throw 'Unable to copy MediaMTX systemd unit' }
+    if ($DeploymentProfile -eq 'production') {
+        scp -q $mediaServicePath "${RemoteHost}:$remoteMediaService"
+        if ($LASTEXITCODE -ne 0) { throw 'Unable to copy MediaMTX systemd unit' }
+        scp -q $mdnsServicePath "${RemoteHost}:$remoteMdnsService"
+        if ($LASTEXITCODE -ne 0) { throw 'Unable to copy LS-Vision mDNS systemd unit' }
+        scp -q $ingressServicePath "${RemoteHost}:$remoteIngressService"
+        if ($LASTEXITCODE -ne 0) { throw 'Unable to copy LS-Vision ingress systemd unit' }
+    }
 
     $remoteScript = @'
 set -euo pipefail
@@ -192,42 +202,79 @@ DEPLOYMENT_PROFILE='$DeploymentProfile'
 SERVICE_NAME='$serviceName'
 REMOTE_SERVICE='$remoteService'
 REMOTE_MEDIA_SERVICE='$remoteMediaService'
+REMOTE_MDNS_SERVICE='$remoteMdnsService'
+REMOTE_INGRESS_SERVICE='$remoteIngressService'
 
 sudo_cmd() { printf '%s\n' "$SUDO_PASSWORD" | sudo -S -p '' "$@"; }
 
-sudo_cmd systemctl stop ls-vision.service >/dev/null 2>&1 || true
-sudo_cmd systemctl stop ls-vision-dev.service >/dev/null 2>&1 || true
-sudo_cmd systemctl stop mediamtx.service >/dev/null 2>&1 || true
-sudo_cmd mkdir -p "$RELEASE_ROOT" "$REMOTE_ROOT/releases" "$REMOTE_ROOT/data/status" "$REMOTE_ROOT/data/state" "$REMOTE_ROOT/data/evidence" "$REMOTE_ROOT/data/queue" "$REMOTE_ROOT/data/logs" "$REMOTE_ROOT/data/mock-videos/cameras/sync-lite" /opt/ls-vision/models/openpilot
+if [ "$DEPLOYMENT_PROFILE" = production ]; then
+  sudo_cmd systemctl stop ls-vision.service >/dev/null 2>&1 || true
+  sudo_cmd systemctl stop mediamtx.service >/dev/null 2>&1 || true
+else
+  sudo_cmd systemctl stop ls-vision-dev.service >/dev/null 2>&1 || true
+fi
+sudo_cmd mkdir -p "$RELEASE_ROOT" "$REMOTE_ROOT/releases" "$REMOTE_ROOT/runtime" "$REMOTE_ROOT/data/status" "$REMOTE_ROOT/data/state" "$REMOTE_ROOT/data/evidence" "$REMOTE_ROOT/data/queue" "$REMOTE_ROOT/data/logs" "$REMOTE_ROOT/data/mock-videos/cameras/sync-lite" /opt/ls-vision/models/openpilot
 sudo_cmd tar -xzf "$REMOTE_ARCHIVE" -C "$RELEASE_ROOT"
-sudo_cmd tar -xzf "$REMOTE_MODEL_ARCHIVE" -C /opt/ls-vision/models
+if [ "$DEPLOYMENT_PROFILE" = production ] || ! printf '%s  %s\n' "$FRONT_MODEL_SHA256" /opt/ls-vision/models/openpilot/driving_supercombo.onnx | sha256sum -c - >/dev/null 2>&1; then
+  sudo_cmd tar -xzf "$REMOTE_MODEL_ARCHIVE" -C /opt/ls-vision/models
+fi
 sudo_cmd tar -xzf "$REMOTE_MOCK_360_ARCHIVE" -C "$REMOTE_ROOT/data/mock-videos/cameras/sync-lite"
-sudo_cmd install -m 644 /dev/null /opt/ls-vision/runtime/mediamtx.conf
+sudo_cmd install -m 644 /dev/null "$REMOTE_ROOT/runtime/mediamtx.conf"
 sudo_cmd rm -f -- /opt/ls-vision/models/openpilot/dmonitoring_model.onnx
 printf '%s  %s\n' "$FRONT_MODEL_SHA256" /opt/ls-vision/models/openpilot/driving_supercombo.onnx | sha256sum -c -
 sudo_cmd chown -R letron:letron "$RELEASE_ROOT"
 sudo_cmd ln -sfn "$RELEASE_ROOT" "$REMOTE_ROOT/current"
 sudo_cmd install -m 644 "$REMOTE_SERVICE" "/etc/systemd/system/$SERVICE_NAME"
-sudo_cmd install -m 644 "$REMOTE_MEDIA_SERVICE" /etc/systemd/system/mediamtx.service
-rm -f "$REMOTE_ARCHIVE" "$REMOTE_MODEL_ARCHIVE" "$REMOTE_MOCK_360_ARCHIVE" "$REMOTE_SERVICE" "$REMOTE_MEDIA_SERVICE"
+if [ "$DEPLOYMENT_PROFILE" = production ]; then
+  sudo_cmd install -m 644 "$REMOTE_MEDIA_SERVICE" /etc/systemd/system/mediamtx.service
+  sudo_cmd install -m 644 "$REMOTE_MDNS_SERVICE" /etc/systemd/system/ls-vision-mdns.service
+  sudo_cmd install -m 644 "$REMOTE_INGRESS_SERVICE" /etc/systemd/system/ls-vision-ingress.service
+  sudo_cmd rm -f -- /etc/systemd/system/tbox.service.d/50-ls-vision-ingress.conf
+fi
+rm -f "$REMOTE_ARCHIVE" "$REMOTE_MODEL_ARCHIVE" "$REMOTE_MOCK_360_ARCHIVE" "$REMOTE_SERVICE"
+if [ "$DEPLOYMENT_PROFILE" = production ]; then rm -f "$REMOTE_MEDIA_SERVICE" "$REMOTE_MDNS_SERVICE" "$REMOTE_INGRESS_SERVICE"; fi
 sudo_cmd systemctl daemon-reload
 if [ "$DEPLOYMENT_PROFILE" = production ]; then
+  while sudo_cmd iptables -t nat -D PREROUTING -p tcp --dport 80 -j REDIRECT --to-port 8000 >/dev/null 2>&1; do :; done
+  while sudo_cmd iptables -t nat -D OUTPUT -p tcp --dport 80 -j REDIRECT --to-port 8000 >/dev/null 2>&1; do :; done
+  while sudo_cmd ip6tables -t nat -D PREROUTING -p tcp --dport 80 -j REDIRECT --to-port 8000 >/dev/null 2>&1; do :; done
+  while sudo_cmd ip6tables -t nat -D OUTPUT -p tcp --dport 80 -j REDIRECT --to-port 8000 >/dev/null 2>&1; do :; done
+  sudo_cmd systemctl enable --now ls-vision-mdns.service
   sudo_cmd systemctl enable --now mediamtx.service
   sudo_cmd systemctl enable --now ls-vision.service
+  sudo_cmd systemctl enable --now ls-vision-ingress.service
 else
-  sudo_cmd systemctl enable --now ls-vision-dev.service
+  sudo_cmd systemctl disable ls-vision-dev.service >/dev/null 2>&1 || true
+  sudo_cmd systemctl start ls-vision-dev.service
 fi
 
+HEALTH_PORT=18080
+if [ "$DEPLOYMENT_PROFILE" = development ]; then HEALTH_PORT=28080; fi
 for attempt in $(seq 1 60); do
-  if curl --fail --silent --show-error --max-time 5 --output /dev/null 'http://127.0.0.1:18080/health/live' \
-    && curl --fail --silent --show-error --max-time 5 --output /dev/null 'http://127.0.0.1:18080/health/ready'; then
+  if curl --fail --silent --show-error --max-time 5 --output /dev/null "http://127.0.0.1:$HEALTH_PORT/health/live" \
+    && curl --fail --silent --show-error --max-time 5 --output /dev/null "http://127.0.0.1:$HEALTH_PORT/health/ready"; then
+    if [ "$DEPLOYMENT_PROFILE" = production ]; then
+      systemctl is-active --quiet ls-vision-ingress.service
+      systemctl is-active --quiet ls-vision-mdns.service
+      curl --fail --silent --show-error --max-time 5 --header 'Host: vision.local' --output /dev/null 'http://127.0.0.1/dashboard.html'
+      curl --fail --silent --show-error --max-time 5 --header 'Host: vision.local' --output /dev/null 'http://127.0.0.1/health/ready'
+      getent hosts vision.local >/dev/null
+      if sudo_cmd iptables -t nat -S | grep -Eq -- '--dport 80 .*--to-ports? 8000|--dport 80 .*--to-port 8000'; then
+        echo 'Global IPv4 NAT redirect from port 80 to 8000 is still present.' >&2
+        exit 1
+      fi
+      if sudo_cmd ip6tables -t nat -S | grep -Eq -- '--dport 80 .*--to-ports? 8000|--dport 80 .*--to-port 8000'; then
+        echo 'Global IPv6 NAT redirect from port 80 to 8000 is still present.' >&2
+        exit 1
+      fi
+    fi
     for old_release in "$REMOTE_ROOT"/releases/*; do
       [ "$old_release" = "$RELEASE_ROOT" ] && continue
       [ -d "$old_release" ] || continue
       sudo_cmd rm -rf -- "$old_release"
     done
     sudo_cmd rm -f -- "$REMOTE_ROOT/data/status/hot-reload.pid"
-    curl --fail --silent --show-error --max-time 5 'http://127.0.0.1:18080/health/live'
+    curl --fail --silent --show-error --max-time 5 "http://127.0.0.1:$HEALTH_PORT/health/live"
     exit 0
   fi
   sleep 2
@@ -247,6 +294,8 @@ exit 1
     $remoteScript = $remoteScript.Replace(([char]36 + 'serviceName'), $serviceName)
     $remoteScript = $remoteScript.Replace(([char]36 + 'remoteService'), $remoteService)
     $remoteScript = $remoteScript.Replace(([char]36 + 'remoteMediaService'), $remoteMediaService)
+    $remoteScript = $remoteScript.Replace(([char]36 + 'remoteMdnsService'), $remoteMdnsService)
+    $remoteScript = $remoteScript.Replace(([char]36 + 'remoteIngressService'), $remoteIngressService)
     $remoteScript = $remoteScript -replace "`r`n", "`n"
     $remoteScript | ssh $RemoteHost "tr -d '\r' | bash -s"
     if ($LASTEXITCODE -ne 0) { throw "Jetson $DeploymentProfile deployment failed" }
