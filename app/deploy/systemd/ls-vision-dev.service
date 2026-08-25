@@ -1,0 +1,35 @@
+[Unit]
+Description=LS-Vision Jetson development runtime with source supervisor
+After=network-online.target
+Wants=network-online.target
+Conflicts=ls-vision.service mediamtx.service
+
+[Service]
+Type=simple
+User=letron
+Group=letron
+WorkingDirectory=/opt/ls-vision-dev/current/app
+EnvironmentFile=/etc/ls-vision/ls-vision-dev.env
+Environment=PYTHONPATH=/opt/ls-vision-dev/current/app/src
+Environment=CAMERA_CONFIG=/opt/ls-vision-dev/current/app/config/production-jetson-native.yaml
+Environment=CAMERA_WEB_ROOT=/opt/ls-vision-dev/current/app/web
+Environment=CAMERA_RUNTIME_ROOT=/opt/ls-vision-dev/data
+Environment=CAMERA_MODELS_DIR=/opt/ls-vision/models
+Environment=CAMERA_FACE_LIBRARY_DIR=/opt/ls-vision/face_library
+Environment=CAMERA_EVIDENCE_DIR=/opt/ls-vision-dev/data/evidence
+Environment=CAMERA_STATE_DIR=/opt/ls-vision-dev/data/state
+Environment=CAMERA_STATUS_DIR=/opt/ls-vision-dev/data/status
+Environment=CAMERA_DASHBOARD_HOST=0.0.0.0
+Environment=DEEPSTREAM_ROOT=/opt/ls-vision/runtime/deepstream
+Environment=GST_PLUGIN_PATH=/opt/ls-vision/runtime/deepstream/lib/gst-plugins:/usr/lib/aarch64-linux-gnu/gstreamer-1.0
+Environment=GST_PLUGIN_SYSTEM_PATH_1_0=/usr/lib/aarch64-linux-gnu/gstreamer-1.0
+Environment=LD_LIBRARY_PATH=/opt/ls-vision/runtime/deepstream/lib:/opt/ls-vision/runtime/deepstream/lib/gst-plugins:/opt/ls-vision/runtime/triton/lib:/usr/local/cuda/lib64:/usr/lib/aarch64-linux-gnu/nvidia:/usr/lib/aarch64-linux-gnu
+ExecStart=/opt/ls-vision/runtime/venv/bin/python3 /opt/ls-vision-dev/current/app/deploy/dev/jetson_supervisor.py --root /opt/ls-vision-dev/current --config /opt/ls-vision-dev/current/app/config/production-jetson-native.yaml --runtime /opt/ls-vision-dev/data --mediamtx-config /opt/ls-vision-dev/current/app/deploy/docker/mediamtx.yml --mediamtx-bin /opt/ls-vision/runtime/bin/mediamtx --pid-file /opt/ls-vision-dev/data/status/jetson-supervisor.pid
+Restart=always
+RestartSec=5
+KillMode=mixed
+TimeoutStopSec=30
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

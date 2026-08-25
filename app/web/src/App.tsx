@@ -21,7 +21,20 @@ function eventTimestamp(event: EventRecord) {
 
 function mergeEvents(current: EventRecord[], incoming: EventRecord[]) {
   const entries = new Map(current.map((event) => [eventId(event), event]))
-  for (const event of incoming) entries.set(eventId(event), event)
+  for (const event of incoming) {
+    const id = eventId(event)
+    const previous = entries.get(id)
+    entries.set(id, previous
+      ? {
+          ...previous,
+          ...event,
+          details: { ...previous.details, ...event.details },
+          start_record: Object.keys(event.start_record ?? {}).length > 0
+            ? event.start_record
+            : previous.start_record,
+        }
+      : event)
+  }
   return [...entries.values()].sort((left, right) => eventTimestamp(right) - eventTimestamp(left)).slice(0, MAX_EVENTS)
 }
 
@@ -32,6 +45,7 @@ function App() {
   const [apiError, setApiError] = useState(false)
   const [eventsLoading, setEventsLoading] = useState(true)
   const [eventsError, setEventsError] = useState(false)
+  const [focusedCameraId, setFocusedCameraId] = useState<string | null>(null)
   const eventCursor = useRef<number | null>(null)
   const eventRunId = useRef<string | null>(null)
   const eventsRequestInFlight = useRef(false)
@@ -72,7 +86,7 @@ function App() {
       }
       if (data.run_id !== eventRunId.current) {
         eventRunId.current = data.run_id
-        eventCursor.current = data.cursor
+        eventCursor.current = null
         setEvents([])
         return
       }
@@ -107,15 +121,21 @@ function App() {
   const handlePlayerState = useCallback((cameraId: string, state: PlayerState) => {
     setPlayerStates((current) => {
       const previous = current[cameraId]
-      if (previous && previous.live === state.live && previous.error === state.error && previous.connecting === state.connecting && previous.transport === state.transport && previous.jitterBufferDelayMs === state.jitterBufferDelayMs && previous.message === state.message) return current
+      if (previous && previous.live === state.live && previous.error === state.error && previous.connecting === state.connecting && previous.transport === state.transport && previous.videoLatencyMs === state.videoLatencyMs && previous.videoLatencySource === state.videoLatencySource && previous.message === state.message) return current
       return { ...current, [cameraId]: state }
     })
   }, [])
 
+  const handleCameraFocus = useCallback((cameraId: string) => {
+    setFocusedCameraId((current) => current === cameraId ? null : cameraId)
+  }, [])
+
   const cameras: CameraDetail[] = metrics?.pipeline.camera_details ?? []
   const liveCount = cameras.filter((camera) => playerStates[camera.id]?.live).length
-  const jitterValues = cameras.map((camera) => playerStates[camera.id]?.jitterBufferDelayMs).filter((value): value is number => value != null)
-  const browserLatency = liveCount === 0 ? (runtimeReady.current ? 'connecting' : 'offline') : jitterValues.length ? `jitter ${Math.max(...jitterValues).toFixed(0)} ms` : 'connected'
+  const glassLatencyValues = cameras.map((camera) => playerStates[camera.id]?.videoLatencyMs).filter((value): value is number => value != null)
+  const glassLatency = liveCount === 0
+    ? (runtimeReady.current ? 'connecting' : 'offline')
+    : glassLatencyValues.length ? `${Math.max(...glassLatencyValues).toFixed(0)} ms` : 'đang đo'
   const status = liveCount > 0
     ? liveCount === cameras.length ? 'LIVE' : `LIVE (${liveCount}/${cameras.length})`
     : apiError || !metrics?.pipeline.running ? 'Runtime offline' : 'Connecting...'
@@ -124,16 +144,26 @@ function App() {
   useEffect(() => {
     const ids = new Set(cameraKey ? cameraKey.split('|') : [])
     setPlayerStates((current) => Object.fromEntries(Object.entries(current).filter(([id]) => ids.has(id))))
+    setFocusedCameraId((current) => current && ids.has(current) ? current : null)
   }, [cameraKey])
+
+  const hasFocusedCamera = focusedCameraId !== null
+  const focusedLayoutClass = hasFocusedCamera
+    ? cameras.length === 1
+      ? 'camera-wall-focused-single'
+      : cameras.length === 2
+        ? 'camera-wall-focused-dual'
+        : 'camera-wall-focused-multi'
+    : ''
 
   return (
     <TooltipProvider>
       <main className="dashboard-shell mx-auto flex min-h-screen w-full max-w-[1600px] flex-col gap-2 px-3 py-4 sm:px-4 md:h-[100dvh] md:overflow-hidden lg:px-6">
-        <DashboardHeader metrics={metrics} status={status} apiError={apiError} browserLatency={browserLatency} />
+        <DashboardHeader metrics={metrics} status={status} apiError={apiError} glassLatency={glassLatency} />
         <div className="dashboard-content grid min-h-0 flex-1 gap-4 md:overflow-hidden lg:grid-cols-[minmax(0,1fr)_minmax(320px,380px)]">
           <section className="flex min-h-0 min-w-0 flex-col gap-4 md:overflow-hidden">
-            <div className="camera-wall grid min-h-0 flex-1 grid-cols-1 content-start gap-3 md:grid-rows-2 md:overflow-hidden md:grid-cols-2">
-              {cameras.map((camera) => <CameraCard key={camera.id} camera={camera} onStateChange={handlePlayerState} />)}
+            <div className={`camera-wall grid min-h-0 flex-1 grid-cols-1 content-start gap-3 md:overflow-hidden md:grid-cols-2 ${hasFocusedCamera ? `camera-wall-focused ${focusedLayoutClass}` : ''}`}>
+              {cameras.map((camera) => <CameraCard key={camera.id} camera={camera} focused={focusedCameraId === camera.id} onFocus={handleCameraFocus} onStateChange={handlePlayerState} />)}
               {cameras.length === 0 && <div className="camera-wall-empty"><span>{apiError ? 'Không thể đọc trạng thái camera' : 'Chưa có camera cấu hình'}</span><small>{apiError ? 'Dữ liệu cuối cùng sẽ được giữ lại khi kết nối lại.' : 'Runtime chưa cung cấp camera detail.'}</small></div>}
             </div>
           </section>

@@ -8,7 +8,7 @@ Frigate trở lại pipeline.
 
 Ba lỗi được xử lý:
 
-1. `track_id` của người trên `camera_dahua` bị tạo lại gần như ở mỗi frame, làm
+1. `track_id` của người trên `DMS` bị tạo lại gần như ở mỗi frame, làm
    lịch sử smoking classifier luôn chỉ có một mẫu và không thể xác nhận theo thời
    gian.
 2. Hai camera mock thường chết ở worker epoch 1 rồi được supervisor khởi động lại
@@ -132,7 +132,7 @@ Kiểm thử và static checks:
 Acceptance cô lập `20260820T092003-ef825101`:
 
 - Cả ba camera có heartbeat frame mới và API báo ready.
-- `camera_face`, `camera_safety`, `camera_dahua` đều giữ worker epoch 1.
+- `camera_face`, `camera_safety`, `DMS` đều giữ worker epoch 1.
 - Không còn lỗi `No supported authentication protocol` trong phần log của run.
 - Dahua giữ nguyên `track_id=1` qua chuỗi 10 mẫu; smoking history của ID này tích
   đủ bốn score thay vì một score trên nhiều ID khác nhau.

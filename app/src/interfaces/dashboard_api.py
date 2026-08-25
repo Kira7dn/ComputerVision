@@ -190,10 +190,12 @@ def _evidence_metrics() -> dict[str, object]:
 
 
 def _event_feed(after: int = 0, limit: int | None = None) -> dict[str, object]:
-    """Return one dashboard record per event start.
+    """Return one latest lifecycle snapshot per event ID.
 
-    END records remain internal evidence for lifecycle closure, but are not a
-    dashboard event and never become a user notification.
+    The evidence journal is append-only, but the dashboard projection is
+    keyed by event_id. START creates a row, UPDATE replaces that row, and END
+    closes that same row. This keeps lifecycle records out of the request path
+    without scanning every event directory.
     """
     try:
         raw_config = load_raw_config(CONFIG_PATH)
@@ -210,41 +212,40 @@ def _event_feed(after: int = 0, limit: int | None = None) -> dict[str, object]:
             return {"run_id": run_id, "cursor": 0, "events": []}
 
         lines = events_path.read_text(encoding="utf-8").splitlines()
-        start = max(0, int(after))
-        if start == 0 and limit is not None and limit > 0:
-            start = max(0, len(lines) - limit)
-        events: list[dict[str, object]] = []
-        severity_by_function = {
-            "face_recognition": ("event", "Sự kiện"),
-            "smoking_behavior": ("warning", "Cảnh báo"),
-            "fire_smoke": ("warning", "Cảnh báo"),
-        }
-        for sequence, line in enumerate(lines[start:], start=start + 1):
+        cursor = max(0, int(after))
+        scan_start = 0 if cursor == 0 else min(cursor, len(lines))
+        latest_by_event: dict[str, tuple[int, dict[str, object]]] = {}
+        for sequence, line in enumerate(lines[scan_start:], start=scan_start + 1):
             if not line.strip():
                 continue
             try:
                 record = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            record_type = str(record.get("record_type") or "").upper()
-            if record_type != "START":
+            if not isinstance(record, dict):
                 continue
+            record_type = str(record.get("record_type") or "").upper()
+            if record_type not in {"START", "UPDATE", "END"}:
+                continue
+            event_id = str(record.get("event_id") or "").strip()
+            if event_id:
+                latest_by_event[event_id] = (sequence, record)
 
-            event_file: Path | None = None
+        severity_by_function = {
+            "face_recognition": ("event", "Sự kiện"),
+            "smoking_behavior": ("warning", "Cảnh báo"),
+            "fire_smoke": ("warning", "Cảnh báo"),
+            "dms": ("warning", "Cảnh báo"),
+        }
+        events: list[dict[str, object]] = []
+        ordered = sorted(latest_by_event.values(), key=lambda item: item[0])
+        if cursor == 0 and limit is not None and limit > 0:
+            ordered = ordered[-limit:]
+        for sequence, record in ordered:
+            record_type = str(record.get("record_type") or "").upper()
+            details_value = record.get("details")
+            details = dict(details_value) if isinstance(details_value, dict) else {}
             event_path = Path(str(record.get("event_path", "")))
-            if event_path and not event_path.is_absolute() and ".." not in event_path.parts:
-                candidate = latest / event_path / "event.json"
-                if candidate.is_file():
-                    event_file = candidate
-            details: dict[str, object] = {}
-            if event_file is not None:
-                try:
-                    loaded = json.loads(event_file.read_text(encoding="utf-8"))
-                    if isinstance(loaded, dict):
-                        details = loaded
-                except (OSError, json.JSONDecodeError):
-                    pass
-
             function = str(record.get("function") or details.get("function") or "event")
             classification = str(
                 record.get("classification") or details.get("classification") or function
@@ -260,6 +261,8 @@ def _event_feed(after: int = 0, limit: int | None = None) -> dict[str, object]:
                 event_name = "Hành vi hút thuốc"
             elif function == "fire_smoke":
                 event_name = "Lửa" if classification == "fire" else "Khói"
+            elif function == "dms":
+                event_name = f"DMS: {str(record.get('label') or details.get('label') or classification).replace('_', ' ')}"
             else:
                 event_name = {
                     "recognized": "Đã nhận diện",
@@ -274,13 +277,21 @@ def _event_feed(after: int = 0, limit: int | None = None) -> dict[str, object]:
             score_value = (
                 None
                 if function == "face_recognition" and classification == "unrecognized"
-                else record.get("score", details.get("last_score"))
+                else record.get("score")
+                if record.get("score") is not None
+                else details.get("score", details.get("last_score"))
             )
             try:
                 score = round(float(score_value), 4) if score_value is not None else None
             except (TypeError, ValueError):
                 score = None
-            timestamp = record.get("started_at") or details.get("started_at")
+            timestamp = (
+                record.get("timestamp")
+                or record.get("updated_at")
+                or record.get("ended_at")
+                or record.get("started_at")
+                or details.get("started_at")
+            )
             thumbnail_url = None
             image_url = None
             thumbnail = latest / event_path / "snapshots" / "start-0001-thumbnail.jpg"
@@ -303,21 +314,29 @@ def _event_feed(after: int = 0, limit: int | None = None) -> dict[str, object]:
                     "/api/event-thumbnail?run_id="
                     f"{quote(run_id)}&event_path={quote(event_path.as_posix())}&variant=original"
                 )
+            lifecycle_state = str(record.get("status") or "active").lower()
+            if lifecycle_state not in {"active", "ended"}:
+                lifecycle_state = "ended" if record_type == "END" else "active"
             events.append(
                 {
                     "sequence": sequence,
                     "event_id": str(record.get("event_id") or details.get("event_id") or sequence),
                     "camera": str(record.get("camera_id") or details.get("camera_id") or "unknown"),
                     "event_name": event_name,
+                    "label": record.get("label") or details.get("label") or classification,
                     "name": identity or "unknown",
                     "function": function,
                     "classification": classification,
                     "severity": severity,
                     "severity_label": severity_label,
                     "timestamp": timestamp,
+                    "started_at": record.get("started_at"),
+                    "updated_at": record.get("updated_at") or timestamp,
+                    "ended_at": record.get("ended_at"),
                     "confidence": score,
-                    "state": "started",
+                    "state": lifecycle_state,
                     "record_type": record_type,
+                    "lifecycle": record_type,
                     "region_track_id": details.get("region_track_id"),
                     "confirmation_state": details.get("confirmation_state"),
                     "detector_hits": details.get("detector_hits"),
@@ -342,7 +361,7 @@ def _event_feed(after: int = 0, limit: int | None = None) -> dict[str, object]:
                     "thumbnail_url": thumbnail_url,
                     "image_url": image_url,
                     "details": details,
-                    "start_record": record,
+                    "start_record": record if record_type == "START" else {},
                 }
             )
         return {"run_id": run_id, "cursor": len(lines), "events": events}
@@ -471,12 +490,19 @@ def collect_metrics(stream_host: str = "localhost") -> dict[str, object]:
                 "last_frame_age_seconds": last_frame_age,
                 "last_output_age_seconds": output_age,
                 "last_output_pts_ns": runtime_status.get("last_output_pts_ns"),
+                "camera_latency_ms": runtime_status.get("camera_latency_ms"),
+                "camera_source_timestamp": runtime_status.get("camera_source_timestamp"),
+                "camera_latency_source": runtime_status.get(
+                    "camera_latency_source", "unavailable"
+                ),
+                "camera_latency_samples": runtime_status.get("camera_latency_samples", 0),
                 "frame_count": runtime_status.get("frame_count"),
                 "analysis_queue_depth": runtime_status.get("analysis_queue_depth"),
                 "analysis_flow": runtime_status.get("analysis_flow", {}),
                 "worker_epoch": runtime_status.get("worker_epoch"),
                 "analysis_error": runtime_status.get("analysis_error"),
                 "smoking_episodes": analysis_debug.get("smoking_episodes", {}),
+                "dms": analysis_debug.get("dms", {}),
                 "fire_smoke_runtime": analysis_debug.get("fire_smoke_runtime", {}),
             }
         )

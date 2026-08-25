@@ -75,8 +75,13 @@ class EvidenceStore:
         self.peak_score_delta = max(
             0.0, float(evidence_config.get("peak_score_delta", 0.05))
         )
+        self.event_feed_update_interval_seconds = max(
+            0.25,
+            float(evidence_config.get("event_feed_update_interval_seconds", 1.0)),
+        )
         self._events: dict[str, dict[str, Any]] = {}
         self._pending_peaks: dict[str, dict[str, Any]] = {}
+        self._last_event_feed_update_at: dict[str, float] = {}
         self._lock = threading.RLock()
         self.db = sqlite3.connect(
             str(self.root / "index.sqlite3"),
@@ -130,11 +135,23 @@ class EvidenceStore:
         temporary.write_text(json.dumps(event, indent=2), encoding="utf-8")
         temporary.replace(event_dir / "event.json")
 
-    def _append_event_index(self, event: dict[str, Any], record_type: str) -> None:
+    def _append_event_index(
+        self,
+        event: dict[str, Any],
+        record_type: str,
+        *,
+        timestamp: float | None = None,
+        payload: dict[str, Any] | None = None,
+        score: float | None = None,
+        frame_number: int | None = None,
+    ) -> None:
         path = self.root / "events.jsonl"
         key = f"{self.run_id}|{self.worker_epoch}|{event['camera_id']}|{event['function']}|{event['event_id']}|index|{record_type}"
+        if record_type == "UPDATE":
+            key = f"{key}|{timestamp or event.get('updated_at', 0)}"
         if not self._claim(key, path, "event-index"):
             return
+        details = dict(payload or {})
         summary = {
             "record_type": record_type,
             "event_id": event["event_id"],
@@ -148,6 +165,12 @@ class EvidenceStore:
             "status": event["status"],
             "started_at": event["started_at"],
             "ended_at": event.get("ended_at"),
+            "updated_at": timestamp or event.get("updated_at"),
+            "timestamp": timestamp or event.get("updated_at") or event["started_at"],
+            "frame": frame_number,
+            "label": details.get("label") or event.get("label"),
+            "score": score if score is not None else event.get("last_score"),
+            "details": details,
             "event_path": str(self._event_dir(event).relative_to(self.root)),
             "idempotency_key": key,
         }
@@ -218,21 +241,29 @@ class EvidenceStore:
         }
         self._events[event_id] = event
         self._write_event(event)
+        start_payload = {
+            "status": "active",
+            "person_track_id": person_track_id,
+            **(metadata or {}),
+        }
         self.record(
             event_id,
             "START",
-            {
-                "status": "active",
-                "person_track_id": person_track_id,
-                **(metadata or {}),
-            },
+            start_payload,
             frame=frame,
             frame_number=frame_number,
             bbox=bbox,
             score=score,
             force_image=frame is not None,
         )
-        self._append_event_index(event, "START")
+        self._append_event_index(
+            event,
+            "START",
+            timestamp=event["started_at"],
+            payload=start_payload,
+            score=score,
+            frame_number=frame_number,
+        )
         return event_id
 
     def record(
@@ -397,10 +428,35 @@ class EvidenceStore:
             "best_classifier_score",
             "best_object_score",
             "best_signal_sources",
+            "dms_status",
+            "dms_alerts",
+            "active_dms_alerts",
+            "dms_metrics",
+            "dms_evidence",
+            "alert_sequence",
+            "candidate_started_at",
+            "confirmed_at",
+            "last_positive_at",
+            "source_timestamp",
+            "score_semantics",
+            "end_reason",
         ):
             if field in payload:
                 event[field] = payload[field]
+        event["updated_at"] = now
         self._write_event(event)
+        if event.get("function") == "dms" and record_type == "UPDATE":
+            last_published = self._last_event_feed_update_at.get(event_id, 0.0)
+            if now - last_published >= self.event_feed_update_interval_seconds:
+                self._append_event_index(
+                    event,
+                    "UPDATE",
+                    timestamp=now,
+                    payload=payload,
+                    score=score,
+                    frame_number=frame_number,
+                )
+                self._last_event_feed_update_at[event_id] = now
         return True
 
     def _flush_peak(self, event_id: str) -> None:
@@ -454,7 +510,15 @@ class EvidenceStore:
         if classification and event["classification"] != classification:
             event["classification"] = classification
         self._write_event(event)
-        self._append_event_index(event, "END")
+        self._append_event_index(
+            event,
+            "END",
+            timestamp=event["ended_at"],
+            payload=end_payload,
+            score=score,
+            frame_number=frame_number,
+        )
+        self._last_event_feed_update_at.pop(event_id, None)
 
     def close(self) -> None:
         self.db.close()

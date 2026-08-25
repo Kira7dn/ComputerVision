@@ -57,7 +57,7 @@ tự vẽ bbox lên live video, không glob evidence tree trong request path và
 | Media output E2E | HLS manifest thật từ MediaMTX đã trả HTTP 200 cho các output mock; không chỉ kiểm tra process tồn tại |
 | Static/package checks | Root pytest `45 passed`; compileall, Vite lint/build, Compose config và `git diff --check` pass |
 | Dashboard migration | `app/web` đã chuyển sang Vite + React + TypeScript + Tailwind v4 + shadcn/ui; API polling giữ state qua transient failure |
-| Native WSL hot reload | `wsl:start` chạy Vite HMR và `hot_reload.py`; thay đổi backend/config đã được xác minh tự restart runner/API, API vẫn HTTP 200 |
+| Jetson hot reload | `npm run dev` chạy source sync, SSH tunnel và Vite HMR; thay đổi backend/config được restart trên isolated Jetson service |
 | Browser dashboard check | 3 camera cards, event table và event detail dialog hoạt động; HLS fallback ổn định 3/3 camera, không còn CORS lỗi |
 
 Report runtime gần nhất: `.tmp/ls-vision-e2e/final-summary.json` với
@@ -341,7 +341,7 @@ analysis:
 ```
 
 Các field trên được resolve riêng cho từng camera rồi normalize về model
-adapter config. `camera_safety` giữ ROI burner/plume; `camera_dahua` dùng
+adapter config. `camera_safety` giữ ROI burner/plume; `DMS` dùng
 `rois: {}` và do đó fire/smoke chạy toàn frame.
 
 - camera ID không trùng;
@@ -392,33 +392,29 @@ Invariants không được đổi khi tiếp tục refactor:
 - dashboard/MediaMTX chỉ bind localhost trong compose hiện tại;
 - model/face library read-only, runtime data read-write volumes.
 
-PowerShell chỉ là operator client; package scripts là contract hiện hành:
+PowerShell chỉ là operator client; production Docker chạy trực tiếp qua Compose:
 
 ```powershell
-npm run docker:start
-npm run docker:status
-npm run docker:stop
+docker compose -f app\deploy\docker\compose.yaml up -d
+docker compose -f app\deploy\docker\compose.yaml ps
+docker compose -f app\deploy\docker\compose.yaml stop
 ```
 
 Không dùng foreground shell trap để sở hữu production process.
 
 ### Development
 
-Native WSL vẫn được hỗ trợ qua `npm run wsl:start` hoặc `start.ps1 -Mode Dev`; không dùng
-Docker Compose hoặc Frigate làm startup path development.
+Development chạy trên Jetson native qua `npm run dev`; không dùng WSL hoặc Frigate
+làm startup path development.
 
 Development runtime gồm Vite tại `http://127.0.0.1:5173/dashboard.html`, dashboard/API tại
-`http://127.0.0.1:18080`, MediaMTX và một worker cho mỗi camera. Vite dùng HMR/polling cho
-`app/web`; `app/deploy/dev/hot_reload.py` theo dõi `app/src`, `app/config`, `.env.local` và
-`app/deploy/docker/mediamtx.yml`, rồi restart đúng API/runner hoặc MediaMTX. Supervisor chỉ dùng
-cho native WSL dev, không được đưa vào production Compose.
+`http://127.0.0.1:18080`, MediaMTX và một worker cho mỗi camera. Vite dùng HMR cho
+`app/web`; `app/deploy/dev/jetson_sync.py` đồng bộ `app/src`, `app/config` và các runtime
+assets lên Jetson, nơi service supervisor restart đúng API/runner hoặc MediaMTX.
 
-`npm run wsl:start` giữ terminal ở foreground và phát log live của pipeline, dashboard/API,
-MediaMTX, hot reload và Vite. Nhấn `Ctrl+C` chỉ ngắt log follower, không dừng runtime; dùng
-`npm run wsl:logs` để bám lại log. `npm run wsl:pause` dừng graceful LS-Vision,
-MediaMTX, mock input, API và Vite nhưng giữ Ubuntu chạy để có thể `wsl:start`
-lại nhanh. `npm run wsl:stop` dừng runtime rồi gọi `wsl --shutdown`; lệnh này
-dừng mọi distro WSL, kể cả backend WSL của Docker Desktop.
+`npm run dev` giữ terminal ở foreground và phát log source sync/Vite. Nhấn
+`Ctrl+C` để dừng sync, SSH tunnel và Vite; service Jetson có thể được quản lý
+riêng qua systemd.
 
 ### Readiness
 
@@ -490,10 +486,10 @@ concurrency/error policy và integration test với volume/restart thực tế.
 - Dashboard đã được scaffold bằng `create-vite@latest` với React + TypeScript.
 - Tailwind v4 và shadcn/ui đã được tích hợp; camera cards, metrics, event table và event detail
   dialog dùng component typed dưới `app/web/src`.
-- `package.json` có contract `wsl:start|status|pause|stop` và `docker:*`; Dockerfile build Vite bundle
+- `package.json` chỉ có ba contract: `dev`, `check`, `deploy`; Dockerfile build Vite bundle
   trong multi-stage image.
-- Native WSL có Vite HMR và backend hot reload; manual verification cho thấy thay đổi backend
-  tạo runner PID mới và API quay lại HTTP 200.
+- Jetson development có Vite HMR và backend source sync; thay đổi backend tạo runner PID mới
+  trên isolated service.
 
 Việc còn lại: xác nhận WebRTC browser primary path, production auth/TLS/origin policy và browser
 acceptance với camera/model thật.

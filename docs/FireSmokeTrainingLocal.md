@@ -141,8 +141,11 @@ Tạo config canary cho riêng `camera_safety`; các camera khác vẫn đọc b
 & $python app\tools\prepare_fire_smoke_canary.py `
   --candidate .tmp\fire-smoke-training\candidate-p0-v1\weights\best.onnx `
   --output .tmp\fire-smoke-canary.yaml
-.\app\deploy\powershell\start.ps1 -Mode Dev -Config .tmp\fire-smoke-canary.yaml
 ```
+
+The canary config is applied through the Jetson development deployment workflow;
+the old WSL launcher is no longer supported. Use `npm run deploy -- -Development`
+after validating the canary file and then start with `npm run dev`.
 
 Launcher mặc định vẫn dùng `config\dev.yaml`. Canary report phải có tối thiểu 8
 giờ, provider GPU active, không stale/out-of-order/duplicate, controlled fire

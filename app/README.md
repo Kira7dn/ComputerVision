@@ -3,27 +3,27 @@
 `app/src` is the canonical DeepStream runtime source root. `server/`
 remains the independent ADAS/FTP/archive boundary.
 
-Development uses native WSL:
+Development runs against the native Jetson development service:
 
 ```powershell
-npm run wsl:start
-npm run wsl:status
-npm run wsl:pause
-npm run wsl:stop
+npm install --prefix app/web
+npm run dev
 ```
 
-Native WSL development includes Vite HMR for `app/web` and backend hot reload for `app/src`,
-`app/config`, `.env.local` and the development MediaMTX configuration.
-`wsl:pause` stops only the development runtime and keeps Ubuntu running. `wsl:stop` shuts down
-all WSL distros, including Docker Desktop's WSL backend.
+`dev` starts source synchronization, the Jetson development service, SSH tunnels
+and local Vite HMR. The isolated runtime uses `/opt/ls-vision-dev` and does not
+share production evidence/state directories.
 
-Production uses Docker Compose on WSL2 with NVIDIA Container Toolkit:
+The three package entrypoints are:
 
 ```powershell
-npm run docker:config
-npm run docker:build
-npm run docker:start
+npm run dev
+npm run check
+npm run deploy -- -JetsonAlias jetson-nano
 ```
+
+Add `-Development` to `deploy` when publishing the isolated Jetson development
+service. Production deploy uses the default `deploy-app` action.
 
 Run the package test suite and the real Compose E2E separately:
 

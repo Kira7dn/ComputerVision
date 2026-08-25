@@ -74,17 +74,22 @@ is still `app/`, but the deployment contract is LeOS `tbox_lab`:
 
 ```powershell
 # From Camera; wrapper around the LeOS deploy contract
-npm run deploy:jetson
+npm run deploy
 
 # Equivalent command from the LeOS repository
 .\services\tbox\factory\tbox_lab.ps1 deploy-app `
-  -JetsonAlias jetson-default `
+  -JetsonAlias jetson-nano `
   -CameraRoot D:\BusinessAnalyze\Camera
 ```
 
 Both commands deploy `app/` to the native Jetson `ls-vision.service` and do
-not start the legacy Docker Compose runtime. Use the `docker:*` scripts for
-the WSL2/Docker target only.
+not start Docker. For Nano or development deployment, pass arguments through
+the single deploy script:
+
+```powershell
+npm run deploy -- -JetsonAlias jetson-nano
+npm run deploy -- -Development -JetsonAlias jetson-nano
+```
 
 ## Preflight
 
@@ -96,7 +101,6 @@ docker info --format '{{.OSType}} {{.Architecture}}'
 Get-CimInstance Win32_Process |
   Where-Object { $_.Name -in @('python.exe', 'pytest.exe') -and $_.CommandLine -like '*BusinessAnalyze\Camera*' } |
   Select-Object ProcessId, Name, CommandLine
-wsl.exe -d Ubuntu-22.04 -- bash -lc "pgrep -af '[m]ediamtx|[r]unner|[a]pplication.camera_worker|[i]nterfaces.dashboard_api|[f]fmpeg.*mock' || true"
 docker compose -f app\deploy\docker\compose.yaml ps
 ```
 
@@ -115,36 +119,32 @@ stop runtime.
 - Không đổi camera topology, model, confirmation gate, event semantics hoặc notification contract
   trong task restructure nếu chưa có yêu cầu riêng.
 
-## Development native WSL
+## Development on Jetson
 
-Native WSL chỉ dùng để phát triển/debug:
-
-```powershell
-npm run wsl:start
-npm run wsl:status
-npm run wsl:stop
-```
-
-Hoặc gọi trực tiếp:
+Development runs on the isolated native Jetson service with local source sync
+and Vite HMR:
 
 ```powershell
-.\app\deploy\powershell\start.ps1 -Action start -Mode Dev
-.\app\deploy\powershell\start.ps1 -Action status -Mode Dev
-.\app\deploy\powershell\start.ps1 -Action stop -Mode Dev
+npm install --prefix app/web
+npm run dev
 ```
 
-Launcher đặt PYTHONPATH=/mnt/d/BusinessAnalyze/Camera/app/src, chạy Vite HMR và một supervisor
-hot_reload.py. Supervisor quản lý python3 -m runner, python3 -m interfaces.dashboard_api, MediaMTX
-và một application.camera_worker cho mỗi camera; thay đổi app/src, app/config, .env.local hoặc
-mediamtx.yml sẽ tự restart phần runtime liên quan. Log dev nằm dưới /opt/camera-safety-dev/logs.
-Không chạy worker riêng song song với runner trừ khi cô lập lỗi.
+For status, call the implementation directly:
+
+```powershell
+.\app\deploy\powershell\start-jetson-dev.ps1 -Action status -JetsonAlias jetson-nano
+```
+
+The `dev` launcher owns `jetson_sync.py`, the SSH API/MediaMTX tunnel and Vite.
+Backend/config changes sync to Jetson and restart the isolated service; frontend
+changes use Vite HMR. Stop the session with `Ctrl+C`.
 
 Kiểm tra dev:
 
 ```powershell
 (Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:5173/dashboard.html').StatusCode
 (Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:18080/health/live').StatusCode
-wsl.exe -d Ubuntu-22.04 -- bash -lc "pgrep -af '[m]ediamtx|[r]unner|[a]pplication.camera_worker|[i]nterfaces.dashboard_api|[f]fmpeg.*mock' || true"
+ssh jetson-nano "systemctl is-active ls-vision-dev.service"
 ```
 
 ## Production Docker Desktop
@@ -162,20 +162,21 @@ Entrypoint đúng phải là ["python3","-m","container"]. Nếu Docker Desktop 
 dừng trước khi build.
 
 ```powershell
-npm run docker:start
-npm run docker:status
-npm run docker:stop
+docker compose -f app\deploy\docker\compose.yaml up -d
+docker compose -f app\deploy\docker\compose.yaml ps
+docker compose -f app\deploy\docker\compose.yaml stop
 ```
 
 Hoặc:
 
 ```powershell
-.\app\deploy\powershell\start.ps1 -Action start -Mode Production
-.\app\deploy\powershell\start.ps1 -Action status -Mode Production
-.\app\deploy\powershell\start.ps1 -Action stop -Mode Production
+docker compose -f app\deploy\docker\compose.yaml up -d
+docker compose -f app\deploy\docker\compose.yaml ps
+docker compose -f app\deploy\docker\compose.yaml stop
 ```
 
-Launcher production chỉ gọi Docker Compose; không sở hữu foreground process bằng PowerShell trap.
+Production Docker is operated directly through Compose and is independent of the
+three Jetson package scripts.
 Không dùng deploy/run.ps1, Docker/Frigate cũ hoặc startup path ngoài Compose này.
 
 ## Test và static checks
@@ -187,7 +188,7 @@ Không dùng deploy/run.ps1, Docker/Frigate cũ hoặc startup path ngoài Compo
 
 $parseErrors = $null
 [System.Management.Automation.Language.Parser]::ParseFile(
-  (Resolve-Path 'app\deploy\powershell\start.ps1'),
+  (Resolve-Path 'app\deploy\powershell\start-jetson-dev.ps1'),
   [ref]$null,
   [ref]$parseErrors
 ) > $null
@@ -226,7 +227,7 @@ Acceptance chỉ hợp lệ khi report có accepted=true và toàn bộ gate sau
 
 - Compose config/startup;
 - dashboard live/ready;
-- đúng một worker cho camera_face, camera_safety, camera_dahua;
+- đúng một worker cho camera_face, camera_safety, DMS;
 - cả ba camera ready và frame input/output fresh;
 - MediaMTX HLS output;
 - event feed chỉ có record START;

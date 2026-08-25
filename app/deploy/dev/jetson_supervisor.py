@@ -1,9 +1,9 @@
-"""Development supervisor for the native WSL runtime.
+"""Supervise the native Jetson development runtime.
 
-Vite owns frontend HMR. This small standard-library-only supervisor owns the
-Python/API/runner processes and restarts them when backend source or runtime
-configuration changes. It is intentionally dev-only and is not used by
-production Compose.
+Vite owns frontend HMR on the workstation. This standard-library-only
+supervisor owns the Jetson MediaMTX, dashboard API and DeepStream runner, and
+restarts only the affected process when source or runtime configuration
+changes.
 """
 
 from __future__ import annotations
@@ -17,13 +17,7 @@ import time
 from pathlib import Path
 from threading import Event
 
-IGNORED_DIRECTORIES = {
-    ".git",
-    ".pytest_cache",
-    "__pycache__",
-    "dist",
-    "node_modules",
-}
+IGNORED_DIRECTORIES = {".git", ".pytest_cache", "__pycache__", "dist", "node_modules"}
 POLL_SECONDS = 0.75
 GRACE_SECONDS = 8.0
 
@@ -33,16 +27,13 @@ def file_snapshot(paths: list[Path], root: Path) -> dict[str, tuple[int, int]]:
     for path in paths:
         candidates = [path] if path.is_file() else path.rglob("*")
         for candidate in candidates:
-            if not candidate.is_file() or any(
-                part in IGNORED_DIRECTORIES for part in candidate.parts
-            ):
+            if not candidate.is_file() or any(part in IGNORED_DIRECTORIES for part in candidate.parts):
                 continue
             try:
                 stat = candidate.stat()
             except OSError:
                 continue
-            relative = candidate.relative_to(root).as_posix()
-            snapshot[relative] = (stat.st_mtime_ns, stat.st_size)
+            snapshot[candidate.relative_to(root).as_posix()] = (stat.st_mtime_ns, stat.st_size)
     return snapshot
 
 
@@ -60,7 +51,7 @@ class ManagedProcess:
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         self._log = self.log_path.open("ab", buffering=0)
         self._log.write(
-            f"\n--- hot reload start {self.name} {time.strftime('%Y-%m-%dT%H:%M:%S%z')} ---\n".encode()
+            f"\n--- Jetson supervisor start {self.name} {time.strftime('%Y-%m-%dT%H:%M:%S%z')} ---\n".encode()
         )
         self.process = subprocess.Popen(
             self.command,
@@ -108,13 +99,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--runtime", type=Path, required=True)
     parser.add_argument("--mediamtx-config", type=Path, required=True)
+    parser.add_argument("--mediamtx-bin", type=Path, required=True)
     parser.add_argument("--pid-file", type=Path, required=True)
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    root = args.root.resolve()
+    # Keep the /current symlink spelling consistent with the systemd config
+    # path; resolving only root makes Path.relative_to reject the config path.
+    root = args.root.absolute()
     runtime = args.runtime
     runtime_logs = runtime / "logs"
     runtime_status = runtime / "status"
@@ -123,8 +117,6 @@ def main() -> int:
     args.pid_file.write_text(f"{os.getpid()}\n", encoding="ascii")
 
     environment = os.environ.copy()
-    # DeepStream treats the presence of these variables as enabled, including
-    # when their value is "0". Remove inherited flags to avoid per-frame logs.
     environment.pop("NVDS_ENABLE_LATENCY_MEASUREMENT", None)
     environment.pop("NVDS_ENABLE_COMPONENT_LATENCY_MEASUREMENT", None)
     environment.update(
@@ -141,7 +133,7 @@ def main() -> int:
     processes = {
         "mediamtx": ManagedProcess(
             "mediamtx",
-            ["/opt/camera-safety/mediamtx/mediamtx", str(args.mediamtx_config)],
+            [str(args.mediamtx_bin), str(args.mediamtx_config)],
             runtime_logs / "mediamtx.log",
             root,
             environment,
@@ -177,7 +169,7 @@ def main() -> int:
         env_file,
     ]
     try:
-        config_relative = args.config.resolve().relative_to(root).as_posix()
+        config_relative = args.config.absolute().relative_to(root).as_posix()
     except ValueError:
         config_relative = ""
     previous_snapshot = file_snapshot(watched_paths, root)
@@ -191,10 +183,9 @@ def main() -> int:
                 for path in set(current_snapshot) | set(previous_snapshot)
                 if current_snapshot.get(path) != previous_snapshot.get(path)
             }
-            changed = bool(changed_paths)
             previous_snapshot = current_snapshot
 
-            if changed:
+            if changed_paths:
                 source_or_config_changed = any(
                     path.startswith("app/src/")
                     or path.startswith("app/config/")
@@ -202,11 +193,10 @@ def main() -> int:
                     or path == ".env.local"
                     for path in changed_paths
                 )
-                mediamtx_changed = "app/deploy/docker/mediamtx.yml" in changed_paths
                 if source_or_config_changed:
                     processes["dashboard"].restart()
                     processes["runner"].restart()
-                if mediamtx_changed:
+                if "app/deploy/docker/mediamtx.yml" in changed_paths:
                     processes["mediamtx"].restart()
 
             for process in processes.values():

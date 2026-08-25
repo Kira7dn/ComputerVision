@@ -268,7 +268,7 @@ def test_fire_geometry_rejects_implausibly_large_bbox() -> None:
 def test_smoking_behavior_returns_raw_scores_per_person_track() -> None:
     engine = SmokingBehaviorEngine(
         {
-            "input": {"camera": "camera_dahua"},
+            "input": {"camera": "DMS"},
             "smoking_behavior": {
                 "enabled": False,
                 "smoking_threshold": 0.60,

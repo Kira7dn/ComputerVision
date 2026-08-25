@@ -14,6 +14,19 @@ def test_profiles_merge_and_production_has_no_mock_source() -> None:
     assert all(camera["source"]["type"] == "rtsp" for camera in production["cameras"])
 
 
+def test_runtime_directories_can_be_overridden_after_config_inheritance(monkeypatch: pytest.MonkeyPatch) -> None:
+    root = Path(__file__).parents[2]
+    monkeypatch.setenv("CAMERA_EVIDENCE_DIR", "/opt/ls-vision-dev/data/evidence")
+    monkeypatch.setenv("CAMERA_STATE_DIR", "/opt/ls-vision-dev/data/state")
+    monkeypatch.setenv("CAMERA_STATUS_DIR", "/opt/ls-vision-dev/data/status")
+
+    config = load_raw_config(root / "config" / "production-jetson-native.yaml")
+
+    assert config["evidence"]["directory"] == "/opt/ls-vision-dev/data/evidence"
+    assert config["runtime"]["state_directory"] == "/opt/ls-vision-dev/data/state"
+    assert config["runtime"]["status_directory"] == "/opt/ls-vision-dev/data/status"
+
+
 def test_production_mock_source_is_rejected() -> None:
     config = {
         "profile": "production",
@@ -38,7 +51,7 @@ def test_analysis_overrides_are_isolated_per_camera() -> None:
     raw = load_raw_config(Path(__file__).parents[2] / "config" / "dev.yaml")
 
     safety = resolve_camera_config(raw, "camera_safety")
-    dahua = resolve_camera_config(raw, "camera_dahua")
+    dahua = resolve_camera_config(raw, "DMS")
 
     assert safety["runtime"]["analysis_result_max_age_seconds"] == 1.0
     assert safety["fire_smoke"]["fire_threshold"] == 0.30
@@ -50,6 +63,26 @@ def test_analysis_overrides_are_isolated_per_camera() -> None:
     assert dahua["fire_smoke"]["tracking"]["confirmation_window"] == 6
     assert dahua["fire_smoke"]["dynamics"]["mode"] == "advisory"
     assert dahua["fire_smoke"]["tracking"]["notification_min_duration_seconds"] == 3.0
+    assert dahua["functions"]["dms"] is True
+    assert dahua["functions"]["smoking_behavior"] is False
+    assert dahua["functions"]["fire_smoke"] is False
+    dms_models = dahua["dms"]["object_detection"]["models"]
+    assert set(dms_models["chaitanya"]["positive_labels"]) == {
+        "Cigarette", "Drinking", "Eating", "Phone", "Seatbelt"
+    }
+    assert dahua["dms"]["alerts"] == {"on_frames": 3, "off_frames": 2}
+    assert dahua["dms"]["event_policy"]["model"] == {
+        "min_score": 0.50,
+        "require_person_match": True,
+        "confirmation_hits": 6,
+        "confirmation_window": 10,
+        "minimum_duration_seconds": 1.0,
+        "candidate_timeout_seconds": 3.0,
+        "clear_seconds": 2.0,
+        "unknown_timeout_seconds": 1.5,
+        "trace_interval_ms": 1000,
+    }
+    assert dahua["dms"]["event_policy"]["no_seatbelt"]["confirmation_hits"] == 12
     assert safety["smoking_behavior"]["padding_ratio"] == 0.20
     assert safety["smoking_behavior"]["temporal"]["confirmation_hits"] == 2
     assert safety["smoking_behavior"]["temporal"]["confirmation_window"] == 4
@@ -82,6 +115,15 @@ def test_invalid_smoking_temporal_window_fails_before_startup() -> None:
         resolve_camera_config(raw, "camera_safety")
 
 
+def test_invalid_dms_confirmation_window_fails_before_startup() -> None:
+    raw = load_raw_config(Path(__file__).parents[2] / "config" / "dev.yaml")
+    raw["dms"]["event_policy"]["model"]["confirmation_hits"] = 11
+    raw["dms"]["event_policy"]["model"]["confirmation_window"] = 10
+
+    with pytest.raises(ValueError, match="dms.event_policy.model confirmation window"):
+        validate_config(raw)
+
+
 def test_smoking_notification_delay_cannot_precede_confirmation_duration() -> None:
     raw = load_raw_config(Path(__file__).parents[2] / "config" / "dev.yaml")
     camera = next(item for item in raw["cameras"] if item["id"] == "camera_safety")
@@ -99,9 +141,9 @@ def test_smoking_notification_delay_cannot_precede_confirmation_duration() -> No
 def test_all_profiles_keep_dynamics_in_advisory_mode() -> None:
     root = Path(__file__).parents[2] / "config"
     production = resolve_camera_config(
-        load_raw_config(root / "production.yaml"), "camera_dahua"
+        load_raw_config(root / "production.yaml"), "DMS"
     )
-    e2e = resolve_camera_config(load_raw_config(root / "e2e.yaml"), "camera_dahua")
+    e2e = resolve_camera_config(load_raw_config(root / "e2e.yaml"), "DMS")
 
     assert production["fire_smoke"]["dynamics"]["mode"] == "advisory"
     assert e2e["fire_smoke"]["dynamics"]["mode"] == "advisory"
@@ -109,22 +151,22 @@ def test_all_profiles_keep_dynamics_in_advisory_mode() -> None:
 
 def test_invalid_fire_dynamics_vote_window_fails_before_startup() -> None:
     raw = load_raw_config(Path(__file__).parents[2] / "config" / "dev.yaml")
-    camera = next(item for item in raw["cameras"] if item["id"] == "camera_dahua")
+    camera = next(item for item in raw["cameras"] if item["id"] == "DMS")
     camera["analysis"]["functions"]["fire_smoke"]["dynamics"] = {
         "confirmation_votes": 6,
         "confirmation_window": 5,
     }
 
     with pytest.raises(ValueError, match="confirmation_votes"):
-        resolve_camera_config(raw, "camera_dahua")
+        resolve_camera_config(raw, "DMS")
 
 
 def test_fire_dynamics_hard_enforcement_is_rejected() -> None:
     raw = load_raw_config(Path(__file__).parents[2] / "config" / "dev.yaml")
-    camera = next(item for item in raw["cameras"] if item["id"] == "camera_dahua")
+    camera = next(item for item in raw["cameras"] if item["id"] == "DMS")
     camera["analysis"]["functions"]["fire_smoke"]["dynamics"] = {
         "enforce": True
     }
 
     with pytest.raises(ValueError, match="hard enforcement is unsupported"):
-        resolve_camera_config(raw, "camera_dahua")
+        resolve_camera_config(raw, "DMS")

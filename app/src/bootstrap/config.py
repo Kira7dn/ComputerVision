@@ -11,7 +11,7 @@ from urllib.parse import urlsplit, urlunsplit
 import yaml
 
 
-def load_raw_config(path: Path) -> dict[str, Any]:
+def _load_raw_config(path: Path) -> dict[str, Any]:
     with path.open("r", encoding="utf-8") as stream:
         data = yaml.safe_load(stream) or {}
     if not isinstance(data, dict):
@@ -21,8 +21,30 @@ def load_raw_config(path: Path) -> dict[str, Any]:
         base_path = (path.parent / str(extends)).resolve()
         if base_path == path.resolve():
             raise ValueError("config cannot extend itself")
-        data = _merge_config(load_raw_config(base_path), data)
+        data = _merge_config(_load_raw_config(base_path), data)
     return data
+
+
+def _apply_runtime_environment_overrides(config: dict[str, Any]) -> dict[str, Any]:
+    """Apply process-owned runtime directories after all config inheritance."""
+    environment = _runtime_environment()
+    runtime = config.setdefault("runtime", {})
+    evidence = config.setdefault("evidence", {})
+    overrides = {
+        "CAMERA_STATUS_DIR": (runtime, "status_directory"),
+        "CAMERA_STATE_DIR": (runtime, "state_directory"),
+        "CAMERA_EVIDENCE_DIR": (evidence, "directory"),
+    }
+    for environment_key, (section, config_key) in overrides.items():
+        value = environment.get(environment_key)
+        if value:
+            section[config_key] = value
+    return config
+
+
+def load_raw_config(path: Path) -> dict[str, Any]:
+    """Load inherited YAML and then apply runtime-only environment overrides."""
+    return _apply_runtime_environment_overrides(_load_raw_config(path))
 
 
 def _merge_config(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -73,6 +95,13 @@ def validate_config(config: dict[str, Any], path: Path | None = None) -> dict[st
         (config.get("smoking_behavior", {}) or {}).get("onnx_path"),
         (config.get("fire_smoke", {}) or {}).get("onnx_path"),
     ]
+    dms_config = config.get("dms", {}) or {}
+    dms_object = dms_config.get("object_detection", {}) or {}
+    if dms_object.get("enabled", False):
+        model_paths.extend(
+            (model or {}).get("onnx_path")
+            for model in (dms_object.get("models", {}) or {}).values()
+        )
     for camera in config.get("cameras", []) or []:
         camera_fire_smoke = (camera.get("fire_smoke", {}) or {}) if isinstance(camera, dict) else {}
         camera_analysis = (camera.get("analysis", {}) or {}) if isinstance(camera, dict) else {}
@@ -88,6 +117,82 @@ def validate_config(config: dict[str, Any], path: Path | None = None) -> dict[st
             (model or {}).get("onnx_path")
             for model in (smoking_object.get("models", {}) or {}).values()
         )
+    if dms_object.get("enabled", False):
+        dms_models = dms_object.get("models", {}) or {}
+        if not isinstance(dms_models, dict) or not dms_models:
+            raise ValueError("dms.object_detection.models must be a non-empty mapping")
+        confidence = float(dms_object.get("confidence", 0.35))
+        nms_iou = float(dms_object.get("nms_iou", 0.50))
+        person_match_iou = float(dms_object.get("person_match_iou", 0.10))
+        if not 0.0 < confidence <= 1.0:
+            raise ValueError("dms.object_detection.confidence must be in (0, 1]")
+        if not 0.0 < nms_iou <= 1.0 or not 0.0 <= person_match_iou <= 1.0:
+            raise ValueError("dms object detection IoU values are invalid")
+        for source, model in dms_models.items():
+            labels = [str(label) for label in (model or {}).get("labels", ())]
+            positive_labels = [
+                str(label) for label in (model or {}).get("positive_labels", ())
+            ]
+            if not labels or not positive_labels or not set(positive_labels).issubset(labels):
+                raise ValueError(f"dms object model {source} has invalid labels")
+        event_policy = dms_config.get("event_policy", {}) or {}
+        for section_name in ("model", "face", "no_seatbelt"):
+            section = event_policy.get(section_name, {}) or {}
+            hits = int(section.get("confirmation_hits", 1))
+            window = int(section.get("confirmation_window", hits))
+            if hits < 1 or window < hits:
+                raise ValueError(
+                    f"dms.event_policy.{section_name} confirmation window is invalid"
+                )
+            for key in (
+                "minimum_duration_seconds",
+                "candidate_timeout_seconds",
+                "clear_seconds",
+                "unknown_timeout_seconds",
+            ):
+                if float(section.get(key, 0.0)) < 0.0:
+                    raise ValueError(
+                        f"dms.event_policy.{section_name}.{key} cannot be negative"
+                    )
+            if float(section.get("trace_interval_ms", 1.0)) <= 0.0:
+                raise ValueError(
+                    f"dms.event_policy.{section_name}.trace_interval_ms must be positive"
+                )
+        model_policy = event_policy.get("model", {}) or {}
+        minimum_event_score = float(model_policy.get("min_score", confidence))
+        if not confidence <= minimum_event_score <= 1.0:
+            raise ValueError(
+                "dms.event_policy.model.min_score must be between detector confidence and 1"
+            )
+        face_policy = dms_config.get("face_mesh", {}) or {}
+        for key in ("ear_threshold", "mar_threshold"):
+            if not 0.0 < float(face_policy.get(key, 0.5)) < 1.0:
+                raise ValueError(f"dms.face_mesh.{key} must be in (0, 1)")
+        for key in ("yaw_threshold_deg", "pitch_threshold_deg"):
+            if float(face_policy.get(key, 1.0)) <= 0.0:
+                raise ValueError(f"dms.face_mesh.{key} must be positive")
+        calibration = face_policy.get("neutral_calibration", {}) or {}
+        minimum_samples = int(calibration.get("minimum_samples", 15))
+        window_size = int(calibration.get("window_size", 30))
+        if minimum_samples < 3 or window_size < minimum_samples:
+            raise ValueError(
+                "dms.face_mesh.neutral_calibration sample window is invalid"
+            )
+        for key in (
+            "max_yaw_std_deg",
+            "max_pitch_std_deg",
+            "neutral_update_max_delta_deg",
+        ):
+            if float(calibration.get(key, 1.0)) <= 0.0:
+                raise ValueError(
+                    f"dms.face_mesh.neutral_calibration.{key} must be positive"
+                )
+        update_alpha = float(calibration.get("neutral_update_alpha", 0.01))
+        if not 0.0 <= update_alpha <= 1.0:
+            raise ValueError(
+                "dms.face_mesh.neutral_calibration.neutral_update_alpha "
+                "must be in [0, 1]"
+            )
     allow_engine_build = bool((config.get("runtime", {}) or {}).get("allow_engine_build", False))
     engine_path = str((config.get("person", {}) or {}).get("engine_path", ""))
     if validate_models:
@@ -526,6 +631,7 @@ def resolve_camera_config(config: dict[str, Any], camera_id: str | None = None) 
             (resolved.get("smoking_behavior", {}) or {}).get("enabled", False)
         ),
         "fire_smoke": bool((resolved.get("fire_smoke", {}) or {}).get("enabled", False)),
+        "dms": bool((resolved.get("dms", {}) or {}).get("enabled", False)),
     }
     functions.update(camera.get("functions", {}) or {})
     resolved["functions"] = functions
@@ -554,6 +660,10 @@ def resolve_camera_config(config: dict[str, Any], camera_id: str | None = None) 
     fire_smoke = deepcopy(resolved.get("fire_smoke", {}) or {})
     fire_smoke["enabled"] = bool(functions["fire_smoke"])
     resolved["fire_smoke"] = fire_smoke
+
+    dms = deepcopy(resolved.get("dms", {}) or {})
+    dms["enabled"] = bool(functions["dms"])
+    resolved["dms"] = dms
 
     _normalize_camera_analysis(resolved, camera, camera_id)
 

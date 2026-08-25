@@ -4,7 +4,7 @@ import type { MetricsResponse } from '@/types'
 
 interface MetricsGridProps {
   metrics: MetricsResponse | null
-  browserLatency: string
+  glassLatency: string
 }
 
 function value(raw: number | null | undefined, suffix = '') {
@@ -18,7 +18,7 @@ function metricTone(raw: number | null | undefined, warningAt: number, dangerAt:
   return 'healthy'
 }
 
-export function MetricsGrid({ metrics, browserLatency }: MetricsGridProps) {
+export function MetricsGrid({ metrics, glassLatency }: MetricsGridProps) {
   const memory = metrics?.host.memory
   const gpu = metrics?.gpu
   const pipeline = metrics?.pipeline
@@ -32,7 +32,7 @@ export function MetricsGrid({ metrics, browserLatency }: MetricsGridProps) {
     { label: 'WSL RAM', value: value(memory?.percent, '%'), detail: memory?.used_mb != null && memory.total_mb != null ? `${memory.used_mb}/${memory.total_mb} MB` : undefined, tone: metricTone(memory?.percent, 75, 90), icon: <HardDrive size={16} /> },
     { label: 'DeepStream', value: value(pipeline?.cpu_percent, '%'), detail: pipeline?.rss_mb == null ? 'CPU process' : `${pipeline.rss_mb} MB RAM`, tone: pipeline?.running ? metricTone(pipeline.cpu_percent, 75, 95) : 'danger', icon: <Gauge size={16} /> },
     { label: 'GPU', value: !gpu?.available ? 'Không khả dụng' : value(gpu.utilization_percent, '%'), detail: gpu?.available ? `${value(gpu.memory_used_mb, ' MB')} · ${value(gpu.temperature_c, '°C')}` : 'Kiểm tra provider', tone: !gpu?.available ? 'warning' : metricTone(gpu.temperature_c, 75, 90), icon: <Thermometer size={16} /> },
-    { label: 'WebRTC / HLS', value: browserLatency, detail: 'Độ trễ trình duyệt', tone: browserLatency === 'offline' ? 'danger' : browserLatency === 'connecting' ? 'warning' : 'healthy', icon: <Wifi size={16} /> },
+    { label: 'Glass-to-glass', value: glassLatency, detail: 'Camera → màn hình · WebRTC', tone: glassLatency === 'offline' ? 'danger' : glassLatency === 'connecting' || glassLatency === 'đang đo' ? 'warning' : 'healthy', icon: <Wifi size={16} /> },
   ] as const
 
   return (

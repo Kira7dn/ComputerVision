@@ -41,7 +41,7 @@ cameras:
           threshold: 0.60
           crop: {strategy: person_padded, padding_ratio: 0.20}
           confirmation: {hits: 2, attempts: 4, clear_hits: 4}
-  - id: camera_dahua
+  - id: DMS
     source:
       type: mock
       url: rtsp://mediamtx:8554/safety_mock

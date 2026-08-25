@@ -29,6 +29,48 @@ smoking_behavior:
     notification_min_duration_seconds: 3.0
     trace_interval_ms: 400
 
+dms:
+  face_mesh:
+    ear_threshold: 0.20
+    mar_threshold: 0.65
+    yaw_threshold_deg: 16.0
+    pitch_threshold_deg: 14.0
+    neutral_calibration:
+      enabled: true
+      minimum_samples: 15
+      window_size: 30
+      max_yaw_std_deg: 8.0
+      max_pitch_std_deg: 5.0
+      neutral_update_alpha: 0.01
+      neutral_update_max_delta_deg: 5.0
+  event_policy:
+    model:
+      min_score: 0.50
+      require_person_match: true
+      confirmation_hits: 6
+      confirmation_window: 10
+      minimum_duration_seconds: 1.0
+      candidate_timeout_seconds: 3.0
+      clear_seconds: 2.0
+      unknown_timeout_seconds: 1.5
+      trace_interval_ms: 1000
+    face:
+      confirmation_hits: 5
+      confirmation_window: 8
+      minimum_duration_seconds: 0.8
+      candidate_timeout_seconds: 2.0
+      clear_seconds: 1.0
+      unknown_timeout_seconds: 0.8
+      trace_interval_ms: 800
+    no_seatbelt:
+      confirmation_hits: 12
+      confirmation_window: 15
+      minimum_duration_seconds: 2.5
+      candidate_timeout_seconds: 4.0
+      clear_seconds: 2.0
+      unknown_timeout_seconds: 1.5
+      trace_interval_ms: 1000
+
 fire_smoke:
   tracking:
     match_iou: 0.10

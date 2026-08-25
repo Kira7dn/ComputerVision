@@ -33,11 +33,17 @@ class _Model:
 
 
 class SmokingObjectDetector:
-    """Run both T-Box detectors once per full frame and return smoking signals."""
+    """Run configured T-Box ONNX detectors once per full frame.
 
-    def __init__(self, config: dict[str, Any]) -> None:
-        smoking = config.get("smoking_behavior", {}) or {}
+    The adapter is shared by the legacy smoking function and the DMS function.
+    The latter configures every model class as a positive class so the DMS
+    engine can apply its own class mapping and alert policy.
+    """
+
+    def __init__(self, config: dict[str, Any], section: str = "smoking_behavior") -> None:
+        smoking = config.get(section, {}) or {}
         runtime = smoking.get("object_detection", {}) or {}
+        self.section = section
         self.enabled = bool(runtime.get("enabled", False))
         self.input_width = int(runtime.get("input_width", 640))
         self.input_height = int(runtime.get("input_height", 640))
@@ -110,7 +116,8 @@ class SmokingObjectDetector:
             )
             self.active_providers[str(source)] = active
         LOG.info(
-            "T-Box smoking object detectors active: models=%s threshold=%.2f providers=%s",
+            "T-Box object detectors active: section=%s models=%s threshold=%.2f providers=%s",
+            self.section,
             [model.source for model in self.models],
             self.confidence,
             self.active_providers,

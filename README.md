@@ -105,30 +105,21 @@ Source code:
 ```text
 app/src/application/camera_worker.py
 app/config/dev.yaml
-app/deploy/powershell/start.ps1
+app/deploy/powershell/start-jetson-dev.ps1
 app/web/dashboard.html
 app/deploy/docker/mediamtx.yml
 ```
 
-The source stays in this workspace. WSL Ubuntu-22.04 provides the DeepStream runtime;
-MediaMTX provides RTSP and WebRTC/HLS transport.
+The source stays in this workspace. The Jetson native development service provides
+the DeepStream runtime; MediaMTX provides RTSP and WebRTC/HLS transport.
 
 ```powershell
-# Start Vite HMR, backend hot reload, mock RTSP input, DeepStream inference, MediaMTX and the API
-npm run wsl:start
-
-# Reattach logs, check status, pause the runtime, or shut down all WSL distros
-npm run wsl:logs
-npm run wsl:status
-npm run wsl:pause
-npm run wsl:stop
+# Start source sync, the Jetson development service, SSH tunnels and Vite HMR
+npm run dev
 ```
 
-`wsl:start` remains attached and streams backend, MediaMTX, hot-reload, and Vite logs. Pressing
-`Ctrl+C` detaches the log stream without stopping the runtime; use `wsl:logs` to reattach.
-`wsl:pause` gracefully stops LS-Vision, MediaMTX, mock publishers, API, and Vite while keeping
-Ubuntu running; use `wsl:start` to resume. `wsl:stop` additionally calls `wsl --shutdown`, which
-stops every WSL distro including the Docker Desktop WSL backend.
+`dev` remains attached and streams synchronization and Vite output. Press `Ctrl+C`
+to stop the local sync, SSH tunnel and Vite processes.
 
 Open the dashboard at:
 

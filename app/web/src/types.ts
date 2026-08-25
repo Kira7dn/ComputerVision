@@ -10,6 +10,10 @@ export interface CameraDetail {
   functions?: Record<string, boolean>
   last_frame_age_seconds?: number | null
   last_output_age_seconds?: number | null
+  camera_latency_ms?: number | null
+  camera_source_timestamp?: number | null
+  camera_latency_source?: 'rtcp_ntp' | 'unavailable' | string
+  camera_latency_samples?: number
   rss_mb?: number | null
   analysis_error?: string | null
 }
@@ -54,6 +58,7 @@ export interface EventRecord {
   event_id?: string
   camera?: string
   event_name?: string
+  label?: string
   timestamp?: number
   sequence?: number
   confidence?: number | null
@@ -65,6 +70,11 @@ export interface EventRecord {
   name?: string
   function?: string
   state?: string
+  lifecycle?: string
+  started_at?: number | null
+  updated_at?: number | null
+  ended_at?: number | null
+  record_type?: string
   region_track_id?: number | string | null
   confirmation_state?: string | null
   best_frame_number?: number | null
@@ -94,12 +104,15 @@ export interface EventsResponse {
 
 export type StreamTransport = 'webrtc' | 'hls-fallback'
 
+export type VideoLatencySource = 'webrtc_capture' | 'rtp_ntp_map' | 'unavailable'
+
 export interface PlayerState {
   live: boolean
   error: boolean
   connecting: boolean
   transport: StreamTransport
-  jitterBufferDelayMs: number | null
+  videoLatencyMs: number | null
+  videoLatencySource: VideoLatencySource
   message: string
 }
 

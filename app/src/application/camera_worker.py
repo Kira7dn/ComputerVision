@@ -20,15 +20,18 @@ import signal
 import subprocess
 import sys
 import tempfile
+import textwrap
 import threading
 import time
 import uuid
+from collections import deque
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 from urllib.request import urlopen
 
 from adapters.media.mock_input import wait_for_rtsp_video
+from adapters.models.dms_engine import DmsBehaviorEngine, DmsInferenceResult
 from adapters.models.face_engine import FaceRecognitionEngine
 from adapters.models.fire_smoke_engine import FireSmokeEngine
 from adapters.models.smoking_engine import SmokingBehaviorEngine
@@ -65,6 +68,7 @@ import numpy as np  # noqa: E402
 import zmq  # noqa: E402
 
 from domain.contracts import AnalysisSample, FrameKey, FunctionResult  # noqa: E402
+from domain.dms_events import DmsAlertEventStore  # noqa: E402
 from domain.fire_smoke_events import FireSmokeEventStore  # noqa: E402
 from domain.recognition import RecognitionCore, TrackKey  # noqa: E402
 from domain.smoking_events import SmokingEpisodeStore, SmokingInferenceBatch  # noqa: E402
@@ -103,6 +107,34 @@ def nms(boxes: list[np.ndarray], threshold: float) -> list[np.ndarray]:
     return selected
 
 
+def _dms_status_text(status: str, alerts: tuple[str, ...]) -> tuple[str, int]:
+    """Return a bounded two-line DMS HUD status and its line count."""
+    if not alerts:
+        return f"DMS {status}", 1
+    alert_text = " • ".join(str(alert) for alert in alerts)
+    lines = textwrap.wrap(
+        alert_text,
+        width=38,
+        break_long_words=False,
+        break_on_hyphens=False,
+    ) or ["-"]
+    if len(lines) > 2:
+        lines = [lines[0], f"{lines[1][:34].rstrip()}…"]
+    return "DMS ALERT\n" + "\n".join(lines[:2]), 1 + min(2, len(lines))
+
+
+def _ntp_latency_ms(ntp_timestamp: int, now: float) -> float | None:
+    """Return camera-to-DeepStream latency from an NTP nanosecond timestamp."""
+    if ntp_timestamp <= 0 or ntp_timestamp >= 2**63 - 1:
+        return None
+    latency_ms = (now - (ntp_timestamp / 1_000_000_000)) * 1000.0
+    # A clock step or malformed metadata must not become a plausible dashboard
+    # number. The camera and Jetson are expected to be NTP-synchronised.
+    if latency_ms < -1_000.0 or latency_ms > 120_000.0:
+        return None
+    return latency_ms
+
+
 class SafetyPipeline:
     def __init__(self, config: dict[str, Any], config_path: Path, run_id: str) -> None:
         self.config = config
@@ -122,13 +154,21 @@ class SafetyPipeline:
         self.last_frame_at: float | None = None
         self.last_output_at: float | None = None
         self.last_output_pts_ns: int | None = None
+        self.last_camera_latency_ms: float | None = None
+        self.last_camera_source_timestamp: float | None = None
+        self.camera_latency_samples = 0
+        # Keep enough history to correlate a browser that is temporarily
+        # buffered behind the live edge without guessing a frame pair.
+        self._frame_timing_samples: deque[dict[str, float | int]] = deque(maxlen=360)
         functions = config.get("functions", {}) or {}
+        self.dms_enabled = bool(functions.get("dms", False))
         self.smoking_behavior_enabled = bool(functions.get("smoking_behavior", False))
         self.fire_smoke_enabled = bool(functions.get("fire_smoke", False))
         self.trace_enabled = bool(functions.get("trace", True))
         LOG.info(
-            "function topology: camera=%s face_recognition=%s smoking_behavior=%s fire_smoke=%s",
+            "function topology: camera=%s dms=%s face_recognition=%s smoking_behavior=%s fire_smoke=%s",
             config.get("input", {}).get("camera", "unknown"),
+            self.dms_enabled,
             bool(functions.get("face_recognition", False)),
             self.smoking_behavior_enabled,
             self.fire_smoke_enabled,
@@ -143,12 +183,14 @@ class SafetyPipeline:
         self.evidence = EvidenceStore(config, run_id)
         self.notifications = NotificationService(config, self.evidence.root, run_id)
         self.event_store = SmokingEpisodeStore(config, self.evidence)
+        self.dms_events = DmsAlertEventStore(config, self.evidence)
         self.fire_smoke_events = FireSmokeEventStore(config, self.evidence)
         self._face_event_ids: dict[int, str] = {}
         self._smoking_by_track: dict[int, Any] = {}
         self.mock_publisher: subprocess.Popen | None = None
         self.recognition = RecognitionCore(config)
         self.face_engine = FaceRecognitionEngine(config, self._on_face_trace)
+        self.dms_engine = DmsBehaviorEngine(config) if self.dms_enabled else None
         self.smoking_behavior_engine = (
             SmokingBehaviorEngine(config) if self.smoking_behavior_enabled else None
         )
@@ -185,11 +227,14 @@ class SafetyPipeline:
         self.last_behavior_error: str | None = None
         self.analysis_enabled = (
             self.face_engine.enabled
+            or self.dms_enabled
             or self.smoking_behavior_enabled
             or self.fire_smoke_enabled
         )
         self._analysis_lock = threading.RLock()
         self._analysis_detections: list[Any] = []
+        self._analysis_dms_detections: list[Any] = []
+        self._analysis_dms_result: DmsInferenceResult | None = None
         self._analysis_fire_smoke: list[Any] = []
         self._analysis_transitions: list[Any] = []
         self._analysis_transitions_by_function: dict[str, list[Any]] = {}
@@ -199,7 +244,7 @@ class SafetyPipeline:
         self._analysis_updated_at_by_function: dict[str, float] = {}
         analysis_intervals = [
             float(engine.interval_seconds)
-            for engine in (self.smoking_behavior_engine, self.fire_smoke_engine)
+            for engine in (self.dms_engine, self.smoking_behavior_engine, self.fire_smoke_engine)
             if engine is not None
         ]
         if self.face_engine.enabled:
@@ -419,6 +464,16 @@ maintain-aspect-ratio=0
         LOG.info("person nvinfer config: %s", handle.name)
         return handle.name
 
+    @staticmethod
+    def _configure_output_payloader(_sink: Gst.Element, payloader: Gst.Element) -> None:
+        """Configure the payloader created internally by rtspclientsink."""
+        try:
+            payloader.set_property("timestamp-offset", 0)
+            payloader.set_property("perfect-rtptime", True)
+            LOG.info("output payloader RTP timestamp mapping configured")
+        except (TypeError, AttributeError):
+            LOG.debug("output payloader does not expose deterministic timestamp properties")
+
     def _build(self) -> None:
         input_cfg = self.config["input"]
         output_cfg = self.config["output"]
@@ -431,6 +486,9 @@ maintain-aspect-ratio=0
             source.set_property("user-pw", input_cfg["rtsp_password"])
         source.set_property("latency", int(input_cfg["latency_ms"]))
         source.set_property("protocols", 4)
+        # Preserve the camera's RTCP Sender Report/NTP mapping so NvDsFrameMeta
+        # can carry the capture timestamp instead of only a local arrival PTS.
+        source.set_property("ntp-sync", True)
         codec = str(input_cfg.get("codec", "h264")).lower()
         if codec in {"h265", "hevc"}:
             depay = make_element("rtph265depay", "rtp-h265-depay")
@@ -531,6 +589,10 @@ maintain-aspect-ratio=0
         sink.set_property("location", output_cfg["rtsp_url"])
         sink.set_property("protocols", 4)
         sink.set_property("latency", 100)
+        try:
+            sink.connect("new-payloader", self._configure_output_payloader)
+        except (TypeError, AttributeError):
+            LOG.debug("rtspclientsink does not expose new-payloader")
 
         elements = [
             source,
@@ -545,7 +607,7 @@ maintain-aspect-ratio=0
             output_input_queue,
             *(
                 [face_cpu_convert, face_cpu_caps]
-                if self.face_engine.enabled or self.smoking_behavior_enabled or self.fire_smoke_enabled
+                if self.face_engine.enabled or self.dms_enabled or self.smoking_behavior_enabled or self.fire_smoke_enabled
                 else []
             ),
             analysis_sink,
@@ -595,7 +657,7 @@ maintain-aspect-ratio=0
             or output_tee_pad.link(output_sink_pad) != Gst.PadLinkReturn.OK
         ):
             raise RuntimeError("Unable to link analysis tee to output queue")
-        needs_cpu_frame = self.face_engine.enabled or self.smoking_behavior_enabled or self.fire_smoke_enabled
+        needs_cpu_frame = self.face_engine.enabled or self.dms_enabled or self.smoking_behavior_enabled or self.fire_smoke_enabled
         if needs_cpu_frame:
             if not analysis_queue.link(face_cpu_convert):
                 raise RuntimeError("Unable to link analysis source to face converter")
@@ -816,6 +878,10 @@ maintain-aspect-ratio=0
                     self._process_face_sample,
                 )
             )
+        if self.dms_enabled and self.dms_engine is not None:
+            definitions.append(
+                ("dms", self.dms_engine.interval_seconds, self._process_dms_sample)
+            )
         if self.smoking_behavior_enabled and self.smoking_behavior_engine is not None:
             definitions.append(
                 (
@@ -859,6 +925,15 @@ maintain-aspect-ratio=0
         if self.smoking_behavior_engine is None:
             return SmokingInferenceBatch((), ())
         return self.smoking_behavior_engine.process(
+            sample.frame,
+            list(sample.persons),
+            sample.key.frame_number,
+        )
+
+    def _process_dms_sample(self, sample: AnalysisSample) -> DmsInferenceResult:
+        if self.dms_engine is None:
+            return DmsInferenceResult(SmokingInferenceBatch((), ()), (), (), "DISABLED", {})
+        return self.dms_engine.process(
             sample.frame,
             list(sample.persons),
             sample.key.frame_number,
@@ -912,6 +987,55 @@ maintain-aspect-ratio=0
             detections = list(face_tracks.values())
             with self._analysis_lock:
                 self._face_tracks = face_tracks
+        elif function == "dms":
+            transitions.extend(
+                self.dms_events.observe(
+                    frame_num=sample.key.frame_number,
+                    timestamp=sample.source_timestamp,
+                    result=raw_result,
+                    frame=sample.frame,
+                )
+            )
+            confirmed_alerts = tuple(self.dms_events.active_labels)
+            confirmed_metrics = {
+                **dict(raw_result.metrics),
+                "active_alerts": list(confirmed_alerts),
+                "candidate_alerts": self.dms_events.candidate_labels,
+                "event_lifecycle": self.dms_events.metrics(),
+            }
+            confirmed_status = raw_result.status
+            if confirmed_status not in {"DEGRADED", "DISABLED"}:
+                confirmed_status = "ALERT" if confirmed_alerts else "OK"
+            published_result = DmsInferenceResult(
+                raw_result.smoking,
+                raw_result.detections,
+                confirmed_alerts,
+                confirmed_status,
+                confirmed_metrics,
+                raw_result.message,
+            )
+            confirmed_detections = [
+                item
+                for item in raw_result.detections
+                if item.label in confirmed_alerts
+            ]
+            metadata.update(
+                {
+                    "status": confirmed_status,
+                    "alerts": list(confirmed_alerts),
+                    "candidate_alerts": self.dms_events.candidate_labels,
+                    "metrics": confirmed_metrics,
+                    "message": raw_result.message,
+                    "raw_detection_count": len(raw_result.detections),
+                    "confirmed_detection_count": len(confirmed_detections),
+                }
+            )
+            # DMS owns its complete lifecycle. Do not also feed DMS Smoking
+            # observations into the independent SmokingEpisodeStore.
+            detections = []
+            with self._analysis_lock:
+                self._analysis_dms_detections = confirmed_detections
+                self._analysis_dms_result = published_result
         elif function == "smoking_behavior":
             metadata["raw_observation_count"] = len(raw_result.observations)
             metadata["invalid_crop_count"] = len(raw_result.invalid_crop_track_ids)
@@ -941,9 +1065,7 @@ maintain-aspect-ratio=0
             detections = list(self.fire_smoke_events.visible_detections)
 
         self._notify_transitions(transitions)
-        model_section = (
-            "smoking_behavior" if function == "smoking_behavior" else function
-        )
+        model_section = "smoking_behavior" if function == "smoking_behavior" else function
         model_revision = str(
             (self.config.get(model_section, {}) or {}).get("onnx_path", "")
         ) or None
@@ -1042,8 +1164,12 @@ maintain-aspect-ratio=0
         frame_meta: Any,
         detection_results: list[Any],
         fire_smoke_detections: list[Any],
+        dms_detections: list[Any],
+        dms_result: DmsInferenceResult | None,
     ) -> None:
         """Render cached inference results on the independent live-output branch."""
+        if self.dms_enabled:
+            self._attach_dms_objects(batch_meta, frame_meta, dms_detections)
         if self.smoking_behavior_enabled:
             self._attach_objects(frame_meta, detection_results)
         if self.fire_smoke_enabled:
@@ -1054,6 +1180,15 @@ maintain-aspect-ratio=0
             if object_label not in {self.config["person"]["label"], "fire", "smoke"}:
                 continue
             if object_label == self.config["person"]["label"]:
+                if self.dms_enabled:
+                    # DMS is the public overlay contract for the DMS camera.
+                    # DeepStream still tracks persons internally for frame
+                    # alignment and smoking event correlation, but the generic
+                    # person detector box is not part of dms.py output.
+                    obj_meta.rect_params.border_width = 0
+                    obj_meta.text_params.display_text = ""
+                    obj_meta.text_params.set_bg_clr = 0
+                    continue
                 if not self._person_track_confirmed(int(obj_meta.object_id)):
                     continue
                 name, score = self.face_engine.current_label(
@@ -1094,6 +1229,74 @@ maintain-aspect-ratio=0
                 text_params.font_params.font_color.set(1.0, 1.0, 1.0, 1.0)
                 text_params.set_bg_clr = 0
             pyds.nvds_add_display_meta_to_frame(frame_meta, display_meta)
+        if self.dms_enabled and dms_result is not None:
+            status_label, status_lines = _dms_status_text(
+                dms_result.status,
+                tuple(dms_result.alerts),
+            )
+            frame_width = int(self.config["input"].get("width", 1920))
+            frame_height = int(self.config["input"].get("height", 1080))
+            dms_label_positions: list[tuple[str, int, int]] = []
+            reserved_top = max(112, 24 + status_lines * 38 + 16)
+            for detection in dms_detections:
+                label = f"{detection.label} {float(detection.score) * 100:.0f}%"
+                left, top, _, _ = detection.bbox
+                estimated_width = max(96, len(label) * 9 + 16)
+                x_offset = max(
+                    24,
+                    min(
+                        int(left),
+                        max(24, frame_width - estimated_width - 24),
+                    ),
+                )
+                y_offset = max(reserved_top, int(top) - 24)
+                dms_label_positions.append((label, x_offset, y_offset))
+
+            # Keep model labels readable when several detections share a
+            # similar top edge. The status/metric panel owns the reserved top.
+            placed: list[tuple[int, int, int, int]] = []
+            laid_out: list[tuple[str, int, int]] = []
+            for label, x_offset, y_offset in sorted(
+                dms_label_positions, key=lambda item: (item[2], item[1], item[0])
+            ):
+                estimated_width = max(96, len(label) * 9 + 16)
+                y_offset = min(y_offset, max(reserved_top, frame_height - 30))
+                while any(
+                    x_offset < right
+                    and x_offset + estimated_width > left
+                    and y_offset < bottom
+                    and y_offset + 22 > top
+                    for left, top, right, bottom in placed
+                ) and y_offset + 22 < frame_height - 8:
+                    y_offset += 24
+                placed.append(
+                    (x_offset, y_offset, x_offset + estimated_width, y_offset + 22)
+                )
+                laid_out.append((label, x_offset, y_offset))
+            display_meta = pyds.nvds_acquire_display_meta_from_pool(batch_meta)
+            display_meta.num_labels = 1 + len(laid_out)
+            first = display_meta.text_params[0]
+            first.display_text = status_label
+            first.x_offset = 24
+            first.y_offset = 24
+            first.font_params.font_name = "Sans"
+            first.font_params.font_size = 32
+            first.font_params.font_color.set(
+                1.0, 0.25, 0.10, 1.0
+            ) if dms_result.alerts else first.font_params.font_color.set(0.10, 1.0, 0.55, 1.0)
+            first.set_bg_clr = 1
+            first.text_bg_clr.set(0.0, 0.0, 0.0, 0.70)
+            for index, (label, x_offset, y_offset) in enumerate(laid_out, start=1):
+                text_params = display_meta.text_params[index]
+                text_params.display_text = label
+                text_params.x_offset = x_offset
+                text_params.y_offset = y_offset
+                text_params.font_params.font_name = "Sans"
+                text_params.font_params.font_size = 14
+                text_params.font_params.font_color.set(1.0, 1.0, 1.0, 1.0)
+                text_params.set_bg_clr = 1
+                text_params.text_bg_clr.set(0.0, 0.0, 0.0, 0.65)
+            pyds.nvds_add_display_meta_to_frame(frame_meta, display_meta)
         self._add_live_timestamp(batch_meta, frame_meta)
 
     def _on_output_buffer(self, pad: Gst.Pad, info: Gst.PadProbeInfo) -> Gst.PadProbeReturn:
@@ -1122,6 +1325,8 @@ maintain-aspect-ratio=0
             # the engine clears it; a renderer TTL must not turn a confirmed
             # smoking track back into a plain person between slow analysis runs.
             detection_results = list(self._analysis_detections)
+            dms_detections = list(self._analysis_dms_detections)
+            dms_result = self._analysis_dms_result
             if fire_smoke_age_seconds <= self._analysis_result_max_age_seconds:
                 fire_smoke_detections = list(self._analysis_fire_smoke)
             else:
@@ -1130,8 +1335,40 @@ maintain-aspect-ratio=0
         while frame_list is not None:
             try:
                 frame_meta = pyds.NvDsFrameMeta.cast(frame_list.data)
+                ntp_timestamp = int(getattr(frame_meta, "ntp_timestamp", 0) or 0)
+                camera_latency_ms = _ntp_latency_ms(ntp_timestamp, self.last_output_at)
+                if camera_latency_ms is not None:
+                    source_timestamp = ntp_timestamp / 1_000_000_000
+                    self.last_camera_source_timestamp = source_timestamp
+                    self.camera_latency_samples += 1
+                    if self.last_output_pts_ns is not None:
+                        self._frame_timing_samples.append(
+                            {
+                                "rtp_timestamp": int(
+                                    (self.last_output_pts_ns * 90_000 // 1_000_000_000)
+                                    & 0xFFFFFFFF
+                                ),
+                                "capture_timestamp": source_timestamp,
+                                "output_timestamp": self.last_output_at,
+                                "output_pts_ns": self.last_output_pts_ns,
+                            }
+                        )
+                    if self.last_camera_latency_ms is None:
+                        self.last_camera_latency_ms = camera_latency_ms
+                    else:
+                        # Keep the displayed value stable while retaining the
+                        # latest source timestamp for diagnostics.
+                        self.last_camera_latency_ms = (
+                            self.last_camera_latency_ms * 0.8
+                            + camera_latency_ms * 0.2
+                        )
                 self._render_output_annotations(
-                    batch_meta, frame_meta, detection_results, fire_smoke_detections
+                    batch_meta,
+                    frame_meta,
+                    detection_results,
+                    fire_smoke_detections,
+                    dms_detections,
+                    dms_result,
                 )
                 frame_list = frame_list.next
             except StopIteration:
@@ -1157,6 +1394,16 @@ maintain-aspect-ratio=0
             "last_frame_at": self.last_frame_at,
             "last_output_at": self.last_output_at,
             "last_output_pts_ns": self.last_output_pts_ns,
+            "camera_latency_ms": (
+                round(self.last_camera_latency_ms, 1)
+                if self.last_camera_latency_ms is not None
+                else None
+            ),
+            "camera_source_timestamp": self.last_camera_source_timestamp,
+            "camera_latency_source": (
+                "rtcp_ntp" if self.camera_latency_samples else "unavailable"
+            ),
+            "camera_latency_samples": self.camera_latency_samples,
             "frame_count": self.frame_count,
             "analysis_queue_depth": sum(
                 executor.queue_depth for executor in self._analysis_executors.values()
@@ -1210,6 +1457,33 @@ maintain-aspect-ratio=0
                         [],
                     )
                 ],
+                "dms": {
+                    "status": self._analysis_dms_result.status
+                    if self._analysis_dms_result
+                    else "DISABLED",
+                    "alerts": list(self._analysis_dms_result.alerts)
+                    if self._analysis_dms_result
+                    else [],
+                    "metrics": dict(self._analysis_dms_result.metrics)
+                    if self._analysis_dms_result
+                    else {},
+                    "message": self._analysis_dms_result.message
+                    if self._analysis_dms_result
+                    else None,
+                    "detections": [
+                        {
+                            "source": detection.source,
+                            "original_class": detection.original_class,
+                            "label": detection.label,
+                            "score": round(float(detection.score), 5),
+                            "bbox": [round(float(value), 2) for value in detection.bbox],
+                            "person_track_id": detection.person_track_id,
+                        }
+                        for detection in self._analysis_dms_detections
+                    ],
+                    "events": self.dms_events.metrics(),
+                    "active_event_ids": self.dms_events.active_event_ids,
+                },
                 "smoking_episodes": self.event_store.metrics(),
                 "fire_smoke_raw_scores": getattr(self.fire_smoke_engine, "last_raw_scores", {}),
                 "fire_smoke_regions": self.fire_smoke_events.metrics(),
@@ -1552,12 +1826,46 @@ maintain-aspect-ratio=0
             obj_meta.text_params.text_bg_clr.set(0.0, 0.0, 0.0, 0.65)
             pyds.nvds_add_obj_meta_to_frame(frame_meta, obj_meta, None)
 
+    def _attach_dms_objects(self, batch_meta: Any, frame_meta: Any, detections: list[Any]) -> None:
+        """Render DMS model boxes on the DeepStream output surface."""
+        colors = {
+            "Seatbelt": (0.10, 0.73, 0.50, 1.0),
+            "Smoking": (1.0, 0.25, 0.10, 1.0),
+        }
+        for detection in detections:
+            left, top, right, bottom = detection.bbox
+            obj_meta = pyds.nvds_acquire_obj_meta_from_pool(batch_meta)
+            obj_meta.class_id = 100
+            obj_meta.object_id = 0
+            obj_meta.confidence = float(detection.score)
+            obj_meta.obj_label = f"dms_{detection.label}"
+            obj_meta.rect_params.left = float(left)
+            obj_meta.rect_params.top = float(top)
+            obj_meta.rect_params.width = float(right - left)
+            obj_meta.rect_params.height = float(bottom - top)
+            obj_meta.rect_params.border_width = 3
+            obj_meta.rect_params.border_color.set(
+                *colors.get(detection.label, (1.0, 0.60, 0.05, 1.0))
+            )
+            obj_meta.rect_params.has_bg_color = 0
+            # The visible DMS text is rendered in _render_output_annotations
+            # so it can be clamped below the top panels and de-duplicated.
+            obj_meta.text_params.display_text = ""
+            obj_meta.text_params.set_bg_clr = 0
+            pyds.nvds_add_obj_meta_to_frame(frame_meta, obj_meta, None)
+
     def _publish_metadata_frame(self, frame_meta: Any) -> None:
         """Publish lightweight overlay state from the non-blocking DeepStream probe."""
-        tracks = self._recognition_tracks(frame_meta)
+        tracks = [] if self.dms_enabled else self._recognition_tracks(frame_meta)
         detection_results, fire_smoke_detections, transitions, _ = self._cached_analysis()
         with self._analysis_lock:
             face_tracks = list(self._face_tracks.values())
+            dms_detections = list(self._analysis_dms_detections)
+            dms_result = self._analysis_dms_result
+            dms_transitions = list(self._analysis_transitions_by_function.get("dms", ()))
+            fire_smoke_transitions = list(
+                self._analysis_transitions_by_function.get("fire_smoke", ())
+            )
         face_by_track = {
             int(item.get("track_id", -1)): item for item in face_tracks
         }
@@ -1610,6 +1918,20 @@ maintain-aspect-ratio=0
                     "score": float(detection.score),
                 }
             )
+        for detection in dms_detections:
+            overlays.append(
+                {
+                    "kind": "dms",
+                    "label": f"{detection.label} {float(detection.score) * 100:.0f}%",
+                    "source": detection.source,
+                    "original_class": detection.original_class,
+                    "score": float(detection.score),
+                    "left": detection.bbox[0],
+                    "top": detection.bbox[1],
+                    "right": detection.bbox[2],
+                    "bottom": detection.bbox[3],
+                }
+            )
         payload = {
             "camera": self.config["input"].get("camera", "safety_camera"),
             "run_id": self.run_id,
@@ -1617,8 +1939,40 @@ maintain-aspect-ratio=0
             "height": int(self.config["input"].get("height", 1080)),
             "frame_num": int(frame_meta.frame_num),
             "timestamp": time.time(),
+            "frame_timing_samples": list(self._frame_timing_samples),
             "bbox_count": len(detection_results),
             "fire_smoke_count": len(fire_smoke_detections),
+            "dms": {
+                "status": dms_result.status if dms_result else "DISABLED",
+                "alerts": list(dms_result.alerts) if dms_result else [],
+                "metrics": dict(dms_result.metrics) if dms_result else {},
+                "message": dms_result.message if dms_result else None,
+                "detections": [
+                    {
+                        "source": detection.source,
+                        "original_class": detection.original_class,
+                        "label": detection.label,
+                        "confidence": round(float(detection.score), 5),
+                        "left": round(float(detection.bbox[0]), 2),
+                        "top": round(float(detection.bbox[1]), 2),
+                        "right": round(float(detection.bbox[2]), 2),
+                        "bottom": round(float(detection.bbox[3]), 2),
+                        "person_track_id": detection.person_track_id,
+                    }
+                    for detection in dms_detections
+                ],
+                "events": self.dms_events.metrics(),
+                "active_event_ids": self.dms_events.active_event_ids,
+                "transitions": [
+                    {
+                        "operation": item.operation,
+                        "event_id": item.event_id,
+                        "label": item.label,
+                        "sequence": item.alert_sequence,
+                    }
+                    for item in dms_transitions
+                ],
+            },
             "event_id": self.event_store.active_event_id,
             "event_state": self.event_store.state.value if self.event_store.state else "IDLE",
             "fire_smoke_events": [
@@ -1627,7 +1981,7 @@ maintain-aspect-ratio=0
                     "event_id": item.event_id,
                     "label": getattr(item, "label", "smoking"),
                 }
-                for item in transitions
+                for item in fire_smoke_transitions
             ],
             "fire_smoke_active_event_ids": self.fire_smoke_events.active_event_ids,
             "recognition_enabled": self.recognition.enabled,
@@ -1707,15 +2061,14 @@ maintain-aspect-ratio=0
 
     def _add_live_timestamp(self, batch_meta: Any, frame_meta: Any) -> None:
         """Stamp output frames with wall-clock time for live/event comparison."""
+        if self.dms_enabled:
+            return
         display_meta = pyds.nvds_acquire_display_meta_from_pool(batch_meta)
         display_meta.num_labels = 1
         text_params = display_meta.text_params[0]
-        text_params.display_text = (
-            f"{self.config['input'].get('camera', 'camera')} | "
-            f"LIVE {dt.datetime.now().astimezone().strftime('%H:%M:%S.%f')[:-3]}"
-        )
-        # Keep the live label clear of the left crop edge in the dashboard's
-        # object-cover viewport.
+        timestamp = f"LIVE {dt.datetime.now().astimezone().strftime('%H:%M:%S.%f')[:-3]}"
+        timestamp = f"{self.config['input'].get('camera', 'camera')} | {timestamp}"
+        text_params.display_text = timestamp
         text_params.x_offset = 48
         text_params.y_offset = 50
         text_params.font_params.font_name = "Sans"
@@ -2052,6 +2405,10 @@ maintain-aspect-ratio=0
                 self.event_store.close()
             except Exception:
                 LOG.exception("smoking event close failed; continuing shutdown")
+            try:
+                self.dms_events.close()
+            except Exception:
+                LOG.exception("DMS event close failed; continuing shutdown")
             try:
                 self.fire_smoke_events.close()
             except Exception:

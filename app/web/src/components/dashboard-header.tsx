@@ -7,7 +7,7 @@ interface DashboardHeaderProps {
   metrics: MetricsResponse | null
   status: string
   apiError: boolean
-  browserLatency: string
+  glassLatency: string
 }
 
 function formatUpdatedAt(timestamp?: number) {
@@ -30,7 +30,7 @@ function StatusDot({ tone }: { tone: 'healthy' | 'warning' | 'danger' | 'neutral
   return <span className={`status-dot status-dot-${tone}`} aria-hidden="true" />
 }
 
-export function DashboardHeader({ metrics, status, apiError, browserLatency }: DashboardHeaderProps) {
+export function DashboardHeader({ metrics, status, apiError, glassLatency }: DashboardHeaderProps) {
   const tone = runtimeTone(metrics, apiError)
   const statusLabel = apiError ? 'Đang kết nối lại' : metrics?.pipeline.running ? status : 'Runtime offline'
 
@@ -55,7 +55,7 @@ export function DashboardHeader({ metrics, status, apiError, browserLatency }: D
       </div>
 
       <div className="header-metrics-wrap min-w-0 flex-1">
-        <MetricsGrid metrics={metrics} browserLatency={browserLatency} />
+        <MetricsGrid metrics={metrics} glassLatency={glassLatency} />
       </div>
     </header>
   )

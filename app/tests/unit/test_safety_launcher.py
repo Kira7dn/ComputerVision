@@ -11,32 +11,22 @@ from bootstrap.config import (
 ROOT = Path(__file__).parents[3]
 
 
-def test_launcher_uses_the_current_deepstream_runtime() -> None:
-    launcher = (ROOT / "app" / "deploy" / "powershell" / "start.ps1").read_text(encoding="utf-8")
-    assert "runner" in launcher
-    assert "interfaces.dashboard_api" in launcher
-    assert "hot_reload.py" in launcher
-    assert "backend hot reload" in launcher
-    assert "deploy/run.ps1" not in launcher
-    assert "docker compose" in launcher
+def test_jetson_dev_launcher_uses_source_sync_and_vite_hmr() -> None:
+    launcher = (ROOT / "app" / "deploy" / "powershell" / "start-jetson-dev.ps1").read_text(encoding="utf-8")
+    assert "jetson_sync.py" in launcher
+    assert "MediaMTX" not in launcher
+    assert "Vite HMR" in launcher
+    assert "ssh" in launcher
+    assert "start.ps1" not in launcher
 
 
-def test_wsl_pause_keeps_distro_running_while_stop_shuts_wsl_down() -> None:
-    launcher = (ROOT / "app" / "deploy" / "powershell" / "start.ps1").read_text(
-        encoding="utf-8"
-    )
+def test_package_has_only_the_three_jetson_entrypoints() -> None:
     package = (ROOT / "package.json").read_text(encoding="utf-8")
-
-    dev_actions = launcher.split("'pause' {", 1)[1]
-    pause_branch = dev_actions.split("'stop' {", 1)[0]
-    stop_branch = dev_actions.split("'stop' {", 1)[1].split("'status' {", 1)[0]
-    assert '"wsl:pause"' in package
-    assert "pkill -TERM" in pause_branch
-    assert "pkill -KILL" not in pause_branch
-    assert "wsl.exe --shutdown" not in pause_branch
-    assert "for attempt in {1..60}" in pause_branch
-    assert "did not stop within 30 seconds" in pause_branch
-    assert "wsl.exe --shutdown" in stop_branch
+    assert '"dev"' in package
+    assert '"check"' in package
+    assert '"deploy"' in package
+    assert '"wsl:' not in package
+    assert '"docker:' not in package
 
 
 def test_cpu_analysis_branch_has_a_terminal_sink() -> None:
@@ -103,7 +93,7 @@ def test_live_output_follows_rtsp_sample_contract() -> None:
     pipeline = (ROOT / "app" / "src" / "application" / "camera_worker.py").read_text(
         encoding="utf-8"
     )
-    launcher = (ROOT / "app" / "deploy" / "powershell" / "start.ps1").read_text(
+    launcher = (ROOT / "app" / "deploy" / "powershell" / "deploy-jetson.ps1").read_text(
         encoding="utf-8"
     )
 
@@ -112,14 +102,14 @@ def test_live_output_follows_rtsp_sample_contract() -> None:
     assert 'make_element("nvv4l2h264enc", "output-encoder")' in pipeline
     assert 'make_element("rtspclientsink", "rtsp-output")' in pipeline
     assert 'output_queue.set_property("leaky", 2)' in pipeline
-    assert "unset NVDS_ENABLE_LATENCY_MEASUREMENT NVDS_ENABLE_COMPONENT_LATENCY_MEASUREMENT" in launcher
+    assert "tbox_lab.ps1" in launcher
 
 
 def test_config_routes_functions_per_camera() -> None:
     config_path = ROOT / "app" / "config" / "dev.yaml"
     raw = load_raw_config(config_path)
 
-    assert camera_ids(raw) == ["camera_face", "camera_safety", "camera_dahua"]
+    assert camera_ids(raw) == ["camera_face", "camera_safety", "DMS"]
     face = resolve_camera_config(raw, "camera_face")
     safety = resolve_camera_config(raw, "camera_safety")
 
@@ -128,22 +118,25 @@ def test_config_routes_functions_per_camera() -> None:
         "face_recognition": True,
         "smoking_behavior": False,
         "fire_smoke": False,
+        "dms": False,
     }
     assert safety["functions"] == {
         "trace": True,
         "face_recognition": False,
         "smoking_behavior": True,
         "fire_smoke": True,
+        "dms": False,
     }
     assert face["person"]["confidence"] == 0.05
     assert face["person"]["tracking"]["confirmation_hits"] == 2
-    dahua = resolve_camera_config(raw, "camera_dahua")
+    dahua = resolve_camera_config(raw, "DMS")
     assert "channel=5" in dahua["input"]["rtsp_url"]
     assert dahua["functions"] == {
-        "trace": True,
+        "trace": False,
         "face_recognition": False,
-        "smoking_behavior": True,
-        "fire_smoke": True,
+        "smoking_behavior": False,
+        "fire_smoke": False,
+        "dms": True,
     }
 
 
@@ -168,7 +161,7 @@ def test_fire_smoke_canary_model_can_be_overridden_for_one_camera() -> None:
     )
 
     safety = resolve_camera_config(raw, "camera_safety")
-    dahua = resolve_camera_config(raw, "camera_dahua")
+    dahua = resolve_camera_config(raw, "DMS")
 
     assert safety["fire_smoke"]["onnx_path"] == "/tmp/fire-smoke-candidate.onnx"
     assert dahua["fire_smoke"]["onnx_path"].endswith("fire_smoke/best.onnx")
@@ -185,7 +178,7 @@ def test_runtime_can_disable_notifications_for_acceptance(monkeypatch) -> None:
     assert resolved["notifications"]["enabled"] is False
 
 
-def test_event_feed_is_start_only_and_recognition_starts_on_exact_frame() -> None:
+def test_event_feed_collapses_lifecycle_and_recognition_starts_on_exact_frame() -> None:
     dashboard_server = (ROOT / "app" / "src" / "interfaces" / "dashboard_api.py").read_text(
         encoding="utf-8"
     )
@@ -196,7 +189,8 @@ def test_event_feed_is_start_only_and_recognition_starts_on_exact_frame() -> Non
         encoding="utf-8"
     )
 
-    assert 'if record_type != "START":' in dashboard_server
+    assert 'if record_type not in {"START", "UPDATE", "END"}:' in dashboard_server
+    assert "latest_by_event[event_id] = (sequence, record)" in dashboard_server
     assert '"thumbnail_url": thumbnail_url' in dashboard_server
     assert '"image_url": image_url' in dashboard_server
     assert "variant=thumbnail" in dashboard_server

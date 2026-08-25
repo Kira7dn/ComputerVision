@@ -128,7 +128,7 @@ def main() -> int:
         report["gates"]["dashboard_ready"] = bool(ready and ready.get("status") == "ready")
         metrics = _http_json("http://127.0.0.1:18080/api/metrics") or {}
         cameras = _camera_metrics(metrics)
-        expected = {"camera_face", "camera_safety", "camera_dahua"}
+        expected = {"camera_face", "camera_safety", "DMS"}
         report["gates"]["one_worker_per_camera"] = {_camera_key(item) for item in cameras} == expected
         report["gates"]["all_cameras_ready"] = bool(cameras) and all(item.get("ready") for item in cameras)
         hls_urls = [str(item["hls_url"]) for item in cameras if item.get("hls_url")]

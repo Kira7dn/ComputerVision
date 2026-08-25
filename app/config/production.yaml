@@ -48,7 +48,7 @@ cameras:
           threshold: 0.60
           crop: {strategy: person_padded, padding_ratio: 0.20}
           confirmation: {hits: 2, attempts: 4, clear_hits: 4}
-  - id: camera_dahua
+  - id: DMS
     source:
       type: rtsp
       url: rtsp://camera-dahua:554/stream
@@ -57,10 +57,11 @@ cameras:
     output:
       rtsp_url: rtsp://mediamtx:8554/dahua_bbox
     functions:
-      trace: true
+      trace: false
       face_recognition: false
-      smoking_behavior: true
-      fire_smoke: true
+      dms: true
+      smoking_behavior: false
+      fire_smoke: false
     analysis:
       functions:
         fire_smoke:
@@ -85,6 +86,30 @@ smoking_behavior:
         onnx_path: /opt/camera-safety/models/smoking_behavior/tbox/chaitanya_best.onnx
       soham:
         onnx_path: /opt/camera-safety/models/smoking_behavior/tbox/soham_best.onnx
+
+dms:
+  object_detection:
+    enabled: true
+    input_width: 640
+    input_height: 640
+    confidence: 0.35
+    nms_iou: 0.50
+    person_match_iou: 0.10
+    models:
+      chaitanya:
+        onnx_path: /opt/camera-safety/models/smoking_behavior/tbox/chaitanya_best.onnx
+        labels: [Cigarette, Drinking, Eating, Phone, Seatbelt]
+        positive_labels: [Cigarette, Drinking, Eating, Phone, Seatbelt]
+      soham:
+        onnx_path: /opt/camera-safety/models/smoking_behavior/tbox/soham_best.onnx
+        labels: [Distracted, Drinking, Drowsy, Eating, PhoneUse, SafeDriving, Seatbelt, Smoking]
+        positive_labels: [Distracted, Drinking, Drowsy, Eating, PhoneUse, SafeDriving, Seatbelt, Smoking]
+  face_mesh:
+    enabled: true
+  alerts:
+    on_frames: 3
+    off_frames: 2
+  interval_ms: 200
 
 fire_smoke:
   onnx_path: /opt/camera-safety/models/fire_smoke/best.onnx

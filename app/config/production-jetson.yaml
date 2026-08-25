@@ -10,7 +10,7 @@ notifications:
   enabled: false
 
 cameras:
-  - id: camera_dahua
+  - id: DMS
     source:
       type: rtsp
       url: rtsp://192.168.1.229:554/cam/realmonitor?channel=5&subtype=0
@@ -25,10 +25,11 @@ cameras:
     output:
       rtsp_url: rtsp://mediamtx:8554/dahua_bbox
     functions:
-      trace: true
+      trace: false
       face_recognition: false
-      smoking_behavior: true
-      fire_smoke: true
+      dms: true
+      smoking_behavior: false
+      fire_smoke: false
     analysis:
       functions:
         fire_smoke:

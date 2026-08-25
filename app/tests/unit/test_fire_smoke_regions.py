@@ -12,7 +12,7 @@ from domain.fire_smoke_events import DynamicsResult, FireSmokeEventStore, Region
 
 def _config(tmp_path: Path, *, hits: int = 4, window: int = 6) -> dict:
     return {
-        "input": {"camera": "camera_dahua"},
+        "input": {"camera": "DMS"},
         "runtime": {"worker_epoch": "epoch-test"},
         "evidence": {"directory": str(tmp_path), "prefix": "regions"},
         "fire_smoke": {

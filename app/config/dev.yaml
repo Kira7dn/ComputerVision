@@ -10,93 +10,75 @@ runtime:
   analysis_result_max_age_seconds: 2.0
 
 cameras:
-  - id: camera_face
+  - id: camera_front
     source:
       type: mock
-      url: rtsp://127.0.0.1:8554/face_mock
-      mock_video: /mnt/d/BusinessAnalyze/Camera/assets/fixtures/mock_videos/face-recognition/segments/01_P1E_S1_C1.mp4
+      url: rtsp://127.0.0.1:8554/camera_front_mock
+      mock_video: /opt/ls-vision-dev/data/mock-videos/cameras/CAM_FRONT.mp4
       loop: true
-      width: 1920
-      height: 1080
+      width: 1600
+      height: 900
       latency_ms: 200
     output:
-      rtsp_url: rtsp://127.0.0.1:8554/face_bbox
+      rtsp_url: rtsp://127.0.0.1:8554/camera_front
     functions:
-      trace: true
-      face_recognition: true
+      trace: false
+      face_recognition: false
       smoking_behavior: false
-  - id: camera_safety
+      fire_smoke: false
+      dms: false
+  - id: camera_back
     source:
       type: mock
-      url: rtsp://127.0.0.1:8554/safety_mock
-      mock_video: /mnt/d/BusinessAnalyze/Camera/assets/fixtures/mock_videos/smoker/samples/part1/bucket11.mp4
+      url: rtsp://127.0.0.1:8554/camera_back_mock
+      mock_video: /opt/ls-vision-dev/data/mock-videos/cameras/CAM_BACK.mp4
       loop: true
-      width: 1920
-      height: 1080
+      width: 1600
+      height: 900
       latency_ms: 200
     output:
-      rtsp_url: rtsp://127.0.0.1:8554/safety_bbox
+      rtsp_url: rtsp://127.0.0.1:8554/camera_back
     functions:
-      trace: true
+      trace: false
       face_recognition: false
-      smoking_behavior: true
-      fire_smoke: true
-    analysis:
-      functions:
-        fire_smoke:
-          interval_ms: 300
-          thresholds:
-            fire: 0.30
-            smoke: 0.40
-          rois:
-            fire: [0.30, 0.05, 0.70, 0.80]
-            smoke: [0.05, 0.00, 0.80, 0.95]
-        smoking:
-          interval_ms: 400
-          threshold: 0.60
-          crop:
-            strategy: person_padded
-            padding_ratio: 0.20
-          confirmation:
-            hits: 2
-            attempts: 4
-            clear_hits: 4
-  - id: camera_dahua
+      smoking_behavior: false
+      fire_smoke: false
+      dms: false
+  - id: camera_left
     source:
-      type: rtsp
-      url: rtsp://192.168.100.229:554/cam/realmonitor?channel=5&subtype=0
-      username_env: FRIGATE_DAHUA_USER
-      password_env: FRIGATE_DAHUA_PASSWORD
-      codec: hevc
+      type: mock
+      url: rtsp://127.0.0.1:8554/camera_left_mock
+      mock_video: /opt/ls-vision-dev/data/mock-videos/cameras/CAM_FRONT_LEFT.mp4
       loop: true
-      width: 1920
-      height: 1080
+      width: 1600
+      height: 900
       latency_ms: 200
     output:
-      rtsp_url: rtsp://127.0.0.1:8554/dahua_bbox
+      rtsp_url: rtsp://127.0.0.1:8554/camera_left
     functions:
-      trace: true
+      trace: false
       face_recognition: false
-      smoking_behavior: true
-      fire_smoke: true
-    analysis:
-      functions:
-        fire_smoke:
-          interval_ms: 300
-          thresholds:
-            fire: 0.30
-            smoke: 0.40
-          rois: {}
-        smoking:
-          interval_ms: 400
-          threshold: 0.60
-          crop:
-            strategy: person_padded
-            padding_ratio: 0.20
-          confirmation:
-            hits: 2
-            attempts: 4
-            clear_hits: 4
+      smoking_behavior: false
+      fire_smoke: false
+      dms: false
+  - id: camera_right
+    source:
+      type: mock
+      url: rtsp://127.0.0.1:8554/camera_right_mock
+      mock_video: /opt/ls-vision-dev/data/mock-videos/cameras/CAM_FRONT_RIGHT.mp4
+      loop: true
+      width: 1600
+      height: 900
+      latency_ms: 200
+    output:
+      rtsp_url: rtsp://127.0.0.1:8554/camera_right
+    functions:
+      trace: false
+      face_recognition: false
+      smoking_behavior: false
+      fire_smoke: false
+      dms: false
+
 
 smoking_behavior:
   onnx_path: /mnt/d/BusinessAnalyze/Camera/assets/models/smoking_behavior/model.onnx
@@ -119,6 +101,30 @@ smoking_behavior:
     - CUDAExecutionProvider
     - CPUExecutionProvider
   require_gpu_provider: true
+
+dms:
+  object_detection:
+    enabled: true
+    input_width: 640
+    input_height: 640
+    confidence: 0.35
+    nms_iou: 0.50
+    person_match_iou: 0.10
+    models:
+      chaitanya:
+        onnx_path: /mnt/d/BusinessAnalyze/Camera/assets/models/smoking_behavior/tbox/chaitanya_best.onnx
+        labels: [Cigarette, Drinking, Eating, Phone, Seatbelt]
+        positive_labels: [Cigarette, Drinking, Eating, Phone, Seatbelt]
+      soham:
+        onnx_path: /mnt/d/BusinessAnalyze/Camera/assets/models/smoking_behavior/tbox/soham_best.onnx
+        labels: [Distracted, Drinking, Drowsy, Eating, PhoneUse, SafeDriving, Seatbelt, Smoking]
+        positive_labels: [Distracted, Drinking, Drowsy, Eating, PhoneUse, SafeDriving, Seatbelt, Smoking]
+  face_mesh:
+    enabled: true
+  alerts:
+    on_frames: 3
+    off_frames: 2
+  interval_ms: 200
 
 fire_smoke:
   # Exported from assets/models/fire_smoke/best.pt for the WSL runtime.
@@ -159,7 +165,7 @@ person:
     confirmation_window: 4
 
 recognition:
-  enabled: true
+  enabled: false
   stream_epoch: deepstream-safety
   face:
     unknown_score: 0.7

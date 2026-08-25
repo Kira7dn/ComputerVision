@@ -2,17 +2,8 @@
   "name": "dahua-local-poc",
   "private": true,
   "scripts": {
-    "wsl:start": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\app\\deploy\\powershell\\start.ps1 -Action start -Mode Dev -FollowLogs",
-    "wsl:logs": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\app\\deploy\\powershell\\start.ps1 -Action logs -Mode Dev",
-    "wsl:pause": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\app\\deploy\\powershell\\start.ps1 -Action pause -Mode Dev",
-    "wsl:stop": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\app\\deploy\\powershell\\start.ps1 -Action stop -Mode Dev",
-    "wsl:status": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\app\\deploy\\powershell\\start.ps1 -Action status -Mode Dev",
-    "docker:config": "docker compose -f .\\app\\deploy\\docker\\compose.yaml config --quiet",
-    "docker:build": "docker compose -f .\\app\\deploy\\docker\\compose.yaml build ls-vision",
-    "docker:start": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\app\\deploy\\powershell\\start.ps1 -Action start -Mode Production",
-    "docker:stop": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\app\\deploy\\powershell\\start.ps1 -Action stop -Mode Production",
-    "docker:status": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\app\\deploy\\powershell\\start.ps1 -Action status -Mode Production",
-    "docker:logs": "docker compose -f .\\app\\deploy\\docker\\compose.yaml logs --no-color --tail 200 ls-vision",
-    "deploy:jetson": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\app\\deploy\\powershell\\deploy-jetson.ps1"
+    "dev": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\app\\deploy\\powershell\\start-jetson-dev.ps1 -Action start",
+    "check": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\app\\deploy\\powershell\\check.ps1",
+    "deploy": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\app\\deploy\\powershell\\deploy-jetson.ps1"
   }
 }

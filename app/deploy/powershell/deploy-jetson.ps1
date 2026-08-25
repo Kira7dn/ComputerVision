@@ -11,8 +11,10 @@
 
 [CmdletBinding()]
 param(
-    [string]$JetsonAlias = 'jetson-default',
-    [string]$LeosRoot = 'D:\BusinessAnalyze\Letron\letron-leos'
+    [string]$JetsonAlias = 'jetson-nano',
+    [string]$LeosRoot = 'D:\BusinessAnalyze\Letron\letron-leos',
+    [string]$SudoPassword = 'letron123',
+    [switch]$Development
 )
 
 $ErrorActionPreference = 'Stop'
@@ -25,13 +27,19 @@ if (-not (Test-Path -LiteralPath $tboxLab -PathType Leaf)) {
     throw "tbox_lab.ps1 was not found: $tboxLab"
 }
 
-Write-Host "==> Deploying Camera native runtime through tbox_lab to $JetsonAlias" -ForegroundColor Cyan
+if ($Development) {
+    Write-Host "==> Deploying Camera Jetson development runtime through tbox_lab to $JetsonAlias" -ForegroundColor Cyan
+} else {
+    Write-Host "==> Deploying Camera native runtime through tbox_lab to $JetsonAlias" -ForegroundColor Cyan
+}
 Push-Location $leosRootPath
 try {
+    $action = if ($Development) { 'deploy-app-dev' } else { 'deploy-app' }
     & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $tboxLab `
-        deploy-app `
+        $action `
         -JetsonAlias $JetsonAlias `
-        -CameraRoot $cameraRoot
+        -CameraRoot $cameraRoot `
+        -SudoPassword $SudoPassword
     $deployExitCode = $LASTEXITCODE
 }
 finally {
