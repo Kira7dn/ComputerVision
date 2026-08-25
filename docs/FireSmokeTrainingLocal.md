@@ -10,7 +10,7 @@ với GPU local. Cài PyTorch CUDA theo phiên bản CUDA của máy, sau đó:
 
 ```powershell
 $python = '.venv\Scripts\python.exe'
-& $python -m pip install -r apps\ls-vision\requirements-training.txt
+& $python -m pip install -r apps\requirements-training.txt
 ```
 
 ## Dataset local
@@ -53,7 +53,7 @@ sources:
 Chuẩn hóa và checksum source:
 
 ```powershell
-& $python apps\ls-vision\tools\prepare_fire_smoke_dataset.py `
+& $python apps\tools\prepare_fire_smoke_dataset.py `
   --source-yolo dfire-v1=.tmp\public\dfire `
   --source-catalog .tmp\fire-smoke-sources.yaml `
   --output .tmp\fire-smoke-dataset-p0
@@ -66,7 +66,7 @@ coi là đã chứng minh độ chính xác theo domain camera thực tế.
 Có thể tạo fixture dataset để kiểm tra pipeline:
 
 ```powershell
-& $python apps\ls-vision\tools\prepare_fire_smoke_dataset.py `
+& $python apps\tools\prepare_fire_smoke_dataset.py `
   --output .tmp\fire-smoke-fixture-v2
 ```
 
@@ -80,7 +80,7 @@ theo domain thực tế.
 ## Training candidate
 
 ```powershell
-& $python apps\ls-vision\tools\train_fire_smoke.py `
+& $python apps\tools\train_fire_smoke.py `
   --data .tmp\fire-smoke-fixture-v2\data.yaml `
   --weights assets\models\fire_smoke\best.pt `
   --project .tmp\fire-smoke-training `
@@ -133,7 +133,7 @@ và replay:
 
 Candidate public-only có thể train và benchmark offline, nhưng chỉ sau các gate runtime
 trên mới được canary; thiếu false alarms/hour hoặc domain evidence thì giữ
-`accepted=false` và không thay đổi `apps/ls-vision/config/*` hoặc manifest model.
+`accepted=false` và không thay đổi `config/*` hoặc manifest model.
 
 Workspace hiện không cung cấp launcher canary tự động. Candidate chỉ được thử trên
 Jetson development sau khi có một thay đổi config được review riêng; không tạo config
@@ -141,4 +141,4 @@ source thứ ba trong repository. Report canary đặt dưới `.tmp/fire-smoke-
 phải có tối thiểu 8 giờ, provider GPU active, không stale/out-of-order/duplicate,
 controlled fire latency không quá 3 giây và đủ negative CCTV đã label để tính
 `false_alarms/hour`. Thiếu bất kỳ gate nào thì giữ `accepted=false` và chạy lại
-baseline từ `apps/ls-vision/config/dev.yaml`.
+baseline từ `config/dev.yaml`.

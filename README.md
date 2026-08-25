@@ -2,22 +2,22 @@
 
 Workspace có hai boundary độc lập:
 
-- `apps/ls-vision/`: ứng dụng multi-camera DeepStream, dashboard và native Jetson deployment.
+- `apps/`: ứng dụng multi-camera DeepStream, dashboard và native Jetson deployment.
 - `services/camera-server/`: dịch vụ Dahua ADAS/FTP/archive có package, dependency và test riêng.
 
 ## LS-Vision
 
 ```powershell
-npm install --prefix apps/ls-vision/web
+npm install --prefix apps/web
 npm test
 npm run check
 npm run dev
 npm run deploy
 ```
 
-Runtime Python nằm trong package `apps/ls-vision/src/ls_vision`. Production vẫn đóng gói ứng dụng dưới `/opt/ls-vision/releases/<release>/app` để tương thích rollback với các release cũ.
+Runtime Python nằm trong package `apps/src`. Production vẫn đóng gói ứng dụng dưới `/opt/ls-vision/releases/<release>/app` để tương thích rollback với các release cũ.
 
-Xem [apps/ls-vision/README.md](apps/ls-vision/README.md) và [kiến trúc Platform](docs/architecture/Platform.md).
+Xem [apps/README.md](apps/README.md) và [kiến trúc Platform](docs/architecture/Platform.md).
 
 ## Camera Server
 

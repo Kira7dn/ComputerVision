@@ -6,7 +6,7 @@ Ngày cập nhật: 25/08/2026
 
 ```text
 production.yaml
-  -> ls_vision.service
+  -> service
       -> dashboard/API
       -> runner
           -> camera process per non-media-only camera

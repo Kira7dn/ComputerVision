@@ -1,0 +1,8 @@
+# Install separately from apps/requirements-runtime.txt for local model training.
+# Select the matching CUDA PyTorch wheel for the host before installing this file.
+ultralytics>=8.3,<9
+onnx>=1.16,<2
+onnxsim>=0.4.36,<1
+onnxslim>=0.1.82,<1
+onnxruntime-gpu>=1.20,<2
+PyYAML>=6,<7

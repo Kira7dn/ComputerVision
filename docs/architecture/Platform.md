@@ -4,11 +4,11 @@ Ngày cập nhật: 25/08/2026
 
 ## Source of truth và ownership
 
-`apps/ls-vision/` là runtime Camera AI canonical. Native Jetson là production target hiện hành. `services/camera-server/` là boundary ADAS/FTP/archive độc lập và không tham gia startup path của LS-Vision.
+`apps/` là runtime Camera AI canonical. Native Jetson là production target hiện hành. `services/camera-server/` là boundary ADAS/FTP/archive độc lập và không tham gia startup path của LS-Vision.
 
 | Lane | Owner |
 | --- | --- |
-| Camera process lifecycle | `ls_vision.runner` |
+| Camera process lifecycle | `runner` |
 | Capture, DeepStream graph, tracking, annotation, RTSP | DeepStream adapter của từng camera |
 | Face, DMS, smoking, fire/smoke, front inference | Model adapters được gán theo camera config |
 | Event transition | Domain/application services của camera process |
