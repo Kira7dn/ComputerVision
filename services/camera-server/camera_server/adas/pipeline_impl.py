@@ -88,9 +88,8 @@ class AdasPipeline:
         self.event_log = event_log
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.model_path = Path(os.environ.get(
-            'ADAS_MODEL_PATH', 'yolov8n.pt'
-        ))
+        default_model = Path(__file__).resolve().parents[2] / 'models' / 'yolov8n.pt'
+        self.model_path = Path(os.environ.get('ADAS_MODEL_PATH', str(default_model)))
         configured_rtsp = os.environ.get('MEDIAMTX_PUBLISH_URL')
         if configured_rtsp:
             parts = urlsplit(configured_rtsp)

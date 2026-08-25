@@ -14,9 +14,15 @@ def test_workspace_uses_explicit_app_and_service_boundaries() -> None:
     assert (WORKSPACE_ROOT / "services" / "camera-server" / "pyproject.toml").is_file()
     assert not (WORKSPACE_ROOT / "app").exists()
     assert not (WORKSPACE_ROOT / "server").exists()
-    assert not (WORKSPACE_ROOT / "pyproject.toml").exists()
+    assert (WORKSPACE_ROOT / "pyproject.toml").is_file()
+    assert (WORKSPACE_ROOT / "requirements-runtime.txt").is_file()
+    assert (WORKSPACE_ROOT / "requirements-runtime-jetson.txt").is_file()
+    assert (WORKSPACE_ROOT / "requirements-training.txt").is_file()
     assert not (WORKSPACE_ROOT / "requirements.txt").exists()
     assert not (WORKSPACE_ROOT / "uv.lock").exists()
+    assert {path.name for path in APP_ROOT.iterdir()} == {"src", "web"}
+    assert (WORKSPACE_ROOT / "training" / "prepare_fire_smoke_dataset.py").is_file()
+    assert (WORKSPACE_ROOT / "training" / "train_fire_smoke.py").is_file()
 
 
 def test_runtime_has_one_package_namespace() -> None:

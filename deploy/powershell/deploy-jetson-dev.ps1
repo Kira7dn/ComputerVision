@@ -230,7 +230,8 @@ try {
     [System.IO.File]::WriteAllText($tempManifest, $manifestJson, $utf8NoBom)
     tar -czf $tempArchive --exclude='./web/node_modules' `
         --exclude='./.pytest_cache' --exclude='./.ruff_cache' --exclude='*/__pycache__' `
-        --exclude='*.pyc' -C $appPath . -C $cameraPath config deploy
+        --exclude='*.pyc' -C $appPath . -C $cameraPath config deploy `
+        pyproject.toml requirements-runtime.txt requirements-runtime-jetson.txt
     if ($LASTEXITCODE -ne 0) { throw 'Unable to package apps source' }
     if ((Get-FileHash -LiteralPath $frontModelPath -Algorithm SHA256).Hash.ToLowerInvariant() -ne $frontModelSha256) {
         throw 'Front model checksum does not match the pinned provenance record'

@@ -25,20 +25,30 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-package-dir = {"" = "src"}
+package-dir = {"" = "apps/src"}
 py-modules = ["runner", "service"]
 
 [tool.setuptools.packages.find]
-where = ["src"]
+where = ["apps/src"]
 
 [tool.pytest.ini_options]
-testpaths = ["../tests"]
-pythonpath = ["src"]
+testpaths = ["tests"]
+pythonpath = ["apps/src"]
 
 [tool.ruff]
 target-version = "py311"
 line-length = 100
+exclude = ["training/vendor", "training/runs"]
 
 [tool.ruff.lint]
 ignore = ["E501"]
 extend-select = ["I", "UP", "B"]
+
+[tool.ruff.lint.isort]
+known-first-party = [
+  "adapters",
+  "application",
+  "bootstrap",
+  "domain",
+  "interfaces",
+]

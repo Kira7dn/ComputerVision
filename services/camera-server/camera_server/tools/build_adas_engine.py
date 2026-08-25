@@ -19,9 +19,10 @@ def sha256(path):
 
 
 def main():
+    service_root = Path(__file__).resolve().parents[2]
     parser = argparse.ArgumentParser()
-    parser.add_argument('--weights', default='yolov8n.pt')
-    parser.add_argument('--output-dir', default=str(Path(__file__).resolve().parent.parent / 'models'))
+    parser.add_argument('--weights', default=str(service_root / 'models' / 'yolov8n.pt'))
+    parser.add_argument('--output-dir', default=str(service_root / 'models'))
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir).resolve()

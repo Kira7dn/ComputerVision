@@ -29,7 +29,6 @@ sdk/
 .coverage.*
 htmlcov/
 *.egg-info/
-__pycache__/
 *.py[cod]
 services/camera-server/uploads/
 services/camera-server/runtime/
@@ -49,15 +48,12 @@ services/camera-server/media/dahua_netsdk_backup/bin/
 services/camera-server/media/dahua_netsdk_backup/obj/
 camera_adas.egg-info/
 .pip-cache/
-.tmp/
 
 # Local mock media and cloned upstream repositories
 assets/fixtures/mock_videos/
-.playwright-cli/
-runtime/output/
-/runtime/
 dahua_sdk/
 assets/models/
-runtime/artifacts/
 assets/face_library/
 output/
+training/vendor/
+training/runs/

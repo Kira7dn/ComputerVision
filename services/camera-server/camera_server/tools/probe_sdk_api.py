@@ -2,6 +2,7 @@
 
 import os
 import sys
+from pathlib import Path
 
 # Fix Windows console encoding
 stdout_reconfigure = getattr(sys.stdout, 'reconfigure', None)
@@ -12,8 +13,8 @@ if callable(stderr_reconfigure):
     stderr_reconfigure(encoding='utf-8', errors='replace')
 
 # Add dahua_sdk to path before importing
-SDK_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), 'vendor', 'dahua_sdk'))
-sys.path.insert(0, SDK_DIR)
+SDK_DIR = Path(__file__).resolve().parents[2] / 'vendor' / 'dahua_sdk'
+sys.path.insert(0, str(SDK_DIR))
 
 from ctypes import sizeof
 

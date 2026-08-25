@@ -19,8 +19,8 @@ from typing import Any
 import cv2
 import yaml
 
-ROOT = Path(__file__).parents[2]
-APP_ROOT = Path(__file__).parents[1]
+ROOT = Path(__file__).parents[1]
+APP_ROOT = ROOT / "apps"
 sys.path.insert(0, str(APP_ROOT / "src"))
 
 from application.fire_smoke_dataset import (  # noqa: E402

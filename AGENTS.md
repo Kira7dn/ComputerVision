@@ -6,7 +6,8 @@
 - Làm việc từ PowerShell tại `D:\BusinessAnalyze\Camera`.
 - Giữ nguyên thay đổi ngoài task; không dùng reset/checkout phá hủy hoặc xóa đệ quy ngoài thư mục tạm đã xác định.
 - `services/camera-server/` là boundary ADAS/FTP/archive độc lập, không thuộc runtime LS-Vision.
-- `apps/` là source, web và tooling owner của LS-Vision; `config/`, `deploy/` và `tests/` nằm ở root.
+- `apps/` chỉ chứa runtime source và web của LS-Vision; `training/` sở hữu tooling offline.
+- `config/`, `deploy/`, `tests/`, `pyproject.toml` và requirements nằm ở root.
 
 ## Runtime canonical
 
@@ -49,9 +50,9 @@ Không dùng workspace khác để điều khiển `ls-vision*` hoặc `mediamtx
 
 ```powershell
 $python = 'D:\BusinessAnalyze\Camera\.venv\Scripts\python.exe'
-& $python -m pytest -c apps/pyproject.toml tests -q
-& $python -m ruff check apps/src tests
-& $python -m compileall -q apps/src tests
+& $python -m pytest -c pyproject.toml tests -q
+& $python -m ruff check apps/src training/prepare_fire_smoke_dataset.py training/train_fire_smoke.py training/models tests
+& $python -m compileall -q apps/src training/prepare_fire_smoke_dataset.py training/train_fire_smoke.py training/models tests
 npm run check
 git diff --check
 ```

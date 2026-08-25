@@ -10,7 +10,7 @@ với GPU local. Cài PyTorch CUDA theo phiên bản CUDA của máy, sau đó:
 
 ```powershell
 $python = '.venv\Scripts\python.exe'
-& $python -m pip install -r apps\requirements-training.txt
+& $python -m pip install -r requirements-training.txt
 ```
 
 ## Dataset local
@@ -53,7 +53,7 @@ sources:
 Chuẩn hóa và checksum source:
 
 ```powershell
-& $python apps\tools\prepare_fire_smoke_dataset.py `
+& $python training\prepare_fire_smoke_dataset.py `
   --source-yolo dfire-v1=.tmp\public\dfire `
   --source-catalog .tmp\fire-smoke-sources.yaml `
   --output .tmp\fire-smoke-dataset-p0
@@ -66,7 +66,7 @@ coi là đã chứng minh độ chính xác theo domain camera thực tế.
 Có thể tạo fixture dataset để kiểm tra pipeline:
 
 ```powershell
-& $python apps\tools\prepare_fire_smoke_dataset.py `
+& $python training\prepare_fire_smoke_dataset.py `
   --output .tmp\fire-smoke-fixture-v2
 ```
 
@@ -80,7 +80,7 @@ theo domain thực tế.
 ## Training candidate
 
 ```powershell
-& $python apps\tools\train_fire_smoke.py `
+& $python training\train_fire_smoke.py `
   --data .tmp\fire-smoke-fixture-v2\data.yaml `
   --weights assets\models\fire_smoke\best.pt `
   --project .tmp\fire-smoke-training `
