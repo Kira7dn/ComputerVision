@@ -56,6 +56,9 @@ $appPath = Join-Path $cameraPath 'apps'
 $modelsPath = Join-Path $cameraPath 'assets\models'
 $frontModelPath = Join-Path $modelsPath 'openpilot\driving_supercombo.onnx'
 $frontModelSha256 = '659727c4d4839adc4992a254409a54259a8756a743f2d567bf5fdc6579f8009b'
+$frontPacketFixtureName = 'CAM_FRONT_20FPS_ALL_I.mp4'
+$frontPacketFixtureSha256 = '6769b0ae76379fa46ec9d6ae84edbc22cf8e77557fdae21aafc9f0785af3e507'
+$frontPacketFixturePath = Join-Path $Mock360Directory $frontPacketFixtureName
 $serviceName = if ($DeploymentProfile -eq 'production') { 'ls-vision.service' } else { 'ls-vision-dev.service' }
 $deployPath = Join-Path $cameraPath 'deploy'
 $configRoot = Join-Path $cameraPath 'config'
@@ -113,7 +116,7 @@ if ([string]::IsNullOrWhiteSpace($SudoPassword)) {
     throw 'LS_VISION_SUDO_PASSWORD is required for deploy/start.'
 }
 
-foreach ($required in @($appPath, $servicePath, $mediaServicePath, $mdnsServicePath, $ingressServicePath, $frontModelPath, $Mock360Directory)) {
+foreach ($required in @($appPath, $servicePath, $mediaServicePath, $mdnsServicePath, $ingressServicePath, $frontModelPath, $Mock360Directory, $frontPacketFixturePath)) {
     if (-not (Test-Path -LiteralPath $required)) {
         throw "Jetson deployment input is missing: $required"
     }
@@ -236,9 +239,12 @@ try {
     if ((Get-FileHash -LiteralPath $frontModelPath -Algorithm SHA256).Hash.ToLowerInvariant() -ne $frontModelSha256) {
         throw 'Front model checksum does not match the pinned provenance record'
     }
+    if ((Get-FileHash -LiteralPath $frontPacketFixturePath -Algorithm SHA256).Hash.ToLowerInvariant() -ne $frontPacketFixtureSha256) {
+        throw 'Front packet-copy fixture checksum does not match the pinned artifact'
+    }
     tar -czf $tempModelArchive -C $modelsPath openpilot/driving_supercombo.onnx
     if ($LASTEXITCODE -ne 0) { throw 'Unable to package the front-assistance model' }
-    tar -czf $tempMock360Archive -C $Mock360Directory CAM_FRONT.mp4 CAM_BACK.mp4 CAM_FRONT_LEFT.mp4 CAM_FRONT_RIGHT.mp4
+    tar -czf $tempMock360Archive -C $Mock360Directory CAM_FRONT.mp4 $frontPacketFixtureName CAM_BACK.mp4 CAM_FRONT_LEFT.mp4 CAM_FRONT_RIGHT.mp4
     if ($LASTEXITCODE -ne 0) { throw 'Unable to package synchronized 360 mock videos' }
 
     Write-Step "Copying Jetson $DeploymentProfile release $releaseName"

@@ -419,10 +419,17 @@ class DmsBehaviorEngine:
         )
         self.interval_seconds = min(behavior_interval, attention_interval)
         self.behavior_interval_seconds = behavior_interval
+        face_config = runtime.get("face_mesh", {}) or {}
+        self.face_interval_seconds = max(
+            0.05, float(face_config.get("interval_ms", 100)) / 1000.0
+        )
         self.object_detector = SmokingObjectDetector(config, section="dms")
         self.face = DmsFaceAnalyzer(config)
         self.attention_policy = DriverAttentionPolicy(attention)
         self._last_behavior_at: float | None = None
+        self._last_face_at: float | None = None
+        self._cached_face_metrics: dict[str, Any] = {}
+        self._cached_face_alerts: set[str] = set()
         self._primary_driver_track_id: int | None = None
         self._cached_raw_objects: list[SmokingObjectDetection] = []
         self.smoother = AlertSmoother(
@@ -513,11 +520,25 @@ class DmsBehaviorEngine:
         )
         if primary_driver is not None:
             self._primary_driver_track_id = int(primary_driver[0])
-        face_metrics, face_alerts, face_latency_ms = self.face.process(
-            frame,
-            timestamp=timestamp,
-            driver_bbox=primary_driver[1] if primary_driver is not None else None,
+        face_latency_ms = 0.0
+        face_inference_ran = (
+            self._last_face_at is None
+            or timestamp - self._last_face_at >= self.face_interval_seconds
         )
+        if face_inference_ran:
+            face_metrics, face_alerts, face_latency_ms = self.face.process(
+                frame,
+                timestamp=timestamp,
+                driver_bbox=primary_driver[1] if primary_driver is not None else None,
+            )
+            self._cached_face_metrics = dict(face_metrics)
+            self._cached_face_alerts = set(face_alerts)
+            self._last_face_at = timestamp
+        else:
+            face_metrics = dict(self._cached_face_metrics)
+            face_alerts = set(self._cached_face_alerts)
+        face_metrics["face_inference_ran"] = face_inference_ran
+        face_metrics["face_rate_hz"] = round(1.0 / self.face_interval_seconds, 3)
         raw_alerts.update(face_alerts)
         smoothed_alerts = set(self.smoother.update(raw_alerts))
 

@@ -18,7 +18,7 @@ from bootstrap.config import load_raw_config
 ROOT = Path(__file__).parents[2]
 
 
-def test_discovers_one_publisher_and_three_direct_files() -> None:
+def test_discovers_four_synchronized_packet_publishers() -> None:
     cameras = discover_timeline_cameras(load_raw_config(ROOT / "config" / "dev.yaml"))
 
     assert [camera.camera_id for camera in cameras] == [
@@ -27,12 +27,19 @@ def test_discovers_one_publisher_and_three_direct_files() -> None:
         "camera_left",
         "camera_right",
     ]
-    assert [camera.camera_id for camera in cameras if not camera.media_only] == [
-        "camera_front"
-    ]
+    assert [camera.camera_id for camera in cameras if not camera.media_only] == ["camera_front"]
     assert {camera.group for camera in cameras} == {"vehicle_surround"}
     assert {camera.period_seconds for camera in cameras} == {191.1}
     assert {camera.epoch_seconds for camera in cameras} == {0.0}
+    assert {camera.publisher_mode for camera in cameras} == {"packet_copy"}
+    assert {camera.camera_id: camera.fps for camera in cameras} == {
+        "camera_front": 20,
+        "camera_back": 10,
+        "camera_left": 10,
+        "camera_right": 10,
+    }
+    front = cameras[0]
+    assert front.mock_video.name == "CAM_FRONT_20FPS_ALL_I.mp4"
 
 
 def test_rejects_timeline_contract_drift() -> None:
@@ -53,7 +60,7 @@ class ReadyPublisher:
         }
 
 
-def test_aggregate_requires_publisher_and_all_direct_files(tmp_path: Path) -> None:
+def test_aggregate_requires_all_publishers_ready(tmp_path: Path) -> None:
     fixture = tmp_path / "fixture.mp4"
     fixture.write_bytes(b"fixture")
     cameras = [
@@ -61,18 +68,19 @@ def test_aggregate_requires_publisher_and_all_direct_files(tmp_path: Path) -> No
         TimelineCamera("back", "surround", 10.0, 0.0, True, fixture, "rtsp://x/back", 15),
     ]
 
-    status = _aggregate_status(cameras, {"front": ReadyPublisher()})  # type: ignore[arg-type]
+    publishers = {"front": ReadyPublisher(), "back": ReadyPublisher()}
+    status = _aggregate_status(cameras, publishers)  # type: ignore[arg-type]
 
     assert status["ready"] is True
     assert status["groups"]["surround"]["locked"] is True
-    assert status["groups"]["surround"]["cameras"]["back"] == {
-        "mode": "direct_file",
-        "ready": True,
-        "file_name": "fixture.mp4",
-    }
+    assert status["groups"]["surround"]["cameras"]["back"]["mode"] == "publisher"
 
-    fixture.unlink()
-    status = _aggregate_status(cameras, {"front": ReadyPublisher()})  # type: ignore[arg-type]
+    publishers["back"] = type(
+        "OfflinePublisher",
+        (),
+        {"status": lambda self, _now: {"mode": "publisher", "ready": False}},
+    )()
+    status = _aggregate_status(cameras, publishers)  # type: ignore[arg-type]
     assert status["ready"] is False
 
 
@@ -107,6 +115,7 @@ def test_publisher_adopts_fresh_matching_process(tmp_path: Path, monkeypatch) ->
             {
                 "camera_id": "front",
                 "sync_group": "surround",
+                "publisher_mode": "frame_encode",
                 "pid": 321,
                 "ready": True,
                 "updated_at": time.time(),
@@ -131,3 +140,49 @@ def test_publisher_adopts_fresh_matching_process(tmp_path: Path, monkeypatch) ->
     assert publisher.process is None
     assert publisher.adopted_pid == 321
     assert publisher.stream_verified is True
+
+
+def test_publisher_does_not_adopt_a_different_mode(tmp_path: Path, monkeypatch) -> None:
+    fixture = tmp_path / "front.mp4"
+    fixture.write_bytes(b"fixture")
+    camera = TimelineCamera(
+        "front",
+        "surround",
+        10.0,
+        0.0,
+        False,
+        fixture,
+        "rtsp://x/front",
+        20,
+        "packet_copy",
+    )
+    status_path = tmp_path / "front.json"
+    status_path.write_text(
+        json.dumps(
+            {
+                "camera_id": "front",
+                "sync_group": "surround",
+                "publisher_mode": "frame_encode",
+                "pid": 321,
+                "ready": True,
+                "updated_at": time.time(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    publisher = ManagedPublisher(camera, status_path)
+    monkeypatch.setattr(publisher, "_pid_alive", lambda pid: pid == 321)
+    process = type("Process", (), {"pid": 654})()
+    monkeypatch.setattr(
+        "application.mock_timeline_runtime.subprocess.Popen",
+        lambda command: (
+            process
+            if any("gstreamer_packet_publisher" in part for part in command)
+            else None
+        ),
+    )
+
+    publisher.start()
+
+    assert publisher.process is process
+    assert publisher.adopted_pid is None

@@ -33,6 +33,7 @@ class TimelineCamera:
     mock_video: Path
     rtsp_url: str
     fps: int
+    publisher_mode: str = "frame_encode"
 
 
 def discover_timeline_cameras(config: dict[str, Any]) -> list[TimelineCamera]:
@@ -56,6 +57,14 @@ def discover_timeline_cameras(config: dict[str, Any]) -> list[TimelineCamera]:
         if not mock_video_value:
             raise ValueError(f"camera {camera_id} synchronized mock requires mock_video")
         mock_video = Path(mock_video_value)
+        publisher_mode = str(source.get("mock_publisher", "frame_encode")).strip().lower()
+        if publisher_mode not in {"frame_encode", "packet_copy"}:
+            raise ValueError(
+                f"camera {camera_id} mock_publisher must be frame_encode or packet_copy"
+            )
+        fps = int(source.get("fps", 0) or 0)
+        if fps <= 0:
+            raise ValueError(f"camera {camera_id} synchronized mock requires positive fps")
         cameras.append(
             TimelineCamera(
                 camera_id=camera_id,
@@ -65,9 +74,8 @@ def discover_timeline_cameras(config: dict[str, Any]) -> list[TimelineCamera]:
                 media_only=bool(source.get("media_only", False)),
                 mock_video=mock_video,
                 rtsp_url=str(source.get("rtsp_url", "")),
-                fps=20
-                if bool((resolved.get("functions", {}) or {}).get("front_assistance", False))
-                else 15,
+                fps=fps,
+                publisher_mode=publisher_mode,
             )
         )
     return cameras
@@ -108,6 +116,8 @@ class ManagedPublisher:
             existing_pid > 0
             and existing.get("camera_id") == self.camera.camera_id
             and existing.get("sync_group") == self.camera.group
+            and existing.get("publisher_mode", "frame_encode")
+            == self.camera.publisher_mode
             and bool(existing.get("ready"))
             and 0.0 <= time.time() - updated_at <= STATUS_FRESH_SECONDS
             and self._pid_alive(existing_pid)
@@ -119,10 +129,15 @@ class ManagedPublisher:
             self.next_probe_at = 0.0
             return
         self.status_path.unlink(missing_ok=True)
+        module = (
+            "adapters.media.gstreamer_packet_publisher"
+            if self.camera.publisher_mode == "packet_copy"
+            else "adapters.media.gstreamer_mock_publisher"
+        )
         command = [
             sys.executable,
             "-m",
-            "adapters.media.gstreamer_mock_publisher",
+            module,
             "--input",
             str(self.camera.mock_video),
             "--output",
@@ -234,6 +249,8 @@ class ManagedPublisher:
             "current_frame_index": payload.get("current_frame_index"),
             "frame_count": payload.get("frame_count"),
             "output_frame_count": payload.get("output_frame_count"),
+            "frame_timing_samples": payload.get("frame_timing_samples", []),
+            "publisher_mode": payload.get("publisher_mode", self.camera.publisher_mode),
             "rtsp_url": self.camera.rtsp_url,
         }
 
@@ -258,14 +275,7 @@ def _aggregate_status(
                 "cameras": {},
             },
         )
-        if camera.media_only:
-            camera_status = {
-                "mode": "direct_file",
-                "ready": camera.mock_video.is_file(),
-                "file_name": camera.mock_video.name,
-            }
-        else:
-            camera_status = publishers[camera.camera_id].status(now)
+        camera_status = publishers[camera.camera_id].status(now)
         group["cameras"][camera.camera_id] = camera_status
         group["locked"] = bool(group["locked"] and camera_status["ready"])
     ready = all(bool(group["locked"]) for group in groups.values())
@@ -296,7 +306,6 @@ def run(
             publisher_status_dir / f"{camera.camera_id}.json",
         )
         for camera in cameras
-        if not camera.media_only
     }
     resolved_status_path.unlink(missing_ok=True)
     stopping = False

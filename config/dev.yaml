@@ -1,6 +1,7 @@
 profile: dev
 runtime:
   live_metadata_interval_ms: 250
+  opencv_threads: 1
   status_directory: /opt/ls-vision-dev/data/status
   state_directory: /opt/ls-vision-dev/data/state
   analysis_result_max_age_seconds: 2.0
@@ -16,6 +17,8 @@ front_assistance:
   mode: vision_only
   model_path: /opt/ls-vision/models/openpilot/driving_supercombo.onnx
   model_rate_hz: 20
+  onnx_intra_op_threads: 1
+  onnx_inter_op_threads: 1
   max_gap_seconds: 0.25
   providers:
   - CUDAExecutionProvider
@@ -30,13 +33,17 @@ cameras:
     username_env: CAMERA_DAHUA_USER
     password_env: CAMERA_DAHUA_PASSWORD
     codec: hevc
-    decoder: software
+    decoder: hardware
     loop: true
     width: 1920
     height: 1080
     latency_ms: 200
   output:
     rtsp_url: rtsp://127.0.0.1:8554/dahua_bbox
+    width: 960
+    height: 540
+    bitrate_bps: 3000000
+    rate_hz: 10
   functions:
     trace: false
     face_recognition: false
@@ -48,17 +55,21 @@ cameras:
   source:
     type: mock
     url: rtsp://127.0.0.1:8554/camera_front_raw
-    mock_video: /opt/ls-vision-dev/data/mock-videos/cameras/sync-lite/CAM_FRONT.mp4
+    mock_video: /opt/ls-vision-dev/data/mock-videos/cameras/sync-lite/CAM_FRONT_20FPS_ALL_I.mp4
+    mock_publisher: packet_copy
+    fps: 20
     sync_group: vehicle_surround
     sync_period_seconds: 191.1
     sync_epoch_seconds: 0.0
     loop: true
-    decoder: software
+    decoder: hardware
     width: 960
     height: 540
     latency_ms: 200
   output:
     rtsp_url: rtsp://127.0.0.1:8554/camera_front
+    dashboard_rtsp_url: rtsp://127.0.0.1:8554/camera_front
+    publish_video: true
   functions:
     trace: false
     face_recognition: false
@@ -100,6 +111,8 @@ cameras:
     type: mock
     url: rtsp://127.0.0.1:8554/camera_back
     mock_video: /opt/ls-vision-dev/data/mock-videos/cameras/sync-lite/CAM_BACK.mp4
+    mock_publisher: packet_copy
+    fps: 10
     media_only: true
     sync_group: vehicle_surround
     sync_period_seconds: 191.1
@@ -122,6 +135,8 @@ cameras:
     type: mock
     url: rtsp://127.0.0.1:8554/camera_left
     mock_video: /opt/ls-vision-dev/data/mock-videos/cameras/sync-lite/CAM_FRONT_LEFT.mp4
+    mock_publisher: packet_copy
+    fps: 10
     media_only: true
     sync_group: vehicle_surround
     sync_period_seconds: 191.1
@@ -144,6 +159,8 @@ cameras:
     type: mock
     url: rtsp://127.0.0.1:8554/camera_right
     mock_video: /opt/ls-vision-dev/data/mock-videos/cameras/sync-lite/CAM_FRONT_RIGHT.mp4
+    mock_publisher: packet_copy
+    fps: 10
     media_only: true
     sync_group: vehicle_surround
     sync_period_seconds: 191.1
@@ -210,6 +227,8 @@ dms:
     input_height: 640
     confidence: 0.35
     nms_iou: 0.5
+    onnx_intra_op_threads: 1
+    onnx_inter_op_threads: 1
     person_match_iou: 0.1
     models:
       soham:
@@ -234,10 +253,17 @@ dms:
         - Smoking
   face_mesh:
     enabled: true
+    interval_ms: 150
     ear_threshold: 0.2
     mar_threshold: 0.65
     yaw_threshold_deg: 16.0
     pitch_threshold_deg: 14.0
+    driver_roi:
+      enabled: true
+      require_person: true
+      upper_body_ratio: 0.55
+      padding_ratio: 0.1
+      max_side: 512
     neutral_calibration:
       enabled: true
       minimum_samples: 15

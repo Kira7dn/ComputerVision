@@ -5,8 +5,10 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from adapters.models import dms_engine as dms_engine_module
 from adapters.models.dms_engine import (
     AlertSmoother,
+    DmsBehaviorEngine,
     DmsDetection,
     NeutralPoseCalibrator,
     compute_face_metrics,
@@ -132,6 +134,57 @@ def test_dms_alert_smoother_ignores_non_alert_classes() -> None:
     assert smoother.update(["Safe Driving", "Seatbelt"]) == []
     assert smoother.update(["Safe Driving", "Seatbelt"]) == []
     assert smoother.update(["Safe Driving", "Seatbelt"]) == []
+
+
+def test_dms_face_inference_uses_configured_interval_and_cached_result(monkeypatch) -> None:
+    class FakeObjectDetector:
+        models = []
+        active_providers = {}
+
+        def __init__(self, _config, section):
+            assert section == "dms"
+
+        def process(self, _frame):
+            return []
+
+    class FakeFaceAnalyzer:
+        enabled = True
+        available = True
+        error = None
+
+        def __init__(self, _config):
+            self.calls = 0
+
+        def process(self, _frame, *, timestamp, driver_bbox):
+            del timestamp, driver_bbox
+            self.calls += 1
+            return {"face_detected": True, "pose_calibrated": False}, set(), 4.0
+
+    monkeypatch.setattr(dms_engine_module, "SmokingObjectDetector", FakeObjectDetector)
+    monkeypatch.setattr(dms_engine_module, "DmsFaceAnalyzer", FakeFaceAnalyzer)
+    engine = DmsBehaviorEngine(
+        {
+            "dms": {
+                "enabled": True,
+                "interval_ms": 200,
+                "attention": {"interval_ms": 100},
+                "face_mesh": {"interval_ms": 150},
+            }
+        }
+    )
+    frame = np.zeros((16, 16, 3), dtype=np.uint8)
+
+    first = engine.process(frame, [], 1, source_timestamp=1.0)
+    cached = engine.process(frame, [], 2, source_timestamp=1.1)
+    refreshed = engine.process(frame, [], 3, source_timestamp=1.2)
+
+    assert engine.face.calls == 2
+    assert first.metrics["face_inference_ran"] is True
+    assert cached.metrics["face_inference_ran"] is False
+    assert cached.metrics["face_detected"] is True
+    assert cached.metrics["face_latency_ms"] == 0.0
+    assert refreshed.metrics["face_inference_ran"] is True
+    assert refreshed.metrics["face_rate_hz"] == pytest.approx(6.667, abs=0.001)
 
 
 def test_dms_overlay_keeps_one_strongest_box_per_behavior_and_driver() -> None:

@@ -734,6 +734,9 @@ def resolve_camera_config(config: dict[str, Any], camera_id: str | None = None) 
             "camera": camera_id,
             "rtsp_url": source.get("url", source.get("rtsp_url", input_config.get("rtsp_url"))),
             "mock_video": source.get("mock_video", input_config.get("mock_video")),
+            "mock_publisher": str(
+                source.get("mock_publisher", input_config.get("mock_publisher", "frame_encode"))
+            ),
             "mock_loop": source.get("loop", source.get("mock_loop", input_config.get("mock_loop", True))),
             "media_only": bool(source.get("media_only", input_config.get("media_only", False))),
             "mock_sync_group": str(source.get("sync_group", input_config.get("mock_sync_group", ""))),
@@ -743,6 +746,7 @@ def resolve_camera_config(config: dict[str, Any], camera_id: str | None = None) 
             "mock_sync_epoch_seconds": float(
                 source.get("sync_epoch_seconds", input_config.get("mock_sync_epoch_seconds", 0.0))
             ),
+            "fps": int(source.get("fps", input_config.get("fps", 0))),
             "width": int(source.get("width", input_config.get("width", 1920))),
             "height": int(source.get("height", input_config.get("height", 1080))),
             "latency_ms": int(source.get("latency_ms", input_config.get("latency_ms", 200))),

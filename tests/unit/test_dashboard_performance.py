@@ -141,6 +141,45 @@ def test_mock_timeline_status_fails_closed_when_stale(tmp_path, monkeypatch) -> 
     assert payload["fresh"] is True
 
 
+def test_live_metadata_merges_packet_publisher_timing_samples(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(dashboard_api, "_status_directory", lambda: tmp_path)
+    monkeypatch.setattr(
+        dashboard_api,
+        "_camera_definitions",
+        lambda: [{"id": "camera_front"}],
+    )
+    (tmp_path / "camera_front.metadata.json").write_text(
+        json.dumps({"camera": "camera_front", "frame_timing_samples": []}),
+        encoding="utf-8",
+    )
+    sample = {
+        "rtp_timestamp": 9000,
+        "capture_timestamp": 100.0,
+        "output_timestamp": 100.01,
+        "output_pts_ns": 100_000_000,
+    }
+    monkeypatch.setattr(
+        dashboard_api,
+        "_mock_timeline_status",
+        lambda: {
+            "ready": True,
+            "groups": {
+                "vehicle_surround": {
+                    "cameras": {
+                        "camera_front": {"frame_timing_samples": [sample]}
+                    }
+                }
+            },
+        },
+    )
+
+    payload = dashboard_api._live_metadata()
+
+    assert payload["cameras"]["camera_front"]["frame_timing_samples"] == [sample]
+
+
 def test_runner_status_exposes_fresh_generation(tmp_path, monkeypatch) -> None:
     status = tmp_path / "runner.json"
     monkeypatch.setattr(
@@ -197,3 +236,87 @@ def test_camera_definitions_use_runner_active_config_when_candidate_is_invalid(
 
     assert definitions[0]["id"] == "DMS"
     assert definitions[0]["webrtc_url"].endswith("/dms/whep")
+
+
+def test_stream_manifest_has_six_stable_cameras_and_fails_closed(monkeypatch) -> None:
+    ready_paths = {"/camera_front", "/camera_back"}
+    monkeypatch.setattr(
+        dashboard_api,
+        "_runner_status",
+        lambda: {"config_generation": 7},
+    )
+    monkeypatch.setattr(
+        dashboard_api,
+        "_mock_timeline_status",
+        lambda: {
+            "ready": True,
+            "groups": {"vehicle_surround": {"locked": True}},
+        },
+    )
+    monkeypatch.setattr(
+        dashboard_api,
+        "_probe_rtsp_path",
+        lambda path: {
+            "published": path in ready_paths,
+            "codec": "h264" if path in ready_paths else None,
+        },
+    )
+
+    manifest = dashboard_api._stream_manifest("vision.local")
+    streams = manifest["streams"]
+
+    assert manifest["schema"] == "letron.vision.stream-manifest/v1"
+    assert manifest["generation"] == 7
+    assert manifest["media_base"]["lan_rtsp"] == "rtsp://vision.local:8554"
+    assert [item["camera_id"] for item in streams] == [
+        "DMS",
+        "camera_front",
+        "camera_back",
+        "camera_left",
+        "camera_right",
+        "camera_cargo",
+    ]
+    assert [item["state"] for item in streams] == [
+        "OFFLINE",
+        "READY",
+        "READY",
+        "OFFLINE",
+        "OFFLINE",
+        "READY",
+    ]
+    assert streams[0]["role"] == "vision_processed"
+    assert streams[1]["role"] == "vision_processed"
+    assert streams[1]["rtsp_path"] == "/camera_front"
+    cargo = streams[-1]
+    assert cargo["role"] == "media_only_passthrough"
+    assert cargo["rtsp_path"] == "/camera_back"
+    assert cargo["sync_group"] == "vehicle_surround"
+    assert cargo["source_camera_id"] == "camera_back"
+    assert cargo["alias_of"] == "camera_back"
+
+
+def test_stream_manifest_degrades_surround_stream_when_timeline_is_unlocked(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(dashboard_api, "_runner_status", lambda: {})
+    monkeypatch.setattr(
+        dashboard_api,
+        "_mock_timeline_status",
+        lambda: {
+            "ready": True,
+            "groups": {"vehicle_surround": {"locked": False}},
+        },
+    )
+    monkeypatch.setattr(
+        dashboard_api,
+        "_probe_rtsp_path",
+        lambda _path: {"published": True, "codec": "h264"},
+    )
+
+    streams = dashboard_api._stream_manifest()["streams"]
+    by_id = {item["camera_id"]: item for item in streams}
+
+    assert by_id["camera_front"]["state"] == "DEGRADED"
+    assert by_id["camera_back"]["state"] == "DEGRADED"
+    assert by_id["camera_cargo"]["state"] == "DEGRADED"
+    assert by_id["DMS"]["state"] == "READY"

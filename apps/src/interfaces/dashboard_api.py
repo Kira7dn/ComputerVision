@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import subprocess
 import time
 from collections import deque
+from datetime import datetime, timezone
 from email.utils import formatdate
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -30,6 +32,8 @@ PREVIOUS_CPU: tuple[int, int] | None = None
 PREVIOUS_PROCESSES: dict[int, tuple[int, float]] = {}
 GPU_CACHE: tuple[float, dict[str, object]] | None = None
 METRICS_CACHE: dict[str, tuple[float, dict[str, object]]] = {}
+STREAM_PROBE_LOCK = Lock()
+STREAM_PROBE_CACHE: dict[str, tuple[float, dict[str, object]]] = {}
 CONFIG_CACHE_LOCK = Lock()
 CONFIG_CACHE: tuple[tuple[object, ...], dict[str, object]] | None = None
 JOURNAL_CACHE_LOCK = Lock()
@@ -40,6 +44,17 @@ DASHBOARD_PORT = int(os.environ.get("CAMERA_DASHBOARD_PORT", "18080"))
 MOCK_MEDIA_PORT = int(os.environ.get("CAMERA_MOCK_MEDIA_PORT", "18081"))
 PUBLIC_HLS_PORT = int(os.environ.get("CAMERA_PUBLIC_HLS_PORT", "8888"))
 PUBLIC_WEBRTC_PORT = int(os.environ.get("CAMERA_PUBLIC_WEBRTC_PORT", "8889"))
+OUTPUT_RTSP_BASE = os.environ.get(
+    "CAMERA_OUTPUT_RTSP_BASE", "rtsp://127.0.0.1:8554"
+).rstrip("/")
+STREAM_CAMERA_ORDER = ("DMS", "camera_front", "camera_back", "camera_left", "camera_right")
+STREAM_NOMINAL_FPS = {
+    "DMS": 10.0,
+    "camera_front": 20.0,
+    "camera_back": 10.0,
+    "camera_left": 10.0,
+    "camera_right": 10.0,
+}
 JETSON_GPU_LOAD_PATHS = (
     Path("/sys/devices/platform/bus@0/17000000.gpu/load"),
     Path("/sys/devices/gpu.0/load"),
@@ -204,7 +219,7 @@ def _camera_definitions(stream_host: str = "localhost") -> list[dict[str, object
             for item in active_cameras:
                 if not isinstance(item, dict) or not item.get("id"):
                     continue
-                output_url = str(item.get("output", ""))
+                output_url = str(item.get("dashboard_output") or item.get("output", ""))
                 output_path = urlparse(output_url).path.strip("/")
                 source = item.get("source")
                 media_only = bool(item.get("media_only", False))
@@ -233,7 +248,10 @@ def _camera_definitions(stream_host: str = "localhost") -> list[dict[str, object
         definitions: list[dict[str, object]] = []
         for camera_id in camera_ids(raw_config):
             config = resolve_camera_config(raw_config, camera_id)
-            output_url = str(config["output"]["rtsp_url"])
+            output_url = str(
+                config["output"].get("dashboard_rtsp_url")
+                or config["output"]["rtsp_url"]
+            )
             output_path = urlparse(output_url).path.strip("/")
             source = config["input"].get("mock_video") or config["input"].get("rtsp_url")
             media_only = bool(config["input"].get("media_only", False))
@@ -264,6 +282,9 @@ def _camera_definitions(stream_host: str = "localhost") -> list[dict[str, object
                         else None
                     ),
                     "output": output_url,
+                    "output_video_published": bool(
+                        config["output"].get("publish_video", True)
+                    ),
                     "webrtc_url": (
                         f"http://{stream_host}:{PUBLIC_WEBRTC_PORT}/{output_path}/whep"
                     ),
@@ -306,7 +327,7 @@ def _memory() -> dict[str, float | int | None]:
     }
 
 
-def _processes() -> list[dict[str, int | str]]:
+def _processes() -> list[dict[str, int | float | str]]:
     result: list[dict[str, int | str]] = []
     for entry in Path("/proc").glob("[0-9]*"):
         try:
@@ -316,12 +337,32 @@ def _processes() -> list[dict[str, int | str]]:
                 continue
             command = (entry / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="ignore").strip()
             parts = command.split()
-            if "application.camera_runtime" not in parts:
+            is_worker = "application.camera_runtime" in parts
+            is_mock_publisher = any(
+                module in parts
+                for module in (
+                    "adapters.media.gstreamer_mock_publisher",
+                    "adapters.media.gstreamer_packet_publisher",
+                )
+            )
+            if not is_worker and not is_mock_publisher:
                 continue
-            if "--config" not in parts:
-                continue
-            config_index = parts.index("--config")
-            if config_index + 1 >= len(parts) or Path(parts[config_index + 1]) != CONFIG_PATH:
+            if is_worker:
+                if "--config" not in parts:
+                    continue
+                config_index = parts.index("--config")
+                if config_index + 1 >= len(parts) or Path(parts[config_index + 1]) != CONFIG_PATH:
+                    continue
+            elif "--status-path" in parts:
+                status_index = parts.index("--status-path")
+                if status_index + 1 >= len(parts):
+                    continue
+                try:
+                    runtime_root = CONFIG_PATH.parents[3]
+                    Path(parts[status_index + 1]).relative_to(runtime_root)
+                except (IndexError, ValueError):
+                    continue
+            else:
                 continue
             stat = (entry / "stat").read_text(encoding="ascii")
             rest = stat[stat.rfind(")") + 2 :].split()
@@ -342,7 +383,17 @@ def _processes() -> list[dict[str, int | str]]:
                 index = parts.index("--run-id")
                 if index + 1 < len(parts):
                     run_id = parts[index + 1]
-            result.append({"pid": pid, "camera": camera, "run_id": run_id, "ticks": ticks, "start_ticks": start_ticks, "rss_mb": round(rss_kb / 1024, 1)})
+            result.append(
+                {
+                    "pid": pid,
+                    "camera": camera,
+                    "run_id": run_id,
+                    "kind": "vision_worker" if is_worker else "mock_publisher",
+                    "ticks": ticks,
+                    "start_ticks": start_ticks,
+                    "rss_mb": round(rss_kb / 1024, 1),
+                }
+            )
         except (FileNotFoundError, PermissionError, IndexError, ValueError):
             continue
     return result
@@ -404,8 +455,19 @@ def _live_metadata() -> dict[str, object]:
                 continue
             if isinstance(payload, dict):
                 cameras[camera_id] = payload
+        timeline = _mock_timeline_status()
+        for group in (timeline.get("groups", {}) or {}).values():
+            if not isinstance(group, dict):
+                continue
+            for camera_id, publisher in (group.get("cameras", {}) or {}).items():
+                camera_payload = cameras.get(str(camera_id))
+                if not isinstance(camera_payload, dict) or not isinstance(publisher, dict):
+                    continue
+                publisher_samples = publisher.get("frame_timing_samples", [])
+                if publisher_samples and not camera_payload.get("frame_timing_samples"):
+                    camera_payload["frame_timing_samples"] = publisher_samples
         result["cameras"] = cameras
-        result["mock_timeline"] = _mock_timeline_status()
+        result["mock_timeline"] = timeline
     except (OSError, TypeError, ValueError):
         pass
     return result
@@ -709,23 +771,36 @@ def _collect_metrics(stream_host: str = "localhost") -> dict[str, object]:
                 cpu_percent = round((total_delta - idle_delta) * 100 / total_delta, 1)
         PREVIOUS_CPU = cpu
 
-    processes = _processes()
+    hot_processes = _processes()
+    processes = [item for item in hot_processes if item.get("kind") == "vision_worker"]
+    process_cpu: dict[int, float] = {}
+    for process in hot_processes:
+        pid = int(process["pid"])
+        previous = PREVIOUS_PROCESSES.get(pid)
+        if previous is not None:
+            tick_delta = int(process["ticks"]) - previous[0]
+            elapsed = max(0.001, now - previous[1])
+            process_cpu[pid] = max(0.0, tick_delta / CLK_TCK / elapsed * 100)
+        PREVIOUS_PROCESSES[pid] = (int(process["ticks"]), now)
     pipeline_cpu_values: list[float] = []
     pipeline_age_values: list[float] = []
     for pipeline in processes:
         pid = int(pipeline["pid"])
-        previous = PREVIOUS_PROCESSES.get(pid)
-        if previous is not None:
-            tick_delta = int(pipeline["ticks"]) - previous[0]
-            elapsed = max(0.001, now - previous[1])
-            pipeline_cpu_values.append(tick_delta / CLK_TCK / elapsed * 100)
-        PREVIOUS_PROCESSES[pid] = (int(pipeline["ticks"]), now)
+        if pid in process_cpu:
+            pipeline_cpu_values.append(process_cpu[pid])
         uptime = float(Path("/proc/uptime").read_text(encoding="ascii").split()[0])
         pipeline_age_values.append(max(0.0, uptime - int(pipeline["start_ticks"]) / CLK_TCK))
 
     pipeline_cpu = round(sum(pipeline_cpu_values), 1) if pipeline_cpu_values else None
     pipeline_rss = round(sum(float(item["rss_mb"]) for item in processes), 1) if processes else None
     pipeline_age = round(min(pipeline_age_values), 1) if pipeline_age_values else None
+    hot_path_cpu_values = [process_cpu[int(item["pid"])] for item in hot_processes if int(item["pid"]) in process_cpu]
+    hot_path_cpu = round(sum(hot_path_cpu_values), 1) if hot_path_cpu_values else None
+    hot_path_rss = (
+        round(sum(float(item["rss_mb"]) for item in hot_processes), 1)
+        if hot_processes
+        else None
+    )
 
     configured_cameras = _camera_definitions(stream_host)
     mock_timeline = _mock_timeline_status()
@@ -783,6 +858,10 @@ def _collect_metrics(stream_host: str = "localhost") -> dict[str, object]:
                 "frame_count": runtime_status.get("frame_count"),
                 "input_decoder": runtime_status.get("input_decoder"),
                 "output_encoder": runtime_status.get("output_encoder"),
+                "output_video_published": runtime_status.get(
+                    "output_video_published",
+                    camera.get("output_video_published", True),
+                ),
                 "analysis_queue_depth": runtime_status.get("analysis_queue_depth"),
                 "analysis_flow": runtime_status.get("analysis_flow", {}),
                 "worker_epoch": runtime_status.get("worker_epoch"),
@@ -826,6 +905,22 @@ def _collect_metrics(stream_host: str = "localhost") -> dict[str, object]:
             "cameras": [str(item["id"]) for item in camera_metrics],
             "cpu_percent": pipeline_cpu,
             "rss_mb": pipeline_rss,
+            "hot_path_cpu_percent": hot_path_cpu,
+            "hot_path_rss_mb": hot_path_rss,
+            "hot_path_processes": [
+                {
+                    "pid": item["pid"],
+                    "camera": item["camera"],
+                    "kind": item["kind"],
+                    "cpu_percent": (
+                        round(process_cpu[int(item["pid"])], 1)
+                        if int(item["pid"]) in process_cpu
+                        else None
+                    ),
+                    "rss_mb": item["rss_mb"],
+                }
+                for item in hot_processes
+            ],
             "age_seconds": pipeline_age,
             "camera_details": camera_metrics,
             "mock_timeline": mock_timeline,
@@ -853,6 +948,151 @@ def collect_metrics(stream_host: str = "localhost") -> dict[str, object]:
         result = _collect_metrics(stream_host)
         METRICS_CACHE[stream_host] = (now, result)
         return result
+
+
+def _rtsp_probe_target(path: str) -> tuple[str, int, str]:
+    parsed = urlparse(OUTPUT_RTSP_BASE)
+    host = parsed.hostname or "127.0.0.1"
+    port = int(parsed.port or 554)
+    normalized_path = f"/{path.strip('/')}"
+    return host, port, f"rtsp://{host}:{port}{normalized_path}"
+
+
+def _probe_rtsp_path(path: str) -> dict[str, object]:
+    """Probe MediaMTX itself so configured paths are not reported as published."""
+    now = time.monotonic()
+    with STREAM_PROBE_LOCK:
+        cached = STREAM_PROBE_CACHE.get(path)
+        if cached is not None and now - cached[0] < 1.0:
+            return cached[1]
+
+    host, port, url = _rtsp_probe_target(path)
+    result: dict[str, object] = {"published": False, "codec": None}
+    request = (
+        f"DESCRIBE {url} RTSP/1.0\r\n"
+        "CSeq: 1\r\n"
+        "Accept: application/sdp\r\n"
+        "User-Agent: ls-vision-stream-contract/1\r\n\r\n"
+    ).encode("ascii")
+    try:
+        with socket.create_connection((host, port), timeout=0.35) as connection:
+            connection.settimeout(0.35)
+            connection.sendall(request)
+            response = connection.recv(16384).decode("utf-8", errors="replace")
+        status_line = response.splitlines()[0] if response else ""
+        published = " 200 " in f" {status_line} " and "m=video" in response
+        upper_response = response.upper()
+        codec = "h264" if "H264/90000" in upper_response else None
+        result = {"published": published, "codec": codec}
+    except OSError:
+        pass
+
+    with STREAM_PROBE_LOCK:
+        STREAM_PROBE_CACHE[path] = (now, result)
+    return result
+
+
+def _configured_stream_contract() -> list[dict[str, object]]:
+    """Build the public stream contract from canonical camera output config."""
+    raw_config = _raw_config()
+    streams: list[dict[str, object]] = []
+    for camera_id in STREAM_CAMERA_ORDER:
+        config = resolve_camera_config(raw_config, camera_id)
+        input_config = config["input"]
+        output_config = config["output"]
+        media_only = bool(input_config.get("media_only", False))
+        output_url = str(output_config["rtsp_url"])
+        output_path = f"/{urlparse(output_url).path.strip('/')}"
+        streams.append(
+            {
+                "camera_id": camera_id,
+                "role": "media_only_passthrough" if media_only else "vision_processed",
+                "rtsp_path": output_path,
+                "width": int(output_config.get("width", input_config["width"])),
+                "height": int(output_config.get("height", input_config["height"])),
+                "nominal_fps": float(
+                    output_config.get("rate_hz") or STREAM_NOMINAL_FPS[camera_id]
+                ),
+                "sync_group": input_config.get("mock_sync_group") or None,
+                "pipeline_output_enabled": media_only
+                or bool(output_config.get("publish_video", True)),
+                "source_camera_id": camera_id,
+                "alias_of": None,
+            }
+        )
+
+    back = next(item for item in streams if item["camera_id"] == "camera_back")
+    streams.append(
+        {
+            **back,
+            "camera_id": "camera_cargo",
+            "source_camera_id": "camera_back",
+            "alias_of": "camera_back",
+        }
+    )
+    return streams
+
+
+def _stream_manifest(stream_host: str = "localhost") -> dict[str, object]:
+    runner = _runner_status()
+    timeline = _mock_timeline_status()
+    surround = (timeline.get("groups", {}) or {}).get("vehicle_surround", {}) or {}
+    surround_locked = bool(timeline.get("ready") and surround.get("locked"))
+    parsed_base = urlparse(OUTPUT_RTSP_BASE)
+    rtsp_port = int(parsed_base.port or 554)
+    generation = int(runner.get("config_generation", 0) or 0)
+    # Jetson production currently runs Python 3.10, before datetime.UTC exists.
+    generated_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")  # noqa: UP017
+    streams: list[dict[str, object]] = []
+
+    for ordinal, contract in enumerate(_configured_stream_contract(), start=1):
+        camera_id = str(contract["camera_id"])
+        path = str(contract["rtsp_path"])
+        sync_group = contract.get("sync_group")
+        probe = _probe_rtsp_path(path)
+        published = bool(probe.get("published"))
+        codec = probe.get("codec")
+        if not contract["pipeline_output_enabled"]:
+            state = "DISABLED"
+            published = False
+            codec = None
+        elif not published:
+            state = "OFFLINE"
+        elif codec != "h264" or (sync_group == "vehicle_surround" and not surround_locked):
+            state = "DEGRADED"
+        else:
+            state = "READY"
+        streams.append(
+            {
+                "camera_id": camera_id,
+                "ordinal": ordinal,
+                "role": contract["role"],
+                "rtsp_path": path,
+                "state": state,
+                "published": published,
+                "codec": codec,
+                "width": contract["width"],
+                "height": contract["height"],
+                "nominal_fps": contract["nominal_fps"],
+                "clock_rate": 90000 if codec == "h264" else None,
+                "sync_group": sync_group,
+                "source_camera_id": contract["source_camera_id"],
+                "alias_of": contract["alias_of"],
+                "source_epoch": None,
+                "last_packet_at": None,
+            }
+        )
+
+    return {
+        "schema": "letron.vision.stream-manifest/v1",
+        "generation": generation,
+        "generated_at": generated_at,
+        "media_base": {
+            "local_rtsp": OUTPUT_RTSP_BASE,
+            "lan_rtsp": f"rtsp://{stream_host}:{rtsp_port}",
+        },
+        "streams": streams,
+    }
 
 
 def _stream_host_from_header(host_header: str) -> str:
@@ -904,6 +1144,17 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+        if path == "/api/v1/streams":
+            stream_host = _stream_host_from_header(self.headers.get("Host", ""))
+            payload = json.dumps(_stream_manifest(stream_host)).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
             self.wfile.write(payload)

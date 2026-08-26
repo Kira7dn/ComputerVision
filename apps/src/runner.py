@@ -90,6 +90,9 @@ def active_camera_definitions(config: dict[str, Any]) -> list[dict[str, Any]]:
                     "mock_sync_epoch_seconds"
                 ),
                 "output": output.get("rtsp_url"),
+                "dashboard_output": output.get("dashboard_rtsp_url")
+                or output.get("rtsp_url"),
+                "output_video_published": bool(output.get("publish_video", True)),
                 "functions": resolved.get("functions", {}),
             }
         )

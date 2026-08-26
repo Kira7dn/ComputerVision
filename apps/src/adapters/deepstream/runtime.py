@@ -166,6 +166,10 @@ class DeepStreamCameraRuntime:
         self.frame_probe_id: int | None = None
         self.started_at = time.monotonic()
         runtime = config.get("runtime", {}) or {}
+        self.opencv_threads = max(1, int(runtime.get("opencv_threads", 1)))
+        cv2_module = importlib.import_module("cv2")
+        cv2_module.setNumThreads(self.opencv_threads)
+        LOG.info("OpenCV worker threads: %d", cv2_module.getNumThreads())
         self.status_dir = Path(str(runtime.get("status_directory", "/opt/ls-vision/data/status")))
         self.status_path = self.status_dir / f"{config.get('input', {}).get('camera', 'camera')}.json"
         self.last_frame_at: float | None = None
@@ -534,6 +538,23 @@ maintain-aspect-ratio=0
     def _build(self) -> None:
         input_cfg = self.config["input"]
         output_cfg = self.config["output"]
+        publish_video = bool(output_cfg.get("publish_video", True))
+        self.output_video_published = publish_video
+        output_width = int(output_cfg.get("width", input_cfg["width"]))
+        output_height = int(output_cfg.get("height", input_cfg["height"]))
+        output_bitrate_bps = int(output_cfg.get("bitrate_bps", 4_000_000))
+        output_rate_hz = float(output_cfg.get("rate_hz", 0.0) or 0.0)
+        if output_width <= 0 or output_height <= 0:
+            raise ValueError("output width and height must be positive")
+        if output_bitrate_bps <= 0:
+            raise ValueError("output bitrate_bps must be positive")
+        self.output_resolution = {"width": output_width, "height": output_height}
+        self.output_rate_hz = output_rate_hz or None
+        self._output_admission_gate = (
+            AnalysisAdmissionGate(1.0 / output_rate_hz)
+            if publish_video and output_rate_hz > 0.0
+            else None
+        )
 
         source = make_element("rtspsrc", "rtsp-source")
         source.set_property("location", input_cfg["rtsp_url"])
@@ -591,71 +612,96 @@ maintain-aspect-ratio=0
         analysis_queue.set_property("max-size-bytes", 0)
         analysis_queue.set_property("max-size-time", 0)
         analysis_queue.set_property("leaky", 2)
-        output_input_queue = make_element("queue", "output-input-queue")
-        output_input_queue.set_property("max-size-buffers", 2)
-        output_input_queue.set_property("max-size-bytes", 0)
-        output_input_queue.set_property("max-size-time", 0)
-        output_input_queue.set_property("leaky", 2)
+        output_input_queue = None
+        if publish_video:
+            output_input_queue = make_element("queue", "output-input-queue")
+            output_input_queue.set_property("max-size-buffers", 2)
+            output_input_queue.set_property("max-size-bytes", 0)
+            output_input_queue.set_property("max-size-time", 0)
+            output_input_queue.set_property("leaky", 2)
         face_cpu_convert = make_element("nvvideoconvert", "face-cpu-convert")
         face_cpu_caps = make_element("capsfilter", "face-cpu-caps")
         face_cpu_caps.set_property("caps", Gst.Caps.from_string("video/x-raw,format=BGRx"))
         analysis_sink = make_element("fakesink", "analysis-sink")
         analysis_sink.set_property("sync", False)
         analysis_sink.set_property("async", False)
-        convert_before_osd = make_element("nvvideoconvert", "convert-before-osd")
-        face_rgba_caps = make_element("capsfilter", "face-rgba-caps")
-        face_rgba_caps.set_property("caps", Gst.Caps.from_string("video/x-raw(memory:NVMM),format=RGBA"))
-        osd = make_element("nvdsosd", "bbox-osd")
-        osd.set_property("display-bbox", True)
-        osd.set_property("display-text", True)
-        convert_after_osd = make_element("nvvideoconvert", "convert-after-osd")
-        output_tee = make_element("tee", "output-tee")
-        output_queue = make_element("queue", "output-queue")
-        # Keep the output branch latest-frame bounded so a slow network reader
-        # cannot turn the live RTSP publication into historical playback.
-        output_queue.set_property("max-size-buffers", 2)
-        output_queue.set_property("max-size-bytes", 0)
-        output_queue.set_property("max-size-time", 0)
-        output_queue.set_property("leaky", 2)
-        try:
-            encoder = make_element("nvv4l2h264enc", "output-encoder")
-            encoder.set_property("bitrate", 4_000_000)
-            encoder.set_property("iframeinterval", 15)
-            encoder.set_property("idrinterval", 15)
-            encoder.set_property("preset-id", 1)
-            for property_name, property_value in (("insert-sps-pps", 1), ("num-B-Frames", 0)):
-                try:
-                    encoder.set_property(property_name, property_value)
-                except (TypeError, AttributeError):
-                    LOG.debug("output encoder does not expose property=%s", property_name)
-            output_caps = "video/x-raw(memory:NVMM),format=I420"
-            self.output_encoder = "nvv4l2h264enc"
-            LOG.info("output encoder: nvv4l2h264enc")
-        except RuntimeError:
-            encoder = make_element("x264enc", "output-encoder")
-            encoder.set_property("bitrate", 4_000)
-            encoder.set_property("speed-preset", "ultrafast")
-            encoder.set_property("tune", "zerolatency")
-            encoder.set_property("key-int-max", 15)
-            encoder.set_property("bframes", 0)
-            output_caps = "video/x-raw,format=I420"
-            self.output_encoder = "x264enc"
-            LOG.warning("output encoder: x264enc fallback")
-        output_i420_caps = make_element("capsfilter", "output-i420-caps")
-        output_i420_caps.set_property(
-            "caps",
-            Gst.Caps.from_string(output_caps),
-        )
-        output_parser = make_element("h264parse", "output-h264-parse")
-        output_parser.set_property("config-interval", 1)
-        sink = make_element("rtspclientsink", "rtsp-output")
-        sink.set_property("location", output_cfg["rtsp_url"])
-        sink.set_property("protocols", 4)
-        sink.set_property("latency", 100)
-        try:
-            sink.connect("new-payloader", self._configure_output_payloader)
-        except (TypeError, AttributeError):
-            LOG.debug("rtspclientsink does not expose new-payloader")
+        output_elements: list[Gst.Element] = []
+        if publish_video:
+            convert_before_osd = make_element("nvvideoconvert", "convert-before-osd")
+            face_rgba_caps = make_element("capsfilter", "face-rgba-caps")
+            face_rgba_caps.set_property("caps", Gst.Caps.from_string("video/x-raw(memory:NVMM),format=RGBA"))
+            osd = make_element("nvdsosd", "bbox-osd")
+            osd.set_property("display-bbox", True)
+            osd.set_property("display-text", True)
+            convert_after_osd = make_element("nvvideoconvert", "convert-after-osd")
+            output_tee = make_element("tee", "output-tee")
+            output_queue = make_element("queue", "output-queue")
+            # Keep the output branch latest-frame bounded so a slow network reader
+            # cannot turn the live RTSP publication into historical playback.
+            output_queue.set_property("max-size-buffers", 2)
+            output_queue.set_property("max-size-bytes", 0)
+            output_queue.set_property("max-size-time", 0)
+            output_queue.set_property("leaky", 2)
+            try:
+                encoder = make_element("nvv4l2h264enc", "output-encoder")
+                encoder.set_property("bitrate", output_bitrate_bps)
+                encoder.set_property("iframeinterval", 15)
+                encoder.set_property("idrinterval", 15)
+                encoder.set_property("preset-id", 1)
+                for property_name, property_value in (("insert-sps-pps", 1), ("num-B-Frames", 0)):
+                    try:
+                        encoder.set_property(property_name, property_value)
+                    except (TypeError, AttributeError):
+                        LOG.debug("output encoder does not expose property=%s", property_name)
+                output_caps = (
+                    "video/x-raw(memory:NVMM),format=I420,"
+                    f"width={output_width},height={output_height}"
+                )
+                self.output_encoder = "nvv4l2h264enc"
+                LOG.info("output encoder: nvv4l2h264enc")
+            except RuntimeError:
+                encoder = make_element("x264enc", "output-encoder")
+                encoder.set_property("bitrate", max(1, output_bitrate_bps // 1_000))
+                encoder.set_property("speed-preset", "ultrafast")
+                encoder.set_property("tune", "zerolatency")
+                encoder.set_property("key-int-max", 15)
+                encoder.set_property("bframes", 0)
+                output_caps = (
+                    "video/x-raw,format=I420,"
+                    f"width={output_width},height={output_height}"
+                )
+                self.output_encoder = "x264enc"
+                LOG.warning("output encoder: x264enc fallback")
+            output_i420_caps = make_element("capsfilter", "output-i420-caps")
+            output_i420_caps.set_property(
+                "caps",
+                Gst.Caps.from_string(output_caps),
+            )
+            output_parser = make_element("h264parse", "output-h264-parse")
+            output_parser.set_property("config-interval", 1)
+            sink = make_element("rtspclientsink", "rtsp-output")
+            sink.set_property("location", output_cfg["rtsp_url"])
+            sink.set_property("protocols", 4)
+            sink.set_property("latency", 100)
+            try:
+                sink.connect("new-payloader", self._configure_output_payloader)
+            except (TypeError, AttributeError):
+                LOG.debug("rtspclientsink does not expose new-payloader")
+            output_elements = [
+                convert_before_osd,
+                face_rgba_caps,
+                osd,
+                convert_after_osd,
+                output_i420_caps,
+                output_tee,
+                output_queue,
+                encoder,
+                output_parser,
+                sink,
+            ]
+        else:
+            self.output_encoder = "disabled"
+            LOG.info("output encoder disabled: metadata-only worker")
 
         elements = [
             source,
@@ -667,7 +713,7 @@ maintain-aspect-ratio=0
             *([self.person_infer] if self.person_infer is not None else []),
             analysis_tee,
             analysis_queue,
-            output_input_queue,
+            *([output_input_queue] if output_input_queue is not None else []),
             *(
                 [face_cpu_convert, face_cpu_caps]
                 if self.face_engine.enabled
@@ -678,16 +724,7 @@ maintain-aspect-ratio=0
                 else []
             ),
             analysis_sink,
-            convert_before_osd,
-            face_rgba_caps,
-            osd,
-            convert_after_osd,
-            output_i420_caps,
-            output_tee,
-            output_queue,
-            encoder,
-            output_parser,
-            sink,
+            *output_elements,
         ]
         # PyGObject exposes Gst.Bin.add() as a single-element call on the
         # DeepStream Jetson image; add the topology one element at a time.
@@ -719,14 +756,15 @@ maintain-aspect-ratio=0
             or analysis_tee_pad.link(analysis_sink_pad) != Gst.PadLinkReturn.OK
         ):
             raise RuntimeError("Unable to link analysis tee to analysis queue")
-        output_tee_pad = analysis_tee.get_request_pad("src_%u")
-        output_sink_pad = output_input_queue.get_static_pad("sink")
-        if (
-            output_tee_pad is None
-            or output_sink_pad is None
-            or output_tee_pad.link(output_sink_pad) != Gst.PadLinkReturn.OK
-        ):
-            raise RuntimeError("Unable to link analysis tee to output queue")
+        if publish_video:
+            output_tee_pad = analysis_tee.get_request_pad("src_%u")
+            output_sink_pad = output_input_queue.get_static_pad("sink")
+            if (
+                output_tee_pad is None
+                or output_sink_pad is None
+                or output_tee_pad.link(output_sink_pad) != Gst.PadLinkReturn.OK
+            ):
+                raise RuntimeError("Unable to link analysis tee to output queue")
         needs_cpu_frame = (
             self.face_engine.enabled
             or self.dms_enabled
@@ -744,30 +782,39 @@ maintain-aspect-ratio=0
             analysis_src = analysis_queue
         if not analysis_src.link(analysis_sink):
             raise RuntimeError("Unable to terminate analysis branch")
-        if not output_input_queue.link(convert_before_osd):
-            raise RuntimeError("Unable to link output queue to OSD converter")
-        if not convert_before_osd.link(face_rgba_caps):
-            raise RuntimeError("Unable to link CPU face frame to OSD converter")
-        if not face_rgba_caps.link(osd) or not osd.link(convert_after_osd):
-            raise RuntimeError("Unable to link OSD branch")
-        if not convert_after_osd.link(output_i420_caps):
-            raise RuntimeError("Unable to link post-OSD output caps")
-        if not output_i420_caps.link(output_tee):
-            raise RuntimeError("Unable to link output tee")
-        if not output_tee.link(output_queue):
-            raise RuntimeError("Unable to link output branches")
-        if not output_queue.link(encoder) or not encoder.link(output_parser):
-            raise RuntimeError("Unable to link output encoder")
-        if not output_parser.link(sink):
-            raise RuntimeError("Unable to link RTSP output")
-        # Attach output metadata immediately before nvdsosd.  Display metadata
-        # added after nvdsosd has already rendered is invisible in the encoded
-        # stream, even though the same coordinates remain available to API
-        # consumers.
-        osd_input_src = face_rgba_caps.get_static_pad("src")
-        if osd_input_src is None:
-            raise RuntimeError("OSD input has no src pad")
-        osd_input_src.add_probe(Gst.PadProbeType.BUFFER, self._on_output_buffer)
+        if publish_video:
+            if not output_input_queue.link(convert_before_osd):
+                raise RuntimeError("Unable to link output queue to OSD converter")
+            if not convert_before_osd.link(face_rgba_caps):
+                raise RuntimeError("Unable to link CPU face frame to OSD converter")
+            if not face_rgba_caps.link(osd) or not osd.link(convert_after_osd):
+                raise RuntimeError("Unable to link OSD branch")
+            if not convert_after_osd.link(output_i420_caps):
+                raise RuntimeError("Unable to link post-OSD output caps")
+            if not output_i420_caps.link(output_tee):
+                raise RuntimeError("Unable to link output tee")
+            if not output_tee.link(output_queue):
+                raise RuntimeError("Unable to link output branches")
+            if not output_queue.link(encoder) or not encoder.link(output_parser):
+                raise RuntimeError("Unable to link output encoder")
+            if self._output_admission_gate is not None:
+                output_admission_src = output_queue.get_static_pad("src")
+                if output_admission_src is None:
+                    raise RuntimeError("Output queue has no src pad")
+                output_admission_src.add_probe(
+                    Gst.PadProbeType.BUFFER,
+                    self._on_output_admission_buffer,
+                )
+            if not output_parser.link(sink):
+                raise RuntimeError("Unable to link RTSP output")
+            # Attach output metadata immediately before nvdsosd.  Display metadata
+            # added after nvdsosd has already rendered is invisible in the encoded
+            # stream, even though the same coordinates remain available to API
+            # consumers.
+            osd_input_src = face_rgba_caps.get_static_pad("src")
+            if osd_input_src is None:
+                raise RuntimeError("OSD input has no src pad")
+            osd_input_src.add_probe(Gst.PadProbeType.BUFFER, self._on_output_buffer)
         metadata_src = primary_analysis.get_static_pad("src")
         if metadata_src is None:
             raise RuntimeError("Primary analysis element has no src pad")
@@ -1207,10 +1254,12 @@ maintain-aspect-ratio=0
             perception = raw_result
             transitions.extend(self.front_policy.observe(perception))
             self._record_front_transitions(transitions, sample, perception)
+            overlay_metrics, _segments = self._front_geometry_segments(perception)
             metadata.update(
                 {
                     **perception.summary(),
                     "active_alerts": list(self.front_policy.active_labels),
+                    "overlay": overlay_metrics,
                     "transitions": [
                         {
                             "operation": item.operation,
@@ -1225,6 +1274,7 @@ maintain-aspect-ratio=0
             with self._analysis_lock:
                 self._front_perception = perception
                 self._front_transitions = list(transitions)
+                self._front_overlay_metrics = overlay_metrics
 
         if function != "front_assistance":
             self._notify_transitions(transitions)
@@ -1312,10 +1362,6 @@ maintain-aspect-ratio=0
 
     def _publish_live_metadata(self, payload: dict[str, Any]) -> None:
         """Publish latest overlay metadata without putting disk I/O on every frame."""
-        now = time.monotonic()
-        if now - self._metadata_write_at < self._metadata_write_interval_seconds:
-            return
-        self._metadata_write_at = now
         try:
             self.status_dir.mkdir(parents=True, exist_ok=True)
             temporary = self.metadata_path.with_suffix(".json.tmp")
@@ -1502,13 +1548,10 @@ maintain-aspect-ratio=0
         if not self.front_assistance_enabled:
             self._add_live_timestamp(batch_meta, frame_meta)
 
-    def _render_front_geometry(
+    def _front_geometry_segments(
         self,
-        batch_meta: Any,
-        frame_meta: Any,
         perception: FrontPerception,
-    ) -> None:
-        """Render projected lane boundaries and a visible predicted path corridor."""
+    ) -> tuple[dict[str, Any], list[tuple[tuple[int, int], tuple[int, int], tuple[float, ...], int]]]:
         front_config = self.config.get("front_assistance", {}) or {}
         calibration = front_config.get("calibration", {}) or {}
         overlay_config = front_config.get("overlay", {}) or {}
@@ -1563,7 +1606,28 @@ maintain-aspect-ratio=0
         metrics = {
             **geometry.summary(),
             "rendered_segment_count": len(segments),
+            "segments": [
+                {
+                    "x1": left[0],
+                    "y1": left[1],
+                    "x2": right[0],
+                    "y2": right[1],
+                    "color": [round(float(value), 4) for value in color],
+                    "width": line_width,
+                }
+                for left, right, color, line_width in segments
+            ],
         }
+        return metrics, segments
+
+    def _render_front_geometry(
+        self,
+        batch_meta: Any,
+        frame_meta: Any,
+        perception: FrontPerception,
+    ) -> None:
+        """Render projected lane boundaries and a visible predicted path corridor."""
+        metrics, segments = self._front_geometry_segments(perception)
         with self._analysis_lock:
             self._front_overlay_metrics = metrics
         for offset in range(0, len(segments), 16):
@@ -1686,6 +1750,10 @@ maintain-aspect-ratio=0
             "frame_count": self.frame_count,
             "input_decoder": getattr(self, "input_decoder", "unknown"),
             "output_encoder": getattr(self, "output_encoder", "unknown"),
+            "output_resolution": getattr(self, "output_resolution", None),
+            "output_rate_hz": getattr(self, "output_rate_hz", None),
+            "opencv_threads": self.opencv_threads,
+            "output_video_published": self.output_video_published,
             "config_generation": int(
                 (self.config.get("runtime", {}) or {}).get("config_generation", 1)
             ),
@@ -2194,6 +2262,18 @@ maintain-aspect-ratio=0
 
     def _publish_metadata_frame(self, frame_meta: Any) -> None:
         """Publish lightweight overlay state from the non-blocking DeepStream probe."""
+        self.frame_count += 1
+        if self.frame_count % 100 == 0:
+            LOG.info(
+                "frames=%d smoking_bbox_count=%d fire_smoke_count=%d",
+                self.frame_count,
+                len(self._analysis_detections),
+                len(self._analysis_fire_smoke),
+            )
+        now = time.monotonic()
+        if now - self._metadata_write_at < self._metadata_write_interval_seconds:
+            return
+        self._metadata_write_at = now
         tracks = [] if self.dms_enabled else self._recognition_tracks(frame_meta)
         detection_results, fire_smoke_detections, transitions, _ = self._cached_analysis()
         with self._analysis_lock:
@@ -2402,19 +2482,16 @@ maintain-aspect-ratio=0
             "smoking_episodes": self.event_store.metrics(),
         }
         self._publish_live_metadata(payload)
-        self.frame_count += 1
-        if self.frame_count % 100 == 0:
-            LOG.info(
-                "frames=%d smoking_bbox_count=%d fire_smoke_count=%d",
-                self.frame_count,
-                len(detection_results),
-                len(fire_smoke_detections),
-            )
 
     def _on_metadata_buffer(self, pad: Gst.Pad, info: Gst.PadProbeInfo) -> Gst.PadProbeReturn:
         buffer = info.get_buffer()
         if buffer is None:
             return Gst.PadProbeReturn.OK
+        if not self.output_video_published:
+            self.last_output_at = time.time()
+            self.last_output_pts_ns = (
+                None if buffer.pts == Gst.CLOCK_TIME_NONE else int(buffer.pts)
+            )
         batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(buffer))
         if batch_meta is None:
             return Gst.PadProbeReturn.OK
@@ -2466,6 +2543,16 @@ maintain-aspect-ratio=0
         _info: Gst.PadProbeInfo,
     ) -> Gst.PadProbeReturn:
         if self._analysis_admission_gate.accept(time.monotonic()):
+            return Gst.PadProbeReturn.OK
+        return Gst.PadProbeReturn.DROP
+
+    def _on_output_admission_buffer(
+        self,
+        _pad: Gst.Pad,
+        _info: Gst.PadProbeInfo,
+    ) -> Gst.PadProbeReturn:
+        gate = self._output_admission_gate
+        if gate is None or gate.accept(time.monotonic()):
             return Gst.PadProbeReturn.OK
         return Gst.PadProbeReturn.DROP
 

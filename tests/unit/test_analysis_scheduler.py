@@ -60,13 +60,63 @@ def test_analysis_admission_gate_limits_cpu_conversion_cadence() -> None:
     gate = AnalysisAdmissionGate(0.1)
 
     assert gate.accept(1.0)
-    assert not gate.accept(1.05)
-    assert gate.accept(1.1)
+    assert not gate.accept(1.049)
+    assert gate.accept(1.05)
     assert gate.status() == {
         "interval_seconds": 0.1,
+        "planned_rate_hz": 10.0,
         "accepted": 2,
         "dropped": 1,
     }
+
+
+def test_analysis_admission_gate_keeps_fixed_phase_under_frame_jitter() -> None:
+    gate = AnalysisAdmissionGate(0.05)
+    jitter = (0.0, -0.003, 0.002, -0.002, 0.003)
+
+    accepted = [
+        gate.accept(1.0 + index * 0.05 + jitter[index % len(jitter)])
+        for index in range(40)
+    ]
+
+    assert sum(accepted) >= 38
+    assert gate.status()["planned_rate_hz"] == 20.0
+
+
+def test_latest_executor_keeps_fixed_phase_under_submission_jitter() -> None:
+    executor = LatestSampleExecutor(
+        "front_assistance",
+        0.05,
+        lambda sample: sample.key.frame_number,
+        lambda *_args: None,
+        lambda _name, exc: (_ for _ in ()).throw(exc),
+    )
+
+    jitter = (0.0, -0.003, 0.002, -0.002, 0.003)
+    accepted = [
+        executor.submit(
+            _sample(index),
+            1.0 + index * 0.05 + jitter[index % len(jitter)],
+        )
+        for index in range(40)
+    ]
+
+    assert sum(accepted) >= 38
+    assert executor.status()["planned_rate_hz"] == 20.0
+
+
+def test_latest_executor_due_check_uses_same_frame_tolerance_as_submit() -> None:
+    executor = LatestSampleExecutor(
+        "dms",
+        0.1,
+        lambda sample: sample.key.frame_number,
+        lambda *_args: None,
+        lambda _name, exc: (_ for _ in ()).throw(exc),
+    )
+
+    assert executor.submit(_sample(1), 1.0)
+    assert not executor.is_due(1.049)
+    assert executor.is_due(1.05)
 
 
 def test_latest_executor_drops_intermediate_sample_without_growing_queue() -> None:

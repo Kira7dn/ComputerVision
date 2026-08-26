@@ -24,6 +24,7 @@ export interface CameraDetail {
   rss_mb?: number | null
   input_decoder?: string | null
   output_encoder?: string | null
+  output_video_published?: boolean
   analysis_error?: string | null
   config_generation?: number | null
   plan_hash?: string | null
@@ -91,6 +92,15 @@ export interface MetricsResponse {
     cameras: string[]
     cpu_percent: number | null
     rss_mb: number | null
+    hot_path_cpu_percent?: number | null
+    hot_path_rss_mb?: number | null
+    hot_path_processes?: Array<{
+      pid: number
+      camera: string
+      kind: 'vision_worker' | 'mock_publisher' | string
+      cpu_percent: number | null
+      rss_mb: number | null
+    }>
     age_seconds: number | null
     config_generation?: number | null
     config_reload_error?: string | null

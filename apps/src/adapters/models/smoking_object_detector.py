@@ -93,7 +93,19 @@ class SmokingObjectDetector:
                 raise ValueError(
                     f"smoking object model {source} has invalid labels/positive_labels"
                 )
-            session = ort.InferenceSession(str(model_path), providers=selected)
+            session_options = ort.SessionOptions()
+            session_options.intra_op_num_threads = max(
+                1, int(runtime.get("onnx_intra_op_threads", 1))
+            )
+            session_options.inter_op_num_threads = max(
+                1, int(runtime.get("onnx_inter_op_threads", 1))
+            )
+            session_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+            session = ort.InferenceSession(
+                str(model_path),
+                sess_options=session_options,
+                providers=selected,
+            )
             input_name = session.get_inputs()[0].name
             active = list(session.get_providers())
             if bool(smoking.get("require_gpu_provider", False)) and not gpu_providers.intersection(

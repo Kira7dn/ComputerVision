@@ -4,9 +4,29 @@ export interface FrameTimingSample {
   output_timestamp: number
 }
 
+export interface LiveCameraMetadata {
+    width?: number
+    height?: number
+    frame_num?: number
+    timestamp?: number
+    frame_timing_samples?: FrameTimingSample[]
+    front_assistance?: {
+      overlay?: {
+        segments?: Array<{
+          x1: number
+          y1: number
+          x2: number
+          y2: number
+          color: [number, number, number, number]
+          width: number
+        }>
+      }
+    }
+}
+
 export interface LiveMetadataResponse {
   timestamp?: number
-  cameras?: Record<string, { frame_timing_samples?: FrameTimingSample[] }>
+  cameras?: Record<string, LiveCameraMetadata>
   mock_timeline?: {
     ready?: boolean
     groups?: Record<string, {

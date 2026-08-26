@@ -172,11 +172,20 @@ class OpenpilotFrontEngine:
         front: dict[str, Any],
         session_factory: Callable[..., Any] | None,
     ) -> None:
+        session_options = None
         if session_factory is None:
             import onnxruntime as ort
 
             session_factory = ort.InferenceSession
             available = set(ort.get_available_providers())
+            session_options = ort.SessionOptions()
+            session_options.intra_op_num_threads = max(
+                1, int(front.get("onnx_intra_op_threads", 1))
+            )
+            session_options.inter_op_num_threads = max(
+                1, int(front.get("onnx_inter_op_threads", 1))
+            )
+            session_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
         else:
             available = set(front.get("available_providers", []))
         requested = list(
@@ -199,9 +208,10 @@ class OpenpilotFrontEngine:
         provider_errors: dict[str, str] = {}
         for provider in providers:
             try:
-                self.session = session_factory(
-                    str(self.model_path), providers=[provider]
-                )
+                kwargs: dict[str, Any] = {"providers": [provider]}
+                if session_options is not None:
+                    kwargs["sess_options"] = session_options
+                self.session = session_factory(str(self.model_path), **kwargs)
                 break
             except Exception as exc:
                 provider_errors[provider] = str(exc)

@@ -62,10 +62,19 @@ class AnalysisAdmissionGate:
 
     def accept(self, now: float) -> bool:
         with self._lock:
-            if now < self._next_due:
+            # Select the source frame nearest to the fixed cadence deadline.
+            # Advancing the deadline by a full slot still bounds admission to
+            # one frame per interval when the source runs faster than analysis.
+            tolerance = self.interval_seconds * 0.50
+            if self._next_due and now + tolerance < self._next_due:
                 self.dropped += 1
                 return False
-            self._next_due = now + self.interval_seconds
+            if not self._next_due:
+                self._next_due = now + self.interval_seconds
+            else:
+                elapsed = max(0.0, now - self._next_due)
+                elapsed_slots = int(elapsed // self.interval_seconds)
+                self._next_due += (elapsed_slots + 1) * self.interval_seconds
             self.accepted += 1
             return True
 
@@ -73,6 +82,7 @@ class AnalysisAdmissionGate:
         with self._lock:
             return {
                 "interval_seconds": self.interval_seconds,
+                "planned_rate_hz": round(1.0 / self.interval_seconds, 3),
                 "accepted": self.accepted,
                 "dropped": self.dropped,
             }
@@ -119,13 +129,20 @@ class LatestSampleExecutor:
 
     def is_due(self, now: float) -> bool:
         with self._lock:
-            return now >= self._next_due
+            tolerance = self.interval_seconds * 0.50
+            return not self._next_due or now + tolerance >= self._next_due
 
     def submit(self, sample: AnalysisSample, now: float) -> bool:
         with self._lock:
-            if now < self._next_due:
+            tolerance = self.interval_seconds * 0.50
+            if self._next_due and now + tolerance < self._next_due:
                 return False
-            self._next_due = now + self.interval_seconds
+            if not self._next_due:
+                self._next_due = now + self.interval_seconds
+            else:
+                elapsed = max(0.0, now - self._next_due)
+                elapsed_slots = int(elapsed // self.interval_seconds)
+                self._next_due += (elapsed_slots + 1) * self.interval_seconds
         try:
             self._queue.put_nowait(sample)
         except queue.Full:
@@ -164,11 +181,15 @@ class LatestSampleExecutor:
         return self._queue.qsize()
 
     def status(self) -> dict[str, Any]:
+        total = self.processed + self.dropped
         return {
+            "interval_seconds": self.interval_seconds,
+            "planned_rate_hz": round(1.0 / self.interval_seconds, 3),
             "queue_depth": self.queue_depth,
             "enqueued": self.enqueued,
             "processed": self.processed,
             "dropped": self.dropped,
+            "drop_ratio": round(self.dropped / total, 6) if total else 0.0,
             "errors": self.errors,
             "last_enqueued_frame": self.last_enqueued_frame,
             "last_processed_frame": self.last_processed_frame,

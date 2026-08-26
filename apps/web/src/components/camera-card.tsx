@@ -1,9 +1,10 @@
-import { useCallback } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { Activity, BrainCircuit, Clock3, Cpu, Flame, ScanFace, Cigarette } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { useMediaStream } from '@/hooks/use-media-stream'
 import { CameraStatusBadge } from '@/components/camera-status-badge'
 import type { CameraDetail, PlayerState } from '@/types'
+import { subscribeLiveMetadata, type LiveCameraMetadata } from '@/lib/live-metadata'
 
 interface CameraCardProps {
   camera: CameraDetail
@@ -16,6 +17,7 @@ export function CameraCard({ camera, focused, onFocus, onStateChange }: CameraCa
     onStateChange(camera.id, state)
   }, [camera.id, onStateChange])
   const { videoRef, state } = useMediaStream(camera, handleStateChange)
+  const [liveOverlay, setLiveOverlay] = useState<LiveCameraMetadata | null>(null)
   const ready = Boolean(camera.worker_ready ?? camera.ready)
   const displayName = camera.display_name ?? friendlyCameraName(camera.id)
   const isDms = camera.id === 'DMS' || Boolean(camera.functions?.dms)
@@ -28,6 +30,15 @@ export function CameraCard({ camera, focused, onFocus, onStateChange }: CameraCa
     )
   )
   const front = camera.front_assistance
+  useEffect(() => {
+    if (!isFrontAssistance || camera.output_video_published !== false) {
+      setLiveOverlay(null)
+      return undefined
+    }
+    return subscribeLiveMetadata((snapshot) => {
+      setLiveOverlay(snapshot.payload.cameras?.[camera.id] ?? null)
+    }, 100)
+  }, [camera.id, camera.output_video_published, isFrontAssistance])
   const frontNeedsAttention = Boolean(
     front?.active_alerts?.length
     || (front?.readiness && !['ready', 'warming'].includes(front.readiness)),
@@ -63,6 +74,27 @@ export function CameraCard({ camera, focused, onFocus, onStateChange }: CameraCa
       <CardContent className="p-0 md:flex md:min-h-0 md:flex-1 md:flex-col">
         <div className="relative aspect-video overflow-hidden bg-[linear-gradient(135deg,_#0d1117,_#151b24)] p-0 md:min-h-0 md:flex-1 md:aspect-auto">
           <video ref={videoRef} className="h-full w-full bg-black object-contain p-0" hidden={!state.live} autoPlay muted playsInline aria-label={`Luồng video ${displayName}`} />
+          {state.live && isFrontAssistance && camera.output_video_published === false && liveOverlay && (
+            <svg
+              className="pointer-events-none absolute inset-0 z-[2] h-full w-full"
+              viewBox={`0 0 ${liveOverlay.width ?? 960} ${liveOverlay.height ?? 540}`}
+              preserveAspectRatio="xMidYMid meet"
+              aria-label="ADAS browser overlay"
+            >
+              {(liveOverlay.front_assistance?.overlay?.segments ?? []).map((segment, index) => (
+                <line
+                  key={`${liveOverlay.frame_num ?? 0}-${index}`}
+                  x1={segment.x1}
+                  y1={segment.y1}
+                  x2={segment.x2}
+                  y2={segment.y2}
+                  stroke={`rgba(${Math.round(segment.color[0] * 255)}, ${Math.round(segment.color[1] * 255)}, ${Math.round(segment.color[2] * 255)}, ${segment.color[3]})`}
+                  strokeWidth={segment.width}
+                  strokeLinecap="round"
+                />
+              ))}
+            </svg>
+          )}
           {!state.live && <CameraEmptyState camera={camera} state={state} ready={ready} />}
           {isFrontAssistance && frontNeedsAttention && (
             <div className="absolute left-1/2 top-3 z-[3] -translate-x-1/2 rounded-md border border-danger/70 bg-black/80 px-3 py-2 font-heading text-sm font-semibold text-danger" title={(front?.blocking_reasons ?? []).join(', ')}>

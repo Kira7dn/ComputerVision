@@ -112,7 +112,7 @@ def test_production_enables_bounded_dms_performance_contract() -> None:
         "require_person": True,
         "upper_body_ratio": 0.55,
         "padding_ratio": 0.10,
-        "max_side": 640,
+        "max_side": 512,
     }
     assert resolved["dms"]["event_policy"]["model"]["trace_interval_ms"] == 2000
 
@@ -153,9 +153,25 @@ def test_front_camera_has_worker_and_calibration_contract() -> None:
         "path_half_width_m": 0.9,
     }
     assert resolved["front_assistance"]["calibration"]["source_width"] == 960
-    assert resolved["input"]["mock_video"].endswith("/CAM_FRONT.mp4")
+    assert resolved["input"]["mock_video"].endswith("/CAM_FRONT_20FPS_ALL_I.mp4")
+    assert resolved["input"]["mock_publisher"] == "packet_copy"
+    assert resolved["input"]["fps"] == 20
     assert resolved["input"]["rtsp_url"].endswith("/camera_front_raw")
     assert resolved["output"]["rtsp_url"].endswith("/camera_front")
+    assert resolved["output"]["dashboard_rtsp_url"].endswith("/camera_front")
+    assert resolved["output"]["publish_video"] is True
+
+
+def test_dms_output_is_streamable_without_changing_input_resolution() -> None:
+    raw = load_raw_config(Path(__file__).parents[2] / "config" / "dev.yaml")
+    resolved = resolve_camera_config(raw, "DMS")
+
+    assert (resolved["input"]["width"], resolved["input"]["height"]) == (1920, 1080)
+    assert (resolved["output"]["width"], resolved["output"]["height"]) == (960, 540)
+    assert resolved["output"]["bitrate_bps"] == 3_000_000
+    assert resolved["output"]["rate_hz"] == 10
+    assert resolved["dms"]["face_mesh"]["driver_roi"]["max_side"] == 512
+    assert resolved["dms"]["face_mesh"]["interval_ms"] == 150
 
 
 def test_media_only_mock_rejects_enabled_cv_function() -> None:

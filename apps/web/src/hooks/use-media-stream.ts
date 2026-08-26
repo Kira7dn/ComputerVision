@@ -134,10 +134,33 @@ export function useMediaStream(camera: CameraDetail, onStateChange: (state: Play
               candidateCounts.set(candidate, (candidateCounts.get(candidate) ?? 0) + 1)
             }
           }
-          const best = [...candidateCounts.entries()].sort((left, right) => right[1] - left[1])[0]
-          // Two coincidental pairs are possible when the browser is outside
-          // the server ring. Require a longer sequence before trusting it.
-          if (best && best[1] >= 5) rtpTimestampOffset = best[0]
+          const candidates = [...candidateCounts.entries()]
+            .filter(([, count]) => count >= 5)
+            .map(([offset, count]) => {
+              const latencies: number[] = []
+              for (const [rtpTimestamp, displayTime] of pendingFrames) {
+                const sample = frameSamples.get((rtpTimestamp - offset) >>> 0)
+                if (!sample || serverBrowserClockOffsetMs == null) continue
+                const displayEpochMs = performance.timeOrigin + displayTime
+                const captureEpochInBrowserMs = sample.capture_timestamp * 1000 - serverBrowserClockOffsetMs
+                latencies.push(displayEpochMs - captureEpochInBrowserMs)
+              }
+              latencies.sort((left, right) => left - right)
+              const medianLatencyMs = latencies.length > 0
+                ? latencies[Math.floor(latencies.length / 2)]
+                : Number.POSITIVE_INFINITY
+              return { offset, count, medianLatencyMs }
+            })
+            // Constant-frame-rate RTP sequences produce several equally good
+            // offsets. The newest causal mapping has the smallest non-negative
+            // display latency; choosing the oldest ring entry invents seconds
+            // of latency and shifts every direct-file mock by the same amount.
+            .filter((candidate) => candidate.medianLatencyMs >= -50)
+            .sort((left, right) => (
+              left.medianLatencyMs - right.medianLatencyMs
+              || right.count - left.count
+            ))
+          if (candidates[0]) rtpTimestampOffset = candidates[0].offset
         }
         for (const [rtpTimestamp, displayTime] of pendingFrames) {
           const mappedRtpTimestamp = rtpTimestampOffset == null
