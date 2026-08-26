@@ -11,6 +11,8 @@ from pathlib import Path
 from threading import Lock
 from urllib.parse import parse_qs, quote, urlparse
 
+import yaml
+
 from bootstrap.config import camera_ids, load_raw_config, resolve_camera_config
 
 APP_ROOT = Path(__file__).resolve().parents[2]
@@ -67,9 +69,42 @@ def _raw_config() -> dict[str, object]:
     with CONFIG_CACHE_LOCK:
         if CONFIG_CACHE is not None and CONFIG_CACHE[0] == fingerprint:
             return CONFIG_CACHE[1]
-        loaded = load_raw_config(CONFIG_PATH)
+        try:
+            loaded = load_raw_config(CONFIG_PATH)
+        except (OSError, TypeError, ValueError, yaml.YAMLError):
+            if CONFIG_CACHE is not None:
+                return CONFIG_CACHE[1]
+            return {}
         CONFIG_CACHE = (fingerprint, loaded)
         return loaded
+
+
+def _status_directory() -> Path:
+    status_directory = os.environ.get("CAMERA_STATUS_DIR", "").strip()
+    runtime_root = os.environ.get("CAMERA_RUNTIME_ROOT", "").strip()
+    if status_directory:
+        return Path(status_directory)
+    if runtime_root:
+        return Path(runtime_root) / "status"
+    raw_config = _raw_config()
+    runtime = raw_config.get("runtime", {}) or {}
+    return Path(str(runtime.get("status_directory", "/opt/ls-vision/data/status")))
+
+
+def _active_evidence_location() -> tuple[Path, str]:
+    runner_status = _runner_status()
+    active_runtime = runner_status.get("active_runtime", {}) or {}
+    if runner_status.get("fresh") and isinstance(active_runtime, dict):
+        directory = active_runtime.get("evidence_directory")
+        if directory:
+            return Path(str(directory)), str(
+                active_runtime.get("evidence_prefix", "snapshots-acceptance")
+            )
+    raw_config = _raw_config()
+    evidence = raw_config.get("evidence", {}) or {}
+    return Path(str(evidence.get("directory", ".tmp/ls-vision"))), str(
+        evidence.get("prefix", "snapshots-acceptance")
+    )
 
 
 def _latest_evidence_run(root: Path, prefix: str) -> Path | None:
@@ -162,6 +197,38 @@ def _event_journal_snapshot(
 
 def _camera_definitions(stream_host: str = "localhost") -> list[dict[str, object]]:
     try:
+        runner_status = _runner_status()
+        active_cameras = runner_status.get("active_cameras", [])
+        if runner_status.get("fresh") and isinstance(active_cameras, list):
+            definitions = []
+            for item in active_cameras:
+                if not isinstance(item, dict) or not item.get("id"):
+                    continue
+                output_url = str(item.get("output", ""))
+                output_path = urlparse(output_url).path.strip("/")
+                source = item.get("source")
+                media_only = bool(item.get("media_only", False))
+                definitions.append(
+                    {
+                        **item,
+                        "media_url": (
+                            f"http://{stream_host}:{MOCK_MEDIA_PORT}/"
+                            f"{quote(Path(str(source)).name)}"
+                            if media_only
+                            else None
+                        ),
+                        "webrtc_url": (
+                            f"http://{stream_host}:{PUBLIC_WEBRTC_PORT}/"
+                            f"{output_path}/whep"
+                        ),
+                        "hls_url": (
+                            f"http://{stream_host}:{PUBLIC_HLS_PORT}/"
+                            f"{output_path}/index.m3u8"
+                        ),
+                    }
+                )
+            if definitions:
+                return definitions
         raw_config = _raw_config()
         definitions: list[dict[str, object]] = []
         for camera_id in camera_ids(raw_config):
@@ -283,10 +350,7 @@ def _processes() -> list[dict[str, int | str]]:
 
 def _runtime_status(camera_id: str) -> dict[str, object]:
     try:
-        raw_config = _raw_config()
-        runtime = raw_config.get("runtime", {}) or {}
-        status_dir = Path(str(runtime.get("status_directory", "/opt/ls-vision/data/status")))
-        path = status_dir / f"{camera_id}.json"
+        path = _status_directory() / f"{camera_id}.json"
         if not path.is_file():
             return {}
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -297,10 +361,7 @@ def _runtime_status(camera_id: str) -> dict[str, object]:
 
 def _mock_timeline_status() -> dict[str, object]:
     try:
-        raw_config = _raw_config()
-        runtime = raw_config.get("runtime", {}) or {}
-        status_dir = Path(str(runtime.get("status_directory", "/opt/ls-vision/data/status")))
-        path = status_dir / "mock-timeline.json"
+        path = _status_directory() / "mock-timeline.json"
         payload = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(payload, dict):
             return {}
@@ -312,13 +373,25 @@ def _mock_timeline_status() -> dict[str, object]:
         return {}
 
 
+def _runner_status() -> dict[str, object]:
+    try:
+        payload = json.loads(
+            (_status_directory() / "runner.json").read_text(encoding="utf-8")
+        )
+        if not isinstance(payload, dict):
+            return {}
+        updated_at = float(payload.get("updated_at", 0.0) or 0.0)
+        payload["fresh"] = 0.0 <= time.time() - updated_at <= 2.0
+        return payload
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return {}
+
+
 def _live_metadata() -> dict[str, object]:
     """Read the latest bounded overlay payloads without running GPU metrics."""
     result: dict[str, object] = {"timestamp": time.time(), "cameras": {}}
     try:
-        raw_config = _raw_config()
-        runtime = raw_config.get("runtime", {}) or {}
-        status_dir = Path(str(runtime.get("status_directory", "/opt/ls-vision/data/status")))
+        status_dir = _status_directory()
         cameras: dict[str, object] = {}
         for camera in _camera_definitions():
             camera_id = str(camera["id"])
@@ -340,10 +413,7 @@ def _live_metadata() -> dict[str, object]:
 
 def _evidence_metrics() -> dict[str, object]:
     try:
-        raw_config = _raw_config()
-        evidence = raw_config.get("evidence", {}) or {}
-        root = Path(str(evidence.get("directory", ".tmp/ls-vision")))
-        prefix = str(evidence.get("prefix", "snapshots-acceptance"))
+        root, prefix = _active_evidence_location()
         latest = _latest_evidence_run(root, prefix)
         if latest is None:
             return {"available": False, "run_id": None, "event_count": 0, "root": str(root)}
@@ -371,10 +441,7 @@ def _event_feed(after: int = 0, limit: int | None = None) -> dict[str, object]:
     without scanning every event directory.
     """
     try:
-        raw_config = _raw_config()
-        evidence = raw_config.get("evidence", {}) or {}
-        root = Path(str(evidence.get("directory", ".tmp/ls-vision")))
-        prefix = str(evidence.get("prefix", "snapshots-acceptance"))
+        root, prefix = _active_evidence_location()
         latest = _latest_evidence_run(root, prefix)
         if latest is None:
             return {"run_id": None, "cursor": 0, "events": []}
@@ -549,10 +616,7 @@ def _event_thumbnail(
 ) -> Path | None:
     """Resolve only a START thumbnail inside the configured latest run."""
     try:
-        raw_config = _raw_config()
-        evidence = raw_config.get("evidence", {}) or {}
-        root = Path(str(evidence.get("directory", ".tmp/ls-vision")))
-        prefix = str(evidence.get("prefix", "snapshots-acceptance"))
+        root, prefix = _active_evidence_location()
         latest = _latest_evidence_run(root, prefix)
         if latest is not None and latest.name != f"{prefix}-{run_id}":
             latest = None
@@ -665,6 +729,10 @@ def _collect_metrics(stream_host: str = "localhost") -> dict[str, object]:
 
     configured_cameras = _camera_definitions(stream_host)
     mock_timeline = _mock_timeline_status()
+    runner_status = _runner_status()
+    runner_cameras = runner_status.get("cameras", {}) or {}
+    if not isinstance(runner_cameras, dict):
+        runner_cameras = {}
     timeline_required = any(camera.get("mock_sync_group") for camera in configured_cameras)
     timeline_ready = bool(mock_timeline.get("ready")) if timeline_required else True
     processes_by_camera = {str(item["camera"]): item for item in processes}
@@ -675,6 +743,7 @@ def _collect_metrics(stream_host: str = "localhost") -> dict[str, object]:
         media_only = bool(camera.get("media_only", False))
         media_ready = media_only and Path(str(camera.get("source", ""))).is_file()
         runtime_status = {} if media_only else _runtime_status(camera_id)
+        plan_status = runtime_status or runner_cameras.get(camera_id, {}) or {}
         last_frame_at = runtime_status.get("last_frame_at")
         last_output_at = runtime_status.get("last_output_at")
         try:
@@ -718,6 +787,17 @@ def _collect_metrics(stream_host: str = "localhost") -> dict[str, object]:
                 "analysis_flow": runtime_status.get("analysis_flow", {}),
                 "worker_epoch": runtime_status.get("worker_epoch"),
                 "analysis_error": runtime_status.get("analysis_error"),
+                "config_generation": plan_status.get(
+                    "config_generation", runner_status.get("config_generation")
+                ),
+                "plan_hash": plan_status.get("plan_hash"),
+                "enabled_functions": plan_status.get("enabled_functions", []),
+                "shared_nodes": plan_status.get("shared_nodes", []),
+                "estimated_inference_rate_hz": plan_status.get(
+                    "estimated_inference_rate_hz"
+                ),
+                "model_revisions": plan_status.get("model_revisions", {}),
+                "resource_warnings": plan_status.get("resource_warnings", []),
                 "smoking_episodes": analysis_debug.get("smoking_episodes", {}),
                 "dms": dms_debug,
                 "driver_attention": dms_metrics.get("driver_attention", {}),
@@ -749,6 +829,11 @@ def _collect_metrics(stream_host: str = "localhost") -> dict[str, object]:
             "age_seconds": pipeline_age,
             "camera_details": camera_metrics,
             "mock_timeline": mock_timeline,
+            "config_generation": runner_status.get("config_generation"),
+            "config_reload_error": runner_status.get("reload_error"),
+            "last_restarted_cameras": runner_status.get(
+                "last_restarted_cameras", []
+            ),
         },
         "stream": {
             "worker_ready": any(bool(camera["worker_ready"]) for camera in camera_metrics),

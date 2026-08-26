@@ -36,6 +36,12 @@ Một camera process sở hữu state, model session, tracking, event transition
 
 Hai YAML profile standalone. Production không kế thừa development. Environment paths được resolve qua một runtime-path owner; source URL, function flags và model policy vẫn được validate trước khi tạo process.
 
+Mỗi resolved camera config được compile thành một `CameraExecutionPlan` bất biến. Plan khai báo function đang bật, shared node cần dùng, model revision SHA-256, interval, estimated inference rate và `plan_hash`; `FunctionRegistry` là mapping tường minh từ function sang config section, dependency, engine factory metadata, interval/model resolver và processor. Worker chỉ tạo model session và latest-only executor cho function nằm trong plan; person detector/CPU frame branch được dùng chung thay vì tạo lại theo từng function.
+
+Runner theo dõi YAML và reconcile theo `plan_hash`: config candidate phải validate toàn bộ trước, camera không đổi giữ nguyên PID/state, chỉ camera có plan đổi mới bị restart. Candidate lỗi, kể cả YAML sai cú pháp, giữ nguyên generation đang chạy và xuất lỗi qua `runner.json`. Dashboard lấy topology/function runtime từ `active_cameras` do runner công bố, không đọc candidate bị từ chối như active state. Các trường thuộc synchronized mock timeline (`sync_group`, period, epoch, media/source URL) không được hot reload; runner fail closed và yêu cầu restart toàn service để bốn camera đổi clock atomically.
+
+Mọi feature section (`recognition`, `dms`, `smoking_behavior`, `fire_smoke`, `front_assistance`) dùng cùng quy tắc deep-merge override tại camera. `runtime.dynamic_pipeline` giới hạn số function và tổng inference rate ước tính theo camera; khi `enforce=true`, plan vượt budget bị từ chối trước khi worker/model khởi động.
+
 ## Storage
 
 ```text
@@ -55,4 +61,4 @@ Release source là immutable sau deploy. Data directories không nằm dưới r
 
 ## Readiness
 
-Liveness chỉ chứng minh service HTTP sống. Readiness của vision camera yêu cầu process và output freshness; synchronized mock còn yêu cầu `mock-timeline.json` fresh và server-side group lock. Browser acceptance kiểm tra đủ bốn member, p95 drift không quá 100 ms, max drift không quá 250 ms và re-lock trong 5 giây sau timeline restart.
+Liveness chỉ chứng minh service HTTP sống. Readiness của vision camera yêu cầu process và output freshness; synchronized mock còn yêu cầu `mock-timeline.json` fresh và server-side group lock. Dashboard công bố `config_generation`, `plan_hash`, function/shared node/model revision và camera vừa restart từ `runner.json`. Browser acceptance kiểm tra đủ bốn member, p95 drift không quá 100 ms, max drift không quá 250 ms và re-lock trong 5 giây sau timeline restart.

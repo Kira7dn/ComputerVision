@@ -29,6 +29,18 @@ npm run dev -- -JetsonAlias jetson-nano
 
 Development dùng `/opt/ls-vision-dev`, port riêng và service bị disable khi kết thúc session. Production tiếp tục sở hữu `vision.local`.
 
+YAML function/model/policy changes được runner validate rồi áp dụng theo camera; xem `data/status/runner.json` để kiểm tra `config_generation`, `plan_hash`, `active_cameras`, model checksum, estimated inference rate, `last_restarted_cameras` và `reload_error`. Candidate lỗi không thay topology mà dashboard đang công bố. Thay đổi synchronized timeline bị từ chối khi hot reload và chỉ có hiệu lực sau restart service, tránh làm lệch clock giữa bốn mock camera.
+
+Selective reload acceptance khi development service đang chạy:
+
+```powershell
+.\.venv\Scripts\python.exe tests\e2e\run_jetson_dynamic_pipeline_e2e.py `
+  --jetson-alias jetson-nano `
+  --report .tmp\ls-vision-dynamic-e2e\summary.json
+```
+
+Script thay đổi tạm DMS interval, xác nhận chỉ DMS đổi PID, front/timeline publisher giữ nguyên; sau đó inject YAML sai cú pháp để xác nhận generation/PID/dashboard active projection không đổi. Config được restore chính xác trước khi kết thúc.
+
 ## Acceptance
 
 ```powershell

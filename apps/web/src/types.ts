@@ -25,6 +25,13 @@ export interface CameraDetail {
   input_decoder?: string | null
   output_encoder?: string | null
   analysis_error?: string | null
+  config_generation?: number | null
+  plan_hash?: string | null
+  enabled_functions?: string[]
+  shared_nodes?: string[]
+  estimated_inference_rate_hz?: number | null
+  model_revisions?: Record<string, string | null>
+  resource_warnings?: string[]
   driver_attention?: {
     contract_version?: number
     readiness?: 'warming' | 'ready' | 'degraded' | 'not_ready' | 'disabled' | string
@@ -85,6 +92,9 @@ export interface MetricsResponse {
     cpu_percent: number | null
     rss_mb: number | null
     age_seconds: number | null
+    config_generation?: number | null
+    config_reload_error?: string | null
+    last_restarted_cameras?: string[]
     camera_details: CameraDetail[]
     mock_timeline?: {
       schema_version?: number

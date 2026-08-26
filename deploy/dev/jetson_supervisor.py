@@ -1,9 +1,9 @@
 """Supervise the native Jetson development runtime.
 
 Vite owns frontend HMR on the workstation. This standard-library-only
-supervisor owns the Jetson MediaMTX, dashboard API and DeepStream runner, and
-restarts only the affected process when source or runtime configuration
-changes.
+supervisor owns the Jetson MediaMTX, dashboard API and DeepStream runner. Source
+changes restart affected services; YAML changes are reconciled per camera by
+the runner unless they alter the synchronized timeline contract.
 """
 
 from __future__ import annotations
@@ -247,22 +247,21 @@ def main() -> int:
                 config_changed = any(
                     path.startswith("app/config/")
                     or (config_relative and path == config_relative)
-                    or path == ".env.local"
                     for path in changed_paths
                 )
+                environment_changed = ".env.local" in changed_paths
                 source_changed = any(path.startswith("app/src/") for path in changed_paths)
-                timeline_changed = config_changed or any(
+                timeline_changed = any(
                     path == "app/src/application/mock_timeline_runtime.py"
                     or path.startswith("app/src/adapters/media/")
                     or path == "app/src/domain/mock_timeline.py"
                     for path in changed_paths
                 )
-                mock_media_changed = config_changed or any(
+                mock_media_changed = any(
                     path == "app/src/interfaces/mock_media_server.py"
                     for path in changed_paths
                 )
-                source_or_config_changed = source_changed or config_changed
-                if source_or_config_changed:
+                if source_changed or environment_changed:
                     processes["dashboard"].restart()
                 if timeline_changed:
                     processes["timeline"].restart()
@@ -270,10 +269,16 @@ def main() -> int:
                         runtime_status / "mock-timeline.json",
                         processes["timeline"],
                     )
-                if source_or_config_changed:
+                if source_changed or environment_changed:
                     processes["runner"].restart()
-                if mock_media_changed and "mock_media" in processes:
+                if (mock_media_changed or environment_changed) and "mock_media" in processes:
                     processes["mock_media"].restart()
+                if config_changed:
+                    # The runner validates and reconciles config changes per camera.
+                    # Timeline-contract changes are rejected there and require an
+                    # explicit service restart so all synchronized publishers move
+                    # to the new epoch/period together.
+                    print("[dev-supervisor] YAML change delegated to camera runner", flush=True)
             for process in processes.values():
                 if process.exited() and not stop_requested.is_set():
                     process.start()

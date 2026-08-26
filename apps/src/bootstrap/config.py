@@ -173,42 +173,51 @@ def validate_config(config: dict[str, Any], path: Path | None = None) -> dict[st
         or (profile == "e2e" and not all_mock_sources)
         or os.environ.get("CAMERA_VALIDATE_MODELS") == "1"
     )
-    model_paths = [
-        (config.get("person", {}) or {}).get("onnx_path"),
-        (config.get("person", {}) or {}).get("engine_path"),
-        ((config.get("recognition", {}) or {}).get("face_runtime", {}) or {}).get("detector_model"),
-        ((config.get("recognition", {}) or {}).get("face_runtime", {}) or {}).get("recognizer_model"),
-        (config.get("smoking_behavior", {}) or {}).get("onnx_path"),
-        (config.get("fire_smoke", {}) or {}).get("onnx_path"),
-    ]
+    model_paths: list[object] = []
+    person_functions = {"face_recognition", "dms", "smoking_behavior", "fire_smoke"}
+    for camera_id in ids:
+        resolved_camera = resolve_camera_config(config, camera_id)
+        functions = resolved_camera.get("functions", {}) or {}
+        enabled = {name for name, value in functions.items() if bool(value)}
+        if enabled & person_functions:
+            person = resolved_camera.get("person", {}) or {}
+            model_paths.extend((person.get("onnx_path"), person.get("engine_path")))
+        if "face_recognition" in enabled:
+            face = (
+                (resolved_camera.get("recognition", {}) or {}).get(
+                    "face_runtime", {}
+                )
+                or {}
+            )
+            model_paths.extend((face.get("detector_model"), face.get("recognizer_model")))
+        for function, section_name in (
+            ("smoking_behavior", "smoking_behavior"),
+            ("fire_smoke", "fire_smoke"),
+        ):
+            if function in enabled:
+                section = resolved_camera.get(section_name, {}) or {}
+                model_paths.append(section.get("onnx_path"))
+                object_models = (
+                    (section.get("object_detection", {}) or {}).get("models", {})
+                    or {}
+                )
+                model_paths.extend(
+                    (model or {}).get("onnx_path")
+                    for model in object_models.values()
+                )
+        if "dms" in enabled:
+            dms = resolved_camera.get("dms", {}) or {}
+            object_models = (
+                (dms.get("object_detection", {}) or {}).get("models", {}) or {}
+            )
+            model_paths.extend(
+                (model or {}).get("onnx_path") for model in object_models.values()
+            )
+        if "front_assistance" in enabled:
+            front = resolved_camera.get("front_assistance", {}) or {}
+            model_paths.append(front.get("model_path"))
     dms_config = config.get("dms", {}) or {}
     dms_object = dms_config.get("object_detection", {}) or {}
-    if dms_object.get("enabled", False):
-        model_paths.extend(
-            (model or {}).get("onnx_path")
-            for model in (dms_object.get("models", {}) or {}).values()
-        )
-    for camera in config.get("cameras", []) or []:
-        camera_fire_smoke = (camera.get("fire_smoke", {}) or {}) if isinstance(camera, dict) else {}
-        camera_analysis = (camera.get("analysis", {}) or {}) if isinstance(camera, dict) else {}
-        camera_fire_override = (camera_analysis.get("functions", {}) or {}).get("fire_smoke", {}) or {}
-        model_paths.extend(
-            [camera_fire_smoke.get("onnx_path"), camera_fire_override.get("onnx_path"), camera_fire_override.get("model_path")]
-        )
-        if bool((camera.get("functions", {}) or {}).get("front_assistance", False)):
-            camera_front = _merge_config(
-                config.get("front_assistance", {}) or {},
-                camera.get("front_assistance", {}) or {},
-            )
-            model_paths.append(camera_front.get("model_path"))
-    smoking_object = (
-        (config.get("smoking_behavior", {}) or {}).get("object_detection", {}) or {}
-    )
-    if smoking_object.get("enabled", False):
-        model_paths.extend(
-            (model or {}).get("onnx_path")
-            for model in (smoking_object.get("models", {}) or {}).values()
-        )
     if dms_object.get("enabled", False):
         dms_models = dms_object.get("models", {}) or {}
         if not isinstance(dms_models, dict) or not dms_models:
@@ -696,6 +705,25 @@ def resolve_camera_config(config: dict[str, Any], camera_id: str | None = None) 
     resolved = deepcopy(config)
     resolved.pop("cameras", None)
 
+    # Every function follows the same camera-local override rule. Function
+    # flags below remain authoritative for enabled/disabled state.
+    for section_name in (
+        "recognition",
+        "dms",
+        "smoking_behavior",
+        "fire_smoke",
+        "front_assistance",
+    ):
+        override = camera.get(section_name, {}) or {}
+        if not isinstance(override, dict):
+            raise ValueError(
+                f"camera {camera_id} {section_name} override must be a mapping"
+            )
+        resolved[section_name] = _merge_config(
+            deepcopy(resolved.get(section_name, {}) or {}),
+            deepcopy(override),
+        )
+
     source = camera.get("source", {}) or {}
     if not isinstance(source, dict):
         raise ValueError(f"camera {camera_id} source must be a mapping")
@@ -803,7 +831,6 @@ def resolve_camera_config(config: dict[str, Any], camera_id: str | None = None) 
     resolved["dms"] = dms
 
     front_assistance = deepcopy(resolved.get("front_assistance", {}) or {})
-    front_assistance.update(camera.get("front_assistance", {}) or {})
     front_assistance["enabled"] = bool(functions["front_assistance"])
     resolved["front_assistance"] = front_assistance
 

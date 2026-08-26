@@ -32,14 +32,9 @@ from urllib.request import urlopen
 
 from adapters.media.mock_input import wait_for_rtsp_video
 from adapters.models.dms_engine import (
-    DmsBehaviorEngine,
     DmsInferenceResult,
     select_dms_overlay_detections,
 )
-from adapters.models.face_engine import FaceRecognitionEngine
-from adapters.models.fire_smoke_engine import FireSmokeEngine
-from adapters.models.openpilot_front_engine import OpenpilotFrontEngine
-from adapters.models.smoking_engine import SmokingBehaviorEngine
 from adapters.notification.service import NotificationService
 from adapters.persistence.evidence_repository import EvidenceStore
 from application.analysis_scheduler import (
@@ -48,6 +43,8 @@ from application.analysis_scheduler import (
     LatestSampleExecutor,
     as_function_result,
 )
+from application.function_registry import FUNCTION_REGISTRY, registration_for
+from application.pipeline_compiler import compile_camera_plan
 from bootstrap.config import load_config, load_raw_config
 
 DEEPSTREAM_ROOT = os.environ.get("DEEPSTREAM_ROOT", "/opt/nvidia/deepstream/deepstream-7.1")
@@ -75,10 +72,7 @@ import zmq  # noqa: E402
 
 from domain.contracts import AnalysisSample, FrameKey, FunctionResult  # noqa: E402
 from domain.dms_events import DmsAlertEventStore  # noqa: E402
-from domain.dms_health import (  # noqa: E402
-    requires_person_inference,
-    resolve_dms_health,
-)
+from domain.dms_health import resolve_dms_health  # noqa: E402
 from domain.fire_smoke_events import FireSmokeEventStore  # noqa: E402
 from domain.front_assistance import (  # noqa: E402
     FrontAlertTransition,
@@ -183,20 +177,23 @@ class DeepStreamCameraRuntime:
         # Keep enough history to correlate a browser that is temporarily
         # buffered behind the live edge without guessing a frame pair.
         self._frame_timing_samples: deque[dict[str, float | int]] = deque(maxlen=360)
+        self.execution_plan = compile_camera_plan(config)
+        enabled_functions = set(self.execution_plan.enabled_functions)
         functions = config.get("functions", {}) or {}
-        self.dms_enabled = bool(functions.get("dms", False))
-        self.smoking_behavior_enabled = bool(functions.get("smoking_behavior", False))
-        self.fire_smoke_enabled = bool(functions.get("fire_smoke", False))
-        self.front_assistance_enabled = bool(
-            functions.get("front_assistance", False)
+        self.face_recognition_enabled = "face_recognition" in enabled_functions
+        self.dms_enabled = "dms" in enabled_functions
+        self.smoking_behavior_enabled = "smoking_behavior" in enabled_functions
+        self.fire_smoke_enabled = "fire_smoke" in enabled_functions
+        self.front_assistance_enabled = "front_assistance" in enabled_functions
+        self.person_inference_enabled = (
+            "person_inference" in self.execution_plan.shared_nodes
         )
-        self.person_inference_enabled = requires_person_inference(functions)
         self.trace_enabled = bool(functions.get("trace", True))
         LOG.info(
             "function topology: camera=%s dms=%s face_recognition=%s smoking_behavior=%s fire_smoke=%s front_assistance=%s person_inference=%s",
             config.get("input", {}).get("camera", "unknown"),
             self.dms_enabled,
-            bool(functions.get("face_recognition", False)),
+            self.face_recognition_enabled,
             self.smoking_behavior_enabled,
             self.fire_smoke_enabled,
             self.front_assistance_enabled,
@@ -217,16 +214,24 @@ class DeepStreamCameraRuntime:
         self._face_event_ids: dict[int, str] = {}
         self._smoking_by_track: dict[int, Any] = {}
         self.mock_publisher: subprocess.Popen | None = None
+        # The per-camera function map is authoritative. This prevents a global
+        # recognition default from loading face models in cameras that did not
+        # request the function, while allowing a camera override to enable it.
+        config.setdefault("recognition", {})["enabled"] = self.face_recognition_enabled
         self.recognition = RecognitionCore(config)
-        self.face_engine = FaceRecognitionEngine(config, self._on_face_trace)
-        self.dms_engine = DmsBehaviorEngine(config) if self.dms_enabled else None
-        self.smoking_behavior_engine = (
-            SmokingBehaviorEngine(config) if self.smoking_behavior_enabled else None
-        )
-        self.fire_smoke_engine = FireSmokeEngine(config) if self.fire_smoke_enabled else None
-        self.front_engine = (
-            OpenpilotFrontEngine(config) if self.front_assistance_enabled else None
-        )
+        for registration in FUNCTION_REGISTRY.values():
+            setattr(self, registration.engine_attribute, None)
+        for spec in self.execution_plan.functions:
+            registration = registration_for(spec.name)
+            setattr(
+                self,
+                registration.engine_attribute,
+                self._create_function_engine(spec.name),
+            )
+        # CPU frame decoding currently lives in the face adapter. Construct its
+        # disabled, model-free form when another function needs CPU frames.
+        if self.face_engine is None:
+            self.face_engine = self._create_function_engine("face_recognition")
         self.front_policy = VisionAlertPolicy()
         self._front_perception: FrontPerception | None = None
         self._front_transitions: list[FrontAlertTransition] = []
@@ -268,13 +273,7 @@ class DeepStreamCameraRuntime:
             tracking_config.get("confirmation_window", 4)
         )
         self.last_behavior_error: str | None = None
-        self.analysis_enabled = (
-            self.face_engine.enabled
-            or self.dms_enabled
-            or self.smoking_behavior_enabled
-            or self.fire_smoke_enabled
-            or self.front_assistance_enabled
-        )
+        self.analysis_enabled = "cpu_frame" in self.execution_plan.shared_nodes
         self._analysis_lock = threading.RLock()
         self._analysis_detections: list[Any] = []
         self._analysis_dms_detections: list[Any] = []
@@ -966,58 +965,35 @@ maintain-aspect-ratio=0
 
     def _start_analysis_workers(self) -> None:
         camera_id = str(self.config["input"].get("camera", "camera"))
-        definitions: list[tuple[str, float, Any]] = []
-        if self.face_engine.enabled:
-            definitions.append(
-                (
-                    "face_recognition",
-                    self.face_engine.recognition_scheduler.interval_seconds,
-                    self._process_face_sample,
+        for spec in self.execution_plan.functions:
+            registration = registration_for(spec.name)
+            engine = getattr(self, registration.engine_attribute, None)
+            if engine is None:
+                raise RuntimeError(
+                    f"camera {camera_id} function {spec.name} has no runtime engine"
                 )
-            )
-        if self.dms_enabled and self.dms_engine is not None:
-            definitions.append(
-                ("dms", self.dms_engine.interval_seconds, self._process_dms_sample)
-            )
-        if self.smoking_behavior_enabled and self.smoking_behavior_engine is not None:
-            definitions.append(
-                (
-                    "smoking_behavior",
-                    self.smoking_behavior_engine.interval_seconds,
-                    self._process_smoking_sample,
-                )
-            )
-        if self.fire_smoke_enabled and self.fire_smoke_engine is not None:
-            definitions.append(
-                (
-                    "fire_smoke",
-                    self.fire_smoke_engine.interval_seconds,
-                    self._process_fire_smoke_sample,
-                )
-            )
-        if self.front_assistance_enabled and self.front_engine is not None:
-            definitions.append(
-                (
-                    "front_assistance",
-                    self.front_engine.interval_seconds,
-                    self._process_front_sample,
-                )
-            )
-        for function, interval, processor in definitions:
             executor = LatestSampleExecutor(
-                name=function,
-                interval_seconds=interval,
-                processor=processor,
+                name=spec.name,
+                interval_seconds=spec.interval_seconds,
+                processor=getattr(self, registration.processor_method),
                 on_result=self._on_analysis_result,
                 on_error=self._on_analysis_error,
             )
-            self._analysis_executors[function] = executor
+            self._analysis_executors[spec.name] = executor
             executor.start()
         LOG.info(
             "analysis executors started: camera=%s functions=%s",
             camera_id,
             sorted(self._analysis_executors),
         )
+
+    def _create_function_engine(self, function: str) -> Any:
+        registration = registration_for(function)
+        module = importlib.import_module(registration.engine_module)
+        engine_class = getattr(module, registration.engine_class)
+        if registration.passes_trace_sink:
+            return engine_class(self.config, self._on_face_trace)
+        return engine_class(self.config)
 
     def _process_face_sample(self, sample: AnalysisSample) -> dict[int, dict[str, Any]]:
         return self.face_engine.process_frame(
@@ -1710,6 +1686,10 @@ maintain-aspect-ratio=0
             "frame_count": self.frame_count,
             "input_decoder": getattr(self, "input_decoder", "unknown"),
             "output_encoder": getattr(self, "output_encoder", "unknown"),
+            "config_generation": int(
+                (self.config.get("runtime", {}) or {}).get("config_generation", 1)
+            ),
+            **self.execution_plan.status(),
             "analysis_queue_depth": sum(
                 executor.queue_depth for executor in self._analysis_executors.values()
             ),
@@ -2985,6 +2965,8 @@ def run_camera_process(
     run_id: str,
     worker_epoch: str,
     duration: int | None = None,
+    config_generation: int = 1,
+    expected_plan_hash: str | None = None,
 ) -> int:
     """Run one configured camera process from the application entrypoint."""
     raw_config = load_raw_config(config_path)
@@ -2998,6 +2980,13 @@ def run_camera_process(
     Gst.init(None)
     config = load_config(config_path, camera_id)
     config.setdefault("runtime", {})["worker_epoch"] = worker_epoch
+    config["runtime"]["config_generation"] = config_generation
+    plan = compile_camera_plan(config)
+    if expected_plan_hash is not None and plan.plan_hash != expected_plan_hash:
+        raise RuntimeError(
+            f"camera {camera_id} config changed during worker start: "
+            f"expected={expected_plan_hash} actual={plan.plan_hash}"
+        )
     pipeline = DeepStreamCameraRuntime(config, config_path, run_id)
     for signum in (signal.SIGINT, signal.SIGTERM):
         signal.signal(signum, lambda *_: pipeline.loop.quit())

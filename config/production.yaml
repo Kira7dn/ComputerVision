@@ -5,6 +5,10 @@ runtime:
   state_directory: /opt/ls-vision/data/state
   analysis_result_max_age_seconds: 2.0
   allow_engine_build: true
+  dynamic_pipeline:
+    enforce: true
+    max_functions_per_camera: 3
+    max_inference_rate_hz: 30.0
 analysis:
   result_max_age_ms: 1000
   functions: {}

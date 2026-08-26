@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import yaml
+
 from interfaces import dashboard_api
 
 
@@ -23,6 +25,29 @@ def test_dashboard_config_is_cached_until_yaml_changes(tmp_path, monkeypatch) ->
     assert dashboard_api._raw_config()["profile"] == "dev"
     assert dashboard_api._raw_config()["profile"] == "dev"
     assert calls == 1
+
+
+def test_dashboard_keeps_last_valid_config_when_yaml_is_malformed(
+    tmp_path, monkeypatch
+) -> None:
+    config_path = tmp_path / "dev.yaml"
+    config_path.write_text("profile: dev\n", encoding="utf-8")
+    malformed = False
+
+    def load(_path: Path) -> dict[str, object]:
+        if malformed:
+            raise yaml.YAMLError("malformed")
+        return {"profile": "dev", "cameras": []}
+
+    monkeypatch.setattr(dashboard_api, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(dashboard_api, "load_raw_config", load)
+    monkeypatch.setattr(dashboard_api, "CONFIG_CACHE", None)
+    assert dashboard_api._raw_config()["profile"] == "dev"
+
+    malformed = True
+    config_path.write_text("cameras: [", encoding="utf-8")
+
+    assert dashboard_api._raw_config()["profile"] == "dev"
 
 
 def test_event_journal_reads_only_appended_lines(tmp_path) -> None:
@@ -114,3 +139,61 @@ def test_mock_timeline_status_fails_closed_when_stale(tmp_path, monkeypatch) -> 
     payload = dashboard_api._mock_timeline_status()
     assert payload["ready"] is True
     assert payload["fresh"] is True
+
+
+def test_runner_status_exposes_fresh_generation(tmp_path, monkeypatch) -> None:
+    status = tmp_path / "runner.json"
+    monkeypatch.setattr(
+        dashboard_api,
+        "_raw_config",
+        lambda: {"runtime": {"status_directory": str(tmp_path)}},
+    )
+    status.write_text(
+        json.dumps(
+            {
+                "updated_at": dashboard_api.time.time(),
+                "config_generation": 3,
+                "last_restarted_cameras": ["DMS"],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    payload = dashboard_api._runner_status()
+
+    assert payload["fresh"] is True
+    assert payload["config_generation"] == 3
+    assert payload["last_restarted_cameras"] == ["DMS"]
+
+
+def test_camera_definitions_use_runner_active_config_when_candidate_is_invalid(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        dashboard_api,
+        "_runner_status",
+        lambda: {
+            "fresh": True,
+            "active_cameras": [
+                {
+                    "id": "DMS",
+                    "display_name": "Driver",
+                    "source": "rtsp://camera/source",
+                    "source_type": "rtsp",
+                    "media_only": False,
+                    "output": "rtsp://127.0.0.1:8554/dms",
+                    "functions": {"dms": True},
+                }
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        dashboard_api,
+        "_raw_config",
+        lambda: (_ for _ in ()).throw(AssertionError("candidate YAML must not be read")),
+    )
+
+    definitions = dashboard_api._camera_definitions("vision.local")
+
+    assert definitions[0]["id"] == "DMS"
+    assert definitions[0]["webrtc_url"].endswith("/dms/whep")

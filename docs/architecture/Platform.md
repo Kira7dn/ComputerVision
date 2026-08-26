@@ -9,6 +9,7 @@ Ngày cập nhật: 26/08/2026
 | Lane | Owner |
 | --- | --- |
 | Camera process lifecycle | `runner` |
+| Per-camera plan compilation và function dependency | `CameraExecutionPlan` + `FunctionRegistry` |
 | Mock group clock và synchronized publisher | Mock timeline runtime |
 | Capture, DeepStream graph, tracking, annotation, RTSP | DeepStream adapter của từng camera |
 | Face, DMS, smoking, fire/smoke, front inference | Model adapters được gán theo camera config |
@@ -30,6 +31,8 @@ Hai profile giữ cùng thứ tự: `DMS`, `camera_front`, `camera_back`, `camer
 - Feed `media_only` chỉ phục vụ playback và không tạo vision worker.
 - Bốn mock 360 dùng một contract `vehicle_surround`; timeline runtime chỉ publish `camera_front_raw`, ba feed còn lại được browser đọc trực tiếp và bù theo live latency của front.
 - Controller timeline có thể restart và adopt synchronized publisher đang sống; full service shutdown vẫn dọn publisher theo systemd/dev process group.
+- Function/model/policy config được reconcile theo từng camera; camera có plan hash không đổi không bị restart.
+- Thay đổi clock/source thuộc `vehicle_surround` không hot reload riêng lẻ mà yêu cầu service restart để giữ một timeline chung.
 
 Việc đổi topology, model, confirmation policy hoặc media-only behavior là product change riêng, không thuộc architecture cleanup.
 

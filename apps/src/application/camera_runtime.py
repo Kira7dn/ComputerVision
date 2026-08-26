@@ -26,6 +26,8 @@ def main() -> None:
     parser.add_argument("--camera-id", type=str, default=None)
     parser.add_argument("--run-id", type=str, default=None)
     parser.add_argument("--worker-epoch", type=str, default=None)
+    parser.add_argument("--config-generation", type=int, default=1)
+    parser.add_argument("--expected-plan-hash", type=str, default=None)
     parser.add_argument("--duration", type=int, default=None)
     args = parser.parse_args()
     configure_logging()
@@ -40,6 +42,8 @@ def main() -> None:
             run_id,
             worker_epoch,
             args.duration,
+            args.config_generation,
+            args.expected_plan_hash,
         )
     )
 

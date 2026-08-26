@@ -14,9 +14,20 @@ def test_native_jetson_declares_isolated_production_and_development_services() -
     assert "CAMERA_MOCK_TIMELINE_ENABLED=1" in production
     assert "CAMERA_DASHBOARD_PORT=28080" in development
     assert "CAMERA_INPUT_RTSP_BASE=rtsp://127.0.0.1:28554" in development
-    assert "application.mock_timeline_runtime" in (
-        root / "deploy/dev/jetson_supervisor.py"
+    dev_supervisor = (root / "deploy/dev/jetson_supervisor.py").read_text(
+        encoding="utf-8"
+    )
+    assert "application.mock_timeline_runtime" in dev_supervisor
+    assert "runner validates and reconciles config changes per camera" in dev_supervisor
+    assert "timeline config change requires service restart" in (
+        root / "apps/src/runner.py"
     ).read_text(encoding="utf-8")
+    production_e2e = (root / "tests/e2e/run_jetson_production_e2e.py").read_text(
+        encoding="utf-8"
+    )
+    assert 'gates["performance_budget"]' in production_e2e
+    assert 'gates["analysis_no_backlog"]' in production_e2e
+    assert 'gates["runner_config_accepted"]' in production_e2e
     assert "Conflicts=ls-vision.service" not in development
     assert "interfaces.host_ingress" in ingress
     assert "127.0.0.1:18080" in ingress

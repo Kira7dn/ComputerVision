@@ -60,6 +60,10 @@ def main() -> int:
     parser.add_argument("--base-url", default="http://vision.local")
     parser.add_argument("--wait", type=int, default=120)
     parser.add_argument("--restart", action="store_true")
+    parser.add_argument("--max-pipeline-cpu-percent", type=float, default=500.0)
+    parser.add_argument("--max-pipeline-rss-mb", type=float, default=3500.0)
+    parser.add_argument("--max-camera-latency-ms", type=float, default=500.0)
+    parser.add_argument("--max-analysis-queue-depth", type=int, default=1)
     parser.add_argument("--report", type=Path, default=DEFAULT_REPORT)
     args = parser.parse_args()
 
@@ -107,6 +111,72 @@ def main() -> int:
     gates["media_contracts_published"] = bool(cameras) and all(
         item.get("media_url") if item.get("media_only") else item.get("hls_url") for item in cameras
     )
+    vision_cameras = [item for item in cameras if not item.get("media_only")]
+    pipeline_cpu = pipeline.get("cpu_percent") if isinstance(pipeline, dict) else None
+    pipeline_rss = pipeline.get("rss_mb") if isinstance(pipeline, dict) else None
+    camera_latencies = {
+        str(item.get("id")): item.get("camera_latency_ms") for item in vision_cameras
+    }
+    queue_depths = {
+        str(item.get("id")): item.get("analysis_queue_depth") for item in vision_cameras
+    }
+    report["performance"] = {
+        "pipeline_cpu_percent": pipeline_cpu,
+        "pipeline_rss_mb": pipeline_rss,
+        "camera_latency_ms": camera_latencies,
+        "analysis_queue_depth": queue_depths,
+        "limits": {
+            "pipeline_cpu_percent": args.max_pipeline_cpu_percent,
+            "pipeline_rss_mb": args.max_pipeline_rss_mb,
+            "camera_latency_ms": args.max_camera_latency_ms,
+            "analysis_queue_depth": args.max_analysis_queue_depth,
+        },
+    }
+    gates["runtime_plans_observable"] = bool(cameras) and all(
+        item.get("plan_hash")
+        and isinstance(item.get("enabled_functions"), list)
+        and isinstance(item.get("shared_nodes"), list)
+        and isinstance(item.get("estimated_inference_rate_hz"), int | float)
+        and isinstance(item.get("model_revisions"), dict)
+        and all(
+            item["model_revisions"].get(function)
+            for function in item.get("enabled_functions", [])
+        )
+        for item in cameras
+    )
+    gates["runner_config_accepted"] = bool(
+        isinstance(pipeline, dict)
+        and int(pipeline.get("config_generation", 0) or 0) >= 1
+        and not pipeline.get("config_reload_error")
+    )
+    gates["resource_budget_clear"] = bool(cameras) and all(
+        not item.get("resource_warnings") for item in cameras
+    )
+    gates["analysis_no_backlog"] = bool(vision_cameras) and all(
+        isinstance(depth, int) and depth <= args.max_analysis_queue_depth
+        for depth in queue_depths.values()
+    )
+    gates["performance_budget"] = bool(
+        isinstance(pipeline_cpu, int | float)
+        and pipeline_cpu <= args.max_pipeline_cpu_percent
+        and isinstance(pipeline_rss, int | float)
+        and pipeline_rss <= args.max_pipeline_rss_mb
+        and camera_latencies
+        and all(
+            isinstance(latency, int | float)
+            and 0.0 <= latency <= args.max_camera_latency_ms
+            for latency in camera_latencies.values()
+        )
+    )
+    for gate_name in (
+        "runtime_plans_observable",
+        "runner_config_accepted",
+        "resource_budget_clear",
+        "analysis_no_backlog",
+        "performance_budget",
+    ):
+        if not gates[gate_name]:
+            errors.append(f"production gate failed: {gate_name}")
     mock_timeline = pipeline.get("mock_timeline", {}) if isinstance(pipeline, dict) else {}
     groups = mock_timeline.get("groups", {}) if isinstance(mock_timeline, dict) else {}
     surround = groups.get("vehicle_surround", {}) if isinstance(groups, dict) else {}
