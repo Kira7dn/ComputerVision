@@ -1,6 +1,6 @@
 # LS-Vision Platform architecture
 
-Ngày cập nhật: 25/08/2026
+Ngày cập nhật: 26/08/2026
 
 ## Source of truth và ownership
 
@@ -9,6 +9,7 @@ Ngày cập nhật: 25/08/2026
 | Lane | Owner |
 | --- | --- |
 | Camera process lifecycle | `runner` |
+| Mock group clock và synchronized publisher | Mock timeline runtime |
 | Capture, DeepStream graph, tracking, annotation, RTSP | DeepStream adapter của từng camera |
 | Face, DMS, smoking, fire/smoke, front inference | Model adapters được gán theo camera config |
 | Event transition | Domain/application services của camera process |
@@ -27,6 +28,8 @@ Hai profile giữ cùng thứ tự: `DMS`, `camera_front`, `camera_back`, `camer
 - DMS dùng Dahua channel 5 và function DMS.
 - Camera front sở hữu front-assistance theo config hiện hành.
 - Feed `media_only` chỉ phục vụ playback và không tạo vision worker.
+- Bốn mock 360 dùng một contract `vehicle_surround`; timeline runtime chỉ publish `camera_front_raw`, ba feed còn lại được browser đọc trực tiếp và bù theo live latency của front.
+- Controller timeline có thể restart và adopt synchronized publisher đang sống; full service shutdown vẫn dọn publisher theo systemd/dev process group.
 
 Việc đổi topology, model, confirmation policy hoặc media-only behavior là product change riêng, không thuộc architecture cleanup.
 

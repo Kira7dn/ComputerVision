@@ -107,6 +107,20 @@ def main() -> int:
     gates["media_contracts_published"] = bool(cameras) and all(
         item.get("media_url") if item.get("media_only") else item.get("hls_url") for item in cameras
     )
+    mock_timeline = pipeline.get("mock_timeline", {}) if isinstance(pipeline, dict) else {}
+    groups = mock_timeline.get("groups", {}) if isinstance(mock_timeline, dict) else {}
+    surround = groups.get("vehicle_surround", {}) if isinstance(groups, dict) else {}
+    timeline_cameras = surround.get("cameras", {}) if isinstance(surround, dict) else {}
+    gates["mock_timeline_ready"] = bool(
+        mock_timeline.get("ready")
+        and surround.get("locked")
+        and set(timeline_cameras) == {
+            "camera_front",
+            "camera_back",
+            "camera_left",
+            "camera_right",
+        }
+    )
 
     if args.restart:
         sudo_password = os.environ.get("LS_VISION_SUDO_PASSWORD", "")

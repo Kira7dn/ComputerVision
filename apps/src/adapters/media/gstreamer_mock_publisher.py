@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import signal
 import sys
 import time
@@ -24,6 +26,13 @@ def make_element(factory: str, name: str) -> Gst.Element:
     return element
 
 
+def _write_status(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(f"{path.suffix}.tmp")
+    temporary.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+    temporary.replace(path)
+
+
 def run(
     input_path: Path,
     output_url: str,
@@ -32,6 +41,9 @@ def run(
     fps: int = 15,
     sync_period_seconds: float = 0.0,
     sync_epoch_seconds: float = 0.0,
+    camera_id: str | None = None,
+    sync_group: str | None = None,
+    status_path: Path | None = None,
 ) -> int:
     capture = cv2.VideoCapture(str(input_path))
     source_fps = float(capture.get(cv2.CAP_PROP_FPS))
@@ -106,6 +118,39 @@ def run(
     output_frame_number = 0
     source_advance = 0.0
     exit_code = 0
+    last_status_at = 0.0
+
+    def publish_status(*, ready: bool, force: bool = False) -> None:
+        nonlocal last_status_at
+        if status_path is None:
+            return
+        now = time.time()
+        if not force and now - last_status_at < 0.25:
+            return
+        phase = (
+            ((now - sync_epoch_seconds) % sync_period_seconds) / sync_period_seconds
+            if synchronized
+            else None
+        )
+        _write_status(
+            status_path,
+            {
+                "schema_version": 1,
+                "camera_id": camera_id,
+                "sync_group": sync_group,
+                "period_seconds": sync_period_seconds if synchronized else None,
+                "epoch_seconds": sync_epoch_seconds if synchronized else None,
+                "normalized_phase": phase,
+                "current_frame_index": current_frame_index,
+                "frame_count": frame_count,
+                "output_frame_count": output_frame_number,
+                "timeline_timestamp": now,
+                "updated_at": now,
+                "pid": os.getpid(),
+                "ready": ready,
+            },
+        )
+        last_status_at = now
 
     def read_next_frame() -> bool:
         nonlocal current_frame, current_frame_index
@@ -169,6 +214,7 @@ def run(
             loop.quit()
             return GLib.SOURCE_REMOVE
         output_frame_number += 1
+        publish_status(ready=True)
 
         # Preserve the fixture's real playback rate. A 10 FPS source is
         # duplicated at 20 FPS; a 30 FPS source is sampled down to 20 FPS.
@@ -203,6 +249,7 @@ def run(
     try:
         loop.run()
     finally:
+        publish_status(ready=False, force=True)
         pipeline.set_state(Gst.State.NULL)
         capture.release()
     return exit_code
@@ -216,6 +263,9 @@ def main() -> int:
     parser.add_argument("--fps", type=int, default=15)
     parser.add_argument("--sync-period", type=float, default=0.0)
     parser.add_argument("--sync-epoch", type=float, default=0.0)
+    parser.add_argument("--camera-id")
+    parser.add_argument("--sync-group")
+    parser.add_argument("--status-path", type=Path)
     args = parser.parse_args()
     return run(
         args.input,
@@ -224,6 +274,9 @@ def main() -> int:
         fps=args.fps,
         sync_period_seconds=args.sync_period,
         sync_epoch_seconds=args.sync_epoch,
+        camera_id=args.camera_id,
+        sync_group=args.sync_group,
+        status_path=args.status_path,
     )
 
 

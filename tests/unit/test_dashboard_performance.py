@@ -94,3 +94,23 @@ def test_gpu_metrics_fall_back_when_nvidia_smi_returns_na(monkeypatch) -> None:
     monkeypatch.setattr(dashboard_api, "_read_jetson_gpu", lambda: expected)
 
     assert dashboard_api._read_gpu() == expected
+
+
+def test_mock_timeline_status_fails_closed_when_stale(tmp_path, monkeypatch) -> None:
+    status = tmp_path / "mock-timeline.json"
+    monkeypatch.setattr(
+        dashboard_api,
+        "_raw_config",
+        lambda: {"runtime": {"status_directory": str(tmp_path)}},
+    )
+    status.write_text('{"ready":true,"updated_at":0,"groups":{}}', encoding="utf-8")
+
+    assert dashboard_api._mock_timeline_status()["ready"] is False
+
+    status.write_text(
+        f'{{"ready":true,"updated_at":{dashboard_api.time.time()},"groups":{{}}}}',
+        encoding="utf-8",
+    )
+    payload = dashboard_api._mock_timeline_status()
+    assert payload["ready"] is True
+    assert payload["fresh"] is True

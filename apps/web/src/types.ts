@@ -86,6 +86,22 @@ export interface MetricsResponse {
     rss_mb: number | null
     age_seconds: number | null
     camera_details: CameraDetail[]
+    mock_timeline?: {
+      schema_version?: number
+      ready?: boolean
+      fresh?: boolean
+      updated_at?: number
+      groups?: Record<string, {
+        locked?: boolean
+        period_seconds?: number
+        epoch_seconds?: number
+        normalized_phase?: number
+        cameras?: Record<string, {
+          mode?: 'publisher' | 'direct_file' | string
+          ready?: boolean
+        }>
+      }>
+    }
   }
   stream: {
     worker_ready: boolean

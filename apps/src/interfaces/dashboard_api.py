@@ -295,6 +295,23 @@ def _runtime_status(camera_id: str) -> dict[str, object]:
         return {}
 
 
+def _mock_timeline_status() -> dict[str, object]:
+    try:
+        raw_config = _raw_config()
+        runtime = raw_config.get("runtime", {}) or {}
+        status_dir = Path(str(runtime.get("status_directory", "/opt/ls-vision/data/status")))
+        path = status_dir / "mock-timeline.json"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            return {}
+        updated_at = float(payload.get("updated_at", 0.0) or 0.0)
+        payload["fresh"] = 0.0 <= time.time() - updated_at <= 1.0
+        payload["ready"] = bool(payload.get("ready") and payload["fresh"])
+        return payload
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return {}
+
+
 def _live_metadata() -> dict[str, object]:
     """Read the latest bounded overlay payloads without running GPU metrics."""
     result: dict[str, object] = {"timestamp": time.time(), "cameras": {}}
@@ -315,6 +332,7 @@ def _live_metadata() -> dict[str, object]:
             if isinstance(payload, dict):
                 cameras[camera_id] = payload
         result["cameras"] = cameras
+        result["mock_timeline"] = _mock_timeline_status()
     except (OSError, TypeError, ValueError):
         pass
     return result
@@ -646,6 +664,9 @@ def _collect_metrics(stream_host: str = "localhost") -> dict[str, object]:
     pipeline_age = round(min(pipeline_age_values), 1) if pipeline_age_values else None
 
     configured_cameras = _camera_definitions(stream_host)
+    mock_timeline = _mock_timeline_status()
+    timeline_required = any(camera.get("mock_sync_group") for camera in configured_cameras)
+    timeline_ready = bool(mock_timeline.get("ready")) if timeline_required else True
     processes_by_camera = {str(item["camera"]): item for item in processes}
     camera_metrics: list[dict[str, object]] = []
     for camera in configured_cameras:
@@ -719,12 +740,15 @@ def _collect_metrics(stream_host: str = "localhost") -> dict[str, object]:
             "pid": processes[0]["pid"] if processes else None,
             "pids": [item["pid"] for item in processes],
             "camera_count": len(camera_metrics),
-            "ready": bool(camera_metrics) and all(bool(camera["ready"]) for camera in camera_metrics),
+            "ready": bool(camera_metrics)
+            and all(bool(camera["ready"]) for camera in camera_metrics)
+            and timeline_ready,
             "cameras": [str(item["id"]) for item in camera_metrics],
             "cpu_percent": pipeline_cpu,
             "rss_mb": pipeline_rss,
             "age_seconds": pipeline_age,
             "camera_details": camera_metrics,
+            "mock_timeline": mock_timeline,
         },
         "stream": {
             "worker_ready": any(bool(camera["worker_ready"]) for camera in camera_metrics),

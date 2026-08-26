@@ -9,6 +9,7 @@ changes.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import signal
 import subprocess
@@ -20,6 +21,7 @@ from threading import Event
 IGNORED_DIRECTORIES = {".git", ".pytest_cache", "__pycache__", "dist", "node_modules"}
 POLL_SECONDS = 0.75
 GRACE_SECONDS = 8.0
+TIMELINE_STARTUP_SECONDS = 60.0
 
 
 def file_snapshot(paths: list[Path], root: Path) -> dict[str, tuple[int, int]]:
@@ -35,6 +37,22 @@ def file_snapshot(paths: list[Path], root: Path) -> dict[str, tuple[int, int]]:
                 continue
             snapshot[candidate.relative_to(root).as_posix()] = (stat.st_mtime_ns, stat.st_size)
     return snapshot
+
+
+def wait_for_timeline(path: Path, process: ManagedProcess) -> None:
+    deadline = time.monotonic() + TIMELINE_STARTUP_SECONDS
+    while time.monotonic() < deadline:
+        if process.exited():
+            raise RuntimeError("mock timeline exited before becoming ready")
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            updated_at = float(payload.get("updated_at", 0.0) or 0.0)
+            if bool(payload.get("ready")) and 0.0 <= time.time() - updated_at <= 1.0:
+                return
+        except (OSError, ValueError):
+            pass
+        time.sleep(0.25)
+    raise TimeoutError("mock timeline did not become ready before runner startup")
 
 
 class ManagedProcess:
@@ -168,6 +186,20 @@ def main() -> int:
             if args.mock_media_root is not None
             else {}
         ),
+        "timeline": ManagedProcess(
+            "mock-timeline",
+            [
+                sys.executable,
+                "-m",
+                "application.mock_timeline_runtime",
+                "--config",
+                str(args.config),
+                "--preserve-publishers-on-exit",
+            ],
+            runtime_logs / "mock-timeline.log",
+            root,
+            environment,
+        ),
         "runner": ManagedProcess(
             "runner",
             [sys.executable, "-m", "runner", "--config", str(args.config)],
@@ -196,8 +228,12 @@ def main() -> int:
         config_relative = ""
     previous_snapshot = file_snapshot(watched_paths, root)
     try:
-        for process in processes.values():
-            process.start()
+        for name in ("mediamtx", "dashboard", "mock_media", "timeline"):
+            process = processes.get(name)
+            if process is not None:
+                process.start()
+        wait_for_timeline(runtime_status / "mock-timeline.json", processes["timeline"])
+        processes["runner"].start()
         while not stop_requested.wait(POLL_SECONDS):
             current_snapshot = file_snapshot(watched_paths, root)
             changed_paths = {
@@ -208,18 +244,36 @@ def main() -> int:
             previous_snapshot = current_snapshot
 
             if changed_paths:
-                source_or_config_changed = any(
-                    path.startswith("app/src/")
-                    or path.startswith("app/config/")
+                config_changed = any(
+                    path.startswith("app/config/")
                     or (config_relative and path == config_relative)
                     or path == ".env.local"
                     for path in changed_paths
                 )
+                source_changed = any(path.startswith("app/src/") for path in changed_paths)
+                timeline_changed = config_changed or any(
+                    path == "app/src/application/mock_timeline_runtime.py"
+                    or path.startswith("app/src/adapters/media/")
+                    or path == "app/src/domain/mock_timeline.py"
+                    for path in changed_paths
+                )
+                mock_media_changed = config_changed or any(
+                    path == "app/src/interfaces/mock_media_server.py"
+                    for path in changed_paths
+                )
+                source_or_config_changed = source_changed or config_changed
                 if source_or_config_changed:
                     processes["dashboard"].restart()
+                if timeline_changed:
+                    processes["timeline"].restart()
+                    wait_for_timeline(
+                        runtime_status / "mock-timeline.json",
+                        processes["timeline"],
+                    )
+                if source_or_config_changed:
                     processes["runner"].restart()
-                    if "mock_media" in processes:
-                        processes["mock_media"].restart()
+                if mock_media_changed and "mock_media" in processes:
+                    processes["mock_media"].restart()
             for process in processes.values():
                 if process.exited() and not stop_requested.is_set():
                     process.start()

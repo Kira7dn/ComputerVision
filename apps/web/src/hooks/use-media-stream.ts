@@ -154,6 +154,7 @@ export function useMediaStream(camera: CameraDetail, onStateChange: (state: Play
           pendingFrames.delete(oldest)
         }
         if (lastValidLatencyAt > 0 && performance.now() - lastValidLatencyAt > 2_000) {
+          delete video.dataset.syncLiveLatencySeconds
           update({ videoLatencyMs: null, videoLatencySource: 'unavailable' })
         }
       } catch {
@@ -198,6 +199,7 @@ export function useMediaStream(camera: CameraDetail, onStateChange: (state: Play
           video,
           Number(camera.mock_sync_period_seconds),
           Number(camera.mock_sync_epoch_seconds ?? 0),
+          Boolean(camera.media_only),
         )
       }
       if (reader !== null) return

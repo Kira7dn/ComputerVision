@@ -109,6 +109,31 @@ def test_live_output_follows_rtsp_sample_contract() -> None:
     assert "tbox_lab.ps1" not in launcher
 
 
+def test_synchronized_mock_timeline_is_owned_outside_camera_worker() -> None:
+    timeline = (
+        APP_ROOT / "src" / "application" / "mock_timeline_runtime.py"
+    ).read_text(encoding="utf-8")
+    pipeline = (
+        APP_ROOT / "src" / "adapters" / "deepstream" / "runtime.py"
+    ).read_text(encoding="utf-8")
+    service = (APP_ROOT / "src" / "service.py").read_text(encoding="utf-8")
+
+    assert '"application.mock_timeline_runtime"' in service
+    assert '"adapters.media.gstreamer_mock_publisher"' in timeline
+    synchronized_branch = pipeline.split("if synchronized:", 1)[1].split(
+        'if shutil.which("ffmpeg"):', 1
+    )[0]
+    assert "wait_for_rtsp_video" in synchronized_branch
+    assert "subprocess.Popen" not in synchronized_branch
+
+    browser_sync = (APP_ROOT / "web" / "src" / "lib" / "mock-stream-sync.ts").read_text(
+        encoding="utf-8"
+    )
+    assert "__LS_VISION_SYNC_STATUS__" in browser_sync
+    assert "const STABLE_LOCK_SECONDS = 2" in browser_sync
+    assert "const MAX_DRIFT_MS = 250" in browser_sync
+
+
 def test_jetson_dev_service_is_isolated_from_production() -> None:
     service = (ROOT / "deploy" / "systemd" / "ls-vision-dev.service").read_text(
         encoding="utf-8"

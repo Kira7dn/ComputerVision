@@ -7,6 +7,13 @@ export interface FrameTimingSample {
 export interface LiveMetadataResponse {
   timestamp?: number
   cameras?: Record<string, { frame_timing_samples?: FrameTimingSample[] }>
+  mock_timeline?: {
+    ready?: boolean
+    groups?: Record<string, {
+      locked?: boolean
+      cameras?: Record<string, { ready?: boolean }>
+    }>
+  }
 }
 
 export interface LiveMetadataSnapshot {

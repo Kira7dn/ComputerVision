@@ -38,3 +38,5 @@ Development dùng `/opt/ls-vision-dev`, port riêng và service bị disable khi
 ```
 
 Sau đó kiểm tra browser thật tại `http://vision.local/dashboard.html`.
+
+Synchronized mock acceptance chỉ đạt khi `pipeline.mock_timeline.ready=true`, browser báo đủ bốn member locked liên tục 30 giây, p95 drift không quá 100 ms, max drift không quá 250 ms và re-lock trong 5 giây sau khi timeline process được restart riêng.

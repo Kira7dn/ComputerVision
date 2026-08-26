@@ -1,6 +1,6 @@
 # LS-Vision DeepStream runtime
 
-Ngày cập nhật: 25/08/2026
+Ngày cập nhật: 26/08/2026
 
 ## Runtime graph
 
@@ -8,6 +8,8 @@ Ngày cập nhật: 25/08/2026
 production.yaml
   -> service
       -> dashboard/API
+      -> mock timeline runtime
+          -> synchronized publisher for each non-media-only mock camera
       -> runner
           -> camera process per non-media-only camera
               -> capture/decode
@@ -19,7 +21,7 @@ production.yaml
   -> native MediaMTX -> RTSP/HLS/WebRTC
 ```
 
-Một camera process sở hữu state, model session, tracking, event transition và output của đúng camera đó. Runner sở hữu restart/backoff; service owner thoát non-zero nếu một child quan trọng chết để systemd restart toàn runtime.
+Một camera process sở hữu state, model session, tracking, event transition và output của đúng camera đó. Synchronized mock timeline là media-plane state độc lập: worker chỉ subscribe raw RTSP và không được tự khởi động publisher. Runner sở hữu restart/backoff của worker; timeline failure được restart riêng và readiness fail closed cho tới khi group lock lại. Khi chỉ controller timeline restart, controller mới adopt publisher còn sống qua PID/status tươi; publisher chỉ bị dừng cùng process group khi toàn service dừng, nhờ đó camera worker không phải reconnect.
 
 ## Layers
 
@@ -53,4 +55,4 @@ Release source là immutable sau deploy. Data directories không nằm dưới r
 
 ## Readiness
 
-Liveness chỉ chứng minh service HTTP sống. Readiness của vision camera yêu cầu process và output freshness; media-only feed giữ contract playback hiện hữu. Production acceptance bổ sung service state, release manifest, topology, media contracts, restart persistence và browser verification.
+Liveness chỉ chứng minh service HTTP sống. Readiness của vision camera yêu cầu process và output freshness; synchronized mock còn yêu cầu `mock-timeline.json` fresh và server-side group lock. Browser acceptance kiểm tra đủ bốn member, p95 drift không quá 100 ms, max drift không quá 250 ms và re-lock trong 5 giây sau timeline restart.

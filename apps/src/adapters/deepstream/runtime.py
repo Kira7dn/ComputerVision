@@ -2716,7 +2716,17 @@ maintain-aspect-ratio=0
         sync_period = float(input_cfg.get("mock_sync_period_seconds", 0.0))
         sync_epoch = float(input_cfg.get("mock_sync_epoch_seconds", 0.0))
         synchronized = bool(sync_group) and sync_period > 0.0
-        if shutil.which("ffmpeg") and not synchronized:
+        if synchronized:
+            LOG.info(
+                "waiting for externally owned mock timeline: group=%s period=%.3f epoch=%.3f",
+                sync_group,
+                sync_period,
+                sync_epoch,
+            )
+            wait_for_rtsp_video(str(input_cfg["rtsp_url"]))
+            LOG.info("external synchronized mock input ready: %s", mock_video)
+            return
+        if shutil.which("ffmpeg"):
             publisher_stderr: int | None = subprocess.DEVNULL
             command = [
                 "ffmpeg",
@@ -2766,25 +2776,9 @@ maintain-aspect-ratio=0
             ]
             if bool(input_cfg.get("mock_loop", True)):
                 command.append("--loop")
-            if synchronized:
-                command.extend(
-                    [
-                        "--sync-period",
-                        str(sync_period),
-                        "--sync-epoch",
-                        str(sync_epoch),
-                    ]
-                )
-                LOG.info(
-                    "using shared mock timeline: group=%s period=%.3f epoch=%.3f",
-                    sync_group,
-                    sync_period,
-                    sync_epoch,
-                )
-            else:
-                LOG.warning(
-                    "ffmpeg is unavailable; using the bounded GStreamer mock publisher"
-                )
+            LOG.warning(
+                "ffmpeg is unavailable; using the bounded GStreamer mock publisher"
+            )
         self.mock_publisher = subprocess.Popen(
             command,
             stdout=subprocess.DEVNULL,
