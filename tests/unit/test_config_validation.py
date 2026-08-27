@@ -47,6 +47,32 @@ def test_dev_and_production_share_the_same_five_camera_topology() -> None:
         assert "model_path" not in profile["dms"]["attention"]
 
 
+def test_only_dms_is_mirrored_before_the_vision_pipeline() -> None:
+    root = Path(__file__).parents[2] / "config"
+
+    for profile_name in ("dev.yaml", "production.yaml"):
+        raw = load_raw_config(root / profile_name)
+        resolved = {
+            camera_id: resolve_camera_config(raw, camera_id)
+            for camera_id in ["DMS", "camera_front", "camera_back", "camera_left", "camera_right"]
+        }
+
+        assert resolved["DMS"]["input"]["mirror_horizontal"] is True
+        assert all(
+            resolved[camera_id]["input"]["mirror_horizontal"] is False
+            for camera_id in ("camera_front", "camera_back", "camera_left", "camera_right")
+        )
+
+
+def test_source_mirror_horizontal_must_be_boolean() -> None:
+    raw = load_raw_config(Path(__file__).parents[2] / "config" / "production.yaml")
+    dms = next(camera for camera in raw["cameras"] if camera["id"] == "DMS")
+    dms["source"]["mirror_horizontal"] = "true"
+
+    with pytest.raises(ValueError, match="source.mirror_horizontal must be boolean"):
+        resolve_camera_config(raw, "DMS")
+
+
 def test_runtime_directories_can_be_overridden_after_config_inheritance(monkeypatch: pytest.MonkeyPatch) -> None:
     root = Path(__file__).parents[2]
     monkeypatch.setenv("CAMERA_EVIDENCE_DIR", "/opt/ls-vision-dev/data/evidence")

@@ -19,7 +19,7 @@ export function CameraCard({ camera, focused, onFocus, onStateChange }: CameraCa
   const { videoRef, state } = useMediaStream(camera, handleStateChange)
   const [liveOverlay, setLiveOverlay] = useState<LiveCameraMetadata | null>(null)
   const ready = Boolean(camera.worker_ready ?? camera.ready)
-  const displayName = camera.display_name ?? friendlyCameraName(camera.id)
+  const displayName = friendlyCameraName(camera.id)
   const isDms = camera.id === 'DMS' || Boolean(camera.functions?.dms)
   const isFrontAssistance = Boolean(camera.functions?.front_assistance)
   const attention = camera.driver_attention
@@ -65,7 +65,7 @@ export function CameraCard({ camera, focused, onFocus, onStateChange }: CameraCa
       <CardHeader className="flex flex-row flex-nowrap items-center justify-between gap-1 space-y-0 overflow-hidden border-b px-2 pt-2 pb-2!">
         <div className="flex h-full min-w-0 flex-1 items-center gap-2">
           <CardTitle className="min-w-0 truncate text-sm leading-none">{displayName}</CardTitle>
-          {!isDms && !isFrontAssistance && <span className="max-w-28 truncate font-mono text-[0.62rem] leading-none text-muted-foreground max-[430px]:hidden">{camera.id}</span>}
+          {!isDms && !isFrontAssistance && <span className="max-w-28 truncate font-mono text-[0.62rem] leading-none text-muted-foreground max-[430px]:hidden">{friendlyCameraName(camera.id)}</span>}
           {(!isFrontAssistance || !camera.running) && <span className="inline-flex shrink-0 items-center gap-[0.2rem] whitespace-nowrap font-mono text-[0.6rem] leading-none text-muted-foreground"><Cpu size={11} /> {camera.media_only ? 'media only' : camera.running ? `worker ${camera.pid ?? '--'}` : 'worker offline'}</span>}
           {camera.analysis_error && <span className="shrink-0 whitespace-nowrap text-[0.62rem] leading-none text-danger" title={camera.analysis_error}>detector lỗi</span>}
         </div>
@@ -147,11 +147,11 @@ function friendlyCameraName(id: string) {
   const names: Record<string, string> = {
     camera_face: 'Cổng nhận diện',
     camera_safety: 'Khu vực an toàn',
-    camera_front: 'Camera trước',
-    camera_back: 'Camera sau',
-    camera_left: 'Camera trái',
-    camera_right: 'Camera phải',
-    DMS: 'DMS',
+    DMS: 'cabin',
+    camera_front: 'front',
+    camera_back: 'back',
+    camera_left: 'left',
+    camera_right: 'right',
   }
   return names[id] ?? id.replace(/^camera_/, '').replaceAll('_', ' ')
 }

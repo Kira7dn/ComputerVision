@@ -585,13 +585,17 @@ maintain-aspect-ratio=0
             else "nvv4l2decoder"
         )
         self.input_decoder = decoder_factory
+        self.input_mirror_horizontal = bool(input_cfg.get("mirror_horizontal", False))
         decoder = make_element(decoder_factory, "input-decoder")
-        decoder_to_nvmm = None
-        decoder_nvmm_caps = None
-        if software_decode:
-            decoder_to_nvmm = make_element("nvvideoconvert", "decoder-to-nvmm")
-            decoder_nvmm_caps = make_element("capsfilter", "decoder-nvmm-caps")
-            decoder_nvmm_caps.set_property(
+        input_transform = None
+        input_transform_caps = None
+        if software_decode or self.input_mirror_horizontal:
+            input_transform = make_element("nvvideoconvert", "input-transform")
+            if self.input_mirror_horizontal:
+                input_transform.set_property("flip-method", 4)
+                LOG.info("input horizontal mirror enabled before nvstreammux")
+            input_transform_caps = make_element("capsfilter", "input-transform-caps")
+            input_transform_caps.set_property(
                 "caps", Gst.Caps.from_string("video/x-raw(memory:NVMM),format=NV12")
             )
         mux = make_element("nvstreammux", "stream-muxer")
@@ -708,7 +712,11 @@ maintain-aspect-ratio=0
             self.depay,
             parser,
             decoder,
-            *([decoder_to_nvmm, decoder_nvmm_caps] if software_decode else []),
+            *(
+                [input_transform, input_transform_caps]
+                if input_transform is not None
+                else []
+            ),
             mux,
             *([self.person_infer] if self.person_infer is not None else []),
             analysis_tee,
@@ -734,10 +742,10 @@ maintain-aspect-ratio=0
         if not self.depay.link(parser) or not parser.link(decoder):
             raise RuntimeError("Unable to link RTSP depayloader to decoder")
         decoder_src = decoder.get_static_pad("src")
-        if software_decode:
-            if not decoder.link(decoder_to_nvmm) or not decoder_to_nvmm.link(decoder_nvmm_caps):
-                raise RuntimeError("Unable to convert software decoder output to NVMM")
-            decoder_src = decoder_nvmm_caps.get_static_pad("src")
+        if input_transform is not None:
+            if not decoder.link(input_transform) or not input_transform.link(input_transform_caps):
+                raise RuntimeError("Unable to transform decoder output before nvstreammux")
+            decoder_src = input_transform_caps.get_static_pad("src")
         mux_sink = mux.get_request_pad("sink_0")
         if decoder_src is None or mux_sink is None or decoder_src.link(mux_sink) != Gst.PadLinkReturn.OK:
             raise RuntimeError("Unable to link decoder to nvstreammux")
@@ -1749,6 +1757,7 @@ maintain-aspect-ratio=0
             "camera_latency_samples": self.camera_latency_samples,
             "frame_count": self.frame_count,
             "input_decoder": getattr(self, "input_decoder", "unknown"),
+            "input_mirror_horizontal": getattr(self, "input_mirror_horizontal", False),
             "output_encoder": getattr(self, "output_encoder", "unknown"),
             "output_resolution": getattr(self, "output_resolution", None),
             "output_rate_hz": getattr(self, "output_rate_hz", None),

@@ -35,6 +35,7 @@ cameras:
     password_env: CAMERA_DAHUA_PASSWORD
     codec: hevc
     decoder: hardware
+    mirror_horizontal: true
     loop: true
     width: 1920
     height: 1080

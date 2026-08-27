@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import hashlib
+import io
 import json
 import os
 import socket
 import subprocess
+import tempfile
 import time
+import uuid
+import zipfile
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from email.utils import formatdate
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -48,6 +54,15 @@ OUTPUT_RTSP_BASE = os.environ.get(
     "CAMERA_OUTPUT_RTSP_BASE", "rtsp://127.0.0.1:8554"
 ).rstrip("/")
 STREAM_CAMERA_ORDER = ("DMS", "camera_front", "camera_back", "camera_left", "camera_right")
+PUBLIC_CAMERA_ORDER = ("cabin", "front", "back", "left", "right", "cargo")
+INTERNAL_TO_PUBLIC_CAMERA = {
+    "DMS": "cabin",
+    "camera_front": "front",
+    "camera_back": "back",
+    "camera_left": "left",
+    "camera_right": "right",
+}
+PUBLIC_TO_INTERNAL_CAMERA = {value: key for key, value in INTERNAL_TO_PUBLIC_CAMERA.items()}
 STREAM_NOMINAL_FPS = {
     "DMS": 10.0,
     "camera_front": 20.0,
@@ -55,6 +70,9 @@ STREAM_NOMINAL_FPS = {
     "camera_left": 10.0,
     "camera_right": 10.0,
 }
+SNAPSHOT_MAX_BODY_BYTES = 16 * 1024
+SNAPSHOT_TIMEOUT_SECONDS = 4.0
+SNAPSHOT_MAX_BYTES = 8 * 1024 * 1024
 JETSON_GPU_LOAD_PATHS = (
     Path("/sys/devices/platform/bus@0/17000000.gpu/load"),
     Path("/sys/devices/gpu.0/load"),
@@ -996,8 +1014,9 @@ def _configured_stream_contract() -> list[dict[str, object]]:
     """Build the public stream contract from canonical camera output config."""
     raw_config = _raw_config()
     streams: list[dict[str, object]] = []
-    for camera_id in STREAM_CAMERA_ORDER:
-        config = resolve_camera_config(raw_config, camera_id)
+    for internal_camera_id in STREAM_CAMERA_ORDER:
+        camera_id = INTERNAL_TO_PUBLIC_CAMERA[internal_camera_id]
+        config = resolve_camera_config(raw_config, internal_camera_id)
         input_config = config["input"]
         output_config = config["output"]
         media_only = bool(input_config.get("media_only", False))
@@ -1011,7 +1030,7 @@ def _configured_stream_contract() -> list[dict[str, object]]:
                 "width": int(output_config.get("width", input_config["width"])),
                 "height": int(output_config.get("height", input_config["height"])),
                 "nominal_fps": float(
-                    output_config.get("rate_hz") or STREAM_NOMINAL_FPS[camera_id]
+                    output_config.get("rate_hz") or STREAM_NOMINAL_FPS[internal_camera_id]
                 ),
                 "sync_group": input_config.get("mock_sync_group") or None,
                 "pipeline_output_enabled": media_only
@@ -1021,13 +1040,13 @@ def _configured_stream_contract() -> list[dict[str, object]]:
             }
         )
 
-    back = next(item for item in streams if item["camera_id"] == "camera_back")
+    back = next(item for item in streams if item["camera_id"] == "back")
     streams.append(
         {
             **back,
-            "camera_id": "camera_cargo",
-            "source_camera_id": "camera_back",
-            "alias_of": "camera_back",
+            "camera_id": "cargo",
+            "source_camera_id": "back",
+            "alias_of": "back",
         }
     )
     return streams
@@ -1103,6 +1122,126 @@ def _stream_host_from_header(host_header: str) -> str:
     if host.startswith("["):
         return host[1:].split("]", 1)[0]
     return host.rsplit(":", 1)[0] if host.count(":") == 1 else host
+
+
+def _capture_rtsp_snapshot(uri: str, *, quality: int) -> bytes:
+    """Capture one JPEG from an already-published local RTSP output."""
+    with tempfile.TemporaryDirectory(prefix="ls-vision-snapshot-") as directory:
+        output = Path(directory) / "snapshot-%05d.jpg"
+        process = subprocess.Popen(
+            [
+                "gst-launch-1.0", "-q", "rtspsrc", f"location={uri}",
+                "protocols=tcp", "latency=100", "!", "rtph264depay", "!",
+                "h264parse", "!", "nvv4l2decoder", "!", "nvvidconv", "!",
+                "video/x-raw,format=I420", "!",
+                "jpegenc", f"quality={quality}", "!", "multifilesink",
+                f"location={output}", "max-files=1",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            deadline = time.monotonic() + SNAPSHOT_TIMEOUT_SECONDS
+            captured: Path | None = None
+            while time.monotonic() < deadline:
+                candidates = sorted(Path(directory).glob("snapshot-*.jpg"))
+                if candidates:
+                    captured = candidates[0]
+                    break
+                if process.poll() is not None:
+                    break
+                time.sleep(0.05)
+            if captured is None or not captured.is_file():
+                raise RuntimeError("RTSP snapshot capture failed")
+            data = captured.read_bytes()
+            if not data or len(data) > SNAPSHOT_MAX_BYTES:
+                raise RuntimeError("RTSP snapshot is invalid or too large")
+            return data
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=1.0)
+
+
+def _snapshot_bundle(payload: dict[str, object]) -> tuple[bytes, dict[str, object]]:
+    requested = payload.get("camera_ids")
+    camera_ids = list(PUBLIC_CAMERA_ORDER)
+    if requested is not None:
+        if not isinstance(requested, list) or not requested:
+            raise ValueError("camera_ids must be a non-empty array")
+        camera_ids = []
+        for value in requested:
+            camera_id = str(value).strip()
+            if camera_id not in PUBLIC_CAMERA_ORDER:
+                raise ValueError(f"unsupported camera_id: {camera_id}")
+            if camera_id not in camera_ids:
+                camera_ids.append(camera_id)
+
+    quality = int(payload.get("quality", 80) or 80)
+    if not 1 <= quality <= 100:
+        raise ValueError("quality must be between 1 and 100")
+    incident_id = str(payload.get("incident_id") or "").strip() or None
+    trigger = str(payload.get("trigger") or "request").strip() or "request"
+    if trigger not in {"request", "incident"}:
+        raise ValueError("trigger must be request or incident")
+    if trigger == "incident" and not incident_id:
+        raise ValueError("incident_id is required for incident trigger")
+
+    manifest = {
+        "schema": "letron.vision.snapshot-bundle/v1",
+        "capture_id": uuid.uuid4().hex,
+        "trigger": trigger,
+        "incident_id": incident_id,
+        "camera_count": len(camera_ids),
+        "cameras": [],
+    }
+    streams = {str(item["camera_id"]): item for item in _stream_manifest().get("streams", [])}
+
+    def capture(camera_id: str) -> tuple[str, bytes | None, dict[str, object]]:
+        stream = streams.get(camera_id, {})
+        rtsp_path = str(stream.get("rtsp_path") or "")
+        item: dict[str, object] = {"camera_id": camera_id, "status": "UNAVAILABLE"}
+        if stream.get("state") != "READY" or stream.get("published") is not True or not rtsp_path:
+            item["error"] = "stream_not_ready"
+            return camera_id, None, item
+        try:
+            data = _capture_rtsp_snapshot(f"{OUTPUT_RTSP_BASE.rstrip('/')}/{rtsp_path.lstrip('/')}", quality=quality)
+        except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+            item["error"] = str(exc)
+            return camera_id, None, item
+        item.update(
+            {
+                "status": "READY",
+                "filename": f"snapshots/{camera_id}.jpg",
+                "content_type": "image/jpeg",
+                "size_bytes": len(data),
+                "sha256": hashlib.sha256(data).hexdigest(),
+            }
+        )
+        return camera_id, data, item
+
+    captured: dict[str, bytes] = {}
+    with ThreadPoolExecutor(max_workers=len(camera_ids), thread_name_prefix="snapshot") as pool:
+        for camera_id, data, item in pool.map(capture, camera_ids):
+            if data is not None:
+                captured[camera_id] = data
+            manifest["cameras"].append(item)
+    manifest["complete"] = all(item.get("status") == "READY" for item in manifest["cameras"])
+    if not captured:
+        raise RuntimeError("no camera snapshot available")
+
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_STORED) as archive:
+        archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, separators=(",", ":")))
+        for camera_id in camera_ids:
+            data = captured.get(camera_id)
+            if data is not None:
+                archive.writestr(f"snapshots/{camera_id}.jpg", data)
+    return output.getvalue(), manifest
 
 
 class DashboardHandler(SimpleHTTPRequestHandler):
@@ -1241,6 +1380,45 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             self.wfile.write(payload)
             return
         super().do_GET()
+
+    def do_POST(self) -> None:
+        parsed = urlparse(self.path)
+        if parsed.path != "/api/v1/snapshots/bundle":
+            self.send_error(404)
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length < 0 or length > SNAPSHOT_MAX_BODY_BYTES:
+                raise ValueError("request body is too large")
+            raw = self.rfile.read(length) if length else b"{}"
+            payload = json.loads(raw.decode("utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("request body must be an object")
+            bundle, manifest = _snapshot_bundle(payload)
+        except (ValueError, json.JSONDecodeError) as exc:
+            body = json.dumps({"ok": False, "error": str(exc)}).encode("utf-8")
+            self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        except RuntimeError as exc:
+            body = json.dumps({"ok": False, "error": str(exc)}).encode("utf-8")
+            self.send_response(503)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        self.send_response(200)
+        self.send_header("Content-Type", "application/zip")
+        self.send_header("Content-Disposition", f'attachment; filename="snapshot-{manifest["capture_id"]}.zip"')
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(bundle)))
+        self.end_headers()
+        self.wfile.write(bundle)
 
     def log_message(self, format: str, *args: object) -> None:
         return

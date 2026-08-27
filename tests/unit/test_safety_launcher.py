@@ -109,6 +109,19 @@ def test_live_output_follows_rtsp_sample_contract() -> None:
     assert "tbox_lab.ps1" not in launcher
 
 
+def test_optional_input_mirror_runs_before_nvstreammux() -> None:
+    pipeline = (APP_ROOT / "src" / "adapters" / "deepstream" / "runtime.py").read_text(
+        encoding="utf-8"
+    )
+
+    mirror = pipeline.index('input_transform.set_property("flip-method", 4)')
+    streammux = pipeline.index('make_element("nvstreammux", "stream-muxer")')
+    inference = pipeline.index('make_element("nvinfer", "person-inference")')
+
+    assert mirror < streammux < inference
+    assert '"input_mirror_horizontal"' in pipeline
+
+
 def test_synchronized_mock_timeline_is_owned_outside_camera_worker() -> None:
     timeline = (
         APP_ROOT / "src" / "application" / "mock_timeline_runtime.py"

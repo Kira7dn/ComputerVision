@@ -728,6 +728,11 @@ def resolve_camera_config(config: dict[str, Any], camera_id: str | None = None) 
     if not isinstance(source, dict):
         raise ValueError(f"camera {camera_id} source must be a mapping")
     input_config = deepcopy(resolved.get("input", {}) or {})
+    mirror_horizontal = source.get(
+        "mirror_horizontal", input_config.get("mirror_horizontal", False)
+    )
+    if not isinstance(mirror_horizontal, bool):
+        raise ValueError(f"camera {camera_id} source.mirror_horizontal must be boolean")
     input_config.update(
         {
             "mode": source.get("type", source.get("mode", input_config.get("mode", "rtsp"))),
@@ -752,6 +757,7 @@ def resolve_camera_config(config: dict[str, Any], camera_id: str | None = None) 
             "latency_ms": int(source.get("latency_ms", input_config.get("latency_ms", 200))),
             "codec": str(source.get("codec", input_config.get("codec", "h264"))),
             "decoder": str(source.get("decoder", input_config.get("decoder", "hardware"))),
+            "mirror_horizontal": mirror_horizontal,
         }
     )
     runtime_environment = _runtime_environment()

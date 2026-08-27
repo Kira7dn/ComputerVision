@@ -269,12 +269,12 @@ def test_stream_manifest_has_six_stable_cameras_and_fails_closed(monkeypatch) ->
     assert manifest["generation"] == 7
     assert manifest["media_base"]["lan_rtsp"] == "rtsp://vision.local:8554"
     assert [item["camera_id"] for item in streams] == [
-        "DMS",
-        "camera_front",
-        "camera_back",
-        "camera_left",
-        "camera_right",
-        "camera_cargo",
+        "cabin",
+        "front",
+        "back",
+        "left",
+        "right",
+        "cargo",
     ]
     assert [item["state"] for item in streams] == [
         "OFFLINE",
@@ -291,8 +291,8 @@ def test_stream_manifest_has_six_stable_cameras_and_fails_closed(monkeypatch) ->
     assert cargo["role"] == "media_only_passthrough"
     assert cargo["rtsp_path"] == "/camera_back"
     assert cargo["sync_group"] == "vehicle_surround"
-    assert cargo["source_camera_id"] == "camera_back"
-    assert cargo["alias_of"] == "camera_back"
+    assert cargo["source_camera_id"] == "back"
+    assert cargo["alias_of"] == "back"
 
 
 def test_stream_manifest_degrades_surround_stream_when_timeline_is_unlocked(
@@ -316,7 +316,7 @@ def test_stream_manifest_degrades_surround_stream_when_timeline_is_unlocked(
     streams = dashboard_api._stream_manifest()["streams"]
     by_id = {item["camera_id"]: item for item in streams}
 
-    assert by_id["camera_front"]["state"] == "DEGRADED"
-    assert by_id["camera_back"]["state"] == "DEGRADED"
-    assert by_id["camera_cargo"]["state"] == "DEGRADED"
-    assert by_id["DMS"]["state"] == "READY"
+    assert by_id["front"]["state"] == "DEGRADED"
+    assert by_id["back"]["state"] == "DEGRADED"
+    assert by_id["cargo"]["state"] == "DEGRADED"
+    assert by_id["cabin"]["state"] == "READY"
