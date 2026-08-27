@@ -11,6 +11,11 @@ Model openpilot đã đối chiếu có SHA-256
 `659727c4d4839adc4992a254409a54259a8756a743f2d567bf5fdc6579f8009b`, trùng với
 model đang được pin bởi bài kiểm tra front-camera offline của LS-Vision.
 
+Với synchronized production mock, front engine reset toàn bộ recurrent image,
+feature, brake và confidence state tại mỗi biên chu kỳ video 191,1 giây. RTCP
+timestamp của publisher vẫn tăng liên tục nên biên này được xác định từ
+`mock_sync_period_seconds`/`mock_sync_epoch_seconds`, không chờ timestamp gap.
+
 ## Bảng tính năng
 
 Quy ước: `✅ Done` đã hoàn tất trong LS-Vision; `🚧 Doing` đã có một phần pipeline
@@ -23,22 +28,40 @@ Các tính năng trong nhóm này có thể chạy từ luồng camera, model v�
 
 | Status | Tính năng | Mức độc lập | Trạng thái LS-Vision hiện tại |
 | --- | --- | --- | --- |
-| 🚧 Doing | Nhận diện 4 vạch làn và độ tin cậy | Cao, chỉ cần inference và calibration | Đã parse cả 4 vạch; đang chỉ render 2 vạch làn chính |
+| ✅ Done | Nhận diện 4 vạch làn và độ tin cậy | Cao, chỉ cần inference và calibration | Parse và render đủ 4 vạch; opacity bám theo probability của từng vạch |
 | ✅ Done | Dự đoán quỹ đạo xe phía trước | Cao cho hiển thị và telemetry | Đã render hành lang và đường tâm dự đoán |
 | ✅ Done | Cảnh báo lệch làn trái/phải (LDW) | Khá độc lập; bản openpilot đầy đủ còn dùng tốc độ xe, xi-nhan và trạng thái lateral control | Đã có policy camera-only `vision_ldw_left` và `vision_ldw_right` |
 | ✅ Done | Cảnh báo va chạm phía trước từ model (FCW) | Khá độc lập, nhánh `hardBrakePredicted` không bắt buộc radar | Đã có policy camera-only `vision_fcw` |
-| 🚧 Doing | Nhận biết tối đa 3 xe dẫn đầu | Cao cho perception và overlay; điều khiển bám xe không độc lập | Đã parse cả 3 lead; summary mới công bố lead đầu tiên, chưa có overlay hoặc cảnh báo khoảng cách |
-| 🚧 Doing | Nhận biết 2 biên đường | Cao cho hiển thị và phân tích | Đã parse nhưng chưa render và chưa có cảnh báo lệch khỏi biên đường |
-| 🚧 Doing | Visual odometry: chuyển động tịnh tiến và quay của camera | Có thể xuất telemetry độc lập | Model đã trả và adapter đã parse `pose`, nhưng chưa đưa vào `FrontPerception` |
-| 🚧 Doing | Ước lượng camera mounting và road transform | Có thể dùng để chẩn đoán camera bị xê dịch; tự calibration đầy đủ còn cần vận tốc xe | Đã parse `wide_from_device_euler` và `road_transform`, nhưng chưa công bố trong contract |
-| 🚧 Doing | Vị trí, vận tốc, gia tốc, hướng và tốc độ quay dự đoán trong 10 giây | Độc lập cho telemetry; không độc lập cho điều khiển xe | Hiện chỉ giữ ba thành phần position của `plan` |
-| 🚧 Doing | Confidence, disengagement và dự đoán hành vi ga/phanh | Có thể dùng cho diagnostics | Hiện chỉ dùng xác suất hard-brake 3 m/s² và 5 m/s² |
+| ✅ Done | Nhận biết tối đa 3 xe dẫn đầu | Cao cho perception và overlay; điều khiển bám xe không độc lập | Contract v2 và HUD giữ đủ 3 lead cùng std; video dùng chevron đỏ/glow vàng kiểu openpilot cho tối đa 2 lead có probability ≥ 0.5, không giả lập bbox; `vision_lead_ttc` là advisory camera-only |
+| ✅ Done | Nhận biết 2 biên đường | Cao cho hiển thị và phân tích | Render đủ 2 biên với opacity theo uncertainty; `vision_road_edge_left/right` dùng clearance 5–30 m và hysteresis |
+| ✅ Done | Visual odometry: chuyển động tịnh tiến và quay của camera | Có thể xuất telemetry độc lập | `pose` và std được công bố trong `FrontPerception` v2 và HUD |
+| ✅ Done | Ước lượng camera mounting và road transform | Có thể dùng để chẩn đoán camera bị xê dịch; tự calibration đầy đủ còn cần vận tốc xe | Công bố Euler/road transform và std; `vision_geometry_drift` học baseline theo epoch và được gắn `experimental_advisory=true` |
+| ✅ Done | Vị trí, vận tốc, gia tốc, hướng và tốc độ quay dự đoán trong 10 giây | Độc lập cho telemetry; không độc lập cho điều khiển xe | Contract v2 giữ đủ 15 thành phần plan, std và sáu horizon gần 0/2/4/6/8/10 giây |
+| ✅ Done | Confidence, disengagement và dự đoán hành vi ga/phanh | Có thể dùng cho diagnostics | Công bố toàn bộ 55 meta probabilities, desire state/prediction và confidence green/yellow/red |
 | ✅ Done | Ghi hình, snapshot, thumbnail và livestream | Độc lập về media | Openpilot có sẵn, nhưng LS-Vision và MediaMTX đã sở hữu các chức năng tương đương; không thêm owner thứ hai |
 
 LDW camera-only của LS-Vision là advisory dựa trên model. So với openpilot đầy
 đủ, policy này chưa dùng tốc độ xe, trạng thái xi-nhan hoặc trạng thái lateral
 control. Tương tự, camera mounting và road transform có thể xuất trực tiếp từ
 model, nhưng quy trình tự calibration đầy đủ cần thêm vận tốc xe.
+
+Toàn bộ cảnh báo front-assistance chỉ là camera-only advisory: chúng bake vào
+RTSP/HLS và tạo evidence `START/END`, không đi vào notification pipeline và
+không có vehicle actuation. Acceptance của Section 1 dùng mock video production
+hiện tại cùng synthetic policy fixtures. Theo yêu cầu vận hành mock, cấu hình
+`dev` và `production` dùng profile độ nhạy đã hiệu chỉnh từ mock replay để event
+tự nhiên xuất hiện nhưng không lặp quá dày: START xác nhận một frame, END cần 20
+frame âm tính để gộp dao động ngắn thành một episode, và chấp nhận khoảng gián
+đoạn timestamp tối đa 500 ms để bao phủ nguồn có độ trễ tới 400 ms. Policy không
+dùng cooldown cố định; mỗi loại rearm theo chính tín hiệu trigger/clear. Riêng geometry drift giữ
+ngưỡng chuẩn: baseline 200 frame, translation 0,25 m, roll/pitch 2°, yaw 3°,
+xác nhận 40/50 frame và clear sau 100 frame. Cấu hình này loại dao động nhỏ của
+mock/calibration khỏi danh sách event. Profile camera-only vẫn không phải
+vehicle-calibrated production acceptance.
+
+Dashboard phân loại `vision_fcw` là `Nguy hiểm`; lead TTC, LDW và road-edge là
+`Cảnh báo`; geometry drift là `Sự kiện` chẩn đoán. Phân loại hiển thị này không
+thay đổi classification kỹ thuật hoặc lifecycle evidence `START/END`.
 
 ### 2. Camera + CAN/Sensor
 
@@ -71,14 +94,9 @@ hướng mở rộng của LS-Vision, không phải tính năng sẵn có từ o
 Các feature sau nên là consumer của cùng `FrontPerception`, không mở thêm phiên
 inference:
 
-1. `front_lead_overlay`: hiển thị xác suất, khoảng cách và quỹ đạo lead.
-2. `front_road_edge_overlay`: hiển thị hai biên đường.
-3. `front_road_departure_advisory`: cảnh báo gần biên đường sau khi có policy và
-   fixture acceptance riêng.
-4. `front_visual_odometry`: xuất pose và road transform làm telemetry, đồng thời
-   hỗ trợ phát hiện camera bị xê dịch.
-5. `front_model_confidence`: công bố uncertainty, continuity và confidence thay
-   vì chỉ trạng thái `READY`/`NOT_READY`.
+Các consumer độc lập đã được triển khai trên cùng `FrontPerception` v2 gồm lead
+overlay/TTC, road-edge overlay/departure advisory, visual odometry/geometry drift
+và model confidence. Chúng không mở thêm model session.
 
 ## Các chức năng openpilot không cung cấp
 

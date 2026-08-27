@@ -25,12 +25,24 @@ def percentile(values: list[float], quantile: float) -> float | None:
     return round(ordered[lower] * (1.0 - weight) + ordered[upper] * weight, 3)
 
 
-def remote_snapshot(alias: str) -> dict[str, Any]:
+def status_root(profile: str) -> str:
+    roots = {
+        "production": "/opt/ls-vision",
+        "development": "/opt/ls-vision-dev",
+    }
+    try:
+        return roots[profile]
+    except KeyError as exc:
+        raise ValueError(f"unknown front-camera profile: {profile}") from exc
+
+
+def remote_snapshot(alias: str, profile: str) -> dict[str, Any]:
+    root = status_root(profile)
     command = "\n".join(
         (
-            "cat /opt/ls-vision-dev/data/status/camera_front.json",
+            f"cat {root}/data/status/camera_front.json",
             "printf '\\n'",
-            "cat /opt/ls-vision-dev/data/status/DMS.json",
+            f"cat {root}/data/status/DMS.json",
             "printf '\\n'",
             "curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:18080/health/ready",
             "printf '\\n'",
@@ -71,6 +83,9 @@ def number(pattern: str, value: str) -> float | None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--jetson", default="jetson-nano")
+    parser.add_argument(
+        "--profile", choices=("production", "development"), default="production"
+    )
     parser.add_argument("--warmup", type=float, default=30.0)
     parser.add_argument("--duration", type=float, default=600.0)
     parser.add_argument("--interval", type=float, default=2.0)
@@ -90,7 +105,7 @@ def main() -> int:
     while time.monotonic() - started < args.duration:
         cycle_started = time.monotonic()
         try:
-            sample = remote_snapshot(args.jetson)
+            sample = remote_snapshot(args.jetson, args.profile)
             samples.append(sample)
             with raw_report.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(sample, ensure_ascii=False) + "\n")
@@ -173,6 +188,22 @@ def main() -> int:
             and front_debug.get("provider")
         }
     )
+    model_hashes = sorted(
+        {
+            str(front_debug["model_hash"])
+            for sample in samples
+            if (front_debug := sample["front"]["analysis_debug"].get("front_assistance", {}))
+            and front_debug.get("model_hash")
+        }
+    )
+    calibration_hashes = sorted(
+        {
+            str(front_debug["calibration_hash"])
+            for sample in samples
+            if (front_debug := sample["front"]["analysis_debug"].get("front_assistance", {}))
+            and front_debug.get("calibration_hash")
+        }
+    )
     same_workers = (
         front_first["pid"] == front_last["pid"]
         and front_first["worker_epoch"] == front_last["worker_epoch"]
@@ -190,7 +221,14 @@ def main() -> int:
         ),
         "front_hls": all(sample["front_hls_http"] == 200 for sample in samples),
         "workers_not_restarted": same_workers,
+        "no_runtime_failures": all(
+            not sample["front"].get("analysis_error")
+            and not sample["dms"].get("analysis_error")
+            for sample in samples
+        ),
         "gpu_provider": providers in (["CUDAExecutionProvider"], ["TensorrtExecutionProvider"]),
+        "model_hash_stable": len(model_hashes) == 1,
+        "calibration_hash_stable": len(calibration_hashes) == 1,
         "model_tick_19hz": processed_delta / elapsed >= 19.0,
         "inference_p95_50ms": (percentile(inference_ms, 0.95) or math.inf) <= 50.0,
         "inference_p99_75ms": (percentile(inference_ms, 0.99) or math.inf) <= 75.0,
@@ -202,7 +240,7 @@ def main() -> int:
     }
     report = {
         "schema_version": 1,
-        "profile": "front-camera-jetson-shadow",
+        "profile": f"front-camera-jetson-{args.profile}",
         "accepted": all(gates.values()),
         "production_accepted": False,
         "jetson": args.jetson,
@@ -217,6 +255,8 @@ def main() -> int:
             "dms_worker_epoch": last["dms"]["worker_epoch"],
             "dms_pid": last["dms"]["pid"],
             "provider": providers,
+            "model_hash": model_hashes,
+            "calibration_hash": calibration_hashes,
             "source_fps": round(frame_delta / elapsed, 3),
             "model_tick_hz": round(processed_delta / elapsed, 3),
             "enqueued": enqueued_delta,

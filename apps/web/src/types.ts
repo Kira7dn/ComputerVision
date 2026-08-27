@@ -55,9 +55,35 @@ export interface CameraDetail {
     inference_ms?: number
     model_hash?: string
     calibration_hash?: string
+    confidence?: 'green' | 'yellow' | 'red' | 'unknown' | string
+    leads?: Array<{
+      index: number
+      probability: number
+      x?: number | null
+      y?: number | null
+      velocity?: number | null
+      acceleration?: number | null
+    }>
+    pose?: number[]
+    road_transform?: number[]
+    wide_from_device_euler?: number[]
+    geometry_diagnostics?: {
+      baseline_ready?: boolean
+      baseline_samples?: number
+      mounting_delta_deg?: number[]
+      road_translation_delta_m?: number
+      experimental_advisory?: boolean
+    }
     overlay?: {
       visible_lane_count?: number
       lane_segment_count?: number
+      visible_road_edge_count?: number
+      road_edge_segment_count?: number
+      visible_lead_count?: number
+      lead_segment_count?: number
+      lead_chevron_count?: number
+      lead_style?: string
+      horizon_marker_count?: number
       path_point_count?: number
       path_segment_count?: number
       path_source?: 'model_position' | 'unavailable' | string

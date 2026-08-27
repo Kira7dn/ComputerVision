@@ -167,8 +167,14 @@ def test_output_parser_shapes_and_probabilities() -> None:
     assert parsed["lane_lines"].shape == (1, 4, 33, 2)
     assert parsed["road_edges"].shape == (1, 2, 33, 2)
     assert parsed["lead"].shape == (1, 3, 6, 4)
+    assert parsed["lead_stds"].shape == (1, 3, 6, 4)
+    assert parsed["pose"].shape == (1, 6)
+    assert parsed["road_transform"].shape == (1, 6)
+    assert parsed["wide_from_device_euler"].shape == (1, 3)
+    assert parsed["meta"].shape == (1, 55)
     assert np.allclose(parsed["lane_lines_prob"], 0.5)
     assert np.allclose(parsed["desire_state"].sum(axis=-1), 1.0)
+    assert all(np.isfinite(value).all() for value in parsed.values())
 
 
 def test_engine_uses_single_frame_for_both_contexts_and_resets_on_epoch(tmp_path: Path) -> None:
@@ -193,8 +199,88 @@ def test_engine_uses_single_frame_for_both_contexts_and_resets_on_epoch(tmp_path
     assert session.inputs["features_buffer"].shape == (1, 24, 512)
     assert session.inputs["traffic_convention"].tolist() == [[1.0, 0.0]]
     assert len(result.lane_lines[0][0]) == 3
+    assert len(result.lane_line_stds) == 4
+    assert len(result.road_edge_stds) == 2
+    assert len(result.leads) == 3
+    assert len(result.leads[0].x_std) == 6
+    assert len(result.plan_velocity) == 33
+    assert len(result.plan_acceleration) == 33
+    assert len(result.plan_orientation) == 33
+    assert len(result.plan_orientation_rate) == 33
+    assert len(result.plan_stds[0]) == 15
+    assert len(result.pose) == len(result.pose_stds) == 6
+    assert len(result.road_transform) == len(result.road_transform_stds) == 6
+    assert len(result.wide_from_device_euler) == 3
+    assert len(result.model_meta) == 55
+    assert result.summary()["contract_version"] == 2
     engine.process(frame, source_epoch="epoch-2", frame_number=2, source_timestamp=2.0)
     assert engine._epoch == "epoch-2"
+
+
+def test_engine_resets_all_temporal_state_on_timestamp_gap(tmp_path: Path) -> None:
+    model = tmp_path / "driving_supercombo.onnx"
+    model.write_bytes(b"pinned-model")
+    session = _Session("", ["CUDAExecutionProvider"])
+    engine = OpenpilotFrontEngine(
+        _config(model), session_factory=lambda *_args, **_kwargs: session
+    )
+    frame = np.zeros((8, 8, 3), dtype=np.uint8)
+    engine.process(frame, source_epoch="epoch", frame_number=1, source_timestamp=1.0)
+    engine._disengage_buffer.fill(1.0)
+    engine.process(frame, source_epoch="epoch", frame_number=2, source_timestamp=2.0)
+
+    assert len(engine._brake_3) == 1
+    assert len(engine._brake_5) == 1
+    assert np.count_nonzero(engine._disengage_buffer) == 0
+    assert sum(np.count_nonzero(item) for item in engine._feature_queue) == 0
+
+
+def test_engine_resets_recurrent_state_at_synchronized_mock_cycle(tmp_path: Path) -> None:
+    model = tmp_path / "driving_supercombo.onnx"
+    model.write_bytes(b"pinned-model")
+    config = _config(model)
+    config["input"] = {
+        "mode": "mock",
+        "mock_sync_group": "vehicle_surround",
+        "mock_sync_period_seconds": 10.0,
+        "mock_sync_epoch_seconds": 0.0,
+    }
+    session = _Session("", ["CUDAExecutionProvider"])
+    engine = OpenpilotFrontEngine(
+        config,
+        session_factory=lambda *_args, **_kwargs: session,
+    )
+    frame = np.zeros((8, 8, 3), dtype=np.uint8)
+
+    before = engine.process(
+        frame,
+        source_epoch="epoch",
+        frame_number=1,
+        source_timestamp=9.95,
+    )
+    reset_count = engine._reset_count
+    engine._feature_queue.append(np.ones(512, dtype=np.float16))
+    after = engine.process(
+        frame,
+        source_epoch="epoch",
+        frame_number=2,
+        source_timestamp=10.05,
+    )
+
+    assert before.source_epoch == after.source_epoch == "epoch"
+    assert engine._reset_count == reset_count + 1
+    assert engine._last_reset_reason == "mock_cycle"
+    assert engine._mock_cycle_index == 1
+    assert sum(np.count_nonzero(item) for item in engine._feature_queue) == 0
+    assert after.diagnostics["last_reset_reason"] == "mock_cycle"
+
+    engine.process(
+        frame,
+        source_epoch="epoch",
+        frame_number=3,
+        source_timestamp=10.10,
+    )
+    assert engine._reset_count == reset_count + 1
 
 
 def test_engine_supports_right_hand_traffic_convention(tmp_path: Path) -> None:

@@ -63,6 +63,24 @@ INTERNAL_TO_PUBLIC_CAMERA = {
     "camera_right": "right",
 }
 PUBLIC_TO_INTERNAL_CAMERA = {value: key for key, value in INTERNAL_TO_PUBLIC_CAMERA.items()}
+FRONT_EVENT_NAMES = {
+    "vision_fcw": "Nguy cơ va chạm phía trước",
+    "vision_lead_ttc": "Đang tiến gần xe phía trước",
+    "vision_road_edge_left": "Xe sát mép đường bên trái",
+    "vision_road_edge_right": "Xe sát mép đường bên phải",
+    "vision_ldw_left": "Xe lệch khỏi làn bên trái",
+    "vision_ldw_right": "Xe lệch khỏi làn bên phải",
+    "vision_geometry_drift": "Camera trước có thể bị xê dịch",
+}
+FRONT_EVENT_SEVERITY = {
+    "vision_fcw": ("danger", "Nguy hiểm"),
+    "vision_lead_ttc": ("warning", "Cảnh báo"),
+    "vision_road_edge_left": ("warning", "Cảnh báo"),
+    "vision_road_edge_right": ("warning", "Cảnh báo"),
+    "vision_ldw_left": ("warning", "Cảnh báo"),
+    "vision_ldw_right": ("warning", "Cảnh báo"),
+    "vision_geometry_drift": ("event", "Sự kiện"),
+}
 STREAM_NOMINAL_FPS = {
     "DMS": 10.0,
     "camera_front": 20.0,
@@ -585,6 +603,11 @@ def _event_feed(after: int = 0, limit: int | None = None) -> dict[str, object]:
                 event_name = "Lửa" if classification == "fire" else "Khói"
             elif function == "dms":
                 event_name = f"DMS: {str(record.get('label') or details.get('label') or classification).replace('_', ' ')}"
+            elif function == "front_assistance":
+                event_name = FRONT_EVENT_NAMES.get(
+                    classification,
+                    classification.replace("_", " ").title(),
+                )
             else:
                 event_name = {
                     "recognized": "Đã nhận diện",
@@ -596,6 +619,11 @@ def _event_feed(after: int = 0, limit: int | None = None) -> dict[str, object]:
             )
             if function == "fire_smoke" and classification == "fire":
                 severity, severity_label = "danger", "Nguy hiểm"
+            elif function == "front_assistance":
+                severity, severity_label = FRONT_EVENT_SEVERITY.get(
+                    classification,
+                    ("event", "Sự kiện"),
+                )
             score_value = (
                 None
                 if function == "face_recognition" and classification == "unrecognized"

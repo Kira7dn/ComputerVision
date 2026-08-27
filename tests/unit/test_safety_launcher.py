@@ -255,6 +255,12 @@ def test_event_feed_collapses_lifecycle_and_recognition_starts_on_exact_frame() 
     assert "variant=thumbnail" in dashboard_server
     assert "max-age=31536000, immutable" in dashboard_server
     assert 'classification == "unrecognized"' in dashboard_server
+    assert '"vision_fcw": "Nguy cơ va chạm phía trước"' in dashboard_server
+    assert '"vision_geometry_drift": "Camera trước có thể bị xê dịch"' in dashboard_server
+    assert 'elif function == "front_assistance":' in dashboard_server
+    assert '"vision_fcw": ("danger", "Nguy hiểm")' in dashboard_server
+    assert '"vision_lead_ttc": ("warning", "Cảnh báo")' in dashboard_server
+    assert '"vision_geometry_drift": ("event", "Sự kiện")' in dashboard_server
     assert '"region_track_id": details.get("region_track_id")' in dashboard_server
     assert '"best_frame_number": details.get("best_frame_number")' in dashboard_server
     assert 'lifecycle != "START"' in notifications

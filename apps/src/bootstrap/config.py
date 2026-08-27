@@ -12,6 +12,7 @@ from urllib.parse import urlsplit, urlunsplit
 import yaml
 
 from bootstrap.paths import RuntimePaths
+from domain.front_assistance import VisionAlertPolicy
 
 
 def _load_raw_config(path: Path) -> dict[str, Any]:
@@ -149,18 +150,47 @@ def validate_config(config: dict[str, Any], path: Path | None = None) -> dict[st
             traffic_convention = str(
                 front.get("traffic_convention", "left_hand")
             ).lower()
+            overlay = front.get("overlay", {}) or {}
+            lane_min_probability = float(overlay.get("lane_min_probability", 0.0))
+            path_half_width_m = float(overlay.get("path_half_width_m", 0.9))
+            lead_min_probability = float(overlay.get("lead_min_probability", 0.5))
+            road_edge_max_std_m = float(overlay.get("road_edge_max_std_m", 0.6))
+            calibration_shape_valid = (
+                len(intrinsic) == 3
+                and all(isinstance(row, list) and len(row) == 3 for row in intrinsic)
+                and len(rpy_calib) == 3
+            )
+            numeric_calibration = (
+                [float(value) for row in intrinsic for value in row]
+                + [float(value) for value in rpy_calib]
+                if calibration_shape_valid
+                else []
+            )
             if (
                 int(front.get("model_rate_hz", 20)) != 20
                 or int(calibration.get("source_width", 0)) <= 0
                 or int(calibration.get("source_height", 0)) <= 0
-                or len(intrinsic) != 3
-                or any(not isinstance(row, list) or len(row) != 3 for row in intrinsic)
-                or len(rpy_calib) != 3
+                or not calibration_shape_valid
                 or traffic_convention not in {"left_hand", "right_hand"}
+                or not all(math.isfinite(value) for value in numeric_calibration)
+                or not 0.0 <= lane_min_probability <= 1.0
+                or path_half_width_m <= 0.0
+                or not 0.0 <= lead_min_probability <= 1.0
+                or road_edge_max_std_m <= 0.0
             ):
                 raise ValueError(
                     f"camera {camera_id} front_assistance calibration/model rate is invalid"
                 )
+            try:
+                VisionAlertPolicy(
+                    config=front.get("alerts", {}) or {},
+                    path_half_width_m=path_half_width_m,
+                    max_gap_seconds=float(front.get("max_gap_seconds", 0.25)),
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"camera {camera_id} front_assistance alert thresholds are invalid"
+                ) from exc
 
     cameras = config.get("cameras", []) or []
     all_mock_sources = bool(cameras) and all(

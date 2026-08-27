@@ -1,0 +1,11 @@
+{
+  "cases": [
+    {"label": "vision_ldw_left", "positive_frames": 5, "clear_frames": 5, "signal": "left"},
+    {"label": "vision_ldw_right", "positive_frames": 5, "clear_frames": 5, "signal": "right"},
+    {"label": "vision_fcw", "positive_frames": 1, "clear_frames": 20, "signal": "fcw"},
+    {"label": "vision_lead_ttc", "positive_frames": 5, "clear_frames": 10, "signal": "lead_ttc"},
+    {"label": "vision_road_edge_left", "positive_frames": 5, "clear_frames": 10, "signal": "edge_left"},
+    {"label": "vision_road_edge_right", "positive_frames": 5, "clear_frames": 10, "signal": "edge_right"},
+    {"label": "vision_geometry_drift", "warmup_frames": 200, "positive_frames": 50, "clear_frames": 100, "signal": "geometry_roll_deg", "signal_value": 3.0}
+  ]
+}

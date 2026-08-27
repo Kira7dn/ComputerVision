@@ -79,7 +79,11 @@ from domain.front_assistance import (  # noqa: E402
     FrontPerception,
     VisionAlertPolicy,
 )
-from domain.front_overlay import project_front_overlay  # noqa: E402
+from domain.front_overlay import (  # noqa: E402
+    build_front_hud,
+    chunk_osd_items,
+    project_front_overlay,
+)
 from domain.recognition import RecognitionCore, TrackKey  # noqa: E402
 from domain.smoking_events import SmokingEpisodeStore, SmokingInferenceBatch  # noqa: E402
 from domain.tracking import (  # noqa: E402
@@ -236,7 +240,13 @@ class DeepStreamCameraRuntime:
         # disabled, model-free form when another function needs CPU frames.
         if self.face_engine is None:
             self.face_engine = self._create_function_engine("face_recognition")
-        self.front_policy = VisionAlertPolicy()
+        front_config = config.get("front_assistance", {}) or {}
+        overlay_config = front_config.get("overlay", {}) or {}
+        self.front_policy = VisionAlertPolicy(
+            config=front_config.get("alerts", {}) or {},
+            path_half_width_m=float(overlay_config.get("path_half_width_m", 0.9)),
+            max_gap_seconds=float(front_config.get("max_gap_seconds", 0.25)),
+        )
         self._front_perception: FrontPerception | None = None
         self._front_transitions: list[FrontAlertTransition] = []
         self._front_overlay_metrics: dict[str, Any] = {
@@ -244,6 +254,13 @@ class DeepStreamCameraRuntime:
             "lane_segment_count": 0,
             "path_point_count": 0,
             "path_segment_count": 0,
+            "visible_road_edge_count": 0,
+            "road_edge_segment_count": 0,
+            "visible_lead_count": 0,
+            "lead_segment_count": 0,
+            "lead_chevron_count": 0,
+            "lead_style": "openpilot_chevron",
+            "horizon_marker_count": 0,
             "rendered_segment_count": 0,
             "lane_confidences": {},
         }
@@ -1267,6 +1284,7 @@ maintain-aspect-ratio=0
                 {
                     **perception.summary(),
                     "active_alerts": list(self.front_policy.active_labels),
+                    "geometry_diagnostics": self.front_policy.geometry_diagnostics,
                     "overlay": overlay_metrics,
                     "transitions": [
                         {
@@ -1524,35 +1542,20 @@ maintain-aspect-ratio=0
         if self.front_assistance_enabled:
             with self._analysis_lock:
                 perception = self._front_perception
-                active_alerts = list(self.front_policy.active_labels)
-            label: str | None = None
-            color = (1.0, 0.75, 0.1, 1.0)
-            if perception is not None and perception.valid:
-                self._render_front_geometry(batch_meta, frame_meta, perception)
-                if active_alerts:
-                    names = {
-                        "vision_ldw_left": "LANE DEPARTURE LEFT",
-                        "vision_ldw_right": "LANE DEPARTURE RIGHT",
-                        "vision_fcw": "FORWARD COLLISION WARNING",
-                    }
-                    label = " | ".join(names.get(item, item.upper()) for item in active_alerts)
-                    color = (1.0, 0.2, 0.1, 1.0)
-            elif perception is not None:
-                reason = ",".join(perception.blocking_reasons) or "NOT READY"
-                label = f"ADAS NOT READY | {reason}"
-            if label is not None:
-                display_meta = pyds.nvds_acquire_display_meta_from_pool(batch_meta)
-                display_meta.num_labels = 1
-                text_params = display_meta.text_params[0]
-                text_params.display_text = label
-                text_params.x_offset = 24
-                text_params.y_offset = 24
-                text_params.font_params.font_name = "Sans"
-                text_params.font_params.font_size = 24
-                text_params.font_params.font_color.set(*color)
-                text_params.set_bg_clr = 1
-                text_params.text_bg_clr.set(0.0, 0.0, 0.0, 0.70)
-                pyds.nvds_add_display_meta_to_frame(frame_meta, display_meta)
+                banner_label = self.front_policy.banner_label
+                recording = bool(self.front_policy.active_labels)
+                geometry_diagnostics = self.front_policy.geometry_diagnostics
+            if perception is not None:
+                if perception.valid:
+                    self._render_front_geometry(batch_meta, frame_meta, perception)
+                self._render_front_hud(
+                    batch_meta,
+                    frame_meta,
+                    perception,
+                    banner_label=banner_label,
+                    recording=recording,
+                    geometry_diagnostics=geometry_diagnostics,
+                )
         if not self.front_assistance_enabled:
             self._add_live_timestamp(batch_meta, frame_meta)
 
@@ -1571,9 +1574,15 @@ maintain-aspect-ratio=0
             width=width,
             height=height,
             lane_min_probability=float(
-                overlay_config.get("lane_min_probability", 0.5)
+                overlay_config.get("lane_min_probability", 0.0)
             ),
             path_half_width_m=float(overlay_config.get("path_half_width_m", 0.9)),
+            lead_min_probability=float(
+                overlay_config.get("lead_min_probability", 0.5)
+            ),
+            road_edge_max_std_m=float(
+                overlay_config.get("road_edge_max_std_m", 0.6)
+            ),
         )
         segments: list[
             tuple[tuple[int, int], tuple[int, int], tuple[float, ...], int]
@@ -1589,17 +1598,54 @@ maintain-aspect-ratio=0
                 for left, right in zip(points, points[1:], strict=False)
             )
 
+        def add_filled_triangle(
+            points: tuple[tuple[int, int], tuple[int, int], tuple[int, int]],
+            color: tuple[float, ...],
+        ) -> None:
+            """Rasterize a filled triangle into bounded NvOSD line primitives."""
+            min_y = min(point[1] for point in points)
+            max_y = max(point[1] for point in points)
+            for y in range(min_y, max_y + 1, 4):
+                intersections: list[float] = []
+                for start, end in zip(points, (*points[1:], points[0]), strict=True):
+                    if start[1] == end[1] or not min(start[1], end[1]) <= y <= max(
+                        start[1], end[1]
+                    ):
+                        continue
+                    ratio = (y - start[1]) / (end[1] - start[1])
+                    intersections.append(start[0] + ratio * (end[0] - start[0]))
+                if len(intersections) >= 2:
+                    segments.append(
+                        (
+                            (int(round(min(intersections))), y),
+                            (int(round(max(intersections))), y),
+                            color,
+                            5,
+                        )
+                    )
+
         lane_colors = {
+            0: (0.65, 0.65, 1.0),
             1: (0.05, 0.85, 1.0, 0.95),
             2: (0.15, 1.0, 0.35, 0.95),
+            3: (0.7, 1.0, 0.7),
         }
         for lane in geometry.lanes:
-            line_width = 5 if lane.confidence >= 0.2 else 3
+            line_width = 5 if lane.confidence >= 0.5 else 3
+            base_color = lane_colors.get(lane.lane_index, (0.8, 0.8, 0.8))
+            color = (*base_color[:3], max(0.15, min(1.0, lane.confidence)))
             add_polyline(
                 lane.points,
-                lane_colors.get(lane.lane_index, (0.8, 0.8, 0.8, 0.8)),
+                color,
                 line_width,
             )
+        for edge in geometry.road_edges:
+            color = (
+                (1.0, 0.15, 0.7, edge.opacity)
+                if edge.edge_index == 0
+                else (0.7, 0.15, 1.0, edge.opacity)
+            )
+            add_polyline(edge.points, color, 4)
         add_polyline(geometry.path_left, (1.0, 0.45, 0.0, 0.95), 5)
         add_polyline(geometry.path_right, (1.0, 0.45, 0.0, 0.95), 5)
         add_polyline(geometry.path_center, (1.0, 0.95, 0.15, 0.95), 4)
@@ -1611,6 +1657,25 @@ maintain-aspect-ratio=0
                 strict=False,
             )
         )
+        for lead in geometry.leads:
+            add_filled_triangle(
+                lead.glow,
+                (218.0 / 255.0, 202.0 / 255.0, 37.0 / 255.0, 1.0),
+            )
+            add_filled_triangle(
+                lead.chevron,
+                (201.0 / 255.0, 34.0 / 255.0, 49.0 / 255.0, lead.fill_alpha),
+            )
+        for horizon in geometry.horizons:
+            marker_x, marker_y = horizon.point
+            segments.append(
+                (
+                    (marker_x - 5, marker_y),
+                    (marker_x + 5, marker_y),
+                    (1.0, 1.0, 1.0, 0.8),
+                    2,
+                )
+            )
         metrics = {
             **geometry.summary(),
             "rendered_segment_count": len(segments),
@@ -1625,6 +1690,10 @@ maintain-aspect-ratio=0
                 }
                 for left, right, color, line_width in segments
             ],
+            "horizons": [
+                {"seconds": horizon.seconds, "x": horizon.point[0], "y": horizon.point[1]}
+                for horizon in geometry.horizons
+            ],
         }
         return metrics, segments
 
@@ -1638,8 +1707,7 @@ maintain-aspect-ratio=0
         metrics, segments = self._front_geometry_segments(perception)
         with self._analysis_lock:
             self._front_overlay_metrics = metrics
-        for offset in range(0, len(segments), 16):
-            chunk = segments[offset : offset + 16]
+        for chunk in chunk_osd_items(segments):
             display_meta = pyds.nvds_acquire_display_meta_from_pool(batch_meta)
             display_meta.num_lines = len(chunk)
             for index, (left, right, color, line_width) in enumerate(chunk):
@@ -1648,6 +1716,45 @@ maintain-aspect-ratio=0
                 line.x2, line.y2 = right
                 line.line_width = line_width
                 line.line_color.set(*color)
+            pyds.nvds_add_display_meta_to_frame(frame_meta, display_meta)
+
+    def _render_front_hud(
+        self,
+        batch_meta: Any,
+        frame_meta: Any,
+        perception: FrontPerception,
+        *,
+        banner_label: str | None,
+        recording: bool,
+        geometry_diagnostics: dict[str, Any],
+    ) -> None:
+        width = int(self.config["input"].get("width", 960))
+        height = int(self.config["input"].get("height", 540))
+        fps = float(self.config["input"].get("fps", 20.0))
+        labels = list(
+            build_front_hud(
+                perception,
+                banner_label=banner_label,
+                fps=fps,
+                recording=recording,
+                width=width,
+                height=height,
+                geometry_diagnostics=geometry_diagnostics,
+            )
+        )
+        for chunk in chunk_osd_items(labels):
+            display_meta = pyds.nvds_acquire_display_meta_from_pool(batch_meta)
+            display_meta.num_labels = len(chunk)
+            for index, label in enumerate(chunk):
+                text_params = display_meta.text_params[index]
+                text_params.display_text = label.text
+                text_params.x_offset = label.x
+                text_params.y_offset = label.y
+                text_params.font_params.font_name = "Sans"
+                text_params.font_params.font_size = label.font_size
+                text_params.font_params.font_color.set(*label.color)
+                text_params.set_bg_clr = 1
+                text_params.text_bg_clr.set(0.0, 0.0, 0.0, 0.70)
             pyds.nvds_add_display_meta_to_frame(frame_meta, display_meta)
 
     def _on_output_buffer(self, pad: Gst.Pad, info: Gst.PadProbeInfo) -> Gst.PadProbeReturn:
@@ -1797,11 +1904,12 @@ maintain-aspect-ratio=0
                     {
                         **self._front_perception.summary(),
                         "active_alerts": list(self.front_policy.active_labels),
+                        "geometry_diagnostics": self.front_policy.geometry_diagnostics,
                         "overlay": dict(self._front_overlay_metrics),
                     }
                     if self._front_perception is not None
                     else {
-                        "contract_version": 1,
+                        "contract_version": 2,
                         "mode": "vision_only",
                         "readiness": "warming"
                         if self.front_assistance_enabled
@@ -2421,6 +2529,7 @@ maintain-aspect-ratio=0
                 {
                     **front_perception.summary(),
                     "active_alerts": list(self.front_policy.active_labels),
+                    "geometry_diagnostics": self.front_policy.geometry_diagnostics,
                     "overlay": front_overlay_metrics,
                     "transitions": [
                         {
@@ -2434,7 +2543,7 @@ maintain-aspect-ratio=0
                 }
                 if front_perception is not None
                 else {
-                    "contract_version": 1,
+                    "contract_version": 2,
                     "mode": "vision_only",
                     "readiness": "warming"
                     if self.front_assistance_enabled

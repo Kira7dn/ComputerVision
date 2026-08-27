@@ -45,6 +45,20 @@ def test_dev_and_production_share_the_same_five_camera_topology() -> None:
         }
         assert "mode" not in profile["dms"]["attention"]
         assert "model_path" not in profile["dms"]["attention"]
+    dev_front = next(
+        camera for camera in dev["cameras"] if camera["id"] == "camera_front"
+    )
+    production_front = next(
+        camera for camera in production["cameras"] if camera["id"] == "camera_front"
+    )
+    assert (
+        dev_front["front_assistance"]["overlay"]
+        == production_front["front_assistance"]["overlay"]
+    )
+    assert (
+        dev_front["front_assistance"]["alerts"]
+        == production_front["front_assistance"]["alerts"]
+    )
 
 
 def test_only_dms_is_mirrored_before_the_vision_pipeline() -> None:
@@ -175,9 +189,28 @@ def test_front_camera_has_worker_and_calibration_contract() -> None:
     assert resolved["front_assistance"]["enabled"] is True
     assert resolved["front_assistance"]["traffic_convention"] == "right_hand"
     assert resolved["front_assistance"]["overlay"] == {
-        "lane_min_probability": 0.5,
+        "lane_min_probability": 0.0,
         "path_half_width_m": 0.9,
+        "lead_min_probability": 0.5,
+        "road_edge_max_std_m": 0.6,
     }
+    alerts = resolved["front_assistance"]["alerts"]
+    assert alerts["ldw_confirmation_window"] == 1
+    assert alerts["ldw_clear_observations"] == 20
+    assert alerts["fcw_brake_probability"] == 0.09
+    assert alerts["fcw_clear_observations"] == 20
+    assert alerts["lead_ttc_seconds"] == 10.0
+    assert alerts["lead_probability"] == 0.65
+    assert alerts["lead_clear_observations"] == 20
+    assert alerts["edge_max_std_m"] == 1.5
+    assert alerts["ldw_lane_probability"] == 0.35
+    assert alerts["edge_clear_observations"] == 20
+    assert alerts["geometry_baseline_frames"] == 200
+    assert alerts["geometry_translation_m"] == 0.25
+    assert alerts["geometry_trigger_hits"] == 40
+    assert alerts["geometry_trigger_window"] == 50
+    assert alerts["geometry_clear_observations"] == 100
+    assert resolved["front_assistance"]["max_gap_seconds"] == 0.5
     assert resolved["front_assistance"]["calibration"]["source_width"] == 960
     assert resolved["input"]["mock_video"].endswith("/CAM_FRONT_20FPS_ALL_I.mp4")
     assert resolved["input"]["mock_publisher"] == "packet_copy"
@@ -186,6 +219,36 @@ def test_front_camera_has_worker_and_calibration_contract() -> None:
     assert resolved["output"]["rtsp_url"].endswith("/camera_front")
     assert resolved["output"]["dashboard_rtsp_url"].endswith("/camera_front")
     assert resolved["output"]["publish_video"] is True
+
+
+@pytest.mark.parametrize(
+    ("section", "key", "value"),
+    (
+        ("overlay", "lead_min_probability", 1.1),
+        ("overlay", "road_edge_max_std_m", 0.0),
+        ("alerts", "ldw_confirmation_hits", 2),
+        ("alerts", "fcw_clear_probability", 0.1),
+        ("alerts", "lead_ttc_seconds", 30.0),
+        ("alerts", "edge_trigger_clearance_m", 4.0),
+        ("alerts", "geometry_trigger_hits", 51),
+    ),
+)
+def test_front_thresholds_fail_closed(section: str, key: str, value: float) -> None:
+    raw = load_raw_config(Path(__file__).parents[2] / "config" / "dev.yaml")
+    front = next(camera for camera in raw["cameras"] if camera["id"] == "camera_front")
+    front["front_assistance"][section][key] = value
+
+    with pytest.raises(ValueError, match="front_assistance"):
+        validate_config(raw)
+
+
+def test_front_non_finite_calibration_fails_closed() -> None:
+    raw = load_raw_config(Path(__file__).parents[2] / "config" / "dev.yaml")
+    front = next(camera for camera in raw["cameras"] if camera["id"] == "camera_front")
+    front["front_assistance"]["calibration"]["intrinsics"][0][0] = float("nan")
+
+    with pytest.raises(ValueError, match="calibration"):
+        validate_config(raw)
 
 
 def test_dms_output_is_streamable_without_changing_input_resolution() -> None:

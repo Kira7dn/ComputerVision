@@ -96,7 +96,7 @@ export function CameraCard({ camera, focused, onFocus, onStateChange }: CameraCa
             </svg>
           )}
           {!state.live && <CameraEmptyState camera={camera} state={state} ready={ready} />}
-          {isFrontAssistance && frontNeedsAttention && (
+          {isFrontAssistance && camera.output_video_published === false && frontNeedsAttention && (
             <div className="absolute left-1/2 top-3 z-[3] -translate-x-1/2 rounded-md border border-danger/70 bg-black/80 px-3 py-2 font-heading text-sm font-semibold text-danger" title={(front?.blocking_reasons ?? []).join(', ')}>
               {front?.active_alerts?.length
                 ? front.active_alerts.map(frontAlertLabel).join(' · ')
@@ -139,6 +139,10 @@ function frontAlertLabel(label: string) {
     vision_ldw_left: 'LỆCH LÀN TRÁI',
     vision_ldw_right: 'LỆCH LÀN PHẢI',
     vision_fcw: 'NGUY CƠ VA CHẠM PHÍA TRƯỚC',
+    vision_lead_ttc: 'KHOẢNG CÁCH XE TRƯỚC NGẮN',
+    vision_road_edge_left: 'SÁT BIÊN ĐƯỜNG TRÁI',
+    vision_road_edge_right: 'SÁT BIÊN ĐƯỜNG PHẢI',
+    vision_geometry_drift: 'CAMERA CÓ THỂ BỊ XÊ DỊCH',
   }
   return labels[label] ?? label
 }

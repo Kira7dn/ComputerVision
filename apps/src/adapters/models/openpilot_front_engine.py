@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import logging
+import math
 import pickle
 import time
 from collections import deque
@@ -25,6 +26,9 @@ from domain.front_assistance import (
 MODEL_RUN_HZ = 20
 FRAME_SKIP = 4
 X_IDXS = tuple(192.0 * ((index / 32.0) ** 2) for index in range(33))
+T_IDXS = tuple(10.0 * ((index / 32.0) ** 2) for index in range(33))
+LEAD_T_IDXS = (0.0, 2.0, 4.0, 6.0, 8.0, 10.0)
+LEAD_T_OFFSETS = (0.0, 2.0, 4.0)
 EXPECTED_INPUTS = {
     "img": ([1, 12, 128, 256], "tensor(uint8)"),
     "big_img": ([1, 12, 128, 256], "tensor(uint8)"),
@@ -109,6 +113,19 @@ class OpenpilotFrontEngine:
         self.enabled = bool(front.get("enabled", False))
         self.interval_seconds = 1.0 / float(front.get("model_rate_hz", MODEL_RUN_HZ))
         self.max_gap_seconds = float(front.get("max_gap_seconds", 0.25))
+        input_config = config.get("input", {}) or {}
+        synchronized_mock = (
+            str(input_config.get("mode", "rtsp")).lower() == "mock"
+            and bool(str(input_config.get("mock_sync_group", "")).strip())
+        )
+        self.mock_sync_period_seconds = (
+            float(input_config.get("mock_sync_period_seconds", 0.0))
+            if synchronized_mock
+            else 0.0
+        )
+        self.mock_sync_epoch_seconds = float(
+            input_config.get("mock_sync_epoch_seconds", 0.0)
+        )
         self.model_path = Path(str(front.get("model_path", "")))
         self.model_hash = ""
         self.provider = "disabled"
@@ -139,18 +156,22 @@ class OpenpilotFrontEngine:
         self._action_t = np.array([[0.075, 0.375]], dtype=np.float16)
         self._epoch: str | None = None
         self._last_timestamp: float | None = None
+        self._mock_cycle_index: int | None = None
+        self._reset_count = 0
+        self._last_reset_reason = "uninitialized"
         self._image_queue: deque[np.ndarray] = deque(maxlen=5)
         self._big_image_queue: deque[np.ndarray] = deque(maxlen=5)
         self._feature_queue: deque[np.ndarray] = deque(maxlen=96)
         self._brake_5: deque[float] = deque(maxlen=5)
         self._brake_3: deque[float] = deque(maxlen=2)
+        self._disengage_buffer = np.zeros(25, dtype=np.float32)
         if not self.enabled:
             return
         if not self.model_path.is_file():
             raise FileNotFoundError(f"front model does not exist: {self.model_path}")
         self.model_hash = hashlib.sha256(self.model_path.read_bytes()).hexdigest()
         self._create_session(front, session_factory)
-        self.reset("initial")
+        self.reset("initial", reason="initialization")
 
     @staticmethod
     def _load_calibration(raw: dict[str, Any]) -> FrontCalibration:
@@ -238,9 +259,12 @@ class OpenpilotFrontEngine:
         decoded = pickle.loads(base64.b64decode(encoded))  # noqa: S301 - trusted pinned model
         self.output_slices = {str(name): section for name, section in decoded.items()}
 
-    def reset(self, source_epoch: str) -> None:
+    def reset(self, source_epoch: str, *, reason: str = "explicit") -> None:
         self._epoch = source_epoch
         self._last_timestamp = None
+        self._mock_cycle_index = None
+        self._reset_count += 1
+        self._last_reset_reason = reason
         zero_image = np.zeros((6, 128, 256), dtype=np.uint8)
         self._image_queue = deque((zero_image.copy() for _ in range(5)), maxlen=5)
         self._big_image_queue = deque((zero_image.copy() for _ in range(5)), maxlen=5)
@@ -249,6 +273,15 @@ class OpenpilotFrontEngine:
         )
         self._brake_5.clear()
         self._brake_3.clear()
+        self._disengage_buffer.fill(0.0)
+
+    def _mock_cycle_for_timestamp(self, source_timestamp: float) -> int | None:
+        if self.mock_sync_period_seconds <= 0.0:
+            return None
+        return math.floor(
+            (source_timestamp - self.mock_sync_epoch_seconds)
+            / self.mock_sync_period_seconds
+        )
 
     def process(
         self,
@@ -260,13 +293,25 @@ class OpenpilotFrontEngine:
     ) -> FrontPerception:
         if self.session is None:
             raise RuntimeError("front model is disabled")
-        if (
-            source_epoch != self._epoch
-            or self._last_timestamp is None
-            or source_timestamp <= self._last_timestamp
-            or source_timestamp - self._last_timestamp > self.max_gap_seconds
+        mock_cycle_index = self._mock_cycle_for_timestamp(source_timestamp)
+        reset_reason: str | None = None
+        if source_epoch != self._epoch:
+            reset_reason = "source_epoch"
+        elif self._last_timestamp is None:
+            reset_reason = "initial_frame"
+        elif source_timestamp <= self._last_timestamp:
+            reset_reason = "timestamp_non_monotonic"
+        elif source_timestamp - self._last_timestamp > self.max_gap_seconds:
+            reset_reason = "timestamp_gap"
+        elif (
+            mock_cycle_index is not None
+            and self._mock_cycle_index is not None
+            and mock_cycle_index != self._mock_cycle_index
         ):
-            self.reset(source_epoch)
+            reset_reason = "mock_cycle"
+        if reset_reason is not None:
+            self.reset(source_epoch, reason=reset_reason)
+        self._mock_cycle_index = mock_cycle_index
         self._last_timestamp = source_timestamp
         blocking: list[str] = []
         if not self.calibration.valid:
@@ -318,12 +363,18 @@ class OpenpilotFrontEngine:
             and all(value > 0.7 for value in self._brake_3)
         )
         lane_values = parsed["lane_lines"][0]
+        lane_stds = parsed["lane_lines_stds"][0]
         edge_values = parsed["road_edges"][0]
+        edge_stds = parsed["road_edges_stds"][0]
         plan = parsed["plan"][0]
+        plan_stds = parsed["plan_stds"][0]
         lead_values = parsed["lead"][0]
+        lead_stds = parsed["lead_stds"][0]
         lead_probs = parsed["lead_prob"][0]
         lane_probabilities = parsed["lane_lines_prob"][0, 1::2]
-        desire = parsed["desire_pred"][0, 0]
+        desire_horizons = parsed["desire_pred"][0]
+        desire = desire_horizons[0]
+        confidence = self._update_confidence(meta, frame_number)
         return FrontPerception(
             source_epoch=source_epoch,
             frame_number=frame_number,
@@ -356,6 +407,16 @@ class OpenpilotFrontEngine:
                     y=tuple(float(value) for value in lead[:, 1]),
                     velocity=tuple(float(value) for value in lead[:, 2]),
                     acceleration=tuple(float(value) for value in lead[:, 3]),
+                    probability_time=LEAD_T_OFFSETS[index],
+                    times=LEAD_T_IDXS,
+                    x_std=tuple(float(value) for value in lead_stds[index, :, 0]),
+                    y_std=tuple(float(value) for value in lead_stds[index, :, 1]),
+                    velocity_std=tuple(
+                        float(value) for value in lead_stds[index, :, 2]
+                    ),
+                    acceleration_std=tuple(
+                        float(value) for value in lead_stds[index, :, 3]
+                    ),
                 )
                 for index, lead in enumerate(lead_values)
             ),
@@ -369,6 +430,9 @@ class OpenpilotFrontEngine:
             calibration_hash=self.calibration.artifact_hash,
             diagnostics={
                 "model_rate_hz": round(1.0 / self.interval_seconds, 3),
+                "mock_cycle_index": self._mock_cycle_index,
+                "recurrent_reset_count": self._reset_count,
+                "last_reset_reason": self._last_reset_reason,
                 "path_x_range": [
                     round(float(np.min(plan[:, 0])), 4),
                     round(float(np.max(plan[:, 0])), 4),
@@ -382,7 +446,76 @@ class OpenpilotFrontEngine:
                     round(float(np.max(plan[:, 2])), 4),
                 ],
             },
+            lane_line_stds=tuple(
+                tuple((float(point[0]), float(point[1])) for point in line)
+                for line in lane_stds
+            ),
+            road_edge_stds=tuple(
+                tuple((float(point[0]), float(point[1])) for point in edge)
+                for edge in edge_stds
+            ),
+            plan_times=T_IDXS,
+            plan_velocity=tuple(
+                (float(point[3]), float(point[4]), float(point[5])) for point in plan
+            ),
+            plan_acceleration=tuple(
+                (float(point[6]), float(point[7]), float(point[8])) for point in plan
+            ),
+            plan_orientation=tuple(
+                (float(point[9]), float(point[10]), float(point[11])) for point in plan
+            ),
+            plan_orientation_rate=tuple(
+                (float(point[12]), float(point[13]), float(point[14])) for point in plan
+            ),
+            plan_stds=tuple(
+                tuple(float(value) for value in point) for point in plan_stds
+            ),
+            pose=tuple(float(value) for value in parsed["pose"][0]),
+            pose_stds=tuple(float(value) for value in parsed["pose_stds"][0]),
+            road_transform=tuple(
+                float(value) for value in parsed["road_transform"][0]
+            ),
+            road_transform_stds=tuple(
+                float(value) for value in parsed["road_transform_stds"][0]
+            ),
+            wide_from_device_euler=tuple(
+                float(value) for value in parsed["wide_from_device_euler"][0]
+            ),
+            wide_from_device_euler_stds=tuple(
+                float(value) for value in parsed["wide_from_device_euler_stds"][0]
+            ),
+            model_meta=tuple(float(value) for value in meta),
+            desire_state=tuple(
+                float(value) for value in parsed["desire_state"][0]
+            ),
+            desire_prediction_horizons=tuple(
+                tuple(float(value) for value in horizon)
+                for horizon in desire_horizons
+            ),
+            confidence=confidence,
         )
+
+    def _update_confidence(self, meta: np.ndarray, frame_number: int) -> str:
+        if frame_number % (2 * MODEL_RUN_HZ) == 0:
+            brake = meta[2:31:6]
+            gas = meta[1:31:6]
+            steer = meta[3:31:6]
+            any_disengage = 1.0 - ((1.0 - brake) * (1.0 - gas) * (1.0 - steer))
+            independent = np.r_[
+                any_disengage[0],
+                np.diff(any_disengage) / np.maximum(1e-6, 1.0 - any_disengage[:-1]),
+            ]
+            self._disengage_buffer[:-5] = self._disengage_buffer[5:]
+            self._disengage_buffer[-5:] = independent
+        score = sum(
+            float(self._disengage_buffer[index * 5 + 4 - index]) / 5.0
+            for index in range(5)
+        )
+        if score < 0.01165:
+            return "green"
+        if score < 0.06157:
+            return "yellow"
+        return "red"
 
     def _empty_perception(
         self,
