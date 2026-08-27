@@ -373,6 +373,44 @@ class VisionAlertPolicy:
     def geometry_diagnostics(self) -> dict[str, Any]:
         return dict(self._geometry_diagnostics)
 
+    def telemetry_features(self, perception: FrontPerception) -> dict[str, Any]:
+        """Return bounded scalar features suitable for joining with CAN telemetry."""
+        lead_signal = self._lead_signal(perception)
+        lead_metrics = lead_signal.metadata
+        edge_signals = self._road_edge_signals(perception)
+        left_lane = perception.lane_lines[1] if len(perception.lane_lines) > 1 else ()
+        right_lane = perception.lane_lines[2] if len(perception.lane_lines) > 2 else ()
+        probabilities = perception.lane_probabilities
+        return {
+            "source_timestamp_ms": round(perception.source_timestamp * 1000.0, 3),
+            "ready": perception.valid and perception.readiness is FrontReadiness.READY,
+            "lead_probability": lead_metrics.get("lead_probability"),
+            "lead_distance_m": lead_metrics.get("distance_m"),
+            "lead_velocity_mps": lead_metrics.get("lead_velocity_mps"),
+            "closing_speed_mps": lead_metrics.get("closing_speed_mps"),
+            "ttc_s": lead_metrics.get("ttc_seconds"),
+            "lane_left_distance_m": (
+                abs(float(left_lane[0][1])) if left_lane else None
+            ),
+            "lane_right_distance_m": (
+                abs(float(right_lane[0][1])) if right_lane else None
+            ),
+            "lane_left_probability": probabilities[1] if len(probabilities) > 1 else None,
+            "lane_right_probability": probabilities[2] if len(probabilities) > 2 else None,
+            "road_edge_left_clearance_m": edge_signals[
+                "vision_road_edge_left"
+            ].metadata.get("clearance_m"),
+            "road_edge_right_clearance_m": edge_signals[
+                "vision_road_edge_right"
+            ].metadata.get("clearance_m"),
+            "hard_brake_probability": max(
+                (
+                    1.0 if perception.hard_brake_predicted else 0.0,
+                    *perception.hard_brake_3_probs,
+                )
+            ),
+        }
+
     def reset(self, source_epoch: str | None = None) -> None:
         for window in self._windows.values():
             window.clear()

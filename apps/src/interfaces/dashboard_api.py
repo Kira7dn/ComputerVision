@@ -34,6 +34,9 @@ CLK_TCK = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
 CPU_LOCK = Lock()
 GPU_LOCK = Lock()
 METRICS_LOCK = Lock()
+METRICS_CACHE_TTL_SECONDS = 0.8
+METRICS_SOURCE_EPOCH = uuid.uuid4().hex
+METRICS_SEQUENCE = 0
 PREVIOUS_CPU: tuple[int, int] | None = None
 PREVIOUS_PROCESSES: dict[int, tuple[int, float]] = {}
 GPU_CACHE: tuple[float, dict[str, object]] | None = None
@@ -986,12 +989,17 @@ def _collect_metrics(stream_host: str = "localhost") -> dict[str, object]:
 
 
 def collect_metrics(stream_host: str = "localhost") -> dict[str, object]:
+    global METRICS_SEQUENCE
     now = time.monotonic()
     with METRICS_LOCK:
         cached = METRICS_CACHE.get(stream_host)
-        if cached is not None and now - cached[0] < 2.5:
+        if cached is not None and now - cached[0] < METRICS_CACHE_TTL_SECONDS:
             return cached[1]
         result = _collect_metrics(stream_host)
+        METRICS_SEQUENCE += 1
+        result["contract_version"] = 1
+        result["source_epoch"] = METRICS_SOURCE_EPOCH
+        result["sequence"] = METRICS_SEQUENCE
         METRICS_CACHE[stream_host] = (now, result)
         return result
 

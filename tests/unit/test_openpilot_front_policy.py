@@ -186,6 +186,48 @@ def test_lead_ttc_uses_ego_minus_lead_velocity() -> None:
     assert lead.metadata["ttc_seconds"] == 2.0
 
 
+def test_front_telemetry_features_are_scalar_and_physically_meaningful() -> None:
+    policy = VisionAlertPolicy()
+    perception = replace(
+        _perception(1),
+        source_timestamp=1_787_812_140.125,
+        plan_velocity=((8.0, 0.0, 0.0),),
+        leads=(
+            FrontLead(
+                probability=0.9,
+                x=(12.0,),
+                y=(0.0,),
+                velocity=(5.0,),
+                acceleration=(-0.5,),
+            ),
+        ),
+        hard_brake_3_probs=(0.01, 0.08, 0.03),
+    )
+
+    features = policy.telemetry_features(perception)
+
+    assert features == {
+        "source_timestamp_ms": 1_787_812_140_125.0,
+        "ready": True,
+        "lead_probability": 0.9,
+        "lead_distance_m": 12.0,
+        "lead_velocity_mps": 5.0,
+        "closing_speed_mps": 3.0,
+        "ttc_s": 4.0,
+        "lane_left_distance_m": 2.0,
+        "lane_right_distance_m": 2.0,
+        "lane_left_probability": 0.8,
+        "lane_right_probability": 0.8,
+        "road_edge_left_clearance_m": 2.1,
+        "road_edge_right_clearance_m": 2.1,
+        "hard_brake_probability": 0.08,
+    }
+    assert all(
+        value is None or isinstance(value, bool | int | float)
+        for value in features.values()
+    )
+
+
 def test_high_sensitivity_ldw_can_confirm_in_one_frame() -> None:
     policy = VisionAlertPolicy(
         config={

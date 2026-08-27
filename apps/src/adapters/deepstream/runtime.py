@@ -104,6 +104,7 @@ except ModuleNotFoundError:  # The model-free E2E mock does not need DeepStream 
     pyds = None  # type: ignore[assignment]
 
 LOG = logging.getLogger("ls-vision")
+RUNTIME_STATUS_INTERVAL_MS = 250
 
 
 def make_element(factory: str, name: str) -> Gst.Element:
@@ -302,6 +303,11 @@ class DeepStreamCameraRuntime:
         self._analysis_fire_smoke: list[Any] = []
         self._analysis_transitions: list[Any] = []
         self._analysis_transitions_by_function: dict[str, list[Any]] = {}
+        self._cv_transition_sequences = {"front_assistance": 0, "dms": 0}
+        self._recent_cv_transitions: dict[str, deque[dict[str, Any]]] = {
+            "front_assistance": deque(maxlen=64),
+            "dms": deque(maxlen=64),
+        }
         self._analysis_results_by_function: dict[str, FunctionResult] = {}
         self._analysis_last_transition: str | None = None
         self._analysis_frame_num: int | None = None
@@ -1150,6 +1156,32 @@ maintain-aspect-ratio=0
                     score=transition.confidence,
                 )
 
+    def _remember_cv_transitions(
+        self,
+        function: str,
+        transitions: list[Any],
+    ) -> None:
+        if function not in self._recent_cv_transitions:
+            return
+        for transition in transitions:
+            operation = str(getattr(transition, "operation", "")).upper()
+            if operation not in {"START", "END"}:
+                continue
+            self._cv_transition_sequences[function] += 1
+            source_timestamp = getattr(
+                transition,
+                "source_timestamp",
+                getattr(transition, "timestamp", None),
+            )
+            self._recent_cv_transitions[function].append(
+                {
+                    "sequence": self._cv_transition_sequences[function],
+                    "operation": operation,
+                    "label": str(getattr(transition, "label", "")),
+                    "source_timestamp": source_timestamp,
+                }
+            )
+
     def _on_analysis_error(self, function: str, exc: Exception) -> None:
         message = f"{function}: {exc}"
         if message != self._analysis_error:
@@ -1320,6 +1352,7 @@ maintain-aspect-ratio=0
             metadata=metadata,
         )
         with self._analysis_lock:
+            self._remember_cv_transitions(function, transitions)
             self._analysis_results_by_function[function] = result
             self._analysis_transitions_by_function[function] = transitions
             self._analysis_transitions = [
@@ -1842,6 +1875,12 @@ maintain-aspect-ratio=0
         self._analysis_executors.clear()
 
     def _write_runtime_status(self) -> bool:
+        with self._analysis_lock:
+            front_perception = self._front_perception
+            front_recent_transitions = list(
+                self._recent_cv_transitions["front_assistance"]
+            )
+            dms_recent_transitions = list(self._recent_cv_transitions["dms"])
         payload = {
             "camera": self.config["input"].get("camera", "unknown"),
             "run_id": self.run_id,
@@ -1902,12 +1941,17 @@ maintain-aspect-ratio=0
             "analysis_debug": {
                 "front_assistance": (
                     {
-                        **self._front_perception.summary(),
+                        **front_perception.summary(),
                         "active_alerts": list(self.front_policy.active_labels),
+                        "telemetry_features": self.front_policy.telemetry_features(
+                            front_perception
+                        ),
+                        "transition_epoch": self.evidence.worker_epoch,
+                        "recent_transitions": front_recent_transitions,
                         "geometry_diagnostics": self.front_policy.geometry_diagnostics,
                         "overlay": dict(self._front_overlay_metrics),
                     }
-                    if self._front_perception is not None
+                    if front_perception is not None
                     else {
                         "contract_version": 2,
                         "mode": "vision_only",
@@ -1915,6 +1959,9 @@ maintain-aspect-ratio=0
                         if self.front_assistance_enabled
                         else "disabled",
                         "active_alerts": [],
+                        "telemetry_features": {},
+                        "transition_epoch": self.evidence.worker_epoch,
+                        "recent_transitions": front_recent_transitions,
                         "overlay": dict(self._front_overlay_metrics),
                     }
                 ),
@@ -1986,6 +2033,8 @@ maintain-aspect-ratio=0
                     ],
                     "events": self.dms_events.metrics(),
                     "active_event_ids": self.dms_events.active_event_ids,
+                    "transition_epoch": self.evidence.worker_epoch,
+                    "recent_transitions": dms_recent_transitions,
                 },
                 "smoking_episodes": self.event_store.metrics(),
                 "fire_smoke_raw_scores": getattr(self.fire_smoke_engine, "last_raw_scores", {}),
@@ -3016,7 +3065,7 @@ maintain-aspect-ratio=0
             self._start_mock_publisher()
             self.pipeline.set_state(Gst.State.PLAYING)
             self._write_runtime_status()
-            GLib.timeout_add_seconds(2, self._write_runtime_status)
+            GLib.timeout_add(RUNTIME_STATUS_INTERVAL_MS, self._write_runtime_status)
             if str(self.config["input"].get("mode", "rtsp")) == "mock":
                 GLib.timeout_add_seconds(1, self._check_mock_publisher)
             if duration:

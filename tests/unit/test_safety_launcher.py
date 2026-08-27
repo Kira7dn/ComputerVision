@@ -61,6 +61,18 @@ def test_live_output_drops_backlog_before_encoding() -> None:
     assert 'output_queue.set_property("leaky", 2)' in output_queue
 
 
+def test_runtime_status_handoff_is_fresh_and_latches_cv_transitions() -> None:
+    pipeline = (APP_ROOT / "src" / "adapters" / "deepstream" / "runtime.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert "RUNTIME_STATUS_INTERVAL_MS = 250" in pipeline
+    assert "GLib.timeout_add(RUNTIME_STATUS_INTERVAL_MS, self._write_runtime_status)" in pipeline
+    assert '"front_assistance": deque(maxlen=64)' in pipeline
+    assert '"recent_transitions": front_recent_transitions' in pipeline
+    assert '"recent_transitions": dms_recent_transitions' in pipeline
+
+
 def test_dashboard_uses_webrtc_as_the_primary_live_transport() -> None:
     dashboard = (APP_ROOT / "web" / "dashboard.html").read_text(encoding="utf-8")
     app = (APP_ROOT / "web" / "src" / "App.tsx").read_text(encoding="utf-8")

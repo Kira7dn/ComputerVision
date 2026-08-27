@@ -8,6 +8,37 @@ import yaml
 from interfaces import dashboard_api
 
 
+def test_metrics_snapshot_refreshes_with_sequence_at_one_hz(monkeypatch) -> None:
+    now = 100.0
+    collections = 0
+
+    def monotonic() -> float:
+        return now
+
+    def collect(_stream_host: str) -> dict[str, object]:
+        nonlocal collections
+        collections += 1
+        return {"timestamp": float(collections), "pipeline": {"camera_details": []}}
+
+    monkeypatch.setattr(dashboard_api.time, "monotonic", monotonic)
+    monkeypatch.setattr(dashboard_api, "_collect_metrics", collect)
+    monkeypatch.setattr(dashboard_api, "METRICS_SEQUENCE", 0)
+    dashboard_api.METRICS_CACHE.clear()
+
+    first = dashboard_api.collect_metrics("127.0.0.1")
+    now += 0.5
+    cached = dashboard_api.collect_metrics("127.0.0.1")
+    now += 0.31
+    second = dashboard_api.collect_metrics("127.0.0.1")
+
+    assert cached is first
+    assert collections == 2
+    assert first["contract_version"] == 1
+    assert first["source_epoch"] == dashboard_api.METRICS_SOURCE_EPOCH
+    assert first["sequence"] == 1
+    assert second["sequence"] == 2
+
+
 def test_dashboard_config_is_cached_until_yaml_changes(tmp_path, monkeypatch) -> None:
     config_path = tmp_path / "dev.yaml"
     config_path.write_text("profile: dev\n", encoding="utf-8")

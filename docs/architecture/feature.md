@@ -16,6 +16,24 @@ feature, brake và confidence state tại mỗi biên chu kỳ video 191,1 giây
 timestamp của publisher vẫn tăng liên tục nên biên này được xác định từ
 `mock_sync_period_seconds`/`mock_sync_epoch_seconds`, không chờ timestamp gap.
 
+## Tiến độ triển khai ngày 27/08/2026
+
+- ✅ Section 1 camera-only đã hoàn tất implementation và được lưu tại commit
+  `2687935` trên `origin/codex/dashboard-ui-compact`.
+- ✅ Production release `release-20260827-133344` đang active trên Jetson; health
+  nội bộ và `http://vision.local/health/ready` trả HTTP 200.
+- ✅ Camera trước publish video có lane, road edge, path corridor và lead chevron.
+  HUD đã được rút gọn: không còn các panel thông số hoặc nhãn horizon; khi có
+  alert chỉ hiện đúng một banner tiếng Việt được bake trực tiếp vào video.
+- ✅ Alert camera-only đã nối vào event/evidence pipeline với lifecycle
+  `START/END`, snapshot và thumbnail; không nối notification hoặc vehicle
+  actuation.
+- ✅ Acceptance hiện tại đạt 224 bài pytest, Ruff, compileall, web build/lint và
+  kiểm tra browser thật tại `http://vision.local`: 5/5 camera ready, video phát,
+  trạng thái không alert không có chữ thừa và trạng thái alert chỉ có một banner.
+- ⚠️ Acceptance này dùng synchronized production mock và synthetic fixtures;
+  chưa phải vehicle-calibrated acceptance với CAN/sensor và xe thật.
+
 ## Bảng tính năng
 
 Quy ước: `✅ Done` đã hoàn tất trong LS-Vision; `🚧 Doing` đã có một phần pipeline
@@ -32,12 +50,12 @@ Các tính năng trong nhóm này có thể chạy từ luồng camera, model v�
 | ✅ Done | Dự đoán quỹ đạo xe phía trước | Cao cho hiển thị và telemetry | Đã render hành lang và đường tâm dự đoán |
 | ✅ Done | Cảnh báo lệch làn trái/phải (LDW) | Khá độc lập; bản openpilot đầy đủ còn dùng tốc độ xe, xi-nhan và trạng thái lateral control | Đã có policy camera-only `vision_ldw_left` và `vision_ldw_right` |
 | ✅ Done | Cảnh báo va chạm phía trước từ model (FCW) | Khá độc lập, nhánh `hardBrakePredicted` không bắt buộc radar | Đã có policy camera-only `vision_fcw` |
-| ✅ Done | Nhận biết tối đa 3 xe dẫn đầu | Cao cho perception và overlay; điều khiển bám xe không độc lập | Contract v2 và HUD giữ đủ 3 lead cùng std; video dùng chevron đỏ/glow vàng kiểu openpilot cho tối đa 2 lead có probability ≥ 0.5, không giả lập bbox; `vision_lead_ttc` là advisory camera-only |
+| ✅ Done | Nhận biết tối đa 3 xe dẫn đầu | Cao cho perception và overlay; điều khiển bám xe không độc lập | Contract v2 và metadata giữ đủ 3 lead cùng std; video dùng chevron đỏ/glow vàng kiểu openpilot cho tối đa 2 lead có probability ≥ 0.5, không giả lập bbox; `vision_lead_ttc` là advisory camera-only |
 | ✅ Done | Nhận biết 2 biên đường | Cao cho hiển thị và phân tích | Render đủ 2 biên với opacity theo uncertainty; `vision_road_edge_left/right` dùng clearance 5–30 m và hysteresis |
-| ✅ Done | Visual odometry: chuyển động tịnh tiến và quay của camera | Có thể xuất telemetry độc lập | `pose` và std được công bố trong `FrontPerception` v2 và HUD |
+| ✅ Done | Visual odometry: chuyển động tịnh tiến và quay của camera | Có thể xuất telemetry độc lập | `pose` và std được công bố trong `FrontPerception` v2 và metadata API; không hiển thị panel thông số trên video |
 | ✅ Done | Ước lượng camera mounting và road transform | Có thể dùng để chẩn đoán camera bị xê dịch; tự calibration đầy đủ còn cần vận tốc xe | Công bố Euler/road transform và std; `vision_geometry_drift` học baseline theo epoch và được gắn `experimental_advisory=true` |
-| ✅ Done | Vị trí, vận tốc, gia tốc, hướng và tốc độ quay dự đoán trong 10 giây | Độc lập cho telemetry; không độc lập cho điều khiển xe | Contract v2 giữ đủ 15 thành phần plan, std và sáu horizon gần 0/2/4/6/8/10 giây |
-| ✅ Done | Confidence, disengagement và dự đoán hành vi ga/phanh | Có thể dùng cho diagnostics | Công bố toàn bộ 55 meta probabilities, desire state/prediction và confidence green/yellow/red |
+| ✅ Done | Vị trí, vận tốc, gia tốc, hướng và tốc độ quay dự đoán trong 10 giây | Độc lập cho telemetry; không độc lập cho điều khiển xe | Contract v2 giữ đủ 15 thành phần plan, std và sáu horizon gần 0/2/4/6/8/10 giây; video chỉ giữ marker hình học, không ghi nhãn giây |
+| ✅ Done | Confidence, disengagement và dự đoán hành vi ga/phanh | Có thể dùng cho diagnostics | Công bố toàn bộ 55 meta probabilities, desire state/prediction và confidence green/yellow/red trong metadata API; không bake panel chẩn đoán lên video |
 | ✅ Done | Ghi hình, snapshot, thumbnail và livestream | Độc lập về media | Openpilot có sẵn, nhưng LS-Vision và MediaMTX đã sở hữu các chức năng tương đương; không thêm owner thứ hai |
 
 LDW camera-only của LS-Vision là advisory dựa trên model. So với openpilot đầy
@@ -45,9 +63,10 @@ LDW camera-only của LS-Vision là advisory dựa trên model. So với openpil
 control. Tương tự, camera mounting và road transform có thể xuất trực tiếp từ
 model, nhưng quy trình tự calibration đầy đủ cần thêm vận tốc xe.
 
-Toàn bộ cảnh báo front-assistance chỉ là camera-only advisory: chúng bake vào
-RTSP/HLS và tạo evidence `START/END`, không đi vào notification pipeline và
-không có vehicle actuation. Acceptance của Section 1 dùng mock video production
+Toàn bộ cảnh báo front-assistance chỉ là camera-only advisory: khi active, cảnh
+báo có một banner tiếng Việt bake vào RTSP/HLS và tạo evidence `START/END` kèm
+snapshot/thumbnail; chúng không đi vào notification pipeline và không có vehicle
+actuation. Acceptance của Section 1 dùng mock video production
 hiện tại cùng synthetic policy fixtures. Theo yêu cầu vận hành mock, cấu hình
 `dev` và `production` dùng profile độ nhạy đã hiệu chỉnh từ mock replay để event
 tự nhiên xuất hiện nhưng không lặp quá dày: START xác nhận một frame, END cần 20
