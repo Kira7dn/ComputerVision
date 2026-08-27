@@ -226,6 +226,7 @@ def test_front_camera_has_worker_and_calibration_contract() -> None:
     (
         ("overlay", "lead_min_probability", 1.1),
         ("overlay", "road_edge_max_std_m", 0.0),
+        ("overlay", "road_edge_max_std_m", float("nan")),
         ("alerts", "ldw_confirmation_hits", 2),
         ("alerts", "fcw_clear_probability", 0.1),
         ("alerts", "lead_ttc_seconds", 30.0),

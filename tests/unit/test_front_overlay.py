@@ -1,3 +1,4 @@
+import math
 from dataclasses import replace
 
 import pytest
@@ -178,6 +179,16 @@ def test_invalid_calibration_fails_closed_without_geometry() -> None:
         "horizon_marker_count": 0,
         "lane_confidences": {},
     }
+
+
+def test_invalid_overlay_calibration_and_nan_threshold_fail_closed() -> None:
+    ragged = {**calibration(), "intrinsics": [[1.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]}
+    assert project_front_overlay(
+        perception(), ragged, width=960, height=540
+    ).path_source == "unavailable"
+    assert project_front_overlay(
+        perception(), calibration(), width=960, height=540, road_edge_max_std_m=math.nan
+    ).path_source == "unavailable"
 
 
 def test_hud_only_renders_priority_banner() -> None:

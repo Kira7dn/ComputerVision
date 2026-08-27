@@ -173,9 +173,13 @@ def validate_config(config: dict[str, Any], path: Path | None = None) -> dict[st
                 or not calibration_shape_valid
                 or traffic_convention not in {"left_hand", "right_hand"}
                 or not all(math.isfinite(value) for value in numeric_calibration)
+                or not math.isfinite(lane_min_probability)
                 or not 0.0 <= lane_min_probability <= 1.0
+                or not math.isfinite(path_half_width_m)
                 or path_half_width_m <= 0.0
+                or not math.isfinite(lead_min_probability)
                 or not 0.0 <= lead_min_probability <= 1.0
+                or not math.isfinite(road_edge_max_std_m)
                 or road_edge_max_std_m <= 0.0
             ):
                 raise ValueError(

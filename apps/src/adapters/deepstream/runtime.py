@@ -25,6 +25,7 @@ import threading
 import time
 import uuid
 from collections import deque
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -77,6 +78,7 @@ from domain.fire_smoke_events import FireSmokeEventStore  # noqa: E402
 from domain.front_assistance import (  # noqa: E402
     FrontAlertTransition,
     FrontPerception,
+    FrontReadiness,
     VisionAlertPolicy,
 )
 from domain.front_overlay import (  # noqa: E402
@@ -249,6 +251,7 @@ class DeepStreamCameraRuntime:
             max_gap_seconds=float(front_config.get("max_gap_seconds", 0.25)),
         )
         self._front_perception: FrontPerception | None = None
+        self._front_last_sample: AnalysisSample | None = None
         self._front_transitions: list[FrontAlertTransition] = []
         self._front_overlay_metrics: dict[str, Any] = {
             "visible_lane_count": 0,
@@ -1156,6 +1159,59 @@ maintain-aspect-ratio=0
                     score=transition.confidence,
                 )
 
+    @staticmethod
+    def _empty_front_overlay_metrics() -> dict[str, Any]:
+        return {
+            "path_source": "unavailable",
+            "visible_lane_count": 0,
+            "lane_segment_count": 0,
+            "path_point_count": 0,
+            "path_segment_count": 0,
+            "visible_road_edge_count": 0,
+            "road_edge_segment_count": 0,
+            "visible_lead_count": 0,
+            "lead_segment_count": 0,
+            "lead_chevron_count": 0,
+            "horizon_marker_count": 0,
+            "rendered_segment_count": 0,
+            "lane_confidences": {},
+        }
+
+    def _invalidate_stale_front_state(self) -> None:
+        """Fail closed when front inference stops producing fresh results."""
+        if not self.front_assistance_enabled:
+            return
+        with self._analysis_lock:
+            perception = self._front_perception
+            sample = self._front_last_sample
+            updated_at = self._analysis_updated_at_by_function.get("front_assistance")
+        if (
+            perception is None
+            or sample is None
+            or not perception.valid
+            or perception.readiness is not FrontReadiness.READY
+            or updated_at is None
+            or time.monotonic() - updated_at <= self._analysis_result_max_age_seconds
+        ):
+            return
+        invalid = replace(
+            perception,
+            valid=False,
+            readiness=FrontReadiness.NOT_READY,
+            blocking_reasons=("inference_stale",),
+        )
+        transitions = self.front_policy.invalidate(invalid, reason="inference_stale")
+        self._record_front_transitions(transitions, sample, invalid)
+        with self._analysis_lock:
+            current = self._front_perception
+            current_updated_at = self._analysis_updated_at_by_function.get(
+                "front_assistance"
+            )
+            if current is perception and current_updated_at == updated_at:
+                self._front_perception = invalid
+                self._front_transitions = list(transitions)
+                self._front_overlay_metrics = self._empty_front_overlay_metrics()
+
     def _remember_cv_transitions(
         self,
         function: str,
@@ -1187,6 +1243,8 @@ maintain-aspect-ratio=0
         if message != self._analysis_error:
             LOG.exception("background analysis failed: %s", message, exc_info=exc)
             self._analysis_error = message
+        if function == "front_assistance":
+            self._invalidate_stale_front_state()
 
     def _on_analysis_result(
         self,
@@ -1331,6 +1389,7 @@ maintain-aspect-ratio=0
             )
             with self._analysis_lock:
                 self._front_perception = perception
+                self._front_last_sample = sample
                 self._front_transitions = list(transitions)
                 self._front_overlay_metrics = overlay_metrics
 
@@ -1792,6 +1851,7 @@ maintain-aspect-ratio=0
 
     def _on_output_buffer(self, pad: Gst.Pad, info: Gst.PadProbeInfo) -> Gst.PadProbeReturn:
         """Render backend-owned labels without applying an old ROI to a new frame."""
+        self._invalidate_stale_front_state()
         buffer = info.get_buffer()
         if buffer is None:
             return Gst.PadProbeReturn.OK
@@ -1875,6 +1935,7 @@ maintain-aspect-ratio=0
         self._analysis_executors.clear()
 
     def _write_runtime_status(self) -> bool:
+        self._invalidate_stale_front_state()
         with self._analysis_lock:
             front_perception = self._front_perception
             front_recent_transitions = list(
@@ -2428,6 +2489,7 @@ maintain-aspect-ratio=0
 
     def _publish_metadata_frame(self, frame_meta: Any) -> None:
         """Publish lightweight overlay state from the non-blocking DeepStream probe."""
+        self._invalidate_stale_front_state()
         self.frame_count += 1
         if self.frame_count % 100 == 0:
             LOG.info(

@@ -34,7 +34,8 @@ def _perception(
         ((0.0, 1.0 if right else 2.0, 1.2),),
         ((0.0, 3.0, 1.2),),
     )
-    desire = (0.0, 0.2 if left else 0.0, 0.2 if right else 0.0)
+    # openpilot Desire enum: laneChangeLeft=3, laneChangeRight=4.
+    desire = (0.0, 0.0, 0.0, 0.2 if left else 0.0, 0.2 if right else 0.0)
     distances = tuple(float(index) for index in range(33))
     return FrontPerception(
         epoch,
@@ -134,7 +135,10 @@ def test_epoch_change_never_carries_active_alert() -> None:
     policy = VisionAlertPolicy(fcw_clear_observations=2)
     policy.observe(_perception(1, fcw=True, epoch="old"))
     assert policy.active_labels == ("vision_fcw",)
-    assert policy.observe(_perception(1, epoch="new")) == []
+    ended = policy.observe(_perception(1, epoch="new"))
+    assert [(item.operation, item.label) for item in ended] == [
+        ("END", "vision_fcw")
+    ]
     assert policy.active_labels == ()
 
 
@@ -149,7 +153,7 @@ def test_lead_ttc_requires_three_of_five_and_ten_clear_frames() -> None:
         ("START", "vision_lead_ttc")
     ]
     start = transitions[0]
-    assert start.metadata["ttc_seconds"] == 2.0
+    assert start.metadata["ttc_seconds"] == 1.4933333333333334
     for frame in range(6, 16):
         transitions.extend(policy.observe(_perception(frame)))
     assert [(item.operation, item.label) for item in transitions][-1] == (
@@ -183,7 +187,7 @@ def test_lead_ttc_uses_ego_minus_lead_velocity() -> None:
     assert lead.metadata["ego_velocity_mps"] == 8.0
     assert lead.metadata["lead_velocity_mps"] == 5.0
     assert lead.metadata["closing_speed_mps"] == 3.0
-    assert lead.metadata["ttc_seconds"] == 2.0
+    assert lead.metadata["ttc_seconds"] == 1.4933333333333334
 
 
 def test_front_telemetry_features_are_scalar_and_physically_meaningful() -> None:
@@ -210,10 +214,10 @@ def test_front_telemetry_features_are_scalar_and_physically_meaningful() -> None
         "source_timestamp_ms": 1_787_812_140_125.0,
         "ready": True,
         "lead_probability": 0.9,
-        "lead_distance_m": 12.0,
+        "lead_distance_m": 10.48,
         "lead_velocity_mps": 5.0,
         "closing_speed_mps": 3.0,
-        "ttc_s": 4.0,
+        "ttc_s": 3.4933333333333336,
         "lane_left_distance_m": 2.0,
         "lane_right_distance_m": 2.0,
         "lane_left_probability": 0.8,
@@ -250,6 +254,21 @@ def test_high_sensitivity_ldw_can_confirm_in_one_frame() -> None:
     ]
 
 
+def test_ldw_uses_lane_change_desire_enum_not_turn_desire() -> None:
+    policy = VisionAlertPolicy(
+        config={"ldw_confirmation_hits": 1, "ldw_confirmation_window": 1}
+    )
+    turning = replace(_perception(1, left=True), desire_prediction=(0.0, 0.9, 0.0, 0.0, 0.0))
+    assert policy.observe(turning) == []
+    lane_change = replace(
+        _perception(2, left=True),
+        desire_prediction=(0.0, 0.0, 0.0, 0.9, 0.0),
+    )
+    assert [(item.operation, item.label) for item in policy.observe(lane_change)] == [
+        ("START", "vision_ldw_left")
+    ]
+
+
 def test_both_road_edges_have_independent_hysteresis() -> None:
     policy = VisionAlertPolicy()
     transitions = []
@@ -273,6 +292,24 @@ def test_both_road_edges_have_independent_hysteresis() -> None:
         ("END", "vision_road_edge_left"),
         ("END", "vision_road_edge_right"),
     }
+
+
+def test_unusable_edge_uncertainty_eventually_clears() -> None:
+    policy = VisionAlertPolicy(
+        config={
+            "edge_confirmation_hits": 1,
+            "edge_confirmation_window": 1,
+            "edge_clear_observations": 2,
+        }
+    )
+    assert policy.observe(_perception(1, edge_left=True))[0].operation == "START"
+    bad_stds = tuple(tuple((9.0, 0.1) for _ in range(33)) for _ in range(2))
+    ended = []
+    for frame in range(2, 4):
+        ended.extend(policy.observe(replace(_perception(frame), road_edge_stds=bad_stds)))
+    assert [(item.operation, item.label) for item in ended] == [
+        ("END", "vision_road_edge_left")
+    ]
 
 
 def test_geometry_drift_learns_baseline_and_clears_below_sixty_percent() -> None:
@@ -308,8 +345,33 @@ def test_banner_priority_and_timestamp_discontinuity_reset_all_state() -> None:
     assert policy.banner_label == "vision_lead_ttc"
     policy.observe(_perception(6, fcw=True))
     assert policy.banner_label == "vision_fcw"
-    assert policy.observe(_perception(7, timestamp=10.0)) == []
+    reset_transitions = policy.observe(_perception(7, timestamp=10.0))
+    assert {(item.operation, item.label) for item in reset_transitions} == {
+        ("END", "vision_fcw"),
+        ("END", "vision_lead_ttc"),
+    }
     assert policy.active_labels == ()
+
+
+def test_mock_cycle_reset_closes_active_alert_and_restarts_state() -> None:
+    policy = VisionAlertPolicy(config={"fcw_clear_observations": 20})
+    first = replace(_perception(1, fcw=True), diagnostics={"mock_cycle_index": 0})
+    assert policy.observe(first)[0].operation == "START"
+    second = replace(_perception(2), diagnostics={"mock_cycle_index": 1})
+    ended = policy.observe(second)
+    assert [(item.operation, item.label) for item in ended] == [
+        ("END", "vision_fcw")
+    ]
+    assert ended[0].metadata["reset_reason"] == "mock_cycle"
+
+
+def test_lead_below_camera_offset_does_not_trigger_visible_alert() -> None:
+    policy = VisionAlertPolicy(
+        config={"lead_confirmation_hits": 1, "lead_confirmation_window": 1}
+    )
+    source = _perception(1, lead_ttc=True)
+    close = replace(source, leads=(replace(source.leads[0], x=(1.2,)),))
+    assert policy.observe(close) == []
 
 
 def test_synthetic_fixture_emits_exactly_one_start_and_end_per_alert() -> None:

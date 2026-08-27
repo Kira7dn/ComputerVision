@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import statistics
+import threading
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
@@ -15,6 +16,13 @@ class FrontReadiness(str, Enum):
     READY = "ready"
     DEGRADED = "degraded"
     NOT_READY = "not_ready"
+
+
+# Keep these indices/offsets in one place so policy and overlay use the same
+# openpilot coordinate contract.
+DESIRE_LANE_CHANGE_LEFT_INDEX = 3
+DESIRE_LANE_CHANGE_RIGHT_INDEX = 4
+LEAD_CAMERA_OFFSET_M = 1.52
 
 
 @dataclass(frozen=True)
@@ -231,6 +239,7 @@ class VisionAlertPolicy:
         path_half_width_m: float = 0.9,
         max_gap_seconds: float = 0.25,
     ) -> None:
+        self._lock = threading.RLock()
         if confirmation_hits < 1 or confirmation_window < confirmation_hits:
             raise ValueError("invalid front alert confirmation window")
         self.confirmation_hits = confirmation_hits
@@ -328,6 +337,7 @@ class VisionAlertPolicy:
         self._geometry_samples: list[tuple[float, ...]] = []
         self._geometry_baseline: tuple[float, ...] | None = None
         self._geometry_diagnostics: dict[str, Any] = {"baseline_ready": False}
+        self._mock_cycle_index: int | None = None
 
     def _validate_thresholds(self) -> None:
         valid = (
@@ -363,7 +373,8 @@ class VisionAlertPolicy:
 
     @property
     def active_labels(self) -> tuple[str, ...]:
-        return tuple(label for label in self.ALERT_PRIORITY if label in self._active)
+        with self._lock:
+            return tuple(label for label in self.ALERT_PRIORITY if label in self._active)
 
     @property
     def banner_label(self) -> str | None:
@@ -371,7 +382,8 @@ class VisionAlertPolicy:
 
     @property
     def geometry_diagnostics(self) -> dict[str, Any]:
-        return dict(self._geometry_diagnostics)
+        with self._lock:
+            return dict(self._geometry_diagnostics)
 
     def telemetry_features(self, perception: FrontPerception) -> dict[str, Any]:
         """Return bounded scalar features suitable for joining with CAN telemetry."""
@@ -412,15 +424,57 @@ class VisionAlertPolicy:
         }
 
     def reset(self, source_epoch: str | None = None) -> None:
-        for window in self._windows.values():
-            window.clear()
-        self._active.clear()
-        self._negative_counts.clear()
-        self._epoch = source_epoch
-        self._last_timestamp = None
-        self._geometry_samples.clear()
-        self._geometry_baseline = None
-        self._geometry_diagnostics = {"baseline_ready": False}
+        with self._lock:
+            for window in self._windows.values():
+                window.clear()
+            self._active.clear()
+            self._negative_counts.clear()
+            self._epoch = source_epoch
+            self._last_timestamp = None
+            self._geometry_samples.clear()
+            self._geometry_baseline = None
+            self._geometry_diagnostics = {"baseline_ready": False}
+            self._mock_cycle_index = None
+
+    def _end_active(
+        self,
+        perception: FrontPerception,
+        *,
+        reason: str,
+    ) -> list[FrontAlertTransition]:
+        transitions: list[FrontAlertTransition] = []
+        for label, event_id in tuple(self._active.items()):
+            self._active.pop(label, None)
+            self._negative_counts.pop(label, None)
+            transitions.append(
+                FrontAlertTransition(
+                    "END",
+                    event_id,
+                    label,
+                    perception.frame_number,
+                    perception.source_timestamp,
+                    0.0,
+                    {
+                        "mode": "vision_only",
+                        "reset_reason": reason,
+                        "readiness": perception.readiness.value,
+                    },
+                )
+            )
+        return transitions
+
+    def invalidate(
+        self,
+        perception: FrontPerception,
+        *,
+        reason: str = "inference_stale",
+    ) -> list[FrontAlertTransition]:
+        """Close episodes when the front inference state is no longer usable."""
+        with self._lock:
+            transitions = self._end_active(perception, reason=reason)
+            self.reset(perception.source_epoch)
+            self._last_timestamp = perception.source_timestamp
+            return transitions
 
     def _raw_signals(self, perception: FrontPerception) -> dict[str, _Signal]:
         probabilities = perception.lane_probabilities
@@ -430,8 +484,16 @@ class VisionAlertPolicy:
         right_y = lanes[2][0][1] if len(lanes) > 2 and lanes[2] else float("inf")
         left_probability = probabilities[1] if len(probabilities) > 1 else 0.0
         right_probability = probabilities[2] if len(probabilities) > 2 else 0.0
-        left_desire = desire[1] if len(desire) > 1 else 0.0
-        right_desire = desire[2] if len(desire) > 2 else 0.0
+        left_desire = (
+            desire[DESIRE_LANE_CHANGE_LEFT_INDEX]
+            if len(desire) > DESIRE_LANE_CHANGE_LEFT_INDEX
+            else 0.0
+        )
+        right_desire = (
+            desire[DESIRE_LANE_CHANGE_RIGHT_INDEX]
+            if len(desire) > DESIRE_LANE_CHANGE_RIGHT_INDEX
+            else 0.0
+        )
         left = (
             left_probability > self.ldw_lane_probability
             and left_y > -(self.ldw_lane_close_m + self.CAMERA_OFFSET)
@@ -485,7 +547,8 @@ class VisionAlertPolicy:
         lead = perception.leads[0]
         if not lead.x or not lead.velocity:
             return _Signal(False, True, 0.0)
-        distance = lead.x[0]
+        raw_distance = lead.x[0]
+        distance = raw_distance - LEAD_CAMERA_OFFSET_M
         ego_velocity = (
             perception.plan_velocity[0][0] if perception.plan_velocity else 0.0
         )
@@ -518,6 +581,7 @@ class VisionAlertPolicy:
             {
                 "lead_probability": lead.probability,
                 "distance_m": distance,
+                "raw_distance_m": raw_distance,
                 "ego_velocity_mps": ego_velocity,
                 "lead_velocity_mps": lead.velocity[0],
                 "closing_speed_mps": closing_speed,
@@ -562,7 +626,12 @@ class VisionAlertPolicy:
                     clearances.append(clearance)
                     accepted_stds.append(std)
             if not clearances:
-                result[label] = _Signal(False, False, 0.0, {"sample_count": 0})
+                result[label] = _Signal(
+                    False,
+                    True,
+                    0.0,
+                    {"sample_count": 0, "data_unavailable": True},
+                )
                 continue
             clearance = min(clearances)
             edge_std = max(accepted_stds)
@@ -580,7 +649,12 @@ class VisionAlertPolicy:
 
     def _geometry_signal(self, perception: FrontPerception) -> _Signal:
         if len(perception.wide_from_device_euler) < 3 or len(perception.road_transform) < 3:
-            return _Signal(False, False, 0.0, {"baseline_ready": False})
+            return _Signal(
+                False,
+                True,
+                0.0,
+                {"baseline_ready": False, "data_unavailable": True},
+            )
         sample = (*perception.wide_from_device_euler[:3], *perception.road_transform[:3])
         if not all(math.isfinite(value) for value in sample):
             return _Signal(False, True, 0.0, {"baseline_ready": False})
@@ -639,84 +713,98 @@ class VisionAlertPolicy:
         )
 
     def observe(self, perception: FrontPerception) -> list[FrontAlertTransition]:
-        discontinuity = (
-            self._last_timestamp is not None
-            and (
-                perception.source_timestamp <= self._last_timestamp
-                or perception.source_timestamp - self._last_timestamp > self.max_gap_seconds
+        with self._lock:
+            discontinuity = (
+                self._last_timestamp is not None
+                and (
+                    perception.source_timestamp <= self._last_timestamp
+                    or perception.source_timestamp - self._last_timestamp > self.max_gap_seconds
+                )
             )
-        )
-        if self._epoch != perception.source_epoch or discontinuity:
-            self.reset(perception.source_epoch)
-        self._last_timestamp = perception.source_timestamp
-        if not perception.valid or perception.readiness is not FrontReadiness.READY:
-            raw = {
-                label: _Signal(False, True, 0.0, {"readiness": perception.readiness.value})
-                for label in (*self._windows, "vision_fcw")
-            }
-            raw["vision_geometry_drift"] = _Signal(
-                False,
-                True,
-                0.0,
-                {
-                    "readiness": perception.readiness.value,
-                    "experimental_advisory": True,
-                },
+            cycle = perception.diagnostics.get("mock_cycle_index")
+            mock_cycle_discontinuity = (
+                cycle is not None
+                and self._mock_cycle_index is not None
+                and int(cycle) != self._mock_cycle_index
             )
-        else:
-            raw = self._raw_signals(perception)
-
-        transitions: list[FrontAlertTransition] = []
-        for label, signal in raw.items():
-            if label in self._windows:
-                window = self._windows[label]
-                window.append(signal.positive)
-                confirmed = signal.positive if label in self._active else (
-                    len(window) == window.maxlen
-                    and sum(window) >= self._confirmation_hits[label]
+            transitions: list[FrontAlertTransition] = []
+            if self._epoch != perception.source_epoch or discontinuity or mock_cycle_discontinuity:
+                reason = (
+                    "mock_cycle"
+                    if mock_cycle_discontinuity
+                    else "timestamp_discontinuity"
+                    if discontinuity
+                    else "source_epoch"
+                )
+                transitions.extend(self._end_active(perception, reason=reason))
+                self.reset(perception.source_epoch)
+            self._mock_cycle_index = int(cycle) if cycle is not None else self._mock_cycle_index
+            self._last_timestamp = perception.source_timestamp
+            if not perception.valid or perception.readiness is not FrontReadiness.READY:
+                raw = {
+                    label: _Signal(False, True, 0.0, {"readiness": perception.readiness.value})
+                    for label in (*self._windows, "vision_fcw")
+                }
+                raw["vision_geometry_drift"] = _Signal(
+                    False,
+                    True,
+                    0.0,
+                    {
+                        "readiness": perception.readiness.value,
+                        "experimental_advisory": True,
+                    },
                 )
             else:
-                confirmed = signal.positive
+                raw = self._raw_signals(perception)
 
-            if confirmed:
-                self._negative_counts[label] = 0
-                if label not in self._active:
-                    sequence = self._sequences.get(label, 0) + 1
-                    self._sequences[label] = sequence
-                    event_id = f"front-{perception.source_epoch}-{label}-{sequence}"
-                    self._active[label] = event_id
+            for label, signal in raw.items():
+                if label in self._windows:
+                    window = self._windows[label]
+                    window.append(signal.positive)
+                    confirmed = signal.positive if label in self._active else (
+                        len(window) == window.maxlen
+                        and sum(window) >= self._confirmation_hits[label]
+                    )
+                else:
+                    confirmed = signal.positive
+
+                if confirmed:
+                    self._negative_counts[label] = 0
+                    if label not in self._active:
+                        sequence = self._sequences.get(label, 0) + 1
+                        self._sequences[label] = sequence
+                        event_id = f"front-{perception.source_epoch}-{label}-{sequence}"
+                        self._active[label] = event_id
+                        transitions.append(
+                            FrontAlertTransition(
+                                "START",
+                                event_id,
+                                label,
+                                perception.frame_number,
+                                perception.source_timestamp,
+                                signal.confidence,
+                                {"mode": "vision_only", **signal.metadata},
+                            )
+                        )
+                    continue
+
+                if label not in self._active or not signal.clear_negative:
+                    continue
+                negative_count = self._negative_counts.get(label, 0) + 1
+                self._negative_counts[label] = negative_count
+                clear_after = self._clear_after[label]
+                if negative_count >= clear_after:
+                    event_id = self._active.pop(label)
+                    self._negative_counts.pop(label, None)
                     transitions.append(
                         FrontAlertTransition(
-                            "START",
+                            "END",
                             event_id,
                             label,
                             perception.frame_number,
                             perception.source_timestamp,
-                            signal.confidence,
+                            0.0,
                             {"mode": "vision_only", **signal.metadata},
                         )
                     )
-                continue
-
-            if label not in self._active:
-                continue
-            if not signal.clear_negative:
-                continue
-            negative_count = self._negative_counts.get(label, 0) + 1
-            self._negative_counts[label] = negative_count
-            clear_after = self._clear_after[label]
-            if negative_count >= clear_after:
-                event_id = self._active.pop(label)
-                self._negative_counts.pop(label, None)
-                transitions.append(
-                    FrontAlertTransition(
-                        "END",
-                        event_id,
-                        label,
-                        perception.frame_number,
-                        perception.source_timestamp,
-                        0.0,
-                        {"mode": "vision_only", **signal.metadata},
-                    )
-                )
-        return transitions
+            return transitions

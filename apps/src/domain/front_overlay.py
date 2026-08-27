@@ -9,7 +9,7 @@ from typing import Any, TypeVar
 
 import numpy as np
 
-from domain.front_assistance import FrontPerception
+from domain.front_assistance import LEAD_CAMERA_OFFSET_M, FrontPerception
 
 Point = tuple[int, int]
 T = TypeVar("T")
@@ -118,17 +118,36 @@ def project_front_overlay(
     intrinsic = calibration.get("intrinsics", [])
     if (
         len(intrinsic) != 3
+        or any(not isinstance(row, list | tuple) or len(row) != 3 for row in intrinsic)
         or width <= 0
         or height <= 0
+        or not math.isfinite(lane_min_probability)
         or lane_min_probability < 0.0
+        or not math.isfinite(path_half_width_m)
         or path_half_width_m <= 0.0
+        or not math.isfinite(lead_min_probability)
         or not 0.0 <= lead_min_probability <= 1.0
+        or not math.isfinite(road_edge_max_std_m)
         or road_edge_max_std_m <= 0.0
     ):
         return FrontOverlayGeometry((), (), (), (), "unavailable")
-    camera_height = float(calibration.get("camera_height_m", 1.51))
-    rpy = tuple(float(value) for value in calibration.get("rpy_calib", [0.0, 0.0, 0.0]))
-    if len(rpy) != 3 or not np.isfinite(camera_height) or camera_height <= 0.0:
+    try:
+        intrinsic_array = np.asarray(intrinsic, dtype=np.float64)
+        camera_height = float(calibration.get("camera_height_m", 1.51))
+        rpy = tuple(
+            float(value)
+            for value in calibration.get("rpy_calib", [0.0, 0.0, 0.0])
+        )
+    except (TypeError, ValueError):
+        return FrontOverlayGeometry((), (), (), (), "unavailable")
+    if (
+        intrinsic_array.shape != (3, 3)
+        or not np.isfinite(intrinsic_array).all()
+        or len(rpy) != 3
+        or not np.isfinite(camera_height)
+        or camera_height <= 0.0
+        or not np.isfinite(rpy).all()
+    ):
         return FrontOverlayGeometry((), (), (), (), "unavailable")
 
     roll, pitch, yaw = rpy
@@ -148,7 +167,7 @@ def project_front_overlay(
         dtype=np.float64,
     )
     projection = (
-        np.asarray(intrinsic, dtype=np.float64)
+        intrinsic_array
         @ view_from_device
         @ device_from_calib
     )
@@ -246,7 +265,7 @@ def project_front_overlay(
         ):
             continue
         # Match radard's vision-only conversion before the UI projection.
-        distance_m = lead.x[0] - 1.52
+        distance_m = lead.x[0] - LEAD_CAMERA_OFFSET_M
         relative_velocity_mps = lead.velocity[0] - model_v_ego
         path_z = min(
             perception.path,

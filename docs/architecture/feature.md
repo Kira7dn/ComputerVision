@@ -56,12 +56,29 @@ Các tính năng trong nhóm này có thể chạy từ luồng camera, model v�
 | ✅ Done | Ước lượng camera mounting và road transform | Có thể dùng để chẩn đoán camera bị xê dịch; tự calibration đầy đủ còn cần vận tốc xe | Công bố Euler/road transform và std; `vision_geometry_drift` học baseline theo epoch và được gắn `experimental_advisory=true` |
 | ✅ Done | Vị trí, vận tốc, gia tốc, hướng và tốc độ quay dự đoán trong 10 giây | Độc lập cho telemetry; không độc lập cho điều khiển xe | Contract v2 giữ đủ 15 thành phần plan, std và sáu horizon gần 0/2/4/6/8/10 giây; video chỉ giữ marker hình học, không ghi nhãn giây |
 | ✅ Done | Confidence, disengagement và dự đoán hành vi ga/phanh | Có thể dùng cho diagnostics | Công bố toàn bộ 55 meta probabilities, desire state/prediction và confidence green/yellow/red trong metadata API; không bake panel chẩn đoán lên video |
+| 🚧 Doing | Sức khỏe và đồng bộ đầu ra model | Hữu ích cho telemetry, không phải perception mới | Đã có source timestamp, inference time, provider và frame number; chưa công bố riêng `frameAge` và `frameDropPerc` như `modelV2` upstream |
 | ✅ Done | Ghi hình, snapshot, thumbnail và livestream | Độc lập về media | Openpilot có sẵn, nhưng LS-Vision và MediaMTX đã sở hữu các chức năng tương đương; không thêm owner thứ hai |
+
+Wide-road camera của openpilot là một **video stream thứ hai**, khác với
+`wide_from_device_euler` (chỉ là output pose). LS-Vision hiện chỉ sở hữu
+`camera_front` và không bật cơ chế chuyển narrow/wide hoặc thêm sensor input, nên
+không xem wide-road camera switching là tính năng đã triển khai.
 
 LDW camera-only của LS-Vision là advisory dựa trên model. So với openpilot đầy
 đủ, policy này chưa dùng tốc độ xe, trạng thái xi-nhan hoặc trạng thái lateral
 control. Tương tự, camera mounting và road transform có thể xuất trực tiếp từ
 model, nhưng quy trình tự calibration đầy đủ cần thêm vận tốc xe.
+
+Trong `ModelDataV2`, `timestampEof` và `modelExecutionTime` tương ứng với
+timestamp/inference time hiện có của LS-Vision; `frameAge` và `frameDropPerc` là
+hai chỉ số đồng bộ model chưa được đưa thành field riêng trong contract. Output
+`action` cũng không phải raw perception độc lập: upstream suy ra nó từ plan,
+độ trễ và tốc độ xe, vì vậy được phân loại ở nhóm Camera + CAN/Sensor.
+
+Về hình ảnh, openpilot còn đổi màu path theo trạng thái throttle/experimental
+và có thể rút ngắn path khi lead ở gần. LS-Vision hiện luôn vẽ corridor model
+với màu cố định; đây là khác biệt trình bày có chủ đích, không phải thiếu output
+perception hay cảnh báo an toàn.
 
 Toàn bộ cảnh báo front-assistance chỉ là camera-only advisory: khi active, cảnh
 báo có một banner tiếng Việt bake vào RTSP/HLS và tạo evidence `START/END` kèm
@@ -90,8 +107,9 @@ chỉ từ video. Chúng cần trạng thái xe, CAN, cảm biến hoặc vehicl
 | Status | Tính năng | Dependency bổ sung | Trạng thái LS-Vision hiện tại |
 | --- | --- | --- | --- |
 | ⬜ Not yet | Automated Lane Centering (ALC) | Tốc độ, trạng thái lái, vehicle model, CAN controller và safety layer | Chưa thuộc camera-only runtime |
-| ⬜ Not yet | Lane change assist | Xi-nhan, tương tác người lái, lateral control và vehicle integration | Chưa triển khai |
+| ⬜ Not yet | Lane change assist | Xi-nhan, tương tác người lái, lateral control và vehicle integration | `desireState` camera-only đã có trong metadata; `laneChangeState`/`laneChangeDirection` của openpilot vẫn cần car state và lateral control |
 | ⬜ Not yet | Adaptive Cruise Control (ACC) | `carState`, cruise state, radar/vision fusion, longitudinal planner và CAN safety | Chưa triển khai |
+| ⬜ Not yet | Model action output (curvature/acceleration/stop) | `vEgo`, action delay, longitudinal/lateral controller và CAN safety | openpilot có `ModelDataV2.action` (`desiredCurvature`, `desiredAcceleration`, `shouldStop`); LS-Vision chỉ giữ plan và không phát lệnh điều khiển |
 
 ### 3. Camera + CAN | Sensor | LiDAR
 
