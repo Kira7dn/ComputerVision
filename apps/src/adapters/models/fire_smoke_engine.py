@@ -6,7 +6,7 @@ import logging
 import statistics
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import cv2
 import numpy as np
@@ -46,10 +46,13 @@ class FireSmokeEngine:
         self.smoothing_clear_seconds = max(
             1.0, float(runtime.get("bbox_smoothing_clear_seconds", runtime.get("clear_seconds", 3.0)))
         )
-        self.class_rois = {
-            str(label): tuple(float(value) for value in roi)
+        self.class_rois = cast(Any, {
+            str(label): (
+                float(roi[0]), float(roi[1]), float(roi[2]), float(roi[3])
+            )
             for label, roi in (runtime.get("class_rois", {}) or {}).items()
-        }
+            if isinstance(roi, list | tuple) and len(roi) >= 4
+        })
         self._last_attempt = 0.0
         self._smoothed: dict[str, tuple[tuple[float, float, float, float], float]] = {}
         self._cached_detections: list[FireSmokeDetection] = []
@@ -57,7 +60,7 @@ class FireSmokeEngine:
         self.last_raw_scores: dict[str, float] = {}
         self.last_inference_ran = False
         self.last_fresh_detections: list[FireSmokeDetection] = []
-        self.session = None
+        self.session: Any = None
         self.input_name = ""
         self.active_providers: list[str] = []
         self.model_path = str(runtime.get("onnx_path", ""))
@@ -205,7 +208,7 @@ class FireSmokeEngine:
             )
             selected: list[FireSmokeDetection] = []
             for raw_index in indices:
-                index = int(raw_index[0] if isinstance(raw_index, list | tuple | np.ndarray) else raw_index)
+                index = int(np.asarray(raw_index).reshape(-1)[0])
                 box, score = candidates[index]
                 selected.append(
                     FireSmokeDetection(
@@ -242,10 +245,8 @@ class FireSmokeEngine:
             if previous is not None and now - previous[1] <= self.smoothing_clear_seconds:
                 old_bbox = np.asarray(previous[0], dtype=np.float32)
                 current_bbox = np.asarray(detection.bbox, dtype=np.float32)
-                bbox = tuple(
-                    float(value)
-                    for value in (old_bbox * (1.0 - self.smoothing_alpha) + current_bbox * self.smoothing_alpha)
-                )
+                blended = old_bbox * (1.0 - self.smoothing_alpha) + current_bbox * self.smoothing_alpha
+                bbox = (float(blended[0]), float(blended[1]), float(blended[2]), float(blended[3]))
             else:
                 bbox = detection.bbox
             self._smoothed[detection.label] = (bbox, now)
@@ -266,7 +267,7 @@ class FireSmokeEngine:
         image, ratio, pad_x, pad_y = self._letterbox(frame)
         tensor = cv2.cvtColor(image, cv2.COLOR_BGR2RGB).astype(np.float32).transpose(2, 0, 1)[None] / 255.0
         started = time.perf_counter()
-        output = self.session.run(None, {self.input_name: tensor})[0]
+        output = np.asarray(self.session.run(None, {self.input_name: tensor})[0])
         detections = self._decode(output, frame, ratio, pad_x, pad_y)
         self.inference_count += 1
         self.inference_latencies_ms.append((time.perf_counter() - started) * 1000.0)

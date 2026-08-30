@@ -22,10 +22,13 @@ Từ workspace root:
 
 ```powershell
 $python = '.\.venv\Scripts\python.exe'
-& $python -m pytest -c services/camera-server/pyproject.toml services/camera-server/tests -q
 Push-Location services\camera-server
-& ..\..\.venv\Scripts\python.exe -m ruff check camera_server tests
-Pop-Location
+try {
+    & ..\..\.venv\Scripts\python.exe -m pytest -c pyproject.toml tests -q
+    & ..\..\.venv\Scripts\python.exe -m ruff check camera_server tests
+} finally {
+    Pop-Location
+}
 ```
 
 Chạy service từ đúng working directory để package và path runtime không phụ thuộc root:

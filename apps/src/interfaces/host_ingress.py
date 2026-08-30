@@ -31,7 +31,10 @@ class HostRoutingHandler(socketserver.BaseRequestHandler):
         use_vision = host == "vision.local"
         try:
             if use_vision:
-                upstream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                unix_family = getattr(socket, "AF_UNIX", None)
+                if unix_family is None:
+                    raise OSError("Unix sockets are unavailable on this platform")
+                upstream = socket.socket(unix_family, socket.SOCK_STREAM)
                 upstream.settimeout(5.0)
                 upstream.connect(self.vision_unix_socket)
             else:

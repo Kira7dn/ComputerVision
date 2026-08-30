@@ -52,3 +52,14 @@ known-first-party = [
   "domain",
   "interfaces",
 ]
+
+[tool.ty.analysis]
+allowed-unresolved-imports = [
+  "gi",
+  "gi.*",
+  "pyds",
+  "mediapipe",
+]
+
+[tool.ty.environment]
+python-version = "3.11"

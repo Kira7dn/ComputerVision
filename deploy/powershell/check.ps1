@@ -25,6 +25,9 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 $cameraServerRoot = Join-Path $cameraRoot 'services\camera-server'
 Push-Location $cameraServerRoot
 try {
+    & $python -m pytest -c pyproject.toml tests -q
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
     & $python -m ruff check camera_server tests
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 

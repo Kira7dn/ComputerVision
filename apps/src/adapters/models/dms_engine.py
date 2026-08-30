@@ -184,11 +184,9 @@ def select_primary_driver(
     strongest_area = max(0.0, strongest[1][2] - strongest[1][0]) * max(
         0.0, strongest[1][3] - strongest[1][1]
     )
-    return (
-        (int(preferred_track_id), preferred)
-        if preferred_area >= strongest_area * 0.70
-        else strongest
-    )
+    if preferred_track_id is not None and preferred_area >= strongest_area * 0.70:
+        return (preferred_track_id, preferred)
+    return strongest
 
 
 def crop_driver_face_input(

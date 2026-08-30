@@ -27,7 +27,7 @@ import uuid
 from collections import deque
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from urllib.parse import urlparse
 from urllib.request import urlopen
 
@@ -98,12 +98,19 @@ from domain.tracking import (  # noqa: E402
 
 gi.require_version("Gst", "1.0")
 gi.require_version("GLib", "2.0")
-from gi.repository import GLib, Gst  # noqa: E402
+from gi.repository import GLib as _GLib  # noqa: E402
+from gi.repository import Gst as _Gst  # noqa: E402
+
+# DeepStream's GI bindings are generated only on the Jetson image and are not
+# represented by portable stubs. Keep this runtime boundary dynamic while the
+# rest of the application remains statically typed.
+GLib: Any = _GLib
+Gst: Any = _Gst
 
 try:
-    pyds = importlib.import_module("pyds")
+    pyds: Any = importlib.import_module("pyds")
 except ModuleNotFoundError:  # The model-free E2E mock does not need DeepStream metadata.
-    pyds = None  # type: ignore[assignment]
+    pyds = cast(Any, None)
 
 LOG = logging.getLogger("ls-vision")
 RUNTIME_STATUS_INTERVAL_MS = 250
@@ -160,6 +167,13 @@ def _ntp_latency_ms(ntp_timestamp: int, now: float) -> float | None:
 
 
 class DeepStreamCameraRuntime:
+    # Function engines are loaded from the configured provider at runtime.
+    # Keep the dynamic plugin boundary explicit for static type checkers.
+    dms_engine: Any
+    smoking_behavior_engine: Any
+    fire_smoke_engine: Any
+    front_engine: Any
+
     def __init__(self, config: dict[str, Any], config_path: Path, run_id: str) -> None:
         self.config = config
         self.config_path = config_path
@@ -219,9 +233,9 @@ class DeepStreamCameraRuntime:
         self.person_score_logged = False
         self.evidence = EvidenceStore(config, run_id)
         self.notifications = NotificationService(config, self.evidence.root, run_id)
-        self.event_store = SmokingEpisodeStore(config, self.evidence)
-        self.dms_events = DmsAlertEventStore(config, self.evidence)
-        self.fire_smoke_events = FireSmokeEventStore(config, self.evidence)
+        self.event_store = SmokingEpisodeStore(config, cast(Any, self.evidence))
+        self.dms_events = DmsAlertEventStore(config, cast(Any, self.evidence))
+        self.fire_smoke_events = FireSmokeEventStore(config, cast(Any, self.evidence))
         self._face_event_ids: dict[int, str] = {}
         self._smoking_by_track: dict[int, Any] = {}
         self.mock_publisher: subprocess.Popen | None = None
@@ -771,7 +785,7 @@ maintain-aspect-ratio=0
         if input_transform is not None:
             if not decoder.link(input_transform) or not input_transform.link(input_transform_caps):
                 raise RuntimeError("Unable to transform decoder output before nvstreammux")
-            decoder_src = input_transform_caps.get_static_pad("src")
+            decoder_src = cast(Any, input_transform_caps).get_static_pad("src")
         mux_sink = mux.get_request_pad("sink_0")
         if decoder_src is None or mux_sink is None or decoder_src.link(mux_sink) != Gst.PadLinkReturn.OK:
             raise RuntimeError("Unable to link decoder to nvstreammux")
@@ -792,7 +806,7 @@ maintain-aspect-ratio=0
             raise RuntimeError("Unable to link analysis tee to analysis queue")
         if publish_video:
             output_tee_pad = analysis_tee.get_request_pad("src_%u")
-            output_sink_pad = output_input_queue.get_static_pad("sink")
+            output_sink_pad = cast(Any, output_input_queue).get_static_pad("sink")
             if (
                 output_tee_pad is None
                 or output_sink_pad is None
@@ -817,7 +831,7 @@ maintain-aspect-ratio=0
         if not analysis_src.link(analysis_sink):
             raise RuntimeError("Unable to terminate analysis branch")
         if publish_video:
-            if not output_input_queue.link(convert_before_osd):
+            if not cast(Any, output_input_queue).link(convert_before_osd):
                 raise RuntimeError("Unable to link output queue to OSD converter")
             if not convert_before_osd.link(face_rgba_caps):
                 raise RuntimeError("Unable to link CPU face frame to OSD converter")
@@ -1240,9 +1254,11 @@ maintain-aspect-ratio=0
 
     def _on_analysis_error(self, function: str, exc: Exception) -> None:
         message = f"{function}: {exc}"
-        if message != self._analysis_error:
-            LOG.exception("background analysis failed: %s", message, exc_info=exc)
+        with self._analysis_lock:
+            should_log = message != self._analysis_error
             self._analysis_error = message
+        if should_log:
+            LOG.exception("background analysis failed: %s", message, exc_info=exc)
         if function == "front_assistance":
             self._invalidate_stale_front_state()
 
@@ -1431,6 +1447,8 @@ maintain-aspect-ratio=0
             )
             self._analysis_processed_count += 1
             self._analysis_last_processed_frame = sample.key.frame_number
+            if self._analysis_error and self._analysis_error.startswith(f"{function}:"):
+                self._analysis_error = None
 
     def _queue_analysis_sample(
         self,

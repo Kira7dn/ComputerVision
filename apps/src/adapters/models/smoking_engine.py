@@ -35,7 +35,7 @@ class SmokingBehaviorEngine:
         self.last_invalid_crop_track_ids: list[int] = []
         self.last_object_scores: dict[int, float] = {}
         self.last_signal_sources: dict[int, list[str]] = {}
-        self.session = None
+        self.session: Any = None
         self.input_name = ""
         self.active_providers: list[str] = []
         self.object_detector = SmokingObjectDetector(config)

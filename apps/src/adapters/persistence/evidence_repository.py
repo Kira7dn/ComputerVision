@@ -151,52 +151,56 @@ class EvidenceStore:
         score: float | None = None,
         frame_number: int | None = None,
     ) -> None:
-        path = self.root / "events.jsonl"
-        key = f"{self.run_id}|{self.worker_epoch}|{event['camera_id']}|{event['function']}|{event['event_id']}|index|{record_type}"
-        if record_type == "UPDATE":
-            key = f"{key}|{timestamp or event.get('updated_at', 0)}"
-        if not self._claim(key, path, "event-index"):
-            return
-        details = dict(payload or {})
-        summary = {
-            "record_type": record_type,
-            "event_id": event["event_id"],
-            "run_id": self.run_id,
-            "worker_epoch": self.worker_epoch,
-            "camera_id": event["camera_id"],
-            "function": event["function"],
-            "classification": event["classification"],
-            "person_track_id": event.get("person_track_id"),
-            "identity": event.get("identity"),
-            "status": event["status"],
-            "started_at": event["started_at"],
-            "ended_at": event.get("ended_at"),
-            "updated_at": timestamp or event.get("updated_at"),
-            "timestamp": timestamp or event.get("updated_at") or event["started_at"],
-            "frame": frame_number,
-            "label": details.get("label") or event.get("label"),
-            "score": score if score is not None else event.get("last_score"),
-            "details": details,
-            "event_path": str(self._event_dir(event).relative_to(self.root)),
-            "idempotency_key": key,
-        }
-        with path.open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps(summary, separators=(",", ":")) + "\n")
-        self.db.execute(
-            "INSERT INTO event_list(event_id,timestamp,event_path,record_json,updated_at) "
-            "VALUES(?,?,?,?,?) "
-            "ON CONFLICT(event_id) DO UPDATE SET "
-            "timestamp=excluded.timestamp,event_path=excluded.event_path,"
-            "record_json=excluded.record_json,updated_at=excluded.updated_at",
-            (
-                str(summary["event_id"]),
-                float(summary["timestamp"]),
-                str(summary["event_path"]),
-                json.dumps(summary, separators=(",", ":")),
-                time.time(),
-            ),
-        )
-        self.db.commit()
+        # One connection is shared by all background analysis executors. Keep
+        # the claim, JSONL append, event-list upsert and commit in one critical
+        # section so another executor cannot commit the same connection midway.
+        with self._lock:
+            path = self.root / "events.jsonl"
+            key = f"{self.run_id}|{self.worker_epoch}|{event['camera_id']}|{event['function']}|{event['event_id']}|index|{record_type}"
+            if record_type == "UPDATE":
+                key = f"{key}|{timestamp or event.get('updated_at', 0)}"
+            if not self._claim(key, path, "event-index"):
+                return
+            details = dict(payload or {})
+            summary = {
+                "record_type": record_type,
+                "event_id": event["event_id"],
+                "run_id": self.run_id,
+                "worker_epoch": self.worker_epoch,
+                "camera_id": event["camera_id"],
+                "function": event["function"],
+                "classification": event["classification"],
+                "person_track_id": event.get("person_track_id"),
+                "identity": event.get("identity"),
+                "status": event["status"],
+                "started_at": event["started_at"],
+                "ended_at": event.get("ended_at"),
+                "updated_at": timestamp or event.get("updated_at"),
+                "timestamp": timestamp or event.get("updated_at") or event["started_at"],
+                "frame": frame_number,
+                "label": details.get("label") or event.get("label"),
+                "score": score if score is not None else event.get("last_score"),
+                "details": details,
+                "event_path": str(self._event_dir(event).relative_to(self.root)),
+                "idempotency_key": key,
+            }
+            with path.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(summary, separators=(",", ":")) + "\n")
+            self.db.execute(
+                "INSERT INTO event_list(event_id,timestamp,event_path,record_json,updated_at) "
+                "VALUES(?,?,?,?,?) "
+                "ON CONFLICT(event_id) DO UPDATE SET "
+                "timestamp=excluded.timestamp,event_path=excluded.event_path,"
+                "record_json=excluded.record_json,updated_at=excluded.updated_at",
+                (
+                    str(summary["event_id"]),
+                    float(summary["timestamp"]),
+                    str(summary["event_path"]),
+                    json.dumps(summary, separators=(",", ":")),
+                    time.time(),
+                ),
+            )
+            self.db.commit()
 
     @staticmethod
     def _annotation_label(event: dict[str, Any], payload: dict[str, Any], score: float | None) -> str:

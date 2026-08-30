@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -84,6 +85,35 @@ def test_event_lifecycle_is_classified_and_deduplicated(tmp_path: Path) -> None:
     finally:
         index.close()
     assert len((tmp_path / "snapshots-acceptance-run-001" / "events.jsonl").read_text(encoding="utf-8").splitlines()) == 2
+
+
+def test_event_index_writes_are_serialized_across_analysis_threads(
+    tmp_path: Path,
+) -> None:
+    store = EvidenceStore(_config(tmp_path), "run-concurrent")
+
+    def write_event(sequence: int) -> None:
+        event_id = store.start_event(
+            event_id=f"concurrent-{sequence}",
+            function="front_assistance",
+            classification="vision_fcw",
+            frame_number=sequence,
+        )
+        store.finish_event(event_id, frame_number=sequence)
+
+    try:
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            list(executor.map(write_event, range(64)))
+    finally:
+        store.close()
+
+    index = sqlite3.connect(
+        str(tmp_path / "snapshots-acceptance-run-concurrent" / "index.sqlite3")
+    )
+    try:
+        assert index.execute("SELECT COUNT(*) FROM event_list").fetchone()[0] == 64
+    finally:
+        index.close()
 
 
 def test_recognition_annotation_uses_identity_not_classification() -> None:

@@ -237,11 +237,7 @@ class SmokingObjectDetector:
                 self.nms_iou,
             )
             for raw_index in indices:
-                index = int(
-                    raw_index[0]
-                    if isinstance(raw_index, list | tuple | np.ndarray)
-                    else raw_index
-                )
+                index = int(np.asarray(raw_index).reshape(-1)[0])
                 box, score, _ = selected[index]
                 detections.append(
                     SmokingObjectDetection(

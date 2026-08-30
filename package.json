@@ -5,7 +5,7 @@
     "dev": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\deploy\\powershell\\deploy-jetson-dev.ps1 -Action start",
     "test": "npm run test:vision && npm run test:camera-server",
     "test:vision": "powershell -NoProfile -Command \"& '.\\.venv\\Scripts\\python.exe' -m pytest -c pyproject.toml tests -q\"",
-    "test:camera-server": "powershell -NoProfile -Command \"& '.\\.venv\\Scripts\\python.exe' -m pytest -c services/camera-server/pyproject.toml services/camera-server/tests -q\"",
+    "test:camera-server": "powershell -NoProfile -Command \"Push-Location services/camera-server; try { & '..\\..\\.venv\\Scripts\\python.exe' -m pytest -c pyproject.toml tests -q } finally { Pop-Location }\"",
     "check": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\deploy\\powershell\\check.ps1",
     "deploy": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\deploy\\powershell\\deploy-jetson.ps1"
   }

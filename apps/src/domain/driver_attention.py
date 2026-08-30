@@ -144,8 +144,10 @@ class NeutralPoseCalibrator:
             and self.neutral_update_alpha > 0.0
         ):
             alpha = self.neutral_update_alpha
-            self.neutral_yaw = (1.0 - alpha) * float(self.neutral_yaw) + alpha * yaw
-            self.neutral_pitch = (1.0 - alpha) * float(self.neutral_pitch) + alpha * pitch
+            neutral_yaw = self.neutral_yaw if self.neutral_yaw is not None else 0.0
+            neutral_pitch = self.neutral_pitch if self.neutral_pitch is not None else 0.0
+            self.neutral_yaw = (1.0 - alpha) * neutral_yaw + alpha * yaw
+            self.neutral_pitch = (1.0 - alpha) * neutral_pitch + alpha * pitch
             yaw_delta = yaw - float(self.neutral_yaw)
             pitch_delta = pitch - float(self.neutral_pitch)
         return self._result(yaw_delta, pitch_delta, True, raw=(yaw, pitch))

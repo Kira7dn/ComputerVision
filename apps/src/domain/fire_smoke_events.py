@@ -6,7 +6,7 @@ import math
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import Any, cast
 
 import cv2
 import numpy as np
@@ -149,7 +149,7 @@ class RegionDynamicsVerifier:
             np.count_nonzero((context_edge_delta > 0) & context_mask) / context_pixels
         )
         edge_change = max(0.0, edge_change - context_edge_change)
-        flow = cv2.calcOpticalFlowFarneback(
+        flow = cast(Any, cv2.calcOpticalFlowFarneback)(
             previous.crop, current.crop, None, 0.5, 3, 15, 3, 5, 1.2, 0
         )
         magnitude, angle = cv2.cartToPolar(flow[..., 0], flow[..., 1])
@@ -516,7 +516,10 @@ class FireSmokeEventStore:
         track.raw_bbox = detection.bbox
         old = np.asarray(track.smoothed_bbox, dtype=np.float32)
         new = np.asarray(detection.bbox, dtype=np.float32)
-        track.smoothed_bbox = tuple(float(value) for value in old * (1.0 - self.smoothing_alpha) + new * self.smoothing_alpha)
+        blended = old * (1.0 - self.smoothing_alpha) + new * self.smoothing_alpha
+        track.smoothed_bbox = (
+            float(blended[0]), float(blended[1]), float(blended[2]), float(blended[3])
+        )
         track.last_seen_at = timestamp
         track.last_frame_number = frame_num
         track.last_score = detection.score

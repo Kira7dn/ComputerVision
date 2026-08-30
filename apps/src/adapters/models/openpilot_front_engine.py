@@ -178,12 +178,20 @@ class OpenpilotFrontEngine:
         intrinsic = raw.get("intrinsics") or []
         if len(intrinsic) != 3 or any(len(row) != 3 for row in intrinsic):
             intrinsic = [[0.0, 0.0, 0.0]] * 3
+        rows = [
+            (float(row[0]), float(row[1]), float(row[2])) for row in intrinsic
+        ]
+        intrinsics = (rows[0], rows[1], rows[2])
         return FrontCalibration(
             profile_id=str(raw.get("profile_id", "unconfigured")),
             source_width=int(raw.get("source_width", 0)),
             source_height=int(raw.get("source_height", 0)),
-            intrinsics=tuple(tuple(float(value) for value in row) for row in intrinsic),
-            rpy_calib=tuple(float(value) for value in raw.get("rpy_calib", [0.0, 0.0, 0.0])),
+            intrinsics=intrinsics,
+            rpy_calib=(
+                float((raw.get("rpy_calib") or [0.0, 0.0, 0.0])[0]),
+                float((raw.get("rpy_calib") or [0.0, 0.0, 0.0])[1]),
+                float((raw.get("rpy_calib") or [0.0, 0.0, 0.0])[2]),
+            ),
             artifact_hash=str(raw.get("artifact_hash", "")),
             valid=bool(raw.get("valid", False)),
         )

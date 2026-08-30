@@ -73,6 +73,15 @@ def test_runtime_status_handoff_is_fresh_and_latches_cv_transitions() -> None:
     assert '"recent_transitions": dms_recent_transitions' in pipeline
 
 
+def test_successful_analysis_clears_only_its_own_previous_error() -> None:
+    pipeline = (APP_ROOT / "src" / "adapters" / "deepstream" / "runtime.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'self._analysis_error.startswith(f"{function}:")' in pipeline
+    assert "self._analysis_error = None" in pipeline
+
+
 def test_dashboard_uses_webrtc_as_the_primary_live_transport() -> None:
     dashboard = (APP_ROOT / "web" / "dashboard.html").read_text(encoding="utf-8")
     app = (APP_ROOT / "web" / "src" / "App.tsx").read_text(encoding="utf-8")

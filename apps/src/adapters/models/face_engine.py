@@ -150,8 +150,8 @@ class FaceRecognitionEngine:
         self._frames_by_pts: dict[int, np.ndarray] = {}
         self._pts_order: list[int] = []
         self._last_decode_info: dict[str, int] = {}
-        self.detector = None
-        self.session = None
+        self.detector: Any = None
+        self.session: Any = None
         LOG.info(
             "face runtime: camera=%s enabled=%s trace_enabled=%s",
             self.camera_id,
@@ -464,7 +464,7 @@ class FaceRecognitionEngine:
         final_name = self._track_names.get(track_id, "unknown")
         final_score = self._track_scores.get(track_id, 0.0)
         if candidates:
-            candidate_name = max(candidates, key=candidates.get)
+            candidate_name = max(candidates, key=lambda name: candidates[name])
             weights = self._track_candidate_weights.get(track_id, {})
             candidate_score = candidates[candidate_name] / max(1e-9, weights.get(candidate_name, 1.0))
             candidate_count = counts.get(candidate_name, 0)
@@ -526,7 +526,7 @@ class FaceRecognitionEngine:
         weight = min(area, self.area_cap) * (score - self.unknown_score) * 10.0
         scores[label] = scores.get(label, 0.0) + score * weight
         weights[label] = weights.get(label, 0.0) + weight
-        best_label = max(scores, key=scores.get)
+        best_label = max(scores, key=lambda name: scores[name])
         if counts[best_label] < self.min_faces or any(
             name != best_label and counts[best_label] == count
             for name, count in counts.items()

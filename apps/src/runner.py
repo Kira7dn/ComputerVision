@@ -287,6 +287,10 @@ class CameraSupervisor:
         candidate, states = resolve_discovered_sources(source, self.discovery_resolver)
         return source, candidate, compile_worker_specs(candidate)
 
+    @staticmethod
+    def _timeline_contract(spec: CameraWorkerSpec | None) -> tuple[object, ...] | None:
+        return spec.plan.timeline_contract if spec is not None else None
+
     def reload_if_changed(self) -> None:
         try:
             signature = _file_signature(self.config_path)
@@ -302,16 +306,8 @@ class CameraSupervisor:
             timeline_changes = sorted(
                 camera_id
                 for camera_id in set(self.specs) | set(candidate_specs)
-                if (
-                    self.specs.get(camera_id).plan.timeline_contract
-                    if camera_id in self.specs
-                    else None
-                )
-                != (
-                    candidate_specs.get(camera_id).plan.timeline_contract
-                    if camera_id in candidate_specs
-                    else None
-                )
+                if self._timeline_contract(self.specs.get(camera_id))
+                != self._timeline_contract(candidate_specs.get(camera_id))
             )
             if timeline_changes:
                 raise ValueError(

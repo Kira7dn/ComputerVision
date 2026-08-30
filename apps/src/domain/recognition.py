@@ -125,7 +125,7 @@ def _weighted_face_vote(
         total_weights[name] = total_weights.get(name, 0.0) + weight
     if not weighted_scores:
         return None, 0.0
-    best_name = max(weighted_scores, key=weighted_scores.get)
+    best_name = max(weighted_scores, key=lambda name: weighted_scores[name])
     if counts[best_name] < policy.min_faces:
         return None, 0.0
     if any(name != best_name and counts[best_name] == count for name, count in counts.items()):

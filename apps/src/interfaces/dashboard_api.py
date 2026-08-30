@@ -19,6 +19,7 @@ from email.utils import formatdate
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Lock, Thread
+from typing import Any
 from urllib.parse import parse_qs, quote, urlparse
 
 import yaml
@@ -46,7 +47,7 @@ METRICS_CACHE: dict[str, tuple[float, dict[str, object]]] = {}
 STREAM_PROBE_LOCK = Lock()
 STREAM_PROBE_CACHE: dict[str, tuple[float, dict[str, object]]] = {}
 CONFIG_CACHE_LOCK = Lock()
-CONFIG_CACHE: tuple[tuple[object, ...], dict[str, object]] | None = None
+CONFIG_CACHE: tuple[tuple[object, ...], dict[str, Any]] | None = None
 SNAPSHOT_CAPTURE_LOCK = Lock()
 DASHBOARD_PORT = int(os.environ.get("CAMERA_DASHBOARD_PORT", "18080"))
 DASHBOARD_UNIX_SOCKET = os.environ.get("CAMERA_DASHBOARD_UNIX_SOCKET", "").strip()
@@ -117,7 +118,7 @@ def _config_fingerprint() -> tuple[object, ...]:
         return (id(load_raw_config), str(CONFIG_PATH), "unavailable")
 
 
-def _raw_config() -> dict[str, object]:
+def _raw_config() -> dict[str, Any]:
     """Cache the standalone YAML until its source file changes."""
     global CONFIG_CACHE
     fingerprint = _config_fingerprint()
@@ -362,11 +363,11 @@ def _processes() -> list[dict[str, int | float | str]]:
                     "ticks": ticks,
                     "start_ticks": start_ticks,
                     "rss_mb": round(rss_kb / 1024, 1),
-                }
+                }  # ty:ignore[invalid-argument-type]
             )
         except (FileNotFoundError, PermissionError, IndexError, ValueError):
             continue
-    return result
+    return result  # ty:ignore[invalid-return-type]
 
 
 def _runtime_status(camera_id: str) -> dict[str, object]:
@@ -394,7 +395,7 @@ def _mock_timeline_status() -> dict[str, object]:
         return {}
 
 
-def _runner_status() -> dict[str, object]:
+def _runner_status() -> dict[str, Any]:
     try:
         payload = json.loads(
             (_status_directory() / "runner.json").read_text(encoding="utf-8")
@@ -426,7 +427,7 @@ def _live_metadata() -> dict[str, object]:
             if isinstance(payload, dict):
                 cameras[camera_id] = payload
         timeline = _mock_timeline_status()
-        for group in (timeline.get("groups", {}) or {}).values():
+        for group in (timeline.get("groups", {}) or {}).values():  # ty:ignore[unresolved-attribute]
             if not isinstance(group, dict):
                 continue
             for camera_id, publisher in (group.get("cameras", {}) or {}).items():
@@ -435,7 +436,7 @@ def _live_metadata() -> dict[str, object]:
                     continue
                 publisher_samples = publisher.get("frame_timing_samples", [])
                 if publisher_samples and not camera_payload.get("frame_timing_samples"):
-                    camera_payload["frame_timing_samples"] = publisher_samples
+                    camera_payload["frame_timing_samples"] = publisher_samples  # ty:ignore[invalid-assignment]
         result["cameras"] = cameras
         result["mock_timeline"] = timeline
     except (OSError, TypeError, ValueError):
@@ -772,11 +773,11 @@ def _collect_metrics(stream_host: str = "localhost") -> dict[str, object]:
         last_frame_at = runtime_status.get("last_frame_at")
         last_output_at = runtime_status.get("last_output_at")
         try:
-            last_frame_age = round(max(0.0, time.time() - float(last_frame_at)), 1)
+            last_frame_age = round(max(0.0, time.time() - float(last_frame_at)), 1)  # ty:ignore[invalid-argument-type]
         except (TypeError, ValueError):
             last_frame_age = None
         try:
-            output_age = round(max(0.0, time.time() - float(last_output_at)), 1)
+            output_age = round(max(0.0, time.time() - float(last_output_at)), 1)  # ty:ignore[invalid-argument-type]
         except (TypeError, ValueError):
             output_age = None
         # This is a worker readiness signal only. The browser owns WebRTC
@@ -785,7 +786,7 @@ def _collect_metrics(stream_host: str = "localhost") -> dict[str, object]:
         worker_ready = bool(media_ready or (process and output_age is not None and output_age <= 5.0))
         ready = worker_ready
         analysis_debug = runtime_status.get("analysis_debug") or {}
-        dms_debug = analysis_debug.get("dms", {}) or {}
+        dms_debug = analysis_debug.get("dms", {}) or {}  # ty:ignore[unresolved-attribute]
         dms_metrics = dms_debug.get("metrics", {}) or {}
         camera_metrics.append(
             {
@@ -827,11 +828,11 @@ def _collect_metrics(stream_host: str = "localhost") -> dict[str, object]:
                 ),
                 "model_revisions": plan_status.get("model_revisions", {}),
                 "resource_warnings": plan_status.get("resource_warnings", []),
-                "smoking_episodes": analysis_debug.get("smoking_episodes", {}),
+                "smoking_episodes": analysis_debug.get("smoking_episodes", {}),  # ty:ignore[unresolved-attribute]
                 "dms": dms_debug,
                 "driver_attention": dms_metrics.get("driver_attention", {}),
-                "front_assistance": analysis_debug.get("front_assistance", {}),
-                "fire_smoke_runtime": analysis_debug.get("fire_smoke_runtime", {}),
+                "front_assistance": analysis_debug.get("front_assistance", {}),  # ty:ignore[unresolved-attribute]
+                "fire_smoke_runtime": analysis_debug.get("fire_smoke_runtime", {}),  # ty:ignore[unresolved-attribute]
             }
         )
 
@@ -992,7 +993,7 @@ def _configured_stream_contract() -> list[dict[str, object]]:
 def _stream_manifest(stream_host: str = "localhost") -> dict[str, object]:
     runner = _runner_status()
     timeline = _mock_timeline_status()
-    surround = (timeline.get("groups", {}) or {}).get("vehicle_surround", {}) or {}
+    surround = (timeline.get("groups", {}) or {}).get("vehicle_surround", {}) or {}  # ty:ignore[unresolved-attribute]
     surround_locked = bool(timeline.get("ready") and surround.get("locked"))
     parsed_base = urlparse(OUTPUT_RTSP_BASE)
     rtsp_port = int(parsed_base.port or 554)
@@ -1118,7 +1119,7 @@ def _snapshot_bundle(payload: dict[str, object]) -> tuple[bytes, dict[str, objec
             if camera_id not in camera_ids:
                 camera_ids.append(camera_id)
 
-    quality = int(payload.get("quality", 80) or 80)
+    quality = int(payload.get("quality", 80) or 80)  # ty:ignore[invalid-argument-type]
     if not 1 <= quality <= 100:
         raise ValueError("Chất lượng ảnh phải từ 1 đến 100.")
     incident_id = str(payload.get("incident_id") or "").strip() or None
@@ -1136,7 +1137,7 @@ def _snapshot_bundle(payload: dict[str, object]) -> tuple[bytes, dict[str, objec
         "camera_count": len(camera_ids),
         "cameras": [],
     }
-    streams = {str(item["camera_id"]): item for item in _stream_manifest().get("streams", [])}
+    streams = {str(item["camera_id"]): item for item in _stream_manifest().get("streams", [])}  # ty:ignore[not-iterable]
 
     def capture(camera_id: str) -> tuple[str, bytes | None, dict[str, object]]:
         stream = streams.get(camera_id, {})
@@ -1185,7 +1186,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def __init__(self, *args: object, **kwargs: object) -> None:
-        super().__init__(*args, directory=str(ROOT), **kwargs)
+        super().__init__(*args, directory=str(ROOT), **kwargs)  # ty:ignore[invalid-argument-type]
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
@@ -1202,7 +1203,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             metrics = collect_metrics(_stream_host_from_header(self.headers.get("Host", "")))
             runner = _runner_status()
             ready = bool(runner.get("fresh"))
-            degraded = ready and not bool((metrics.get("pipeline") or {}).get("ready"))
+            degraded = ready and not bool((metrics.get("pipeline") or {}).get("ready"))  # ty:ignore[unresolved-attribute]
             payload = json.dumps(
                 {
                     "status": "ready" if ready else "starting",
@@ -1218,7 +1219,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         if path == "/health/operational":
             metrics = collect_metrics(_stream_host_from_header(self.headers.get("Host", "")))
             pipeline = metrics.get("pipeline") or {}
-            operational = bool(pipeline.get("ready"))
+            operational = bool(pipeline.get("ready"))  # ty:ignore[unresolved-attribute]
             payload = json.dumps(
                 {
                     "status": "operational" if operational else "degraded",
@@ -1273,7 +1274,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             query = parse_qs(parsed.query)
             event_id = parts[2] if len(parts) >= 3 else ""
             feed = _event_feed()
-            event = next((item for item in feed.get("events", []) if item.get("event_id") == event_id), None)
+            event = next((item for item in feed.get("events", []) if item.get("event_id") == event_id), None)  # ty:ignore[not-iterable]
             if event is None:
                 self.send_error(404)
                 return
@@ -1394,7 +1395,7 @@ def _unix_server(path: Path) -> ThreadingUnixHTTPServer:
         if not stat.S_ISSOCK(mode):
             raise RuntimeError(f"Đường dẫn Vision API không phải socket: {path}")
         path.unlink()
-    server = ThreadingUnixHTTPServer(str(path), DashboardHandler)
+    server = ThreadingUnixHTTPServer(str(path), DashboardHandler)  # ty:ignore[invalid-argument-type]
     path.chmod(0o660)
     return server
 

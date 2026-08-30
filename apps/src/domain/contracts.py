@@ -3,19 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any
 
-try:
-    from enum import StrEnum
-except ImportError:  # Python 3.10 on the native Jetson runtime.
-    from enum import Enum
 
-    class StrEnum(str, Enum):
-        def __str__(self) -> str:
-            return str(self.value)
-
-
-class Lifecycle(StrEnum):
+class Lifecycle(str, Enum):
     START = "START"
     UPDATE = "UPDATE"
     END = "END"

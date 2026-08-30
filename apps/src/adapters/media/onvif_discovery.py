@@ -142,7 +142,8 @@ class OnvifSourceResolver:
 
     def resolve(self, camera_id: str, discovery: dict[str, object]) -> DiscoveryResult:
         interface = str(discovery.get("interface") or "eno1")
-        timeout = float(discovery.get("timeout_seconds") or 3.0)
+        timeout_value = discovery.get("timeout_seconds")
+        timeout = float(timeout_value) if isinstance(timeout_value, int | float | str) else 3.0
         devices = probe_onvif(interface, timeout)
         binding = self.store.load().get(camera_id, "")
         selected = next((item for item in devices if item.endpoint_uuid == binding), None)
@@ -164,7 +165,8 @@ class OnvifSourceResolver:
                 break
         if not host:
             return DiscoveryResult("UNAVAILABLE", endpoint_uuid=selected.endpoint_uuid, error="ONVIF XAddr has no host")
-        port = int(discovery.get("rtsp_port") or 554)
+        port_value = discovery.get("rtsp_port")
+        port = int(port_value) if isinstance(port_value, int | float | str) else 554
         path = str(discovery.get("rtsp_path") or "").strip()
         if not path.startswith("/"):
             path = "/" + path

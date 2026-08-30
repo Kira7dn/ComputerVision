@@ -125,7 +125,7 @@ class DmsAlertEventStore:
         self.pitch_threshold = float(face.get("pitch_threshold_deg", 14.0))
         self._episodes: dict[str, _AlertEpisode] = {}
         self._next_sequence: dict[str, int] = {}
-        self._metrics = {
+        self._metrics: dict[str, Any] = {
             "started_alerts": 0,
             "updated_alerts": 0,
             "ended_alerts": 0,

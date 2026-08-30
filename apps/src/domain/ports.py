@@ -17,4 +17,15 @@ class EvidencePort(Protocol):
         self, event_id: str, record_type: str, payload: dict[str, Any], **evidence: Any
     ) -> bool: ...
 
-    def finish_event(self, event_id: str, **event: Any) -> None: ...
+    def finish_event(
+        self,
+        event_id: str,
+        *,
+        classification: str | None = None,
+        identity: str | None = None,
+        payload: dict[str, Any] | None = None,
+        frame: Any = None,
+        frame_number: int | None = None,
+        bbox: tuple[float, float, float, float] | None = None,
+        score: float | None = None,
+    ) -> None: ...
