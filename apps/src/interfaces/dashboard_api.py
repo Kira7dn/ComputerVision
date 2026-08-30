@@ -5,18 +5,20 @@ import io
 import json
 import os
 import socket
+import socketserver
+import sqlite3
+import stat
 import subprocess
 import tempfile
 import time
 import uuid
 import zipfile
-from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from email.utils import formatdate
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from threading import Lock
+from threading import Lock, Thread
 from urllib.parse import parse_qs, quote, urlparse
 
 import yaml
@@ -45,11 +47,9 @@ STREAM_PROBE_LOCK = Lock()
 STREAM_PROBE_CACHE: dict[str, tuple[float, dict[str, object]]] = {}
 CONFIG_CACHE_LOCK = Lock()
 CONFIG_CACHE: tuple[tuple[object, ...], dict[str, object]] | None = None
-JOURNAL_CACHE_LOCK = Lock()
-JOURNAL_CACHE: dict[Path, dict[str, object]] = {}
-EVIDENCE_RUN_CACHE_LOCK = Lock()
-EVIDENCE_RUN_CACHE: dict[tuple[str, str], tuple[int, Path | None]] = {}
+SNAPSHOT_CAPTURE_LOCK = Lock()
 DASHBOARD_PORT = int(os.environ.get("CAMERA_DASHBOARD_PORT", "18080"))
+DASHBOARD_UNIX_SOCKET = os.environ.get("CAMERA_DASHBOARD_UNIX_SOCKET", "").strip()
 MOCK_MEDIA_PORT = int(os.environ.get("CAMERA_MOCK_MEDIA_PORT", "18081"))
 PUBLIC_HLS_PORT = int(os.environ.get("CAMERA_PUBLIC_HLS_PORT", "8888"))
 PUBLIC_WEBRTC_PORT = int(os.environ.get("CAMERA_PUBLIC_WEBRTC_PORT", "8889"))
@@ -58,6 +58,7 @@ OUTPUT_RTSP_BASE = os.environ.get(
 ).rstrip("/")
 STREAM_CAMERA_ORDER = ("DMS", "camera_front", "camera_back", "camera_left", "camera_right")
 PUBLIC_CAMERA_ORDER = ("cabin", "front", "back", "left", "right", "cargo")
+SNAPSHOT_CAMERA_ORDER = ("cabin", "front", "back", "left", "right")
 INTERNAL_TO_PUBLIC_CAMERA = {
     "DMS": "cabin",
     "camera_front": "front",
@@ -161,92 +162,22 @@ def _active_evidence_location() -> tuple[Path, str]:
     )
 
 
-def _latest_evidence_run(root: Path, prefix: str) -> Path | None:
+def _active_evidence_run() -> Path | None:
+    """Resolve the active run from runner status, with a simple stale fallback."""
+    root, prefix = _active_evidence_location()
+    runner_status = _runner_status()
+    if runner_status.get("fresh"):
+        run_id = str(runner_status.get("run_id") or "").strip()
+        if run_id:
+            active = root / f"{prefix}-{run_id}"
+            if active.is_dir():
+                return active
+            return None
     try:
-        root_mtime = root.stat().st_mtime_ns
+        runs = [path for path in root.glob(f"{prefix}-*") if path.is_dir()]
+        return max(runs, key=lambda path: path.stat().st_mtime) if runs else None
     except OSError:
         return None
-    key = (str(root), prefix)
-    with EVIDENCE_RUN_CACHE_LOCK:
-        cached = EVIDENCE_RUN_CACHE.get(key)
-        if cached is not None and cached[0] == root_mtime:
-            return cached[1]
-        runs = [path for path in root.glob(f"{prefix}-*") if path.is_dir()]
-        latest = max(runs, key=lambda path: path.stat().st_mtime) if runs else None
-        EVIDENCE_RUN_CACHE[key] = (root_mtime, latest)
-        return latest
-
-
-def _event_journal_snapshot(
-    path: Path,
-    *,
-    after: int | None,
-) -> tuple[int, tuple[tuple[int, str], ...], int]:
-    """Read only bytes appended since the previous request.
-
-    Cursor compatibility remains line-based. The cache retains complete lines
-    and a bounded set of event IDs while disk reads advance by byte offset.
-    """
-    try:
-        stat = path.stat()
-    except OSError:
-        return 0, (), 0
-    with JOURNAL_CACHE_LOCK:
-        state = JOURNAL_CACHE.get(path)
-        identity = (int(stat.st_dev), int(stat.st_ino))
-        if (
-            state is None
-            or state.get("identity") != identity
-            or int(stat.st_size) < int(state.get("offset", 0))
-        ):
-            if state is None and len(JOURNAL_CACHE) >= 4:
-                JOURNAL_CACHE.pop(next(iter(JOURNAL_CACHE)))
-            state = {
-                "identity": identity,
-                "offset": 0,
-                "pending": b"",
-                "cursor": 0,
-                "lines": deque(maxlen=10_000),
-                "event_ids": set(),
-            }
-            JOURNAL_CACHE[path] = state
-        offset = int(state["offset"])
-        if int(stat.st_size) > offset:
-            with path.open("rb") as stream:
-                stream.seek(offset)
-                chunk = stream.read()
-                state["offset"] = stream.tell()
-            payload = bytes(state["pending"]) + chunk
-            parts = payload.split(b"\n")
-            state["pending"] = parts.pop() if parts else b""
-            lines = state["lines"]
-            event_ids = state["event_ids"]
-            assert isinstance(lines, deque)
-            assert isinstance(event_ids, set)
-            for raw_line in parts:
-                line = raw_line.decode("utf-8", errors="replace")
-                state["cursor"] = int(state["cursor"]) + 1
-                lines.append((int(state["cursor"]), line))
-                if not line.strip():
-                    continue
-                try:
-                    record = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                event_id = record.get("event_id") if isinstance(record, dict) else None
-                if event_id:
-                    event_ids.add(str(event_id))
-        lines = state["lines"]
-        event_ids = state["event_ids"]
-        assert isinstance(lines, deque)
-        assert isinstance(event_ids, set)
-        cursor = int(state["cursor"])
-        selected = (
-            ()
-            if after is None
-            else tuple(item for item in lines if int(item[0]) > max(0, after))
-        )
-        return cursor, selected, len(event_ids)
 
 
 def _camera_definitions(stream_host: str = "localhost") -> list[dict[str, object]]:
@@ -515,64 +446,42 @@ def _live_metadata() -> dict[str, object]:
 def _evidence_metrics() -> dict[str, object]:
     try:
         root, prefix = _active_evidence_location()
-        latest = _latest_evidence_run(root, prefix)
+        latest = _active_evidence_run()
         if latest is None:
             return {"available": False, "run_id": None, "event_count": 0, "root": str(root)}
-        events_path = latest / "events.jsonl"
-        _cursor, _lines, event_count = _event_journal_snapshot(
-            events_path,
-            after=None,
-        )
+        with sqlite3.connect(f"file:{(latest / 'index.sqlite3').as_posix()}?mode=ro", uri=True) as db:
+            event_count = int(db.execute("SELECT COUNT(*) FROM event_list").fetchone()[0])
         return {
             "available": (latest / "manifest.json").is_file(),
             "run_id": latest.name.removeprefix(f"{prefix}-"),
             "event_count": event_count,
             "root": str(latest),
         }
-    except (OSError, TypeError, ValueError):
+    except (OSError, TypeError, ValueError, sqlite3.Error):
         return {"available": False, "run_id": None, "event_count": 0}
 
 
-def _event_feed(after: int = 0, limit: int | None = None) -> dict[str, object]:
-    """Return one latest lifecycle snapshot per event ID.
-
-    The evidence journal is append-only, but the dashboard projection is
-    keyed by event_id. START creates a row, UPDATE replaces that row, and END
-    closes that same row. This keeps lifecycle records out of the request path
-    without scanning every event directory.
-    """
+def _event_feed(limit: int = 50) -> dict[str, object]:
+    """Return the latest event rows from the SQLite event-list table."""
     try:
-        root, prefix = _active_evidence_location()
-        latest = _latest_evidence_run(root, prefix)
+        latest = _active_evidence_run()
         if latest is None:
-            return {"run_id": None, "cursor": 0, "events": []}
-        run_id = latest.name.removeprefix(f"{prefix}-")
-        events_path = latest / "events.jsonl"
-        if not events_path.is_file():
-            return {"run_id": run_id, "cursor": 0, "events": []}
-
-        requested_cursor = max(0, int(after))
-        scan_start = requested_cursor
-        cursor, lines, _event_count = _event_journal_snapshot(
-            events_path,
-            after=scan_start,
-        )
-        latest_by_event: dict[str, tuple[int, dict[str, object]]] = {}
-        for sequence, line in lines:
-            if not line.strip():
-                continue
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(record, dict):
-                continue
-            record_type = str(record.get("record_type") or "").upper()
-            if record_type not in {"START", "UPDATE", "END"}:
-                continue
-            event_id = str(record.get("event_id") or "").strip()
-            if event_id:
-                latest_by_event[event_id] = (sequence, record)
+            return {"events": []}
+        db_path = latest / "index.sqlite3"
+        if not db_path.is_file():
+            return {"events": []}
+        with sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True) as db:
+            rows = db.execute(
+                "SELECT record_json FROM event_list "
+                "ORDER BY timestamp DESC, updated_at DESC LIMIT ?",
+                (max(1, min(int(limit), 200)),),
+            ).fetchall()
+        latest_by_event = [
+            (index, record)
+            for index, row in enumerate(rows, start=1)
+            for record in (json.loads(row[0]),)
+            if isinstance(record, dict)
+        ]
 
         severity_by_function = {
             "face_recognition": ("event", "Sự kiện"),
@@ -581,10 +490,7 @@ def _event_feed(after: int = 0, limit: int | None = None) -> dict[str, object]:
             "dms": ("warning", "Cảnh báo"),
         }
         events: list[dict[str, object]] = []
-        ordered = sorted(latest_by_event.values(), key=lambda item: item[0])
-        if requested_cursor == 0 and limit is not None and limit > 0:
-            ordered = ordered[-limit:]
-        for sequence, record in ordered:
+        for sequence, record in latest_by_event:
             record_type = str(record.get("record_type") or "").upper()
             details_value = record.get("details")
             details = dict(details_value) if isinstance(details_value, dict) else {}
@@ -655,8 +561,8 @@ def _event_feed(after: int = 0, limit: int | None = None) -> dict[str, object]:
                 and thumbnail.is_file()
             ):
                 thumbnail_url = (
-                    "/api/event-thumbnail?run_id="
-                    f"{quote(run_id)}&event_path={quote(event_path.as_posix())}&variant=thumbnail"
+                    "/api/event-thumbnail?"
+                    f"event_path={quote(event_path.as_posix())}&variant=thumbnail"
                 )
             if (
                 not event_path.is_absolute()
@@ -664,8 +570,8 @@ def _event_feed(after: int = 0, limit: int | None = None) -> dict[str, object]:
                 and original.is_file()
             ):
                 image_url = (
-                    "/api/event-thumbnail?run_id="
-                    f"{quote(run_id)}&event_path={quote(event_path.as_posix())}&variant=original"
+                    "/api/event-thumbnail?"
+                    f"event_path={quote(event_path.as_posix())}&variant=original"
                 )
             lifecycle_state = str(record.get("status") or "active").lower()
             if lifecycle_state not in {"active", "ended"}:
@@ -717,20 +623,15 @@ def _event_feed(after: int = 0, limit: int | None = None) -> dict[str, object]:
                     "start_record": record if record_type == "START" else {},
                 }
             )
-        return {"run_id": run_id, "cursor": cursor, "events": events}
-    except (OSError, TypeError, ValueError):
-        return {"run_id": None, "cursor": 0, "events": []}
+        return {"events": events}
+    except (OSError, TypeError, ValueError, sqlite3.Error):
+        return {"events": []}
 
 
-def _event_thumbnail(
-    run_id: str, event_path: str, variant: str = "thumbnail"
-) -> Path | None:
+def _event_thumbnail(event_path: str, variant: str = "thumbnail") -> Path | None:
     """Resolve only a START thumbnail inside the configured latest run."""
     try:
-        root, prefix = _active_evidence_location()
-        latest = _latest_evidence_run(root, prefix)
-        if latest is not None and latest.name != f"{prefix}-{run_id}":
-            latest = None
+        latest = _active_evidence_run()
         relative = Path(event_path)
         if latest is None or relative.is_absolute() or ".." in relative.parts:
             return None
@@ -1188,10 +1089,10 @@ def _capture_rtsp_snapshot(uri: str, *, quality: int) -> bytes:
                     break
                 time.sleep(0.05)
             if captured is None or not captured.is_file():
-                raise RuntimeError("RTSP snapshot capture failed")
+                raise RuntimeError("Không chụp được ảnh RTSP.")
             data = captured.read_bytes()
             if not data or len(data) > SNAPSHOT_MAX_BYTES:
-                raise RuntimeError("RTSP snapshot is invalid or too large")
+                raise RuntimeError("Ảnh RTSP không hợp lệ.")
             return data
         finally:
             if process.poll() is None:
@@ -1205,27 +1106,27 @@ def _capture_rtsp_snapshot(uri: str, *, quality: int) -> bytes:
 
 def _snapshot_bundle(payload: dict[str, object]) -> tuple[bytes, dict[str, object]]:
     requested = payload.get("camera_ids")
-    camera_ids = list(PUBLIC_CAMERA_ORDER)
+    camera_ids = list(SNAPSHOT_CAMERA_ORDER)
     if requested is not None:
         if not isinstance(requested, list) or not requested:
-            raise ValueError("camera_ids must be a non-empty array")
+            raise ValueError("camera_ids phải là danh sách khác rỗng.")
         camera_ids = []
         for value in requested:
             camera_id = str(value).strip()
-            if camera_id not in PUBLIC_CAMERA_ORDER:
-                raise ValueError(f"unsupported camera_id: {camera_id}")
+            if camera_id not in SNAPSHOT_CAMERA_ORDER:
+                raise ValueError(f"Camera không được hỗ trợ: {camera_id}.")
             if camera_id not in camera_ids:
                 camera_ids.append(camera_id)
 
     quality = int(payload.get("quality", 80) or 80)
     if not 1 <= quality <= 100:
-        raise ValueError("quality must be between 1 and 100")
+        raise ValueError("Chất lượng ảnh phải từ 1 đến 100.")
     incident_id = str(payload.get("incident_id") or "").strip() or None
     trigger = str(payload.get("trigger") or "request").strip() or "request"
     if trigger not in {"request", "incident"}:
-        raise ValueError("trigger must be request or incident")
+        raise ValueError("trigger chỉ nhận request hoặc incident.")
     if trigger == "incident" and not incident_id:
-        raise ValueError("incident_id is required for incident trigger")
+        raise ValueError("Thiếu incident_id.")
 
     manifest = {
         "schema": "letron.vision.snapshot-bundle/v1",
@@ -1268,7 +1169,7 @@ def _snapshot_bundle(payload: dict[str, object]) -> tuple[bytes, dict[str, objec
             manifest["cameras"].append(item)
     manifest["complete"] = all(item.get("status") == "READY" for item in manifest["cameras"])
     if not captured:
-        raise RuntimeError("no camera snapshot available")
+        raise RuntimeError("Không chụp được camera nào.")
 
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_STORED) as archive:
@@ -1299,10 +1200,34 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             return
         if path == "/health/ready":
             metrics = collect_metrics(_stream_host_from_header(self.headers.get("Host", "")))
-            ready = bool((metrics.get("pipeline") or {}).get("ready"))
-            payload = json.dumps({"status": "ready" if ready else "starting"}).encode("utf-8")
+            runner = _runner_status()
+            ready = bool(runner.get("fresh"))
+            degraded = ready and not bool((metrics.get("pipeline") or {}).get("ready"))
+            payload = json.dumps(
+                {
+                    "status": "ready" if ready else "starting",
+                    "degraded": degraded,
+                }
+            ).encode("utf-8")
             self.send_response(200 if ready else 503)
             self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+        if path == "/health/operational":
+            metrics = collect_metrics(_stream_host_from_header(self.headers.get("Host", "")))
+            pipeline = metrics.get("pipeline") or {}
+            operational = bool(pipeline.get("ready"))
+            payload = json.dumps(
+                {
+                    "status": "operational" if operational else "degraded",
+                    "cameras": (_runner_status().get("cameras") or {}),
+                }
+            ).encode("utf-8")
+            self.send_response(200 if operational else 503)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
             self.wfile.write(payload)
@@ -1362,9 +1287,8 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 return
             variant = "thumbnail" if parts[3] == "thumbnail" else "original"
             start_record = event.get("start_record", {}) or {}
-            run_id = str(query.get("run_id", [start_record.get("run_id", "")])[0])
             event_path = str(query.get("event_path", [start_record.get("event_path", "")])[0])
-            thumbnail = _event_thumbnail(run_id, event_path, variant)
+            thumbnail = _event_thumbnail(event_path, variant)
             if thumbnail is None:
                 self.send_error(404)
                 return
@@ -1379,14 +1303,10 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         if path == "/api/events":
             query = parse_qs(parsed.query)
             try:
-                after = int(query.get("after", ["0"])[0])
+                limit = int(query.get("limit", ["50"])[0])
             except ValueError:
-                after = 0
-            try:
-                limit = int(query.get("limit", ["0"])[0])
-            except ValueError:
-                limit = 0
-            payload = json.dumps(_event_feed(after, limit if limit > 0 else None)).encode("utf-8")
+                limit = 50
+            payload = json.dumps(_event_feed(limit)).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Cache-Control", "no-store")
@@ -1396,10 +1316,9 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             return
         if path == "/api/event-thumbnail":
             query = parse_qs(parsed.query)
-            run_id = query.get("run_id", [""])[0]
             event_path = query.get("event_path", [""])[0]
             variant = query.get("variant", ["thumbnail"])[0]
-            thumbnail = _event_thumbnail(run_id, event_path, variant)
+            thumbnail = _event_thumbnail(event_path, variant)
             if thumbnail is None:
                 self.send_error(404)
                 return
@@ -1425,12 +1344,13 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         try:
             length = int(self.headers.get("Content-Length", "0"))
             if length < 0 or length > SNAPSHOT_MAX_BODY_BYTES:
-                raise ValueError("request body is too large")
+                raise ValueError("Dữ liệu yêu cầu quá lớn.")
             raw = self.rfile.read(length) if length else b"{}"
             payload = json.loads(raw.decode("utf-8"))
             if not isinstance(payload, dict):
-                raise ValueError("request body must be an object")
-            bundle, manifest = _snapshot_bundle(payload)
+                raise ValueError("Dữ liệu yêu cầu phải là đối tượng JSON.")
+            with SNAPSHOT_CAPTURE_LOCK:
+                bundle, manifest = _snapshot_bundle(payload)
         except (ValueError, json.JSONDecodeError) as exc:
             body = json.dumps({"ok": False, "error": str(exc)}).encode("utf-8")
             self.send_response(400)
@@ -1460,9 +1380,58 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         return
 
 
+class ThreadingUnixHTTPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+    address_family = getattr(socket, "AF_UNIX", socket.AF_INET)
+    daemon_threads = True
+
+
+def _unix_server(path: Path) -> ThreadingUnixHTTPServer:
+    if not hasattr(socket, "AF_UNIX"):
+        raise RuntimeError("Hệ điều hành không hỗ trợ Unix socket.")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        mode = path.stat().st_mode
+        if not stat.S_ISSOCK(mode):
+            raise RuntimeError(f"Đường dẫn Vision API không phải socket: {path}")
+        path.unlink()
+    server = ThreadingUnixHTTPServer(str(path), DashboardHandler)
+    path.chmod(0o660)
+    return server
+
+
 def main() -> None:
-    bind_host = os.environ.get("CAMERA_DASHBOARD_HOST", "127.0.0.1")
-    ThreadingHTTPServer((bind_host, DASHBOARD_PORT), DashboardHandler).serve_forever()
+    bind_host = os.environ.get("CAMERA_DASHBOARD_HOST")
+    if bind_host is None and not DASHBOARD_UNIX_SOCKET:
+        bind_host = "127.0.0.1"
+
+    servers: list[ThreadingHTTPServer | ThreadingUnixHTTPServer] = []
+    unix_path = Path(DASHBOARD_UNIX_SOCKET) if DASHBOARD_UNIX_SOCKET else None
+    if unix_path is not None:
+        servers.append(_unix_server(unix_path))
+    if bind_host:
+        servers.append(ThreadingHTTPServer((bind_host, DASHBOARD_PORT), DashboardHandler))
+    if not servers:
+        raise RuntimeError("Vision API chưa có địa chỉ lắng nghe.")
+
+    threads: list[Thread] = []
+    try:
+        for server in servers[1:]:
+            thread = Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            threads.append(thread)
+        servers[0].serve_forever()
+    finally:
+        for server in servers[1:]:
+            server.shutdown()
+        for server in servers:
+            server.server_close()
+        for thread in threads:
+            thread.join(timeout=2.0)
+        if unix_path is not None:
+            try:
+                unix_path.unlink()
+            except FileNotFoundError:
+                pass
 
 
 if __name__ == "__main__":

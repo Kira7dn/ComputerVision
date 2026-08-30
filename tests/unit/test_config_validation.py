@@ -30,8 +30,9 @@ def test_dev_and_production_share_the_same_five_camera_topology() -> None:
         camera_id: resolve_camera_config(dev, camera_id)["functions"]
         for camera_id in expected_ids
     }
+    assert "channel=5" in dev["cameras"][0]["source"]["url"]
+    assert "channel=5" in production["cameras"][0]["source"]["discovery"]["rtsp_path"]
     for profile in (dev, production):
-        assert "channel=5" in profile["cameras"][0]["source"]["url"]
         assert all(camera["source"].get("mock_video") for camera in profile["cameras"][1:])
         surround = profile["cameras"][1:]
         assert {camera["source"]["sync_group"] for camera in surround} == {
@@ -346,16 +347,15 @@ def test_analysis_overrides_are_isolated_per_camera() -> None:
         "Seatbelt",
         "Smoking",
     }
-    assert dahua["dms"]["alerts"] == {"on_frames": 3, "off_frames": 2}
     assert dahua["dms"]["event_policy"]["model"] == {
         "min_score": 0.35,
         "require_person_match": True,
-        "confirmation_hits": 6,
-        "confirmation_window": 10,
-        "minimum_duration_seconds": 1.0,
-        "candidate_timeout_seconds": 3.0,
-        "clear_seconds": 2.0,
-        "unknown_timeout_seconds": 1.5,
+        "confirmation_hits": 2,
+        "confirmation_window": 3,
+        "minimum_duration_seconds": 0.2,
+        "candidate_timeout_seconds": 1.0,
+        "clear_seconds": 0.4,
+        "unknown_timeout_seconds": 0.8,
         "trace_interval_ms": 2000,
     }
     assert dahua["dms"]["event_policy"]["no_seatbelt"]["confirmation_hits"] == 12

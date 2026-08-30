@@ -35,7 +35,11 @@ def test_snapshot_bundle_captures_requested_cameras(monkeypatch) -> None:
     )
 
     bundle, manifest = dashboard_api._snapshot_bundle(
-        {"camera_ids": list(frames), "trigger": "request", "quality": 80}
+        {
+            "camera_ids": list(frames),
+            "trigger": "request",
+            "quality": 80,
+        }
     )
 
     assert manifest["schema"] == "letron.vision.snapshot-bundle/v1"
@@ -51,3 +55,35 @@ def test_snapshot_bundle_captures_requested_cameras(monkeypatch) -> None:
             item = next(item for item in archived_manifest["cameras"] if item["camera_id"] == camera_id)
             assert item["sha256"] == hashlib.sha256(data).hexdigest()
             assert archive.read(item["filename"]) == data
+
+
+def test_snapshot_defaults_to_physical_cameras(monkeypatch) -> None:
+    camera_ids = set(dashboard_api.SNAPSHOT_CAMERA_ORDER)
+    monkeypatch.setattr(
+        dashboard_api,
+        "_stream_manifest",
+        lambda: {
+            "streams": [
+                {
+                    "camera_id": camera_id,
+                    "rtsp_path": f"/{camera_id}",
+                    "state": "READY",
+                    "published": True,
+                }
+                for camera_id in camera_ids
+            ]
+        },
+    )
+    captured: list[str] = []
+
+    def capture(uri: str, *, quality: int) -> bytes:
+        captured.append(uri.rsplit("/", 1)[-1])
+        return b"jpeg"
+
+    monkeypatch.setattr(dashboard_api, "_capture_rtsp_snapshot", capture)
+
+    _bundle, manifest = dashboard_api._snapshot_bundle({"trigger": "request"})
+
+    assert set(captured) == camera_ids
+    assert "cargo" not in captured
+    assert manifest["camera_count"] == 5

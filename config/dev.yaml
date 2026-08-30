@@ -96,6 +96,8 @@ cameras:
       ldw_clear_observations: 20
       fcw_brake_probability: 0.09
       fcw_clear_probability: 0.05
+      fcw_confirmation_hits: 3
+      fcw_confirmation_window: 5
       fcw_clear_observations: 20
       lead_probability: 0.65
       lead_clear_probability: 0.4
@@ -331,12 +333,12 @@ dms:
     model:
       min_score: 0.35
       require_person_match: true
-      confirmation_hits: 6
-      confirmation_window: 10
-      minimum_duration_seconds: 1.0
-      candidate_timeout_seconds: 3.0
-      clear_seconds: 2.0
-      unknown_timeout_seconds: 1.5
+      confirmation_hits: 2
+      confirmation_window: 3
+      minimum_duration_seconds: 0.2
+      candidate_timeout_seconds: 1.0
+      clear_seconds: 0.4
+      unknown_timeout_seconds: 0.8
       trace_interval_ms: 1000
     face:
       confirmation_hits: 5
@@ -354,9 +356,6 @@ dms:
       clear_seconds: 2.0
       unknown_timeout_seconds: 1.5
       trace_interval_ms: 1000
-  alerts:
-    on_frames: 3
-    off_frames: 2
   interval_ms: 200
 fire_smoke:
   onnx_path: /opt/ls-vision/models/fire_smoke/best.onnx

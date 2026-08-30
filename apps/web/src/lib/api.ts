@@ -9,8 +9,6 @@ export function fetchMetrics(): Promise<MetricsResponse> {
   return getJson<MetricsResponse>('/api/metrics')
 }
 
-export function fetchEvents(after: number, limit?: number): Promise<EventsResponse> {
-  const params = new URLSearchParams({ after: String(after) })
-  if (limit !== undefined) params.set('limit', String(limit))
-  return getJson<EventsResponse>(`/api/events?${params.toString()}`)
+export function fetchEvents(): Promise<EventsResponse> {
+  return getJson<EventsResponse>('/api/events')
 }

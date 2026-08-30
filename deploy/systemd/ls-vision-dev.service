@@ -1,12 +1,13 @@
 [Unit]
 Description=LS-Vision Jetson development runtime with source supervisor
-After=network-online.target
-Wants=network-online.target
 
 [Service]
 Type=simple
 User=letron
 Group=letron
+RuntimeDirectory=ls-vision
+RuntimeDirectoryMode=0750
+UMask=0007
 WorkingDirectory=/opt/ls-vision-dev/current/app
 EnvironmentFile=/etc/ls-vision/ls-vision-dev.env
 Environment=PYTHONPATH=/opt/ls-vision-dev/current/app/src
@@ -20,6 +21,7 @@ Environment=CAMERA_STATE_DIR=/opt/ls-vision-dev/data/state
 Environment=CAMERA_STATUS_DIR=/opt/ls-vision-dev/data/status
 Environment=CAMERA_DASHBOARD_HOST=0.0.0.0
 Environment=CAMERA_DASHBOARD_PORT=28080
+Environment=CAMERA_DASHBOARD_UNIX_SOCKET=/run/ls-vision/api.sock
 Environment=CAMERA_MOCK_MEDIA_PORT=18081
 Environment=CAMERA_INPUT_RTSP_BASE=rtsp://127.0.0.1:28554
 Environment=CAMERA_OUTPUT_RTSP_BASE=rtsp://127.0.0.1:28554

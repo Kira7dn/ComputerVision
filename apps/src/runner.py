@@ -9,6 +9,7 @@ import subprocess
 import sys
 import time
 import uuid
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 import yaml
 
+from adapters.media.onvif_discovery import CameraBindingStore, OnvifSourceResolver
 from adapters.persistence.evidence_repository import run_directory, write_manifest
 from application.pipeline_compiler import compile_camera_plan
 from bootstrap.config import (
@@ -49,7 +51,53 @@ def compile_worker_specs(config: dict[str, Any]) -> dict[str, CameraWorkerSpec]:
             compile_camera_plan(resolve_camera_config(config, camera_id)),
         )
         for camera_id in camera_ids(config)
+        if not _camera_waiting_for_discovery(config, camera_id)
     }
+
+
+def _raw_camera(config: dict[str, Any], camera_id: str) -> dict[str, Any]:
+    return next(
+        (
+            item
+            for item in config.get("cameras", []) or []
+            if isinstance(item, dict) and str(item.get("id")) == camera_id
+        ),
+        {},
+    )
+
+
+def _camera_waiting_for_discovery(config: dict[str, Any], camera_id: str) -> bool:
+    source = _raw_camera(config, camera_id).get("source", {}) or {}
+    return bool(source.get("discovery")) and not bool(source.get("url") or source.get("rtsp_url"))
+
+
+def resolve_discovered_sources(
+    config: dict[str, Any],
+    resolver: OnvifSourceResolver,
+) -> tuple[dict[str, Any], dict[str, dict[str, str]]]:
+    resolved = deepcopy(config)
+    states: dict[str, dict[str, str]] = {}
+    for camera in resolved.get("cameras", []) or []:
+        if not isinstance(camera, dict):
+            continue
+        source = camera.get("source", {}) or {}
+        discovery = source.get("discovery")
+        if not isinstance(discovery, dict):
+            continue
+        camera_id = str(camera.get("id") or "")
+        result = resolver.resolve(camera_id, discovery)
+        source["discovery_state"] = result.state
+        source["endpoint_uuid"] = result.endpoint_uuid
+        source.pop("url", None)
+        source.pop("rtsp_url", None)
+        if result.rtsp_url:
+            source["url"] = result.rtsp_url
+        states[camera_id] = {
+            "state": result.state,
+            "endpoint_uuid": result.endpoint_uuid,
+            "error": result.error,
+        }
+    return resolved, states
 
 
 def active_camera_definitions(config: dict[str, Any]) -> list[dict[str, Any]]:
@@ -61,10 +109,24 @@ def active_camera_definitions(config: dict[str, Any]) -> list[dict[str, Any]]:
     }
     definitions: list[dict[str, Any]] = []
     for camera_id in camera_ids(config):
+        raw_camera = raw_cameras.get(camera_id, {})
+        raw_source = raw_camera.get("source", {}) or {}
+        if _camera_waiting_for_discovery(config, camera_id):
+            definitions.append(
+                {
+                    "id": camera_id,
+                    "display_name": raw_camera.get("display_name"),
+                    "source": None,
+                    "source_type": raw_source.get("type", "rtsp"),
+                    "state": raw_source.get("discovery_state", "UNAVAILABLE"),
+                    "media_only": False,
+                    "functions": raw_camera.get("functions", {}),
+                }
+            )
+            continue
         resolved = resolve_camera_config(config, camera_id)
         input_config = resolved.get("input", {}) or {}
         output = resolved.get("output", {}) or {}
-        raw_camera = raw_cameras.get(camera_id, {})
         source = input_config.get("mock_video") or input_config.get("rtsp_url")
         if source and not input_config.get("mock_video"):
             parsed = urlsplit(str(source))
@@ -94,6 +156,7 @@ def active_camera_definitions(config: dict[str, Any]) -> list[dict[str, Any]]:
                 or output.get("rtsp_url"),
                 "output_video_published": bool(output.get("publish_video", True)),
                 "functions": resolved.get("functions", {}),
+                "state": raw_source.get("discovery_state", "READY"),
             }
         )
     return definitions
@@ -114,11 +177,19 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
 class CameraSupervisor:
     def __init__(self, config_path: Path, raw_config: dict[str, Any], run_id: str) -> None:
         self.config_path = config_path
-        self.raw_config = raw_config
+        self.source_config = raw_config
         self.run_id = run_id
         self.run_root = run_directory(raw_config, run_id)
-        self.specs = compile_worker_specs(raw_config)
-        self.active_cameras = active_camera_definitions(raw_config)
+        runtime = raw_config.get("runtime", {}) or {}
+        state_directory = Path(str(runtime.get("state_directory", "/opt/ls-vision/data/state")))
+        self.discovery_resolver = OnvifSourceResolver(
+            CameraBindingStore(state_directory / "camera-bindings.json")
+        )
+        self.raw_config, self.discovery_states = resolve_discovered_sources(
+            raw_config, self.discovery_resolver
+        )
+        self.specs = compile_worker_specs(self.raw_config)
+        self.active_cameras = active_camera_definitions(self.raw_config)
         self.workers: dict[str, subprocess.Popen[bytes]] = {}
         self.restart_at: dict[str, float] = {
             camera_id: 0.0 for camera_id, spec in self.specs.items() if not spec.media_only
@@ -129,7 +200,7 @@ class CameraSupervisor:
         self.generation = 1
         self.reload_error: str | None = None
         self.last_restarted_cameras: list[str] = []
-        runtime = raw_config.get("runtime", {}) or {}
+        self.next_discovery_at = time.monotonic() + self._discovery_interval()
         evidence = raw_config.get("evidence", {}) or {}
         self.active_runtime = {
             "status_directory": runtime.get("status_directory"),
@@ -167,10 +238,14 @@ class CameraSupervisor:
         ]
 
     def start_worker(self, camera_id: str) -> None:
+        environment = _environment()
+        source = _raw_camera(self.raw_config, camera_id).get("source", {}) or {}
+        if source.get("discovery") and source.get("url"):
+            environment["CAMERA_DISCOVERED_RTSP_URL"] = str(source["url"])
         worker = subprocess.Popen(
             self._command_for(camera_id),
             cwd=str(Path(__file__).resolve().parents[1]),
-            env=_environment(),
+            env=environment,
         )
         self.workers[camera_id] = worker
         self.worker_started_at[camera_id] = time.monotonic()
@@ -201,15 +276,16 @@ class CameraSupervisor:
             self.stop_worker(camera_id)
 
     def start(self) -> None:
-        write_manifest(self.raw_config, self.run_id, self.run_root)
+        write_manifest(self.source_config, self.run_id, self.run_root)
         print(f"run_id={self.run_id} evidence_root={self.run_root}", flush=True)
         for camera_id in self.worker_ids:
             self.start_worker(camera_id)
         self.write_status()
 
-    def _load_candidate(self) -> tuple[dict[str, Any], dict[str, CameraWorkerSpec]]:
-        candidate = validate_config(load_raw_config(self.config_path), self.config_path)
-        return candidate, compile_worker_specs(candidate)
+    def _load_candidate(self) -> tuple[dict[str, Any], dict[str, Any], dict[str, CameraWorkerSpec]]:
+        source = validate_config(load_raw_config(self.config_path), self.config_path)
+        candidate, states = resolve_discovered_sources(source, self.discovery_resolver)
+        return source, candidate, compile_worker_specs(candidate)
 
     def reload_if_changed(self) -> None:
         try:
@@ -222,7 +298,7 @@ class CameraSupervisor:
             return
         self.observed_signature = signature
         try:
-            candidate, candidate_specs = self._load_candidate()
+            source_candidate, candidate, candidate_specs = self._load_candidate()
             timeline_changes = sorted(
                 camera_id
                 for camera_id in set(self.specs) | set(candidate_specs)
@@ -263,7 +339,17 @@ class CameraSupervisor:
         for camera_id in stopped:
             self.stop_worker(camera_id)
 
+        self.source_config = source_candidate
         self.raw_config = candidate
+        self.discovery_states = {
+            camera_id: {
+                "state": str((_raw_camera(candidate, camera_id).get("source", {}) or {}).get("discovery_state", "READY")),
+                "endpoint_uuid": str((_raw_camera(candidate, camera_id).get("source", {}) or {}).get("endpoint_uuid", "")),
+                "error": "",
+            }
+            for camera_id in camera_ids(candidate)
+            if (_raw_camera(candidate, camera_id).get("source", {}) or {}).get("discovery")
+        }
         self.specs = candidate_specs
         self.active_cameras = active_camera_definitions(candidate)
         runtime = candidate.get("runtime", {}) or {}
@@ -282,12 +368,52 @@ class CameraSupervisor:
             self.worker_epochs.setdefault(camera_id, 0)
         for camera_id in started:
             self.start_worker(camera_id)
-        write_manifest(self.raw_config, self.run_id, self.run_root)
+        write_manifest(self.source_config, self.run_id, self.run_root)
         print(
             f"[supervisor] config generation={self.generation} "
             f"restarted={self.last_restarted_cameras}",
             flush=True,
         )
+        self.write_status()
+
+    def _discovery_interval(self) -> float:
+        intervals = [
+            float(((_raw_camera(self.source_config, camera_id).get("source", {}) or {}).get("discovery", {}) or {}).get("refresh_seconds", 10))
+            for camera_id in camera_ids(self.source_config)
+            if (_raw_camera(self.source_config, camera_id).get("source", {}) or {}).get("discovery")
+        ]
+        return max(2.0, min(intervals, default=10.0))
+
+    def refresh_discovery(self) -> None:
+        now = time.monotonic()
+        if now < self.next_discovery_at:
+            return
+        self.next_discovery_at = now + self._discovery_interval()
+        candidate, states = resolve_discovered_sources(self.source_config, self.discovery_resolver)
+        candidate_specs = compile_worker_specs(candidate)
+        old_ids = set(self.worker_ids)
+        new_ids = {camera_id for camera_id, spec in candidate_specs.items() if not spec.media_only}
+        changed = {
+            camera_id
+            for camera_id in old_ids & new_ids
+            if self.specs[camera_id].plan.plan_hash != candidate_specs[camera_id].plan.plan_hash
+        }
+        if not changed and old_ids == new_ids and states == self.discovery_states:
+            return
+        for camera_id in sorted((old_ids - new_ids) | changed):
+            self.stop_worker(camera_id)
+        self.raw_config = candidate
+        self.discovery_states = states
+        self.specs = candidate_specs
+        self.active_cameras = active_camera_definitions(candidate)
+        self.generation += 1
+        self.last_restarted_cameras = sorted(changed | (old_ids ^ new_ids))
+        for camera_id in new_ids:
+            self.restart_at.setdefault(camera_id, 0.0)
+            self.restart_attempts.setdefault(camera_id, 0)
+            self.worker_epochs.setdefault(camera_id, 0)
+        for camera_id in sorted((new_ids - old_ids) | changed):
+            self.start_worker(camera_id)
         self.write_status()
 
     def maintain_workers(self) -> None:
@@ -326,23 +452,35 @@ class CameraSupervisor:
                 "last_restarted_cameras": self.last_restarted_cameras,
                 "active_cameras": self.active_cameras,
                 "active_runtime": self.active_runtime,
+                "discovery": self.discovery_states,
                 "cameras": {
-                    camera_id: {
-                        **spec.plan.status(),
-                        "config_generation": self.generation,
-                        "media_only": spec.media_only,
-                        "pid": (
-                            self.workers[camera_id].pid
-                            if camera_id in self.workers
-                            and self.workers[camera_id].poll() is None
-                            else None
-                        ),
-                        "worker_epoch": self.worker_epochs.get(camera_id, 0),
-                    }
-                    for camera_id, spec in self.specs.items()
+                    camera_id: self._camera_status(camera_id)
+                    for camera_id in camera_ids(self.raw_config)
                 },
             },
         )
+
+    def _camera_status(self, camera_id: str) -> dict[str, Any]:
+        spec = self.specs.get(camera_id)
+        if spec is None:
+            discovery = self.discovery_states.get(camera_id, {})
+            return {
+                "state": discovery.get("state", "UNAVAILABLE"),
+                "error": discovery.get("error", "source unavailable"),
+                "config_generation": self.generation,
+                "media_only": False,
+                "pid": None,
+                "worker_epoch": self.worker_epochs.get(camera_id, 0),
+            }
+        running = camera_id in self.workers and self.workers[camera_id].poll() is None
+        return {
+            **spec.plan.status(),
+            "state": "RUNNING" if running else "STARTING",
+            "config_generation": self.generation,
+            "media_only": spec.media_only,
+            "pid": self.workers[camera_id].pid if running else None,
+            "worker_epoch": self.worker_epochs.get(camera_id, 0),
+        }
 
 
 def _environment() -> dict[str, str]:
@@ -381,6 +519,7 @@ def main() -> int:
         supervisor.start()
         while not supervisor.stopping:
             supervisor.reload_if_changed()
+            supervisor.refresh_discovery()
             supervisor.maintain_workers()
             supervisor.write_status()
             time.sleep(POLL_SECONDS)

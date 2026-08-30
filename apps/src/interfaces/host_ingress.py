@@ -9,7 +9,7 @@ MAX_HEADER_BYTES = 64 * 1024
 
 
 class HostRoutingHandler(socketserver.BaseRequestHandler):
-    vision_upstream: tuple[str, int]
+    vision_unix_socket: str
     default_upstream: tuple[str, int]
 
     def handle(self) -> None:
@@ -28,11 +28,14 @@ class HostRoutingHandler(socketserver.BaseRequestHandler):
             if separator and name.strip().lower() == b"host":
                 host = value.strip().decode("ascii", errors="ignore").split(":", 1)[0].lower()
                 break
-        upstream_address = (
-            self.vision_upstream if host == "vision.local" else self.default_upstream
-        )
+        use_vision = host == "vision.local"
         try:
-            upstream = socket.create_connection(upstream_address, timeout=5.0)
+            if use_vision:
+                upstream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                upstream.settimeout(5.0)
+                upstream.connect(self.vision_unix_socket)
+            else:
+                upstream = socket.create_connection(self.default_upstream, timeout=5.0)
         except OSError:
             self.request.sendall(
                 b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
@@ -73,7 +76,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Host-routing ingress for LS-Vision and T-Box")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=80)
-    parser.add_argument("--vision-upstream", default="127.0.0.1:18080")
+    parser.add_argument("--vision-unix-socket", default="/run/ls-vision/api.sock")
     parser.add_argument("--default-upstream", default="127.0.0.1:8000")
     args = parser.parse_args()
 
@@ -85,7 +88,7 @@ def main() -> int:
         "ConfiguredHostRoutingHandler",
         (HostRoutingHandler,),
         {
-            "vision_upstream": address(args.vision_upstream),
+            "vision_unix_socket": args.vision_unix_socket,
             "default_upstream": address(args.default_upstream),
         },
     )

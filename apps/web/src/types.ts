@@ -200,8 +200,6 @@ export interface EventRecord {
 }
 
 export interface EventsResponse {
-  run_id: string | null
-  cursor: number
   events: EventRecord[]
 }
 

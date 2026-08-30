@@ -48,6 +48,20 @@ def _supervisor(tmp_path: Path, monkeypatch) -> tuple[runner.CameraSupervisor, P
     _write_config(config_path, raw)
     monkeypatch.setattr(runner, "write_manifest", lambda *args: None)
     monkeypatch.setattr(runner, "validate_config", lambda config, _path: config)
+    def resolve_with_test_camera(config, resolver):
+        candidate = deepcopy(config)
+        dms = next(item for item in candidate["cameras"] if item["id"] == "DMS")
+        dms["source"]["url"] = "rtsp://192.0.2.10:554/cam/realmonitor?channel=5&subtype=0"
+        dms["source"]["discovery_state"] = "READY"
+        return candidate, {
+            "DMS": {
+                "state": "READY",
+                "endpoint_uuid": "urn:uuid:test-camera",
+                "error": "",
+            }
+        }
+
+    monkeypatch.setattr(runner, "resolve_discovered_sources", resolve_with_test_camera)
     monkeypatch.setattr(
         runner.subprocess,
         "Popen",

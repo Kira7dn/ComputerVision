@@ -81,35 +81,47 @@ def test_dashboard_keeps_last_valid_config_when_yaml_is_malformed(
     assert dashboard_api._raw_config()["profile"] == "dev"
 
 
-def test_event_journal_reads_only_appended_lines(tmp_path) -> None:
-    journal = tmp_path / "events.jsonl"
-    first = {"record_type": "START", "event_id": "event-1"}
-    second = {"record_type": "UPDATE", "event_id": "event-1"}
-    journal.write_text(
-        "\n".join(json.dumps(item) for item in (first, second)) + "\n",
-        encoding="utf-8",
-    )
-    dashboard_api.JOURNAL_CACHE.clear()
+def test_active_evidence_run_uses_runner_run_id_not_directory_cache(
+    tmp_path, monkeypatch
+) -> None:
+    root = tmp_path / "evidence"
+    old_run = root / "snapshots-acceptance-old"
+    active_run = root / "snapshots-acceptance-active"
+    old_run.mkdir(parents=True)
+    active_run.mkdir(parents=True)
 
-    cursor, lines, event_count = dashboard_api._event_journal_snapshot(
-        journal,
-        after=0,
+    monkeypatch.setattr(
+        dashboard_api,
+        "_active_evidence_location",
+        lambda: (root, "snapshots-acceptance"),
     )
-    assert cursor == 2
-    assert len(lines) == 2
-    assert event_count == 1
-
-    third = {"record_type": "START", "event_id": "event-2"}
-    with journal.open("a", encoding="utf-8") as stream:
-        stream.write(json.dumps(third) + "\n")
-
-    cursor, lines, event_count = dashboard_api._event_journal_snapshot(
-        journal,
-        after=2,
+    monkeypatch.setattr(
+        dashboard_api,
+        "_runner_status",
+        lambda: {"fresh": True, "run_id": "active"},
     )
-    assert cursor == 3
-    assert [json.loads(line)["event_id"] for _sequence, line in lines] == ["event-2"]
-    assert event_count == 2
+
+    assert dashboard_api._active_evidence_run() == active_run
+
+
+def test_evidence_metrics_degrade_cleanly_before_index_exists(
+    tmp_path, monkeypatch
+) -> None:
+    active_run = tmp_path / "snapshots-acceptance-active"
+    active_run.mkdir()
+    monkeypatch.setattr(dashboard_api, "_active_evidence_run", lambda: active_run)
+    monkeypatch.setattr(
+        dashboard_api,
+        "_active_evidence_location",
+        lambda: (tmp_path, "snapshots-acceptance"),
+    )
+
+    assert dashboard_api._evidence_metrics() == {
+        "available": False,
+        "run_id": None,
+        "event_count": 0,
+    }
+    assert dashboard_api._event_feed() == {"events": []}
 
 
 def test_jetson_gpu_metrics_use_sysfs_when_nvidia_smi_is_not_supported(

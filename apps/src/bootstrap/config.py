@@ -125,8 +125,21 @@ def validate_config(config: dict[str, Any], path: Path | None = None) -> dict[st
                     f"camera {camera_id} media_only requires sync_group and positive sync_period_seconds"
                 )
         source_url = str(source.get("url", source.get("rtsp_url", "")))
+        discovery = source.get("discovery")
+        if discovery is not None:
+            if source_type != "rtsp" or not isinstance(discovery, dict):
+                raise ValueError(f"camera {camera_id} discovery requires an RTSP source mapping")
+            if str(discovery.get("protocol") or "").lower() != "onvif":
+                raise ValueError(f"camera {camera_id} discovery.protocol must be onvif")
+            if not str(discovery.get("interface") or "").strip():
+                raise ValueError(f"camera {camera_id} discovery.interface is required")
+            if not str(discovery.get("rtsp_path") or "").startswith("/"):
+                raise ValueError(f"camera {camera_id} discovery.rtsp_path must start with /")
+        if not source_url and discovery is None:
+            raise ValueError(f"camera {camera_id} source URL is required")
         output_url = str((camera.get("output", {}) or {}).get("rtsp_url", ""))
-        for label, value in (("source", source_url), ("output", output_url)):
+        urls = (("output", output_url),) if discovery is not None else (("source", source_url), ("output", output_url))
+        for label, value in urls:
             parsed = urlsplit(value)
             if parsed.scheme not in {"rtsp", "rtsps", "rtmp"} or not parsed.netloc:
                 raise ValueError(f"camera {camera_id} {label} URL is invalid: {value}")
@@ -795,13 +808,19 @@ def resolve_camera_config(config: dict[str, Any], camera_id: str | None = None) 
         }
     )
     runtime_environment = _runtime_environment()
+    discovered_url = runtime_environment.get("CAMERA_DISCOVERED_RTSP_URL", "").strip()
+    if discovered_url and source.get("discovery"):
+        input_config["rtsp_url"] = discovered_url
+        input_config["discovery_state"] = "READY"
+    elif source.get("discovery"):
+        input_config["discovery_state"] = str(source.get("discovery_state") or "UNAVAILABLE")
     username_env = source.get("username_env")
     password_env = source.get("password_env")
     if username_env:
         input_config["rtsp_username"] = runtime_environment.get(str(username_env), "")
     if password_env:
         input_config["rtsp_password"] = runtime_environment.get(str(password_env), "")
-    if not input_config.get("rtsp_url"):
+    if not input_config.get("rtsp_url") and not source.get("discovery"):
         raise ValueError(f"camera {camera_id} source must define url/rtsp_url")
     input_base = runtime_environment.get("CAMERA_INPUT_RTSP_BASE", "").rstrip("/")
     input_url = str(input_config["rtsp_url"])

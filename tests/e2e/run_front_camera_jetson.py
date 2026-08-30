@@ -44,7 +44,7 @@ def remote_snapshot(alias: str, profile: str) -> dict[str, Any]:
             "printf '\\n'",
             f"cat {root}/data/status/DMS.json",
             "printf '\\n'",
-            "curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:18080/health/ready",
+            "curl --unix-socket /run/ls-vision/api.sock -sS -o /dev/null -w '%{http_code}' http://localhost/health/ready",
             "printf '\\n'",
             "curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:8888/camera_front/index.m3u8",
             "printf '\\n'",

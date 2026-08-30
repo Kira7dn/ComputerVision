@@ -94,6 +94,12 @@ class EvidenceStore:
             "idempotency_key TEXT PRIMARY KEY, path TEXT NOT NULL, "
             "kind TEXT NOT NULL, created_at REAL NOT NULL)"
         )
+        self.db.execute(
+            "CREATE TABLE IF NOT EXISTS event_list ("
+            "event_id TEXT PRIMARY KEY, timestamp REAL NOT NULL, "
+            "event_path TEXT NOT NULL, record_json TEXT NOT NULL, "
+            "updated_at REAL NOT NULL)"
+        )
         self.db.commit()
         manifest = self.root / "manifest.json"
         if not manifest.exists():
@@ -176,6 +182,21 @@ class EvidenceStore:
         }
         with path.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(summary, separators=(",", ":")) + "\n")
+        self.db.execute(
+            "INSERT INTO event_list(event_id,timestamp,event_path,record_json,updated_at) "
+            "VALUES(?,?,?,?,?) "
+            "ON CONFLICT(event_id) DO UPDATE SET "
+            "timestamp=excluded.timestamp,event_path=excluded.event_path,"
+            "record_json=excluded.record_json,updated_at=excluded.updated_at",
+            (
+                str(summary["event_id"]),
+                float(summary["timestamp"]),
+                str(summary["event_path"]),
+                json.dumps(summary, separators=(",", ":")),
+                time.time(),
+            ),
+        )
+        self.db.commit()
 
     @staticmethod
     def _annotation_label(event: dict[str, Any], payload: dict[str, Any], score: float | None) -> str:

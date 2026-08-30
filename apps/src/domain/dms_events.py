@@ -23,9 +23,14 @@ BBox = tuple[float, float, float, float]
 
 MODEL_ALERTS = frozenset(
     {
+        "Distracted",
         "Smoking",
         "Drinking",
         "Eating",
+        "PhoneUse",
+        "Drowsy",
+        "SafeDriving",
+        "Seatbelt",
     }
 )
 ALL_ALERTS = tuple(sorted(MODEL_ALERTS | {"No Seatbelt", ATTENTION_EVENT_LABEL}))

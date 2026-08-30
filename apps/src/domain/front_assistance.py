@@ -272,6 +272,8 @@ class VisionAlertPolicy:
         self.fcw_clear_observations = int(
             raw.get("fcw_clear_observations", fcw_clear_observations)
         )
+        self.fcw_confirmation_hits = int(raw.get("fcw_confirmation_hits", 3))
+        self.fcw_confirmation_window = int(raw.get("fcw_confirmation_window", 5))
         self.lead_probability = float(raw.get("lead_probability", 0.7))
         self.lead_clear_probability = float(raw.get("lead_clear_probability", 0.5))
         self.lead_min_distance_m = float(raw.get("lead_min_distance_m", 1.0))
@@ -305,6 +307,7 @@ class VisionAlertPolicy:
         )
         self._validate_thresholds()
         self._windows = {
+            "vision_fcw": deque(maxlen=self.fcw_confirmation_window),
             "vision_ldw_left": deque(maxlen=self.ldw_confirmation_window),
             "vision_ldw_right": deque(maxlen=self.ldw_confirmation_window),
             "vision_lead_ttc": deque(maxlen=self.lead_confirmation_window),
@@ -313,6 +316,7 @@ class VisionAlertPolicy:
             "vision_geometry_drift": deque(maxlen=self.geometry_trigger_window),
         }
         self._confirmation_hits = {
+            "vision_fcw": self.fcw_confirmation_hits,
             "vision_ldw_left": self.ldw_confirmation_hits,
             "vision_ldw_right": self.ldw_confirmation_hits,
             "vision_lead_ttc": self.lead_confirmation_hits,
@@ -349,6 +353,7 @@ class VisionAlertPolicy:
             and self.ldw_clear_observations >= 1
             and 0.0 <= self.fcw_clear_probability < self.fcw_brake_probability <= 1.0
             and self.fcw_clear_observations >= 1
+            and 1 <= self.fcw_confirmation_hits <= self.fcw_confirmation_window
             and 0.0 <= self.lead_clear_probability < self.lead_probability <= 1.0
             and 0.0 < self.lead_min_distance_m < self.lead_max_distance_m
             and self.lead_min_closing_speed_mps > 0.0
@@ -529,6 +534,7 @@ class VisionAlertPolicy:
                 1.0 if perception.hard_brake_predicted else fcw_score,
                 {
                     "fcw_brake_probability": fcw_score,
+                    "hard_brake_predicted": perception.hard_brake_predicted,
                     "hard_brake_3_probs": list(perception.hard_brake_3_probs),
                     "hard_brake_5_probs": list(perception.hard_brake_5_probs),
                 },
@@ -761,9 +767,12 @@ class VisionAlertPolicy:
                 if label in self._windows:
                     window = self._windows[label]
                     window.append(signal.positive)
-                    confirmed = signal.positive if label in self._active else (
-                        len(window) == window.maxlen
-                        and sum(window) >= self._confirmation_hits[label]
+                    confirmed = signal.positive and (
+                        label in self._active
+                        or (
+                            len(window) == window.maxlen
+                            and sum(window) >= self._confirmation_hits[label]
+                        )
                     )
                 else:
                     confirmed = signal.positive

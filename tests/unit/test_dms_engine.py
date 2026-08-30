@@ -7,7 +7,6 @@ import pytest
 
 from adapters.models import dms_engine as dms_engine_module
 from adapters.models.dms_engine import (
-    AlertSmoother,
     DmsBehaviorEngine,
     DmsDetection,
     NeutralPoseCalibrator,
@@ -114,26 +113,6 @@ def _result(
         },
         detections=detections,
     )
-
-
-def test_dms_alert_smoother_matches_reference_hysteresis() -> None:
-    smoother = AlertSmoother(on_frames=3, off_frames=2)
-
-    assert smoother.update(["Smoking"]) == []
-    assert smoother.update(["Smoking"]) == []
-    assert smoother.update(["Smoking"]) == ["Smoking"]
-    assert smoother.update([]) == ["Smoking"]
-    assert smoother.update([]) == ["Smoking"]
-    assert smoother.update([]) == ["Smoking"]
-    assert smoother.update([]) == ["Smoking"]
-    assert smoother.update([]) == []
-
-
-def test_dms_alert_smoother_ignores_non_alert_classes() -> None:
-    smoother = AlertSmoother()
-    assert smoother.update(["Safe Driving", "Seatbelt"]) == []
-    assert smoother.update(["Safe Driving", "Seatbelt"]) == []
-    assert smoother.update(["Safe Driving", "Seatbelt"]) == []
 
 
 def test_dms_face_inference_uses_configured_interval_and_cached_result(monkeypatch) -> None:
@@ -317,9 +296,9 @@ def test_low_score_smoking_never_becomes_an_event(tmp_path) -> None:
             result=_result(detections=(seatbelt, low_smoking)),
             frame=None,
         )
-        assert transitions == []
+        assert [item for item in transitions if item.label == "Smoking"] == []
 
-    assert store.active_event_ids == []
+    assert not [event_id for event_id in store.active_event_ids if "-smoking-" in event_id]
     assert store.candidate_labels == []
     evidence.close()
 
@@ -338,33 +317,45 @@ def test_confirmed_smoking_has_one_lifecycle_and_complete_evidence(
 
     assert store.observe(frame_num=1, timestamp=1.0, result=positive, frame=frame) == []
     assert store.observe(frame_num=2, timestamp=1.2, result=positive, frame=frame) == []
-    started = store.observe(
+    started = [
+        item
+        for item in store.observe(
         frame_num=3,
         timestamp=1.4,
         result=positive,
         frame=frame,
-    )
+        )
+        if item.label == "Smoking"
+    ]
     assert [item.operation for item in started] == ["START"]
     event_id = started[0].event_id
 
-    updated = store.observe(
+    updated = [
+        item
+        for item in store.observe(
         frame_num=4,
         timestamp=1.6,
         result=positive,
         frame=frame,
-    )
+        )
+        if item.label == "Smoking"
+    ]
     assert [item.operation for item in updated] == ["UPDATE"]
 
     negative = _result(detections=(seatbelt,))
-    assert store.observe(frame_num=5, timestamp=1.8, result=negative, frame=frame) == []
-    assert store.observe(frame_num=6, timestamp=2.0, result=negative, frame=frame) == []
-    ended = store.observe(
-        frame_num=7,
-        timestamp=2.2,
-        result=negative,
-        frame=frame,
-    )
-    assert [item.operation for item in ended] == ["END"]
+    assert not [item for item in store.observe(frame_num=5, timestamp=1.8, result=negative, frame=frame) if item.label == "Smoking"]
+    assert not [item for item in store.observe(frame_num=6, timestamp=2.0, result=negative, frame=frame) if item.label == "Smoking"]
+    ended = [
+        item
+        for item in store.observe(
+            frame_num=7,
+            timestamp=2.2,
+            result=negative,
+            frame=frame,
+        )
+        if item.label == "Smoking"
+    ]
+    assert [item.operation for item in ended if item.label == "Smoking"] == ["END"]
     assert ended[0].event_id == event_id
 
     event_dir = evidence.event_directory(event_id)
@@ -382,7 +373,8 @@ def test_confirmed_smoking_has_one_lifecycle_and_complete_evidence(
     assert records[-1]["dms_evidence"]["best_score"] == pytest.approx(0.62)
 
     monkeypatch.setattr(dashboard_api, "load_raw_config", lambda _path: config)
-    feed = dashboard_api._event_feed(0, 50)
+    monkeypatch.setattr(dashboard_api, "_runner_status", lambda: {})
+    feed = dashboard_api._event_feed(50)
     matching = [item for item in feed["events"] if item["event_id"] == event_id]
     assert len(matching) == 1
     assert matching[0]["state"] == "ended"
@@ -445,7 +437,7 @@ def test_driver_inattention_has_one_event_for_changing_reasons(tmp_path) -> None
         }
     )
     ended = store.observe(frame_num=13, timestamp=1.4, result=attentive, frame=None)
-    assert [item.operation for item in ended] == ["END"]
+    assert [item.operation for item in ended if item.label == "Driver Inattention"] == ["END"]
     evidence.close()
 
 
@@ -489,17 +481,21 @@ def test_no_seatbelt_requires_a_tracked_driver(tmp_path) -> None:
         result=driver_without_seatbelt,
         frame=None,
     )
-    assert [item.operation for item in started] == ["START"]
-    assert started[0].label == "No Seatbelt"
+    assert [item.operation for item in started if item.label == "No Seatbelt"] == ["START"]
+    assert next(item for item in started if item.label == "No Seatbelt").label == "No Seatbelt"
 
     seatbelt = _result(detections=(_detection("Seatbelt", 0.8),))
-    assert store.observe(frame_num=13, timestamp=1.6, result=seatbelt, frame=None) == []
-    assert store.observe(frame_num=14, timestamp=1.8, result=seatbelt, frame=None) == []
-    ended = store.observe(
+    assert not [item for item in store.observe(frame_num=13, timestamp=1.6, result=seatbelt, frame=None) if item.label == "No Seatbelt"]
+    assert not [item for item in store.observe(frame_num=14, timestamp=1.8, result=seatbelt, frame=None) if item.label == "No Seatbelt"]
+    ended = [
+        item
+        for item in store.observe(
         frame_num=15,
         timestamp=2.0,
         result=seatbelt,
         frame=None,
-    )
+        )
+        if item.label == "No Seatbelt"
+    ]
     assert [item.operation for item in ended] == ["END"]
     evidence.close()

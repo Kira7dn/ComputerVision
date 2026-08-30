@@ -94,7 +94,10 @@ def test_ldw_requires_window_and_closes_once() -> None:
 
 
 def test_fcw_starts_immediately_and_invalid_state_clears() -> None:
-    policy = VisionAlertPolicy(fcw_clear_observations=2)
+    policy = VisionAlertPolicy(
+        config={"fcw_confirmation_hits": 1, "fcw_confirmation_window": 1},
+        fcw_clear_observations=2,
+    )
     started = policy.observe(_perception(1, fcw=True))
     assert started[0].label == "vision_fcw"
     assert policy.observe(_perception(2, valid=False)) == []
@@ -108,6 +111,8 @@ def test_high_sensitivity_fcw_uses_brake_probability_with_hysteresis() -> None:
             "fcw_brake_probability": 0.02,
             "fcw_clear_probability": 0.01,
             "fcw_clear_observations": 2,
+            "fcw_confirmation_hits": 1,
+            "fcw_confirmation_window": 1,
         }
     )
     started = policy.observe(
@@ -131,8 +136,28 @@ def test_high_sensitivity_fcw_uses_brake_probability_with_hysteresis() -> None:
     ]
 
 
+def test_fcw_ignores_single_probability_spike() -> None:
+    policy = VisionAlertPolicy(
+        config={
+            "fcw_brake_probability": 0.09,
+            "fcw_confirmation_hits": 3,
+            "fcw_confirmation_window": 5,
+        }
+    )
+    assert policy.observe(replace(_perception(1), hard_brake_3_probs=(0.1, 0.1))) == []
+    for frame in (2, 3, 4, 5):
+        assert policy.observe(replace(_perception(frame), hard_brake_3_probs=(0.0, 0.0))) == []
+    assert policy.observe(replace(_perception(6), hard_brake_3_probs=(0.1, 0.1))) == []
+    assert policy.observe(replace(_perception(7), hard_brake_3_probs=(0.1, 0.1))) == []
+    started = policy.observe(replace(_perception(8), hard_brake_3_probs=(0.1, 0.1)))
+    assert [(item.operation, item.label) for item in started] == [("START", "vision_fcw")]
+
+
 def test_epoch_change_never_carries_active_alert() -> None:
-    policy = VisionAlertPolicy(fcw_clear_observations=2)
+    policy = VisionAlertPolicy(
+        config={"fcw_confirmation_hits": 1, "fcw_confirmation_window": 1},
+        fcw_clear_observations=2,
+    )
     policy.observe(_perception(1, fcw=True, epoch="old"))
     assert policy.active_labels == ("vision_fcw",)
     ended = policy.observe(_perception(1, epoch="new"))
@@ -339,7 +364,9 @@ def test_geometry_drift_learns_baseline_and_clears_below_sixty_percent() -> None
 
 
 def test_banner_priority_and_timestamp_discontinuity_reset_all_state() -> None:
-    policy = VisionAlertPolicy()
+    policy = VisionAlertPolicy(
+        config={"fcw_confirmation_hits": 1, "fcw_confirmation_window": 1}
+    )
     for frame in range(1, 6):
         policy.observe(_perception(frame, lead_ttc=True))
     assert policy.banner_label == "vision_lead_ttc"
@@ -354,7 +381,13 @@ def test_banner_priority_and_timestamp_discontinuity_reset_all_state() -> None:
 
 
 def test_mock_cycle_reset_closes_active_alert_and_restarts_state() -> None:
-    policy = VisionAlertPolicy(config={"fcw_clear_observations": 20})
+    policy = VisionAlertPolicy(
+        config={
+            "fcw_clear_observations": 20,
+            "fcw_confirmation_hits": 1,
+            "fcw_confirmation_window": 1,
+        }
+    )
     first = replace(_perception(1, fcw=True), diagnostics={"mock_cycle_index": 0})
     assert policy.observe(first)[0].operation == "START"
     second = replace(_perception(2), diagnostics={"mock_cycle_index": 1})

@@ -185,8 +185,22 @@ def test_vision_ingress_has_no_tbox_service_dependency() -> None:
     )
 
     assert "tbox.service" not in ingress
-    assert "After=network-online.target" in ingress
-    assert "Wants=network-online.target" in ingress
+    assert "network-online.target" not in ingress
+
+
+def test_production_units_start_without_network_online_and_mdns_is_dynamic() -> None:
+    systemd_root = ROOT / "deploy" / "systemd"
+    for name in (
+        "ls-vision.service",
+        "ls-vision-ingress.service",
+        "ls-vision-mdns.service",
+        "mediamtx.service",
+    ):
+        assert "network-online.target" not in (systemd_root / name).read_text(
+            encoding="utf-8"
+        )
+    mdns = (systemd_root / "ls-vision-mdns.service").read_text(encoding="utf-8")
+    assert "interfaces.mdns_publisher" in mdns
 
 
 def test_config_routes_functions_per_camera() -> None:
@@ -200,7 +214,10 @@ def test_config_routes_functions_per_camera() -> None:
     assert front["person"]["tracking"]["confirmation_hits"] == 2
     dahua = resolve_camera_config(raw, "DMS")
     assert dahua["input"]["mode"] == "rtsp"
-    assert "channel=5" in dahua["input"]["rtsp_url"]
+    assert dahua["input"]["rtsp_url"] is None
+    dms_source = raw["cameras"][0]["source"]
+    assert dms_source["discovery"]["protocol"] == "onvif"
+    assert "channel=5" in dms_source["discovery"]["rtsp_path"]
     assert dahua["functions"] == {
         "trace": False,
         "face_recognition": False,
@@ -260,8 +277,8 @@ def test_event_feed_collapses_lifecycle_and_recognition_starts_on_exact_frame() 
         encoding="utf-8"
     )
 
-    assert 'if record_type not in {"START", "UPDATE", "END"}:' in dashboard_server
-    assert "latest_by_event[event_id] = (sequence, record)" in dashboard_server
+    assert "SELECT record_json FROM event_list" in dashboard_server
+    assert "for sequence, record in latest_by_event:" in dashboard_server
     assert '"thumbnail_url": thumbnail_url' in dashboard_server
     assert '"image_url": image_url' in dashboard_server
     assert "variant=thumbnail" in dashboard_server

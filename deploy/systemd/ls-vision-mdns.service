@@ -1,11 +1,15 @@
 [Unit]
 Description=LS-Vision production mDNS address
-After=network-online.target avahi-daemon.service
-Wants=network-online.target avahi-daemon.service
+After=avahi-daemon.service
+Wants=avahi-daemon.service
 
 [Service]
 Type=simple
-ExecStart=/bin/sh /opt/ls-vision/current/app/deploy/systemd/publish-vision-mdns.sh
+User=letron
+Group=letron
+WorkingDirectory=/opt/ls-vision/current/app
+Environment=PYTHONPATH=/opt/ls-vision/current/app/src
+ExecStart=/opt/ls-vision/runtime/venv/bin/python3 -m interfaces.mdns_publisher
 Restart=always
 RestartSec=3
 

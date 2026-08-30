@@ -1094,7 +1094,7 @@ maintain-aspect-ratio=0
 
     def _process_dms_sample(self, sample: AnalysisSample) -> DmsInferenceResult:
         if self.dms_engine is None:
-            return DmsInferenceResult(SmokingInferenceBatch((), ()), (), (), "DISABLED", {})
+            return DmsInferenceResult((), (), "DISABLED", {})
         return self.dms_engine.process(
             sample.frame,
             list(sample.persons),
@@ -1309,7 +1309,6 @@ maintain-aspect-ratio=0
                 }
             )
             published_result = DmsInferenceResult(
-                raw_result.smoking,
                 raw_result.detections,
                 confirmed_alerts,
                 confirmed_status,

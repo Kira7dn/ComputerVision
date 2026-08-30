@@ -96,7 +96,7 @@ done
 sudo_cmd systemctl daemon-reload
 sudo_cmd systemctl restart mediamtx.service ls-vision.service ls-vision-ingress.service
 for attempt in $(seq 1 30); do
-  if curl --fail --silent --max-time 5 http://127.0.0.1:18080/health/ready >/dev/null; then
+  if curl --fail --silent --max-time 5 --header 'Host: vision.local' http://127.0.0.1/health/ready >/dev/null; then
     echo "$TARGET"
     exit 0
   fi
@@ -318,20 +318,22 @@ if [ "$DEPLOYMENT_PROFILE" = production ]; then
   while sudo_cmd iptables -t nat -D OUTPUT -p tcp --dport 80 -j REDIRECT --to-port 8000 >/dev/null 2>&1; do :; done
   while sudo_cmd ip6tables -t nat -D PREROUTING -p tcp --dport 80 -j REDIRECT --to-port 8000 >/dev/null 2>&1; do :; done
   while sudo_cmd ip6tables -t nat -D OUTPUT -p tcp --dport 80 -j REDIRECT --to-port 8000 >/dev/null 2>&1; do :; done
-  sudo_cmd systemctl enable --now ls-vision-mdns.service
-  sudo_cmd systemctl enable --now mediamtx.service
-  sudo_cmd systemctl enable --now ls-vision.service
-  sudo_cmd systemctl enable --now ls-vision-ingress.service
+  sudo_cmd systemctl enable ls-vision-mdns.service mediamtx.service ls-vision.service ls-vision-ingress.service
+  sudo_cmd systemctl restart ls-vision-mdns.service mediamtx.service ls-vision.service ls-vision-ingress.service
 else
   sudo_cmd systemctl disable ls-vision-dev.service >/dev/null 2>&1 || true
   sudo_cmd systemctl start ls-vision-dev.service
 fi
 
-HEALTH_PORT=18080
-if [ "$DEPLOYMENT_PROFILE" = development ]; then HEALTH_PORT=28080; fi
 for attempt in $(seq 1 60); do
-  if curl --fail --silent --show-error --max-time 5 --output /dev/null "http://127.0.0.1:$HEALTH_PORT/health/live" \
-    && curl --fail --silent --show-error --max-time 5 --output /dev/null "http://127.0.0.1:$HEALTH_PORT/health/ready"; then
+  if [ "$DEPLOYMENT_PROFILE" = production ]; then
+    HEALTH_LIVE=$(curl --fail --silent --show-error --max-time 5 --unix-socket /run/ls-vision/api.sock http://localhost/health/live || true)
+    HEALTH_READY=$(curl --fail --silent --show-error --max-time 5 --unix-socket /run/ls-vision/api.sock http://localhost/health/ready || true)
+  else
+    HEALTH_LIVE=$(curl --fail --silent --show-error --max-time 5 http://127.0.0.1:28080/health/live || true)
+    HEALTH_READY=$(curl --fail --silent --show-error --max-time 5 http://127.0.0.1:28080/health/ready || true)
+  fi
+  if [ -n "$HEALTH_LIVE" ] && [ -n "$HEALTH_READY" ]; then
     if [ "$DEPLOYMENT_PROFILE" = production ]; then
       systemctl is-active --quiet ls-vision-ingress.service
       systemctl is-active --quiet ls-vision-mdns.service
@@ -355,7 +357,7 @@ for attempt in $(seq 1 60); do
       sudo_cmd rm -rf -- "$old_release"
     done
     sudo_cmd rm -f -- "$REMOTE_ROOT/data/status/hot-reload.pid"
-    curl --fail --silent --show-error --max-time 5 "http://127.0.0.1:$HEALTH_PORT/health/live"
+    printf '%s\n' "$HEALTH_LIVE"
     exit 0
   fi
   sleep 2

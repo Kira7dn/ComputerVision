@@ -1,9 +1,7 @@
 """DMS behavior adapter for the DeepStream camera worker.
 
-The runtime uses one Soham YOLO model,
-MediaPipe face metrics, canonical alert names and a small hysteresis smoother.
-This module keeps that policy while receiving frames from the
-DeepStream probe and returning frame-aligned results to the worker.
+The runtime uses raw Soham YOLO labels plus MediaPipe face metrics.
+Temporal event state is owned by DmsAlertEventStore.
 """
 
 from __future__ import annotations
@@ -25,13 +23,13 @@ from adapters.models.smoking_object_detector import (
     SmokingObjectDetection,
     SmokingObjectDetector,
 )
+from domain.dms_events import MODEL_ALERTS
 from domain.driver_attention import (
     ATTENTION_EVENT_LABEL,
     AttentionObservation,
     DriverAttentionPolicy,
     NeutralPoseCalibrator,
 )
-from domain.smoking_events import SmokingInferenceBatch, SmokingObservation
 
 LOG = logging.getLogger("deepstream.dms")
 
@@ -40,25 +38,17 @@ ALERT_CLASSES = frozenset(
         "Smoking",
         "Drinking",
         "Eating",
-        "Phone Usage",
+        "PhoneUse",
         "Distracted",
         "Drowsy",
+        "SafeDriving",
+        "Seatbelt",
         "Yawning",
         "Eyes Closed",
         "Head Away",
         "No Seatbelt",
     }
 )
-LABEL_MAP = {
-    "Smoking": "Smoking",
-    "Drinking": "Drinking",
-    "Eating": "Eating",
-    "PhoneUse": "Phone Usage",
-    "Seatbelt": "Seatbelt",
-    "Distracted": "Distracted",
-    "Drowsy": "Drowsy",
-    "SafeDriving": "Safe Driving",
-}
 LEFT_EYE = (33, 160, 158, 133, 153, 144)
 RIGHT_EYE = (362, 385, 387, 263, 373, 380)
 MOUTH = (61, 13, 291, 14)
@@ -76,7 +66,6 @@ class DmsDetection:
 
 @dataclass(frozen=True)
 class DmsInferenceResult:
-    smoking: SmokingInferenceBatch
     detections: tuple[DmsDetection, ...]
     alerts: tuple[str, ...]
     status: str
@@ -113,29 +102,6 @@ def select_dms_overlay_detections(
             str(item.source),
         ),
     )
-
-
-class AlertSmoother:
-    """The same 3-hit-on / 2-miss-off alert hysteresis as dms.py."""
-
-    def __init__(self, on_frames: int = 3, off_frames: int = 2) -> None:
-        self.on_frames = max(1, int(on_frames))
-        self.off_frames = max(1, int(off_frames))
-        self.counts: dict[str, int] = {}
-        self.active: dict[str, bool] = {}
-
-    def update(self, raw_alerts: Iterable[str]) -> list[str]:
-        raw = {str(item) for item in raw_alerts if str(item) in ALERT_CLASSES}
-        for alert in set(self.counts) | set(self.active) | raw:
-            if alert in raw:
-                self.counts[alert] = min(self.on_frames, self.counts.get(alert, 0) + 1)
-            else:
-                self.counts[alert] = max(-self.off_frames, self.counts.get(alert, 0) - 1)
-            if self.counts[alert] >= self.on_frames:
-                self.active[alert] = True
-            elif self.counts[alert] <= -self.off_frames:
-                self.active[alert] = False
-        return sorted(alert for alert, is_active in self.active.items() if is_active)
 
 
 def _distance(first: tuple[float, float], second: tuple[float, float]) -> float:
@@ -432,12 +398,8 @@ class DmsBehaviorEngine:
         self._cached_face_alerts: set[str] = set()
         self._primary_driver_track_id: int | None = None
         self._cached_raw_objects: list[SmokingObjectDetection] = []
-        self.smoother = AlertSmoother(
-            int((runtime.get("alerts", {}) or {}).get("on_frames", 3)),
-            int((runtime.get("alerts", {}) or {}).get("off_frames", 2)),
-        )
         self.last_result = DmsInferenceResult(
-            SmokingInferenceBatch((), ()), (), (), "DISABLED", {}, "not initialized"
+            (), (), "DISABLED", {}, "not initialized"
         )
         if self.enabled:
             LOG.info(
@@ -446,10 +408,6 @@ class DmsBehaviorEngine:
                 self.face.available,
                 self.interval_seconds * 1000.0,
             )
-
-    @staticmethod
-    def _canonical(label: str) -> str:
-        return LABEL_MAP.get(label, label)
 
     def process(
         self,
@@ -460,7 +418,6 @@ class DmsBehaviorEngine:
     ) -> DmsInferenceResult:
         del frame_number
         timestamp = float(source_timestamp if source_timestamp is not None else time.monotonic())
-        observed_ids = tuple(sorted(int(person[0]) for person in persons))
         if not self.enabled or frame.size == 0:
             return self.last_result
         started = time.perf_counter()
@@ -496,13 +453,12 @@ class DmsBehaviorEngine:
             DmsDetection(
                 source=item.source,
                 original_class=item.label,
-                label=self._canonical(item.label),
+                label=item.label,
                 score=float(item.score),
                 bbox=item.bbox,
                 person_track_id=matched_person(item),
             )
             for item in raw_objects
-            if self._canonical(item.label) != "Safe Driving"
         )
         raw_alerts = {item.label for item in detections if item.label in ALERT_CLASSES}
         if (
@@ -540,7 +496,10 @@ class DmsBehaviorEngine:
         face_metrics["face_inference_ran"] = face_inference_ran
         face_metrics["face_rate_hz"] = round(1.0 / self.face_interval_seconds, 3)
         raw_alerts.update(face_alerts)
-        smoothed_alerts = set(self.smoother.update(raw_alerts))
+        # DmsAlertEventStore is the single temporal owner for DMS alerts.
+        # Keep this inference result frame-local; applying a second hysteresis
+        # layer here made overlay, diagnostics, and event state diverge.
+        frame_alerts = set(raw_alerts)
 
         messages: list[str] = []
         if not self.object_detector.models:
@@ -556,18 +515,18 @@ class DmsBehaviorEngine:
             driver_present=bool(person_bboxes),
             face_detected=face_metrics.get("face_detected") is True,
             pose=(
-                "Head Away" in smoothed_alerts or "Distracted" in matched_labels
+                "Head Away" in frame_alerts or "Distracted" in matched_labels
             )
             if face_metrics.get("face_detected") is True
             and face_metrics.get("pose_calibrated") is True
             else None,
-            eyes=("Eyes Closed" in smoothed_alerts)
+            eyes=("Eyes Closed" in frame_alerts)
             if face_metrics.get("face_detected") is True
             else None,
-            phone=("Phone Usage" in matched_labels)
+            phone=("PhoneUse" in matched_labels)
             if self.object_detector.models and person_bboxes
             else None,
-            fatigue=("Drowsy" in matched_labels or "Yawning" in smoothed_alerts)
+            fatigue=("Drowsy" in matched_labels or "Yawning" in frame_alerts)
             if face_metrics.get("face_detected") is True
             else None,
             uncertain=False,
@@ -586,8 +545,8 @@ class DmsBehaviorEngine:
 
         behavior_alerts = {
             label
-            for label in smoothed_alerts
-            if label in {"Smoking", "Drinking", "Eating", "No Seatbelt"}
+            for label in frame_alerts
+            if label in MODEL_ALERTS or label == "No Seatbelt"
         }
         if attention_state.event_active:
             behavior_alerts.add(ATTENTION_EVENT_LABEL)
@@ -597,30 +556,6 @@ class DmsBehaviorEngine:
         else:
             status = "ALERT" if alerts else "OK"
 
-        smoking_objects = [item for item in detections if item.label == "Smoking"]
-        observations: list[SmokingObservation] = []
-        for track_id, bbox in person_bboxes.items():
-            matched = [
-                item
-                for item in smoking_objects
-                if item.person_track_id == track_id
-            ]
-            if not matched:
-                continue
-            score = max(item.score for item in matched)
-            sources = tuple(sorted({f"dms:{item.source}:{item.original_class}" for item in matched}))
-            observations.append(
-                SmokingObservation(
-                    track_id=track_id,
-                    score=score,
-                    person_bbox=bbox,
-                    model_roi_bbox=bbox,
-                    positive=True,
-                    classifier_score=0.0,
-                    object_score=score,
-                    signal_sources=sources,
-                )
-            )
         metrics = {
             **face_metrics,
             "raw_alerts": sorted(raw_alerts),
@@ -651,7 +586,6 @@ class DmsBehaviorEngine:
             "total_latency_ms": round((time.perf_counter() - started) * 1000.0, 2),
         }
         self.last_result = DmsInferenceResult(
-            SmokingInferenceBatch(tuple(observations), observed_ids),
             detections,
             alerts,
             status,

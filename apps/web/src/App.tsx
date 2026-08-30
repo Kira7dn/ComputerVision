@@ -10,32 +10,9 @@ const MAX_EVENTS = 50
 const EVENT_POLL_MS = 1000
 const METRICS_POLL_MS = 2000
 
-function eventId(event: EventRecord) {
-  return String(event.event_id ?? `${event.camera}-${event.timestamp}-${event.event_name}`)
-}
-
 function eventTimestamp(event: EventRecord) {
   const timestamp = Number(event.timestamp)
   return Number.isFinite(timestamp) ? timestamp : Number.MAX_SAFE_INTEGER
-}
-
-function mergeEvents(current: EventRecord[], incoming: EventRecord[]) {
-  const entries = new Map(current.map((event) => [eventId(event), event]))
-  for (const event of incoming) {
-    const id = eventId(event)
-    const previous = entries.get(id)
-    entries.set(id, previous
-      ? {
-          ...previous,
-          ...event,
-          details: { ...previous.details, ...event.details },
-          start_record: Object.keys(event.start_record ?? {}).length > 0
-            ? event.start_record
-            : previous.start_record,
-        }
-      : event)
-  }
-  return [...entries.values()].sort((left, right) => eventTimestamp(right) - eventTimestamp(left)).slice(0, MAX_EVENTS)
 }
 
 function App() {
@@ -46,8 +23,6 @@ function App() {
   const [eventsLoading, setEventsLoading] = useState(true)
   const [eventsError, setEventsError] = useState(false)
   const [focusedCameraId, setFocusedCameraId] = useState<string | null>(null)
-  const eventCursor = useRef<number | null>(null)
-  const eventRunId = useRef<string | null>(null)
   const metricsRequestInFlight = useRef(false)
   const eventsRequestInFlight = useRef(false)
   const liveCameras = useRef<Set<string>>(new Set())
@@ -76,32 +51,13 @@ function App() {
     if (eventsRequestInFlight.current) return
     eventsRequestInFlight.current = true
     try {
-      const cursor = eventCursor.current
-      const data = await fetchEvents(cursor ?? 0, cursor === null ? MAX_EVENTS * 2 : undefined)
+      const data = await fetchEvents()
       setEventsLoading(false)
       setEventsError(false)
-      if (cursor === null) {
-        eventRunId.current = data.run_id
-        eventCursor.current = data.cursor
-        const initial = [...(data.events ?? [])]
-          .sort((left, right) => Number(left.sequence ?? 0) - Number(right.sequence ?? 0))
-          .filter((event) => liveCameras.current.size === 0 || liveCameras.current.has(String(event.camera)))
-        setEvents((current) => mergeEvents(current, initial))
-        return
-      }
-      if (data.run_id !== eventRunId.current) {
-        eventRunId.current = data.run_id
-        eventCursor.current = null
-        setEvents([])
-        return
-      }
-      eventCursor.current = data.cursor
-      if (runtimeReady.current) {
-        const fresh = [...(data.events ?? [])]
-          .sort((left, right) => Number(left.sequence ?? 0) - Number(right.sequence ?? 0))
-          .filter((event) => liveCameras.current.has(String(event.camera)))
-        if (fresh.length) setEvents((current) => mergeEvents(current, fresh))
-      }
+      const current = [...(data.events ?? [])]
+        .sort((left, right) => eventTimestamp(right) - eventTimestamp(left))
+        .filter((event) => liveCameras.current.size === 0 || liveCameras.current.has(String(event.camera)))
+      setEvents(current.slice(0, MAX_EVENTS))
     } catch {
       // Keep existing events visible while the API is unavailable.
       setEventsLoading(false)

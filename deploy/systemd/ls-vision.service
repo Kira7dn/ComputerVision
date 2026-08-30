@@ -1,20 +1,22 @@
 [Unit]
 Description=LeOS native DeepStream Camera Vision
-After=network-online.target mediamtx.service
-Wants=network-online.target
+After=mediamtx.service
 Requires=mediamtx.service
 
 [Service]
 Type=simple
 User=letron
 Group=letron
+RuntimeDirectory=ls-vision
+RuntimeDirectoryMode=0750
+UMask=0007
 WorkingDirectory=/opt/ls-vision/current/app
 EnvironmentFile=/etc/ls-vision/ls-vision.env
 Environment=PYTHONPATH=/opt/ls-vision/current/app/src
 Environment=CAMERA_CONFIG=/opt/ls-vision/current/app/config/production.yaml
 Environment=CAMERA_WEB_ROOT=/opt/ls-vision/current/app/web
 Environment=CAMERA_RUNTIME_ROOT=/opt/ls-vision/data
-Environment=CAMERA_DASHBOARD_HOST=0.0.0.0
+Environment=CAMERA_DASHBOARD_UNIX_SOCKET=/run/ls-vision/api.sock
 Environment=CAMERA_MOCK_MEDIA_ROOT=/opt/ls-vision/data/mock-videos/cameras/sync-lite
 Environment=CAMERA_MOCK_MEDIA_PORT=18081
 Environment=CAMERA_MOCK_TIMELINE_ENABLED=1

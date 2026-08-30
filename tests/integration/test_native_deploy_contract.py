@@ -12,7 +12,9 @@ def test_native_jetson_declares_isolated_production_and_development_services() -
     assert "config/production.yaml" in production
     assert "CAMERA_RUNTIME_ROOT=/opt/ls-vision/data" in production
     assert "CAMERA_MOCK_TIMELINE_ENABLED=1" in production
+    assert "CAMERA_DASHBOARD_UNIX_SOCKET=/run/ls-vision/api.sock" in production
     assert "CAMERA_DASHBOARD_PORT=28080" in development
+    assert "CAMERA_DASHBOARD_UNIX_SOCKET=/run/ls-vision/api.sock" in development
     assert "CAMERA_INPUT_RTSP_BASE=rtsp://127.0.0.1:28554" in development
     dev_supervisor = (root / "deploy/dev/jetson_supervisor.py").read_text(
         encoding="utf-8"
@@ -30,7 +32,8 @@ def test_native_jetson_declares_isolated_production_and_development_services() -
     assert 'gates["runner_config_accepted"]' in production_e2e
     assert "Conflicts=ls-vision.service" not in development
     assert "interfaces.host_ingress" in ingress
-    assert "127.0.0.1:18080" in ingress
+    assert "--vision-unix-socket /run/ls-vision/api.sock" in ingress
+    assert "127.0.0.1:18080" not in ingress
     assert "127.0.0.1:8000" in ingress
     assert "tbox.service" not in ingress
     assert "release-manifest.json" in deploy
